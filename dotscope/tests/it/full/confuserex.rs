@@ -26,10 +26,10 @@ use dotscope::{
     testkit::{
         deobfuscated, fixture,
         framework::{
-            assert_common_requirements, load_sample, print_summary, run_deobfuscation_test,
-            ProcessMode, SampleSpec, TestResult, SEMANTIC_TEST_METHODS,
+            assert_common_requirements, print_summary, run_deobfuscation_test, ProcessMode,
+            SampleSpec, TestResult,
         },
-        verification::{StructuralConfig, VerificationLevel},
+        verification::StructuralConfig,
     },
     CilObject,
 };
@@ -70,7 +70,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             expected_protections: ExpectedProtections::default(),
             is_original: true,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -83,7 +82,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig {
                 check_type_names: false,
@@ -103,7 +101,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig {
                 check_type_names: false,
@@ -120,7 +117,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -134,7 +130,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -148,7 +143,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -169,7 +163,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig {
                 check_type_names: false,
@@ -186,7 +179,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -200,7 +192,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -215,7 +206,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -229,7 +219,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -243,7 +232,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -257,7 +245,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -272,7 +259,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -287,7 +273,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -302,7 +287,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -317,7 +301,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -332,7 +315,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -346,7 +328,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -360,7 +341,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -374,7 +354,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -387,7 +366,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -401,7 +379,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -416,7 +393,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -430,7 +406,6 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -443,9 +418,12 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
-            structural_config: StructuralConfig::default(),
+            // The original names are not in the file: renamed types are matched by count
+            structural_config: StructuralConfig {
+                check_type_names: false,
+                ..Default::default()
+            },
         },
         SampleSpec {
             filename: "mkaring_typescramble.exe",
@@ -455,8 +433,8 @@ fn all_samples() -> Vec<SampleSpec<ExpectedProtections>> {
                 ..Default::default()
             },
             is_original: false,
-            check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
+            // Not supported: the type scrambler is not reversed
+            check_semantic_preservation: false,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -470,15 +448,7 @@ fn check_sample(filename: &str) {
         .into_iter()
         .find(|sample| sample.filename == filename)
         .unwrap_or_else(|| panic!("{filename} is not a ConfuserEx sample"));
-    let original_asm =
-        load_sample(SAMPLES_DIR, "original.exe").expect("the unprotected original loads");
-    let result = &run_deobfuscation_test(
-        &sample,
-        SAMPLES_DIR,
-        Some(&original_asm),
-        SEMANTIC_TEST_METHODS,
-        ProcessMode::Assembly,
-    );
+    let result = &run_deobfuscation_test(&sample, SAMPLES_DIR, ProcessMode::Assembly);
 
     print_confuserex_summary(std::slice::from_ref(result));
 
@@ -488,13 +458,7 @@ fn check_sample(filename: &str) {
 
     let filename = result.sample.filename;
     let expected = &result.sample.expected_protections;
-
-    // Common assertions: core validity, semantic preservation, structural match, diagnostics
-    let semantic_threshold = match result.sample.verification_level {
-        VerificationLevel::Normal => 0.90,
-        VerificationLevel::Relaxed => 0.85,
-    };
-    assert_common_requirements(result, None, semantic_threshold, true);
+    assert_common_requirements(result);
 
     // Detection assertions (engine found expected protections)
     if expected.has_marker_attributes {

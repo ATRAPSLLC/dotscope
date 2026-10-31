@@ -13,6 +13,8 @@
 //! native PE imports and exports to assemblies, writing them to disk,
 //! and ensuring they can be loaded back correctly with the modifications intact.
 
+use std::fs;
+
 use dotscope::{prelude::*, testkit::fixture, DataDirectoryType};
 
 #[test]
@@ -112,7 +114,7 @@ fn add_native_imports_to_crafted_2() -> Result<()> {
     );
 
     // Verify we have the DLLs we added by checking the import descriptors
-    let dll_names: Vec<&str> = imports.iter().map(|imp| imp.dll.as_str()).collect();
+    let dll_names: Vec<&str> = imports.iter().map(|imp| &*imp.dll).collect();
     assert!(
         dll_names.contains(&"kernel32.dll"),
         "Should have kernel32.dll in import table"
@@ -125,7 +127,7 @@ fn add_native_imports_to_crafted_2() -> Result<()> {
     // Verify the kernel32.dll functions
     let kernel32_functions: Vec<&str> = imports
         .iter()
-        .filter(|imp| imp.dll == "kernel32.dll")
+        .filter(|imp| &*imp.dll == "kernel32.dll")
         .filter_map(|imp| imp.name.as_deref())
         .collect();
 
@@ -146,7 +148,7 @@ fn add_native_imports_to_crafted_2() -> Result<()> {
     // Verify the user32.dll functions
     let user32_functions: Vec<&str> = imports
         .iter()
-        .filter(|imp| imp.dll == "user32.dll")
+        .filter(|imp| &*imp.dll == "user32.dll")
         .filter_map(|imp| imp.name.as_deref())
         .collect();
 
@@ -215,45 +217,9 @@ fn add_native_exports_to_crafted_2() -> Result<()> {
     assert!(export_rva > 0, "Export table RVA should be positive");
     assert!(export_size > 0, "Export table size should be positive");
 
-    // Step 5: Now verify that our added exports can be parsed back correctly
-    // Check export directory first
-    let export_directory = modified_view
-        .file()
-        .get_data_directory(DataDirectoryType::ExportTable);
-
-    let reloaded_assembly = modified_view.to_owned();
-    let parsed_exports = reloaded_assembly.native_exports();
-
-    // Check if export parsing now works with our fixes
-    if parsed_exports.is_empty() {
-        // Export table generation should be successful - verify with goblin
-        assert!(
-            export_directory.is_some(),
-            "Export directory should exist after writing exports"
-        );
-
-        let (export_rva, export_size) = export_directory.unwrap();
-        assert!(export_rva > 0, "Export table RVA should be positive");
-        assert!(export_size > 0, "Export table size should be positive");
-
-        // Try parsing with goblin manually to verify PE format correctness
-        let pe = goblin::pe::PE::parse(reloaded_assembly.view().file().data())
-            .expect("Goblin should successfully parse PE after export table generation");
-
-        // Verify the exports were written correctly
-        assert_eq!(
-            pe.exports.len(),
-            3,
-            "Goblin should find exactly 3 exports in the generated export table"
-        );
-
-        // Export table generation is successful - PE format is valid
-        // Note: dotscope native_exports() contains user modifications only,
-        // which is why it's empty for reloaded assemblies
-        return Ok(());
-    }
-
-    let exports = parsed_exports;
+    // Step 5: The exports the loaded image holds
+    let reloaded = CilObject::from_mem(modified_view.file().data().to_vec())?;
+    let exports = reloaded.exports();
 
     // Verify the DLL name we set
     assert_eq!(
@@ -415,7 +381,7 @@ fn add_both_imports_and_exports_to_crafted_2() -> Result<()> {
     );
 
     // Verify we have kernel32.dll
-    let dll_names: Vec<&str> = imports.iter().map(|imp| imp.dll.as_str()).collect();
+    let dll_names: Vec<&str> = imports.iter().map(|imp| &*imp.dll).collect();
     assert!(
         dll_names.contains(&"kernel32.dll"),
         "Should have kernel32.dll in import table"
@@ -423,7 +389,7 @@ fn add_both_imports_and_exports_to_crafted_2() -> Result<()> {
 
     let kernel32_functions: Vec<&str> = imports
         .iter()
-        .filter(|imp| imp.dll == "kernel32.dll")
+        .filter(|imp| &*imp.dll == "kernel32.dll")
         .filter_map(|imp| imp.name.as_deref())
         .collect();
 
@@ -444,24 +410,7 @@ fn add_both_imports_and_exports_to_crafted_2() -> Result<()> {
     // Verify exports using the file's parsed exports
     let parsed_exports = modified_view.file().exports();
 
-    // Export table generation should work correctly
-    if parsed_exports.is_none() {
-        // Verify with goblin directly as fallback
-        let pe = goblin::pe::PE::parse(modified_view.file().data())
-            .expect("Goblin should successfully parse PE in combined import/export test");
-
-        assert_eq!(
-            pe.exports.len(),
-            2,
-            "Goblin should find exactly 2 exports in combined import/export test"
-        );
-
-        // All added imports and exports verified successfully
-        return Ok(());
-    }
-
-    // Verify exports using goblin Export structure
-    let exports = parsed_exports.unwrap();
+    let exports = parsed_exports.expect("the written export table reads back");
     assert_eq!(exports.len(), 2, "Should have 2 exported functions");
 
     // Find the exported functions by name
@@ -590,13 +539,6 @@ fn test_native_imports_parsing_from_existing_pe() -> Result<()> {
 
     let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))?;
 
-    // Verify the file has imports to parse
-    let original_imports = view.file().imports();
-    if original_imports.is_none() || original_imports.unwrap().is_empty() {
-        // Skip test if no imports exist
-        return Ok(());
-    }
-
     // Verify that native imports are accessible from the PE file
     // Note: With copy-on-write semantics, assembly.native_imports() only returns user modifications.
     // To access the original PE imports, we use the file's parsed imports.
@@ -610,7 +552,7 @@ fn test_native_imports_parsing_from_existing_pe() -> Result<()> {
     assert!(!imports.is_empty(), "Parsed imports should not be empty");
 
     // Verify the specific import that should exist in crafted_2.exe
-    let dll_names: Vec<&str> = imports.iter().map(|imp| imp.dll.as_str()).collect();
+    let dll_names: Vec<&str> = imports.iter().map(|imp| &*imp.dll).collect();
     assert!(
         dll_names.contains(&"mscoree.dll"),
         "Should have parsed mscoree.dll"
@@ -618,7 +560,7 @@ fn test_native_imports_parsing_from_existing_pe() -> Result<()> {
 
     let mscoree_functions: Vec<&str> = imports
         .iter()
-        .filter(|imp| imp.dll == "mscoree.dll")
+        .filter(|imp| &*imp.dll == "mscoree.dll")
         .filter_map(|imp| imp.name.as_deref())
         .collect();
 
@@ -725,4 +667,265 @@ fn test_import_table_format_validation() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// An export as a written image reads it back: `(name, ordinal, rva, forwarder)`, a
+/// forwarder's RVA left out (it moves with the table).
+type ReadExport = (Option<String>, u16, Option<u32>, Option<String>);
+
+/// What `bytes`' export directory reads back as: its header, and its exports, sorted.
+fn read_exports(bytes: &[u8]) -> (Option<PeExportHeader>, Vec<ReadExport>) {
+    let view = CilAssemblyView::from_mem(bytes.to_vec()).unwrap();
+    let pe = view.file().pe();
+    assert_eq!(pe.export_error, None, "the export table reads in full");
+    let mut exports: Vec<ReadExport> = pe
+        .exports
+        .iter()
+        .map(|export| {
+            (
+                export.name.clone(),
+                export.ordinal,
+                export.forwarder.is_none().then_some(export.rva),
+                export.forwarder.clone(),
+            )
+        })
+        .collect();
+    exports.sort();
+    (pe.export_header.clone(), exports)
+}
+
+/// `bytes` written back unchanged.
+fn rewritten(bytes: &[u8]) -> Vec<u8> {
+    CilAssembly::new(CilAssemblyView::from_mem(bytes.to_vec()).unwrap())
+        .to_memory()
+        .unwrap()
+}
+
+/// The file offset of `rva` in `bytes`.
+fn offset_of(bytes: &[u8], rva: u32) -> usize {
+    let view = CilAssemblyView::from_mem(bytes.to_vec()).unwrap();
+    view.file().rva_to_offset(rva as usize).unwrap()
+}
+
+/// The file offset of `bytes`' `kind` directory.
+fn directory_offset(bytes: &[u8], kind: DataDirectoryType) -> usize {
+    let view = CilAssemblyView::from_mem(bytes.to_vec()).unwrap();
+    let (rva, _) = view.file().get_data_directory(kind).unwrap();
+    view.file().rva_to_offset(rva as usize).unwrap()
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn patch_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// crafted_2.exe exporting `First` at ordinal 1, a forwarder `Forwarded` at 2, and ordinal 4
+/// without a name.
+fn with_exports() -> Vec<u8> {
+    let mut assembly = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+    NativeExportsBuilder::new("TestLibrary.dll")
+        .add_function("First", 1, 0x1000)
+        .add_forwarder("Forwarded", 2, "Other.dll.Target")
+        .add_function_by_ordinal(4, 0x2000)
+        .build(&mut assembly)
+        .unwrap();
+    assembly.to_memory().unwrap()
+}
+
+/// Each export reads back with its own ordinal, and a second write keeps every one. The
+/// exports were goblin's, which lists only named exports and has no ordinals: an export
+/// without a name was dropped, and each ordinal was taken from the file offset.
+#[test]
+fn native_exports_keep_their_ordinals_through_a_second_write() {
+    let first = with_exports();
+    let (header, exports) = read_exports(&first);
+    let header = header.expect("the image has an export directory");
+    assert_eq!((header.name.as_str(), header.base), ("TestLibrary.dll", 1));
+    assert_eq!(
+        exports,
+        vec![
+            (None, 4, Some(0x2000), None),
+            (Some("First".into()), 1, Some(0x1000), None),
+            (
+                Some("Forwarded".into()),
+                2,
+                None,
+                Some("Other.dll.Target".into())
+            ),
+        ]
+    );
+
+    let object = CilObject::from_mem(first.clone()).unwrap();
+    let native = object.exports().native();
+    assert_eq!(native.dll_name(), "TestLibrary.dll");
+    assert_eq!(
+        native.get_function_by_ordinal(4).map(|f| f.address),
+        Some(0x2000)
+    );
+    assert_eq!(
+        native
+            .get_forwarder_by_ordinal(2)
+            .map(|f| f.target.as_str()),
+        Some("Other.dll.Target")
+    );
+
+    assert_eq!(read_exports(&rewritten(&first)), read_exports(&first));
+}
+
+/// An ordinal under two names, and ordinal base 0, which makes the first slot ordinal 0,
+/// read back and survive a write.
+#[test]
+fn export_aliases_and_ordinal_zero_survive_a_write() {
+    let mut bytes = with_exports();
+    let directory = directory_offset(&bytes, DataDirectoryType::ExportTable);
+    patch_u32(&mut bytes, directory + 16, 0);
+    // The names are sorted, "First" then "Forwarded": the second takes the first's slot
+    let ordinals = offset_of(&bytes, read_u32(&bytes, directory + 36));
+    let slot = [bytes[ordinals], bytes[ordinals + 1]];
+    bytes[ordinals + 2..ordinals + 4].copy_from_slice(&slot);
+
+    let (_, exports) = read_exports(&bytes);
+    assert_eq!(
+        exports,
+        vec![
+            (None, 1, None, Some("Other.dll.Target".into())),
+            (None, 3, Some(0x2000), None),
+            (Some("First".into()), 0, Some(0x1000), None),
+            (Some("Forwarded".into()), 0, Some(0x1000), None),
+        ]
+    );
+    assert_eq!(read_exports(&rewritten(&bytes)), read_exports(&bytes));
+}
+
+/// An export directory that lists no exports is written back under its name: the writer
+/// dropped it.
+#[test]
+fn an_empty_export_directory_is_kept() {
+    let mut bytes = with_exports();
+    let directory = directory_offset(&bytes, DataDirectoryType::ExportTable);
+    patch_u32(&mut bytes, directory + 20, 0);
+    patch_u32(&mut bytes, directory + 24, 0);
+
+    let (header, exports) = read_exports(&bytes);
+    assert!(header.is_some() && exports.is_empty());
+    assert_eq!(read_exports(&rewritten(&bytes)), (header, exports));
+}
+
+/// An export table that cannot be read in full loads, and is not written back without what
+/// could not be read.
+#[test]
+fn an_unreadable_export_table_is_not_rebuilt() {
+    let mut bytes = with_exports();
+    let directory = directory_offset(&bytes, DataDirectoryType::ExportTable);
+    // The DLL's name, at no RVA of the image
+    patch_u32(&mut bytes, directory + 12, 0x7FFF_FFF0);
+
+    let view = CilAssemblyView::from_mem(bytes.clone()).unwrap();
+    assert!(view.file().pe().export_error.is_some());
+    CilObject::from_mem(bytes).expect("the image loads");
+    assert!(CilAssembly::new(view).to_memory().is_err());
+}
+
+/// crafted_2.exe's import reads as the loader reads it: mscoree.dll's `_CorExeMain` by name
+/// (with no ordinal), its hint from the entry its lookup table names, at its import address
+/// table slot. A descriptor without a lookup table is read from its import address table.
+#[test]
+fn an_import_reads_by_name_with_its_hint() {
+    let bytes = fs::read(fixture("crafted_2.exe")).unwrap();
+    let view = CilAssemblyView::from_mem(bytes.clone()).unwrap();
+    let pe = view.file().pe();
+    assert_eq!(pe.import_error, None);
+    assert_eq!(pe.imports.len(), 1);
+    let import = &pe.imports[0];
+    assert_eq!(
+        (&*import.dll, import.name.as_deref(), import.ordinal),
+        ("mscoree.dll", Some("_CorExeMain"), None)
+    );
+    let (iat, _) = view
+        .file()
+        .get_data_directory(DataDirectoryType::ImportAddressTable)
+        .unwrap();
+    assert_eq!(import.rva, iat);
+    let entry = offset_of(&bytes, u32::try_from(import.ilt_value).unwrap());
+    assert_eq!(
+        import.hint,
+        u16::from_le_bytes([bytes[entry], bytes[entry + 1]])
+    );
+
+    let mut without_lookup = bytes.clone();
+    let directory = directory_offset(&bytes, DataDirectoryType::ImportTable);
+    patch_u32(&mut without_lookup, directory, 0);
+    let view = CilAssemblyView::from_mem(without_lookup).unwrap();
+    let read = &view.file().pe().imports;
+    assert_eq!(read.len(), 1);
+    assert_eq!(
+        (read[0].name.as_deref(), read[0].rva),
+        (Some("_CorExeMain"), import.rva)
+    );
+}
+
+/// An import table with an entry that cannot be read loads, but is not written back: the
+/// writer wrote the table without the entries goblin skipped, and without the table when it
+/// skipped them all.
+#[test]
+fn an_unreadable_import_table_is_not_rebuilt() {
+    let mut bytes = fs::read(fixture("crafted_2.exe")).unwrap();
+    let directory = directory_offset(&bytes, DataDirectoryType::ImportTable);
+    let lookup = offset_of(&bytes, read_u32(&bytes, directory));
+    // The hint/name entry's RVA, at no RVA of the image
+    patch_u32(&mut bytes, lookup, 0x7FFF_FFF0);
+
+    let view = CilAssemblyView::from_mem(bytes.clone()).unwrap();
+    assert!(view.file().pe().import_error.is_some());
+    CilObject::from_mem(bytes).expect("the image loads");
+    assert!(CilAssembly::new(view).to_memory().is_err());
+}
+
+/// An import table that names no import is written back as a table: the writer dropped the
+/// import directory when it read no import, where the image has one.
+#[test]
+fn an_empty_import_table_is_kept() {
+    let mut bytes = fs::read(fixture("crafted_2.exe")).unwrap();
+    let directory = directory_offset(&bytes, DataDirectoryType::ImportTable);
+    // The descriptor's name: the walk ends at it
+    patch_u32(&mut bytes, directory + 12, 0);
+
+    let view = CilAssemblyView::from_mem(bytes.clone()).unwrap();
+    assert!(view.file().pe().imports.is_empty());
+    assert_eq!(view.file().pe().import_error, None);
+    let written = rewritten(&bytes);
+    let view = CilAssemblyView::from_mem(written).unwrap();
+    assert!(view
+        .file()
+        .get_data_directory(DataDirectoryType::ImportTable)
+        .is_some_and(|(rva, _)| rva != 0));
+}
+
+/// An import directory whose size reads 0 (BitMono writes it so) is written back: the loader
+/// goes by its RVA, and the writer dropped it.
+#[test]
+fn an_import_directory_of_size_zero_is_kept() {
+    let mut bytes = fs::read(fixture("crafted_2.exe")).unwrap();
+    let view = CilAssemblyView::from_mem(bytes.clone()).unwrap();
+    let pe_offset = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
+    let directories = pe_offset + 24 + if view.file().pe().is_64bit { 112 } else { 96 };
+    // The import directory is the second; its size follows its RVA
+    patch_u32(&mut bytes, directories + 8 + 4, 0);
+
+    let view = CilAssemblyView::from_mem(bytes.clone()).unwrap();
+    assert_eq!(view.file().pe().imports.len(), 1);
+    let written = rewritten(&bytes);
+    let view = CilAssemblyView::from_mem(written).unwrap();
+    assert_eq!(
+        view.file()
+            .pe()
+            .imports
+            .iter()
+            .map(|import| import.name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("_CorExeMain")]
+    );
 }

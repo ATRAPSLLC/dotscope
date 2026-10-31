@@ -27,9 +27,9 @@ use dotscope::{
         engine, fixture,
         framework::{
             assert_common_requirements, load_sample, print_summary, run_deobfuscation_test,
-            ProcessMode, SampleSpec, SEMANTIC_TEST_METHODS,
+            ProcessMode, SampleSpec,
         },
-        verification::{AssemblyStats, StructuralConfig, VerificationLevel},
+        verification::StructuralConfig,
     },
     CilObject,
 };
@@ -76,7 +76,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             expected_protections: JiejieExpectedProtections::default(),
             is_original: true,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -89,7 +88,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -103,7 +101,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -120,7 +117,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -137,7 +133,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -150,7 +145,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig {
                 check_type_names: false,
@@ -166,7 +160,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -185,7 +178,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         },
@@ -205,7 +197,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig {
                 check_type_names: false,
@@ -228,7 +219,6 @@ fn all_samples() -> Vec<SampleSpec<JiejieExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig {
                 check_type_names: false,
@@ -246,18 +236,7 @@ fn check_sample(filename: &str) {
         .find(|sample| sample.filename == filename)
         .unwrap_or_else(|| panic!("{filename} is not a JIEJIE.NET sample"));
 
-    // The original, for semantic and structural comparison
-    let original_asm =
-        load_sample(SAMPLES_DIR, "original.exe").expect("the unprotected original loads");
-    let original_stats = AssemblyStats::from_file(&fixture(&format!("{SAMPLES_DIR}/original.exe")));
-
-    let result = run_deobfuscation_test(
-        &sample,
-        SAMPLES_DIR,
-        Some(&original_asm),
-        SEMANTIC_TEST_METHODS,
-        ProcessMode::Assembly,
-    );
+    let result = run_deobfuscation_test(&sample, SAMPLES_DIR, ProcessMode::Assembly);
 
     print_summary(std::slice::from_ref(&result), "JIEJIE.NET", |result| {
         if !result.sample.is_original {
@@ -279,13 +258,7 @@ fn check_sample(filename: &str) {
         );
         return;
     }
-
-    // Common assertions: core validity, semantic preservation, structural match, diagnostics
-    let semantic_threshold = match result.sample.verification_level {
-        VerificationLevel::Relaxed => 0.85,
-        VerificationLevel::Normal => 0.90,
-    };
-    assert_common_requirements(&result, Some(&original_stats), semantic_threshold, true);
+    assert_common_requirements(&result);
 
     // Detection: JIEJIE.NET should be identified when detectable protections
     // are present. Rename-only samples have no structural pattern to detect.

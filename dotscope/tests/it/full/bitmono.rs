@@ -32,12 +32,12 @@ use dotscope::{
     testkit::{
         deobfuscated, engine, fixture,
         framework::{
-            assert_common_requirements, load_sample, print_summary, run_deobfuscation_test,
-            ProcessMode, SampleSpec, TestResult, SEMANTIC_TEST_METHODS,
+            assert_common_requirements, load_sample, original, print_summary,
+            run_deobfuscation_test, ProcessMode, SampleSpec, TestResult,
         },
         verification::{
-            verify_semantic_preservation, SemanticVerificationResult, StructuralConfig,
-            VerificationLevel,
+            inlined_away, verify_semantic_preservation, SemanticVerificationResult,
+            StructuralConfig,
         },
     },
     CilObject,
@@ -105,7 +105,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             expected_protections: ExpectedProtections::default(),
             is_original: true,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -119,7 +118,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -132,7 +130,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -145,7 +142,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -159,7 +155,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -173,7 +168,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -186,7 +180,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -199,7 +192,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -212,7 +204,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -225,7 +216,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -240,7 +230,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -254,7 +243,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -268,7 +256,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -285,7 +272,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -307,7 +293,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -332,7 +317,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -347,7 +331,6 @@ fn all_samples(version: &str) -> Vec<SampleSpec<ExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: true,
             structural_config: StructuralConfig::default(),
         });
@@ -366,15 +349,7 @@ fn check_sample(version: &str, filename: &str) {
         .find(|sample| sample.filename == filename)
         .unwrap_or_else(|| panic!("{filename} is not a BitMono {version} sample"));
 
-    // Load original.exe for semantic comparison
-    let original_asm = load_sample(dir, "original.exe").expect("the unprotected original loads");
-    let result = &run_deobfuscation_test(
-        &sample,
-        dir,
-        Some(&original_asm),
-        SEMANTIC_TEST_METHODS,
-        ProcessMode::File,
-    );
+    let result = &run_deobfuscation_test(&sample, dir, ProcessMode::File);
 
     print_bitmono_summary(std::slice::from_ref(result));
 
@@ -392,13 +367,7 @@ fn check_sample(version: &str, filename: &str) {
 
     let filename = result.sample.filename;
     let expected = &result.sample.expected_protections;
-
-    // Common assertions: core validity, semantic preservation, structural match, diagnostics
-    let semantic_threshold = match result.sample.verification_level {
-        VerificationLevel::Normal => 0.90,
-        VerificationLevel::Relaxed => 0.85,
-    };
-    assert_common_requirements(result, None, semantic_threshold, true);
+    assert_common_requirements(result);
 
     // Detection assertions
     let has_attributed_protections = expected.has_pe_corruption
@@ -727,7 +696,6 @@ fn test_bitmono_detection_scoring() {
 fn run_pe_protection_test(
     dir: &str,
     filename: &str,
-    semantic_threshold: f64,
 ) -> (
     &'static CilObject,
     &'static DeobfuscationResult,
@@ -761,34 +729,25 @@ fn run_pe_protection_test(
     );
 
     let semantic_result = {
-        let original_path = fixture(&format!("{dir}/original.exe"));
-        let original_asm =
-            CilObject::from_path_with_validation(&original_path, ValidationConfig::analysis())
-                .unwrap_or_else(|e| panic!("Failed to load original.exe: {}", e));
-
+        let original = original(dir);
+        // A PE-protected input may not load as it is; then nothing vouches for the methods
+        // the run inlined away, and they count as lost
+        let inlined = load_sample(dir, filename)
+            .map(|input| inlined_away(&input, deob_result))
+            .unwrap_or_default();
         let result = verify_semantic_preservation(
-            &original_asm,
-            Arc::new(
-                CilObject::from_mem_with_validation(bytes.to_vec(), ValidationConfig::analysis())
-                    .unwrap(),
-            ),
-            SEMANTIC_TEST_METHODS,
-            VerificationLevel::Normal,
+            &original.pure_methods,
+            &original.pure_results,
+            &Arc::new(reloaded),
+            &inlined,
         );
-
-        if result.methods_checked > 0 {
-            let ratio = result.methods_preserved as f64 / result.methods_checked as f64;
-            assert!(
-                ratio >= semantic_threshold,
-                "{}: semantic preservation too low ({}/{} = {:.0}%, expected >= {:.0}%)",
-                filename,
-                result.methods_preserved,
-                result.methods_checked,
-                ratio * 100.0,
-                semantic_threshold * 100.0
-            );
-        }
-
+        assert!(
+            result.failures.is_empty() && result.methods_checked > 0,
+            "{filename}: {}/{} pure methods compute what the original's do:\n{}",
+            result.methods_preserved,
+            result.methods_checked,
+            result.failures.join("\n")
+        );
         result
     };
 
@@ -814,7 +773,7 @@ fn test_protection_bitdotnet() {
         let dir = samples_dir(version);
         let dir = dir.as_str();
         eprintln!("=== BitMono {version} ===");
-        let (_, result, _) = run_pe_protection_test(dir, "bitmono_bitdotnet.exe", 1.0);
+        let (_, result, _) = run_pe_protection_test(dir, "bitmono_bitdotnet.exe");
         assert!(
             result
                 .attribution
@@ -832,7 +791,7 @@ fn test_protection_bitdecompiler() {
         let dir = samples_dir(version);
         let dir = dir.as_str();
         eprintln!("=== BitMono {version} ===");
-        let (_, result, _) = run_pe_protection_test(dir, "bitmono_bitdecompiler.exe", 1.0);
+        let (_, result, _) = run_pe_protection_test(dir, "bitmono_bitdecompiler.exe");
         assert!(
             result
                 .attribution
@@ -850,7 +809,7 @@ fn test_protection_packer() {
         let dir = samples_dir(version);
         let dir = dir.as_str();
         eprintln!("=== BitMono {version} ===");
-        let (_, result, _) = run_pe_protection_test(dir, "bitmono_packer.exe", 1.0);
+        let (_, result, _) = run_pe_protection_test(dir, "bitmono_packer.exe");
         assert!(
             result
                 .attribution
@@ -868,7 +827,7 @@ fn test_protection_pe_combined() {
         let dir = samples_dir(version);
         let dir = dir.as_str();
         eprintln!("=== BitMono {version} ===");
-        let (_, result, _) = run_pe_protection_test(dir, "bitmono_pe_combined.exe", 0.4);
+        let (_, result, _) = run_pe_protection_test(dir, "bitmono_pe_combined.exe");
         assert!(
             result
                 .attribution

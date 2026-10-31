@@ -38,7 +38,11 @@ mod modify_impexp;
 mod modify_roundtrips_crafted2;
 mod modify_roundtrips_method;
 mod modify_roundtrips_wbdll;
+mod pdb;
+mod readytorun;
+mod resources;
 mod roundtrip_asm;
+mod sections;
 mod ssa;
 mod stream_directory;
 
@@ -51,5 +55,6 @@ mod full {
     mod mono;
     mod netreactor;
     mod obfuscar;
+    mod oracle;
     mod runtime;
 }

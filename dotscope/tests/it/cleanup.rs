@@ -52,7 +52,7 @@ fn with_type_token(mut blob: Vec<u8>, token: Token) -> Vec<u8> {
         0x01 => 1,
         _ => 2,
     };
-    write_compressed_uint((token.row() << 2) | tag, &mut blob);
+    write_compressed_uint((token.row() << 2) | tag, &mut blob).unwrap();
     blob
 }
 

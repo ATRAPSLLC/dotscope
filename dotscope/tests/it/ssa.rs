@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 use dotscope::{
     analysis::{
-        ConstValue, SsaExceptionHandlerCilExt, SsaFunction, SsaOp, SsaType, SsaVarId,
+        ConstValue, FloatFormat, SsaExceptionHandlerCilExt, SsaFunction, SsaOp, SsaType, SsaVarId,
         SymbolicEvaluator, SymbolicExpr,
     },
     assembly::{Immediate, InstructionAssembler, Operand},
@@ -1501,9 +1501,9 @@ fn test_ssa_load_r4_constant() -> Result<()> {
         matches!(
             instr.op(),
             SsaOp::Const {
-                value: ConstValue::F32(_),
+                value: ConstValue::Float(bits),
                 ..
-            }
+            } if bits.format() == FloatFormat::Single
         )
     });
     assert!(has_f32_const, "Expected F32 constant");
@@ -1524,9 +1524,9 @@ fn test_ssa_load_r8_constant() -> Result<()> {
         matches!(
             instr.op(),
             SsaOp::Const {
-                value: ConstValue::F64(_),
+                value: ConstValue::Float(bits),
                 ..
-            }
+            } if bits.format() == FloatFormat::Double
         )
     });
     assert!(has_f64_const, "Expected F64 constant");

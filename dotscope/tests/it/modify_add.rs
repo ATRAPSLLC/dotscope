@@ -268,3 +268,34 @@ fn extend_crafted_2() -> Result<()> {
     );
     Ok(())
 }
+
+/// A thousand methods added to a small assembly write and read back: the writer sized its
+/// output by an estimate that left out the rows they add, and refused the write when it ran
+/// past it.
+#[test]
+fn a_thousand_methods_added_write_and_read_back() -> Result<()> {
+    let mut assembly = CilAssembly::from_path(fixture("crafted_2.exe"))?;
+    for index in 0..1000 {
+        MethodBuilder::new(&format!("Added{index}"))
+            .public()
+            .static_method()
+            .parameter("a", TypeSignature::I4)
+            .parameter("b", TypeSignature::I4)
+            .returns(TypeSignature::I4)
+            .implementation(|body| {
+                body.implementation(|asm| {
+                    asm.ldarg_0()?.ldarg_1()?.add()?.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut assembly)?;
+    }
+    let written = CilObject::from_mem(assembly.to_memory()?)?;
+    let added = written
+        .methods()
+        .iter()
+        .filter(|entry| entry.value().name.starts_with("Added"))
+        .count();
+    assert_eq!(added, 1000);
+    Ok(())
+}

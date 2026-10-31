@@ -34,12 +34,10 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Mutex,
     },
-    time::Duration,
 };
 
 use dotscope::{
@@ -55,7 +53,7 @@ use dotscope::{
     testkit::{
         engine,
         fixtures::samples_dir,
-        tools::{require_tool, run_with_timeout, ToolKind},
+        tools::{peverify_metadata_findings, require_tool, ToolKind},
     },
     CilAssembly, CilObject, MethodBodyBuilder, Parser,
 };
@@ -327,28 +325,6 @@ fn every_method_validates_against_its_own_lift() {
         "methods disagree with their own lift:\n{}",
         findings.report()
     );
-}
-
-/// What Mono's metadata verifier says about an assembly: its findings, empty
-/// when it found none.
-///
-/// Only the metadata check is used: it reads the file and runs nothing, while
-/// Mono's IL check needs the assembly's references loaded into a runtime and
-/// cannot open most samples.
-///
-/// `references` is the directory the assembly's references are looked up in.
-fn mono_metadata_findings(path: &Path, references: &Path) -> String {
-    let output = run_with_timeout(
-        Command::new("peverify")
-            .args(["--verify", "metadata,error"])
-            .arg(path)
-            .env("MONO_PATH", references),
-        Duration::from_secs(300),
-    )
-    .unwrap_or_else(|e| panic!("peverify on {}: {e}", path.display()));
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    text.trim().to_string()
 }
 
 /// The bytes of a method's code as they lie in the file it was loaded from.
@@ -673,8 +649,12 @@ fn every_sample_recompiles_to_an_assembly_that_loads() {
 
         let references = path.parent().unwrap_or(Path::new("."));
         if mono_check {
-            let after = mono_metadata_findings(&written, references);
-            if !after.is_empty() && mono_metadata_findings(path, references).is_empty() {
+            let after = peverify_metadata_findings(&written, references).unwrap();
+            if !after.is_empty()
+                && peverify_metadata_findings(path, references)
+                    .unwrap()
+                    .is_empty()
+            {
                 findings.record("mono metadata check regressed", name, "", &after);
             }
         }

@@ -2953,12 +2953,14 @@ fn test_comparison_sub_equals_zero() -> Result<()> {
     )
 }
 
-/// Test: (x - y) < 0 simplified to x < y (signed).
+/// Test: (x - y) < 0 stays a test of the difference.
 ///
 /// Input:  ldarg.0, ldarg.1, sub, ldc.i4.0, clt, ret
-/// Output: ldarg.0, ldarg.1, clt, ret
+/// Output: ldarg.0, ldarg.1, sub, ldc.i4.0, clt, ret
 ///
-/// The subtraction-based less-than check is simplified to a direct comparison.
+/// The subtraction wraps, so the sign of the difference is not the order of
+/// the operands: with `x = i32::MIN + 5` and `y = 10` the difference is
+/// positive while `x < y`. Reading `x < y` into it would change the result.
 #[test]
 fn test_comparison_sub_less_than_zero() -> Result<()> {
     let mut asm = InstructionAssembler::new();
@@ -2972,18 +2974,22 @@ fn test_comparison_sub_less_than_zero() -> Result<()> {
         &[
             instr!("ldarg.0"),
             instr!("ldarg.1"),
+            instr!("sub"),
+            instr!("ldc.i4.0"),
             instr!("clt"),
             instr!("ret"),
         ],
     )
 }
 
-/// Test: (x - y) > 0 simplified to x > y (signed).
+/// Test: (x - y) > 0 stays a test of the difference.
 ///
 /// Input:  ldarg.0, ldarg.1, sub, ldc.i4.0, cgt, ret
-/// Output: ldarg.0, ldarg.1, cgt, ret
+/// Output: ldarg.0, ldarg.1, sub, ldc.i4.0, cgt, ret
 ///
-/// The subtraction-based greater-than check is simplified to a direct comparison.
+/// The subtraction wraps, so the sign of the difference is not the order of
+/// the operands: with `x = i32::MAX - 5` and `y = -10` the difference is
+/// negative while `x > y`. Reading `x > y` into it would change the result.
 #[test]
 fn test_comparison_sub_greater_than_zero() -> Result<()> {
     let mut asm = InstructionAssembler::new();
@@ -2997,6 +3003,8 @@ fn test_comparison_sub_greater_than_zero() -> Result<()> {
         &[
             instr!("ldarg.0"),
             instr!("ldarg.1"),
+            instr!("sub"),
+            instr!("ldc.i4.0"),
             instr!("cgt"),
             instr!("ret"),
         ],
@@ -3153,25 +3161,16 @@ fn test_conv_narrowing_widening_constant() -> Result<()> {
     run_deobfuscation_test(asm, 0, 0, &[instr!("ldc.i4", i32: 232), instr!("ret")])
 }
 
-/// Test: float conversion chain with constant is folded (r4 preserved, r8 conversion remains).
+/// Test: float conversion chain with constant is folded through both conversions.
 ///
 /// Input:  ldc.i4.s 42, conv.r4, conv.r8, ret
-/// Output: ldc.r4 42.0, conv.r8, ret (float conversions preserved to avoid precision issues)
+/// Output: ldc.r8 42.0, ret (binary32 to binary64 widens exactly)
 #[test]
 fn test_conv_float_chain_constant() -> Result<()> {
     let mut asm = InstructionAssembler::new();
     asm.ldc_i4_const(42)?.conv_r4()?.conv_r8()?.ret()?;
 
-    run_deobfuscation_test(
-        asm,
-        0,
-        0,
-        &[
-            instr!("ldc.r4", f32: 42.0),
-            instr!("conv.r8"),
-            instr!("ret"),
-        ],
-    )
+    run_deobfuscation_test(asm, 0, 0, &[instr!("ldc.r8", f64: 42.0), instr!("ret")])
 }
 
 /// Test: constant conversion i4 to i8 is fully folded.

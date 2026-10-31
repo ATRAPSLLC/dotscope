@@ -39,10 +39,10 @@ use dotscope::{
     testkit::{
         deobfuscated, fixture,
         framework::{
-            load_sample, print_summary, run_deobfuscation_test, ProcessMode, SampleSpec,
-            SEMANTIC_TEST_METHODS,
+            assert_common_requirements, print_summary, run_deobfuscation_test, ProcessMode,
+            SampleSpec,
         },
-        verification::{StructuralConfig, VerificationLevel},
+        verification::StructuralConfig,
     },
     CilObject, Error,
 };
@@ -91,7 +91,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             expected_protections: ReactorExpectedProtections::default(),
             is_original: true,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -104,7 +103,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -117,7 +115,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -130,7 +127,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -143,7 +139,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -156,7 +151,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -169,7 +163,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -182,7 +175,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -195,7 +187,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -209,7 +200,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -224,7 +214,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -237,7 +226,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -250,7 +238,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -263,7 +250,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -284,7 +270,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: true,
-            verification_level: VerificationLevel::Normal,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -298,7 +283,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: false, // Native stub may alter execution model
-            verification_level: VerificationLevel::Relaxed,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -311,7 +295,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: false, // VM replaces method bodies with stubs
-            verification_level: VerificationLevel::Relaxed,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -333,7 +316,6 @@ fn all_samples() -> Vec<SampleSpec<ReactorExpectedProtections>> {
             },
             is_original: false,
             check_semantic_preservation: false, // VM + full protection
-            verification_level: VerificationLevel::Relaxed,
             check_structural_match: false,
             structural_config: StructuralConfig::default(),
         },
@@ -408,16 +390,7 @@ fn check_sample(filename: &str) {
         );
         return;
     }
-
-    let original_asm =
-        load_sample(SAMPLES_DIR, "original.exe").expect("the unprotected original loads");
-    let result = &run_deobfuscation_test(
-        &sample,
-        SAMPLES_DIR,
-        Some(&original_asm),
-        SEMANTIC_TEST_METHODS,
-        ProcessMode::Assembly,
-    );
+    let result = &run_deobfuscation_test(&sample, SAMPLES_DIR, ProcessMode::Assembly);
 
     print_summary(std::slice::from_ref(result), "NET REACTOR", |result| {
         if !result.sample.is_original {
@@ -439,29 +412,11 @@ fn check_sample(filename: &str) {
         return;
     }
 
-    // The contract cleanup must satisfy is structural validity, not a survival ratio.
-    // An assembly that fails validation has had something deleted out from under a
-    // reference that still names it, which is over-cleanup by definition. A ratio only
-    // correlates with that loosely: samples have been observed at 82% survival and
-    // still invalid, and it says nothing about *which* methods went.
-    assert!(
-        result.success,
-        "{}: deobfuscation did not complete: {}",
-        result.sample.filename,
-        result.error.as_deref().unwrap_or("unknown error")
-    );
-    assert!(
-        result.assembly_valid,
-        "{}: deobfuscated output failed validation: {}",
-        result.sample.filename,
-        result.error.as_deref().unwrap_or("no error recorded")
-    );
-    assert!(
-        result.roundtrip_ok,
-        "{}: deobfuscated output does not round-trip: {}",
-        result.sample.filename,
-        result.error.as_deref().unwrap_or("no error recorded")
-    );
+    // The contract cleanup must satisfy is structural validity, not a survival ratio: an
+    // assembly that fails validation has had something deleted out from under a reference
+    // that still names it, which is over-cleanup by definition. A ratio only correlates with
+    // that loosely, and says nothing about *which* methods went.
+    assert_common_requirements(result);
 
     // Coarse backstop, and only that. Validity catches deletions that leave a dangling
     // reference; it cannot catch deleting code nothing statically references (a VM
@@ -477,10 +432,6 @@ fn check_sample(filename: &str) {
             result.methods_before
         );
     }
-
-    // Once detection is implemented, add assertions here:
-    // - Verify correct technique detection per sample
-    // - Verify semantic preservation
 }
 
 sample_tests! {

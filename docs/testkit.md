@@ -48,12 +48,14 @@ set up. It is `#[doc(hidden)]`, unstable, and outside the semver surface.
 | `builders` | Fluent builders for metadata objects: types, methods, fields, references |
 | `factories` | Assemblies and rows crafted for validator and table tests |
 | `helpers` | Sample loading (`load_sample`, `load_test_assembly`) and small utilities |
-| `framework` | The obfuscator sample harness: deobfuscate, verify, summarize; `engine()`, `engine_with(config)`, and `deobfuscated(sample)`, each sample's run shared by every test (feature `deobfuscation`) |
-| `verification` | SSA-based semantic comparison of original and deobfuscated assemblies |
+| `framework` | The obfuscator sample harness: deobfuscate, verify, summarize (`run_deobfuscation_test`, `assert_common_requirements`); `engine()`, `engine_with(config)`, and `deobfuscated(sample)`, each sample's run shared by every test (feature `deobfuscation`) |
+| `verification` | Structural and semantic comparison of a deobfuscated assembly with its unprotected original: the original's methods run against their counterparts on fixed inputs |
 | `compatibility` | Loading and comparing whole runtime corpora (Mono, .NET) |
 | `analysis`, `mono` | Analysis and runtime harnesses |
 | `tools` | `require_tool` and `run_with_timeout`: which external tools a test may go without, and running them |
 | `emulation` | Emulator test setup: `emulation_config()`, `emulation_limits()`, `process_builder()` (feature `emulation`) |
+| `passes` | `run_verified`: a pass run as the scheduler runs it, its result verified (feature `compiler`) |
+| `equivalence` | `regenerate_and_compare`: generated code run against the SSA it came from (feature `compiler`) |
 | crate root | `TestTypeProvider`, and `build_cfg` / `build_ssa` / `build_ssa_with_handlers` for SSA from assembled CIL |
 
 There is one copy of each: `tests/common/` is gone, and so is the never-declared
@@ -89,16 +91,97 @@ corpus sweep holds the file to exactly that error. A file that must load has no 
 
 ## Corpus sweep
 
-`testkit::corpus` runs checks over every `.dll` and `.exe` the manifest lists. Each assembly is
+`testkit::corpus` runs checks over every `.dll`, `.exe` and `.winmd` the manifest lists. Each assembly is
 loaded once, as `CilObject::from_mem` loads it by default, and handed to every check in turn on
 one thread; assemblies run on up to eight threads at once. A check states a property and
 reports, a line per finding, what one assembly gets wrong; a check that panics reports the
-panic. The sweep passes when nothing is reported: there is no list of failures to expect.
+panic. The sweep passes when nothing is reported: there is no list of failures to expect. What
+a check counts without finding a defect in it (cases it cannot decide) are its tallies, which
+every sweep prints with its findings.
 
-`full::corpus` runs two checks: `Loads` (every assembly loads, and a `reject` fixture fails
-with exactly the error it names) and `Lifts` (every method with a body lifts to SSA that
-`SsaVerifier` accepts at the standard level). `DOTSCOPE_CORPUS_FILTER=part,part` narrows a
-sweep to the fixtures whose path contains one of the parts.
+`full::corpus` runs fourteen checks:
+
+- `Loads`: every assembly loads, and a `reject` fixture fails with exactly the error it names.
+- `TableRows`: every row of every table reads exactly its row size and writes back to its own
+  bytes.
+- `Heaps`: `#Strings`, `#US`, `#Blob` and `#GUID` read as a walk of their ECMA-335 layout
+  finds them: every entry, at its offset, with its content.
+- `Signatures`, `CustomAttributes`, `Marshalling`, `PermissionSets` and `MethodBodies`: every
+  signature blob (read as the kind of the column naming it), custom attribute value,
+  marshalling descriptor, binary permission set and method body decodes and encodes back to
+  its own bytes.
+- `BodyCode`: every method's instructions, encoded in place with their own branch forms, are
+  the bytes of its code.
+- `ExceptionStructure`: every method's exception clauses structure its code as ECMA-335
+  requires: regions nest or are disjoint, every boundary and branch target is an instruction
+  start, a region is entered only at its start and left only by `leave` (or `endfinally`,
+  `endfilter`, `throw`, `rethrow`).
+- `WritesBackUnchanged`: written back by `CilAssembly` without a change, the assembly has the
+  canonical dump it was read with; one with field data the reader cannot read (past its
+  section's VirtualSize, where the runtimes read different bytes) must refuse the write,
+  naming that field.
+- `Deterministic`: loading on one thread and on eight gives the same IL listing and the same
+  written-back bytes.
+- `Lifts`: every method with a body lifts to SSA that `SsaVerifier` accepts at the standard
+  level.
+- `CodegenEquivalence`: every method, lifted with no pass run on it, regenerates to code that,
+  lifted again, returns what the SSA returns on the same arguments. Both run under
+  `SsaEvaluator` on eight argument vectors drawn from ordinary and edge values of each
+  argument's type. The evaluator computes pure values (arithmetic, logic, comparisons,
+  conversions, slots, branches), so a method that calls, touches memory or objects, or has
+  exception regions is tallied as unsupported by the first operation it cannot compute; so are
+  the generator's refusals (which the codegen validation sweep judges) and runs the evaluator
+  cannot finish. A difference is found only where the result depends on the arguments.
+
+The row codecs are also held, in a unit test, to random rows under every column width: small
+and large heaps and tables, and each coded-index family on both sides of the row count where
+it widens. `DOTSCOPE_CORPUS_FILTER=part,part` narrows a sweep to the fixtures whose path
+contains one of the parts, and `DOTSCOPE_CORPUS_REPORT=path` has a failing sweep write every
+finding to `path`.
+
+`testkit::dump::CanonicalDump` is what the writer check compares: every row by table and
+RID, written again with every index four bytes wide and its heap columns resolved to the
+strings, blobs and GUIDs they name; every method body decoded, branch targets and protected
+regions as instruction positions; field data and embedded resources by content; debug
+directory entries by content; and the CLI header. Heap offsets, RVAs, column widths, the
+stream directory, relocations and signatures are left out: a writer may lay them out anew.
+
+## The System.Reflection.Metadata oracle
+
+The dump's format is written down in `testkit::dump` so that a second reader can write it.
+`tests/oracle/srm-dump/SrmDump.cs` does: it writes an assembly's dump, as a JSON object of
+path to value, from what Microsoft's System.Reflection.Metadata (SRM) reads in the file, using
+SRM's object model for every column it exposes and the row SRM locates for the rest (column
+widths checked against SRM's row sizes), and System.Reflection.Emit's opcode table for the
+code. `testkit::oracle` builds it with Mono's `mcs` against the SRM 5.0 the fixtures hold
+(`mono_4.5`, pinned by its manifest hash) and runs it under Mono. `full::oracle` has three
+tests:
+
+- `every_srm_fixture_reads_as_its_golden`: the fixtures the manifest tags `srm` have their
+  SRM dumps committed under `tests/oracle/goldens/<fixture path>.json`, and dotscope's dump of
+  each (read without validation, reasons after `unreadable` cut) must equal it. This needs no
+  .NET tool.
+- `the_srm_dumper_writes_the_goldens`: the dumper, built and run again, writes exactly the
+  committed goldens. `make oracle-goldens` rewrites them.
+- `every_corpus_assembly_reads_as_srm_reads_it`: a corpus check, `ReadsAsSrm`, compares the
+  two dumps for every corpus assembly (about three minutes). Where SRM is not the authority,
+  the fixture is declared in `disagreement` with its evidence: SRM refuses a file the runtime
+  runs, or reads a stream directory by another rule than the runtime's
+  (`stream_directory.rs` holds dotscope to what the CLR printed). A declaration is held both
+  ways, so it fails once SRM and dotscope agree.
+
+Both tool-running tests need `mcs` and `mono` (`ToolKind::MonoCompiler`), so they skip
+without them, and fail in the oracle tier.
+
+## Codec properties
+
+The corpus holds the codecs to what compilers emit; `testkit::arb` holds them to everything
+their models can state. It generates signatures, custom attribute named arguments,
+marshalling descriptors, permission sets, method bodies with their exception sections, and
+method headers, and `testkit::arb::check` runs a property over 1024 of them from a fixed seed,
+so every run checks the same values and a failure is shrunk to the smallest value that shows
+it. Each encoder's tests hold the property that whatever it accepts decodes back to itself: a
+value it would write as something else must be refused.
 
 ## Validator tests
 
@@ -156,6 +239,22 @@ are typed `I32` and `newobj` results `Object`: a test that needs other types for
 real assembly. There is no all-`I32` default: a test that keeps an `int64` or a float in a slot
 declares it, so the converter sees the types the method's signatures would give it.
 
+`SsaFunctionBuilder` builds SSA directly. It records each variable's uses and types what it
+can: arithmetic by its operands (ECMA-335 III.1.5), and a placeholder from `var()` or `phi` by
+its definition's stated type (`op_typed`), its operand's, the op's own result type or, for a
+phi, its operands'. A variable left untyped and read fails the build.
+
+## Pass tests
+
+A pass test runs the pass with `testkit::passes::run_verified(&pass, &mut ssa, &method, &ctx)`,
+not `run_on_method`: it runs analyssa's `PassScheduler::run_once`, the scheduler's own step,
+with the edit-failure check and the repair or rebuild the pass's modification scope asks for,
+and verifies the result at the standard level as a pipeline under `verify_hard` does. A pass
+that fails, panics or leaves invalid SSA is an error, and the function is restored. The SSA it
+is handed is verified first, so a test whose own fixture is invalid is told apart from a pass
+that breaks valid SSA. A test asserts what the function holds after the repair: a nop the pass
+leaves may be gone.
+
 ## Results independent of machine load
 
 How busy the machine is must never decide whether a test passes. A test orders threads with
@@ -174,6 +273,33 @@ on the deterministic limits (instructions, call depth, memory):
 The timeouts on external tools (`run_with_timeout`) are the exception: they stop a hung
 `dotnet build` or `mono`, and are sized to pass in CI and locally.
 
+## Fuzzing
+
+Fuzzing runs on a developer's machine (`make fuzz`), never in CI. Each target in
+`fuzz/fuzz_targets/` is a one-line wrapper over its entry point in `testkit::fuzz`, which states
+the property the target checks: what a decoder reads its encoder writes back to the same value
+(signatures, marshalling descriptors, permission sets, method bodies, and values generated from
+the fuzzer's bytes through `testkit::arb::from_bytes`), an RVA the section map places in the file
+reads that byte (`pe_file`), an assembly written back unchanged holds what it held
+(`writer_roundtrip`), SSA that lifts verifies and regenerates to code that computes what it does
+(`il_pipeline`), and the parsers, loaders, emulator and engine return on any input. Work is
+bounded by counts (instructions, emulations, methods), never by time. The targets run on one
+rayon thread (`RAYON_NUM_THREADS=1`): each thread adds AddressSanitizer allocator caches, and a
+731 KB assembly that deobfuscates in 141 MB natively peaks at 2.6 GB under ASan on 56 threads,
+1.3 GB on one, inside the 2 GB limit.
+
+An input that crashes a target goes, once the defect is fixed, under
+`tests/samples/fuzz-regressions/<target>/`. `tests/fuzz_regressions.rs` replays every one
+through its own target's entry point, in the quick tier, with the counting allocator
+(`benches/common/alloc.rs`) installed: each input may allocate at most 256 MiB all told, which
+bounds its peak however its threads interleave. It does not check what a run still holds when
+it returns, which moves by hundreds of kilobytes from run to run as other threads free memory
+late; a leak is LeakSanitizer's to find, under the fuzzer.
+
+`tests/allocations.rs` holds checks on what work allocates, under the same allocator: an
+emulated loop over an array allocates in proportion to the array (doubling the input must not
+quadruple the bytes).
+
 ## Test tiers
 
 The tiers are cargo aliases in `.cargo/config.toml`, run by name from the Makefile, GitHub CI
@@ -181,8 +307,8 @@ and GitLab, all in the `ci-test` profile with the z3 feature:
 
 | Tier | Command | What runs |
 |---|---|---|
-| quick | `cargo test-quick`, `make test-quick` | unit tests and the integration tests outside a `full` module |
-| full | `cargo test-full`, `make test-full` | every test: also the `full` modules (the corpus sweep among them) and `fuzzer` |
+| quick | `cargo test-quick`, `make test-quick` | unit tests, the integration tests outside a `full` module, `fuzz_regressions` and `allocations` |
+| full | `cargo test-full`, `make test-full` | every test: also the `full` modules (the corpus sweep among them) and `fuzzer` (the local fuzz corpus) |
 | oracle | `make test-oracle` | full with `DOTSCOPE_REQUIRE_TOOLS=1` |
 
 The integration tests are one binary, `tests/it/main.rs`, with a module per suite. A test
@@ -218,6 +344,17 @@ read `testkit::deobfuscated(path)`, the sample run once per test binary through 
 with the default engine; a test asking while the run is in progress waits for it. A test with
 another configuration builds its own engine with `engine_with(config)`.
 
+`assert_common_requirements(result)` holds every sample to the same bar: the output loads and
+passes validation, its structure matches the family's unprotected original (types, methods,
+fields, resources, file size within a tolerance) where the spec asks for it, and it computes
+what the original computes. For that last check the original's methods with fixed inputs
+(`PURE_TEST_METHODS`: arithmetic, recursion, string and byte transforms) run under the
+emulator in both assemblies. A method is matched with its counterpart by name, or, where
+renaming lost the name, by running it among the methods of the same signature. A method of the
+original with no counterpart passes only when every call to it was inlined, which cleanup
+records as `deobfuscation::INLINED_METHOD_REMOVED`; an original that does not finish fails the
+check rather than skipping it.
+
 ## External tools
 
 Some tests compile C#, run it on Mono or .NET, disassemble it, or verify it with `peverify`.
@@ -243,9 +380,13 @@ The kinds are `Toolchain` (a C# compiler and a runtime that runs what it builds)
 .NET Framework executables, which `dotnet` does not run.
 
 `full::runtime` deobfuscates every sample of each packer family and runs its output and the
-family's unprotected original under Mono (`tests/it/full/runtime.rs`). Each family is held to
-the harness's preconditions: the original runs, and every sample is deobfuscated, written and
-run, or refused as not supported.
+family's unprotected original under Mono (`tests/it/full/runtime.rs`). The output must pass
+production validation, `peverify` must accept it wherever it accepts the protected sample
+(`tools::peverify_metadata_findings`), and it must print exactly what the original prints.
+A sample is declared otherwise only in the test's `expectation`, each with its reason: its
+lines in any order (a protection that reordered output the original order is lost from), a
+protection dotscope does not reverse (still deobfuscated, validated and verified, not run), or
+a file the engine refuses. A declaration naming a sample that does not exist fails the family.
 
 Every tool runs through `run_with_timeout(command, timeout)`: stdout and stderr are drained on
 their own threads while it runs, so a chatty tool cannot block on a full pipe, and one that
