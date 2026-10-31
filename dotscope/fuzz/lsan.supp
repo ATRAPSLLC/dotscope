@@ -1,0 +1,8 @@
+# LeakSanitizer suppressions for `make fuzz`.
+#
+# iced-x86 builds its decoder tables once per process, in a lazy_static, and LeakSanitizer
+# reports the opcode handlers it boxes there: 552 bytes in 12 allocations, the same whether a
+# run takes one input or ten (measured with the writer_roundtrip target). It is third-party
+# initialisation, not a leak an input causes; a leak that grows with the inputs is reported.
+# A suppression matches a symbolized stack, so `make fuzz` sets ASAN_SYMBOLIZER_PATH.
+leak:iced_x86::decoder::table_de

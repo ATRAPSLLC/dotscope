@@ -13,15 +13,16 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
-# The custom-attribute parser takes the constructor parameter list as `Arc<boxcar::Vec<_>>`.
-boxcar = "0.2.14"
 
+# Each target calls its entry point in `dotscope::testkit::fuzz`, which the regression
+# replay (`tests/fuzz_regressions.rs`) calls too.
 [dependencies.dotscope]
 path = ".."
+features = ["testkit"]
 
 [[bin]]
-name = "cilobject"
-path = "fuzz_targets/cilobject.rs"
+name = "assembly_identity"
+path = "fuzz_targets/assembly_identity.rs"
 test = false
 doc = false
 bench = false
@@ -34,8 +35,50 @@ doc = false
 bench = false
 
 [[bin]]
-name = "signatures"
-path = "fuzz_targets/signatures.rs"
+name = "cdi_blob"
+path = "fuzz_targets/cdi_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cilobject"
+path = "fuzz_targets/cilobject.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_method_body"
+path = "fuzz_targets/codec_method_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_named_arguments"
+path = "fuzz_targets/codec_named_arguments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_native_type"
+path = "fuzz_targets/codec_native_type.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_permissions"
+path = "fuzz_targets/codec_permissions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_signatures"
+path = "fuzz_targets/codec_signatures.rs"
 test = false
 doc = false
 bench = false
@@ -48,8 +91,15 @@ doc = false
 bench = false
 
 [[bin]]
-name = "methodbody"
-path = "fuzz_targets/methodbody.rs"
+name = "deobfuscate_bounded"
+path = "fuzz_targets/deobfuscate_bounded.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emulate_template"
+path = "fuzz_targets/emulate_template.rs"
 test = false
 doc = false
 bench = false
@@ -57,6 +107,76 @@ bench = false
 [[bin]]
 name = "emulation"
 path = "fuzz_targets/emulation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "il_pipeline"
+path = "fuzz_targets/il_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "marshal"
+path = "fuzz_targets/marshal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "methodbody"
+path = "fuzz_targets/methodbody.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "methodbody_eh"
+path = "fuzz_targets/methodbody_eh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pdb_blobs"
+path = "fuzz_targets/pdb_blobs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pe_file"
+path = "fuzz_targets/pe_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "permission_set"
+path = "fuzz_targets/permission_set.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resources"
+path = "fuzz_targets/resources.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signatures"
+path = "fuzz_targets/signatures.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_roundtrip"
+path = "fuzz_targets/writer_roundtrip.rs"
 test = false
 doc = false
 bench = false

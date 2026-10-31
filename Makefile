@@ -23,7 +23,7 @@ TEST_THREADS ?= $(shell nproc 2>/dev/null || echo 8)
 # concurrency cap the tiers do not.
 TEST_FLAGS := --workspace --profile ci-test --features z3 --no-fail-fast
 
-.PHONY: help build test test-quick test-full test-oracle test-doc test-coverage clean fmt clippy doc bench fuzz install coverage audit
+.PHONY: help build test test-quick test-full test-oracle oracle-goldens test-doc test-coverage clean fmt clippy doc bench fuzz install coverage audit
 
 # Default target
 help:
@@ -33,6 +33,7 @@ help:
 	@echo "  test-quick  - Unit tests and the fast integration tests (no \`full\` modules)"
 	@echo "  test-full   - test-quick plus the packer suites, runtime corpora, codegen validation"
 	@echo "  test-oracle - test-full, failing when an external .NET tool is missing"
+	@echo "  oracle-goldens - Rewrite the System.Reflection.Metadata goldens (needs mcs and mono)"
 	@echo "  test-doc    - Run doc tests (memory-bounded; see DOC_TEST_THREADS)"
 	@echo "  clean       - Clean build artifacts"
 	@echo "  fmt         - Format code"
@@ -64,9 +65,10 @@ build-release:
 # release with debug assertions and overflow checks on (see the workspace Cargo.toml), so
 # the invariants release compiles out are checked here.
 #
-# quick:  the unit tests and the integration tests outside a `full` module.
+# quick:  the unit tests, the integration tests outside a `full` module, the fuzz
+#         regression replay and the allocation checks.
 # full:   quick plus the `full` modules (packer suites, runtime corpora, codegen validation),
-#         the lift verification sweep and the fuzz regression replay.
+#         the lift verification sweep and the local fuzz corpus, when there is one.
 # oracle: full with DOTSCOPE_REQUIRE_TOOLS=1: a test that needs dotnet, mono, ildasm or
 #         peverify fails when the tool is missing instead of skipping.
 test-quick:
@@ -77,6 +79,22 @@ test-full:
 
 test-oracle:
 	DOTSCOPE_REQUIRE_TOOLS=1 RUST_TEST_THREADS=$(TEST_THREADS) cargo test-full
+
+# The System.Reflection.Metadata oracle's goldens: the dumps `dotscope/tests/oracle/srm-dump`
+# writes for the fixtures the manifest tags `srm`, built against the System.Reflection.Metadata
+# the fixtures hold. The oracle tier checks the dumper still writes exactly these (see
+# `testkit::oracle`, which builds it the same way).
+ORACLE_SAMPLES := dotscope/tests/samples
+ORACLE_GOLDENS := dotscope/tests/oracle/goldens
+oracle-goldens:
+	@build=$$(mktemp -d) && \
+	cp $(ORACLE_SAMPLES)/mono_4.5/System.Reflection.Metadata.dll $(ORACLE_SAMPLES)/mono_4.5/System.Collections.Immutable.dll $$build && \
+	(cd $$build && mcs -unsafe -out:SrmDump.exe -r:System.Reflection.Metadata.dll \
+		-r:System.Collections.Immutable.dll -r:Facades/System.Runtime.dll \
+		$(CURDIR)/dotscope/tests/oracle/srm-dump/SrmDump.cs) && \
+	rm -rf $(ORACLE_GOLDENS) && \
+	(cd $$build && mono SrmDump.exe $(CURDIR)/$(ORACLE_SAMPLES) $(CURDIR)/$(ORACLE_GOLDENS)) && \
+	rm -rf $$build
 
 test: test-full
 
@@ -121,19 +139,35 @@ doc-open:
 bench:
 	cargo bench --all-features
 
-# Run fuzzing
-# Runs every target in turn, each seeded from the committed crash corpus. Override the target
-# with `make fuzz FUZZ_TARGETS=signatures`, or the duration with `FUZZ_TIME=300`.
-FUZZ_TARGETS ?= cilobject assemblyview signatures customattributes methodbody emulation
+# Run fuzzing, locally: CI never fuzzes, it replays the committed regressions
+# (`tests/fuzz_regressions.rs`) as ordinary tests.
+# Runs every target in turn (`dotscope/fuzz/fuzz_targets`, each a wrapper over
+# `dotscope::testkit::fuzz`) with debug assertions, each seeded from its own committed
+# regressions. Override the targets with `make fuzz FUZZ_TARGETS=signatures`, or the duration
+# with `FUZZ_TIME=300`. A crash lands in `dotscope/fuzz/artifacts/<target>/`; once fixed, its
+# input goes under `dotscope/tests/samples/fuzz-regressions/<target>/`.
+# Targets run on one rayon thread: libFuzzer runs inputs one at a time, and each thread adds
+# AddressSanitizer caches (a 731 KB assembly deobfuscates in 141 MB natively, 1.3 GB under
+# ASan on one thread, 2.6 GB on 56).
+FUZZ_TARGETS ?= $(basename $(notdir $(wildcard dotscope/fuzz/fuzz_targets/*.rs)))
 FUZZ_TIME ?= 60
-FUZZ_RSS_LIMIT_MB ?= 4096
+FUZZ_RSS_LIMIT_MB ?= 2048
+# LeakSanitizer matches dotscope/fuzz/lsan.supp against symbolized stacks: without a
+# symbolizer every suppressed leak is reported
+FUZZ_SYMBOLIZER ?= $(firstword $(shell command -v llvm-symbolizer 2>/dev/null) \
+	$(lastword $(sort $(wildcard /usr/lib/llvm-*/bin/llvm-symbolizer))))
 
 fuzz:
+	@if [ -z "$(FUZZ_SYMBOLIZER)" ]; then \
+		echo "fuzz needs llvm-symbolizer (set FUZZ_SYMBOLIZER)"; exit 1; \
+	fi
 	@for t in $(FUZZ_TARGETS); do \
 		echo "=== fuzzing $$t ==="; \
 		mkdir -p dotscope/fuzz/corpus/$$t; \
-		cp dotscope/tests/samples/fuzz-regressions/* dotscope/fuzz/corpus/$$t/ 2>/dev/null || true; \
-		(cd dotscope/fuzz && cargo +nightly fuzz run $$t -- \
+		cp dotscope/tests/samples/fuzz-regressions/$$t/* dotscope/fuzz/corpus/$$t/ 2>/dev/null || true; \
+		(cd dotscope/fuzz && RAYON_NUM_THREADS=1 ASAN_SYMBOLIZER_PATH=$(FUZZ_SYMBOLIZER) \
+			LSAN_OPTIONS=suppressions=$(CURDIR)/dotscope/fuzz/lsan.supp \
+			cargo +nightly fuzz run -O --debug-assertions $$t -- \
 			-max_total_time=$(FUZZ_TIME) -rss_limit_mb=$(FUZZ_RSS_LIMIT_MB)) || exit 1; \
 	done
 

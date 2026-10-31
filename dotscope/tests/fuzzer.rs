@@ -7,51 +7,20 @@
     missing_docs
 )]
 
-//! Regression tests over adversarial inputs.
+//! The local fuzzing corpus, replayed when one is present.
 //!
-//! Every file loaded here is malformed on purpose. A parse error is the expected outcome and
-//! is not a failure; the property under test is that `CilObject::from_path` returns rather
-//! than panicking, aborting, hanging, or exhausting memory.
-//!
-//! # Two corpora, two guarantees
-//!
-//! - [`fuzzer_crashes`] runs over `tests/samples/fuzz-regressions/`, which is **committed**.
-//!   Each file there once crashed the parser. This test is mandatory: if the directory is
-//!   missing or empty, that is itself a failure, because a regression suite that silently
-//!   finds nothing to check is worse than no suite at all.
-//! - [`fuzzer_corpus`] runs over the local fuzzing corpus under `fuzz/corpus/`, which is too
-//!   large to commit and is therefore absent on a clean checkout. It skips loudly when
-//!   absent, and is exercised by anyone who has run the fuzzer locally.
+//! Every input under `fuzz/corpus/cilobject/` goes through `CilObject::from_path`; the property
+//! is that the call returns rather than panicking, aborting, hanging or exhausting memory. The
+//! corpus is what a local fuzzing run (`make fuzz`) grew: too large to commit, so absent on a
+//! clean checkout, where this skips loudly. The committed inputs that once crashed a target are
+//! replayed through their own targets by `tests/fuzz_regressions.rs`.
 
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-use dotscope::{metadata::cilobject::CilObject, testkit::fixture};
-
-/// Loads every input in the committed crash corpus.
-///
-/// Fails if the directory is missing or empty — see the module docs for why.
-#[test]
-fn fuzzer_crashes() {
-    let path = fixture("fuzz-regressions");
-    let loaded = load_every_file(&path).unwrap_or_else(|e| {
-        panic!(
-            "crash-regression corpus at {} is unusable: {e}.\n\
-             These inputs are committed to the repository; if they are missing, the checkout \
-             is incomplete or the corpus was deleted.",
-            path.display()
-        )
-    });
-
-    assert!(
-        loaded > 0,
-        "crash-regression corpus at {} contains no files — this test would otherwise pass \
-         without checking anything",
-        path.display()
-    );
-}
+use dotscope::metadata::cilobject::CilObject;
 
 /// Loads every input in the local fuzzing corpus, when one is present.
 ///

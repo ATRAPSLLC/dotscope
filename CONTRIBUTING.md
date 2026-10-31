@@ -152,8 +152,8 @@ cargo clippy --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo doc --all-features --no-deps
 
-# For extended fuzzing (do this locally, not in CI):
-cd dotscope/fuzz && cargo +nightly fuzz run cilobject -- -max_total_time=1800  # 30 minutes
+# Fuzzing runs only locally, never in CI; for a longer run of one target:
+make fuzz FUZZ_TARGETS=cilobject FUZZ_TIME=1800  # 30 minutes
 ```
 
 ### 4. Submit Pull Request
@@ -178,9 +178,10 @@ cd dotscope/fuzz && cargo +nightly fuzz run cilobject -- -max_total_time=1800  #
 Tests run in the `ci-test` profile (release with debug assertions): unoptimised, the
 sample-driven tests take hours. The tiers are cargo aliases (`.cargo/config.toml`):
 
-- `cargo test-quick`: the unit tests and the integration tests outside a `full` module.
+- `cargo test-quick`: the unit tests, the integration tests outside a `full` module and the
+  fuzz regression replay.
 - `cargo test-full`: everything, including the packer suites, the runtime corpora, the codegen
-  validation sweep, lift verification and the fuzz regression replay.
+  validation sweep and lift verification.
 
 1. **Unit Tests**: Test individual functions and modules, in `#[cfg(test)]` modules
 
@@ -191,11 +192,11 @@ sample-driven tests take hours. The tiers are cargo aliases (`.cargo/config.toml
    cargo test --profile ci-test --features z3 --test it -- ssa::
    ```
 
-3. **Fuzzing**: Test with random inputs
+3. **Fuzzing**: Test with random inputs, locally (CI replays the committed regressions only).
+   A fixed crash's input goes under `dotscope/tests/samples/fuzz-regressions/<target>/`
 
    ```bash
-   cd dotscope/fuzz
-   cargo +nightly fuzz run cilobject
+   make fuzz FUZZ_TARGETS=cilobject
    ```
 
 4. **Benchmarks**: Performance tests
