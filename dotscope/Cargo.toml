@@ -186,6 +186,11 @@ name = "security"
 harness = false
 
 [[bench]]
+name = "workloads"
+harness = false
+required-features = ["deobfuscation"]
+
+[[bench]]
 name = "deobfuscation"
 harness = false
 required-features = ["deobfuscation"]

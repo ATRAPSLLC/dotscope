@@ -1,5 +1,8 @@
 //! Benchmarks for owned vs. zero-copy parsing of standalone `.resources` files.
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
 use std::{fs, hint::black_box};
@@ -38,7 +41,7 @@ fn bench_parse_resources_file(c: &mut Criterion) {
     group.bench_function("parse_dotnet_resource", |b| {
         b.iter(|| {
             let parsed = parse_dotnet_resource(black_box(&data));
-            black_box(parsed.ok());
+            black_box(parsed.expect("the benchmarked work succeeds on its input"));
         });
     });
     group.finish();
@@ -49,7 +52,7 @@ fn bench_parse_resources_file(c: &mut Criterion) {
     group.bench_function("parse_dotnet_resource_ref", |b| {
         b.iter(|| {
             let parsed = parse_dotnet_resource_ref(black_box(&data));
-            black_box(parsed.ok());
+            black_box(parsed.expect("the benchmarked work succeeds on its input"));
         });
     });
     group.finish();

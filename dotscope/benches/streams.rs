@@ -8,6 +8,9 @@
 //!
 //! Includes both construction/parsing and access pattern benchmarks.
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
 use std::hint::black_box;
@@ -27,7 +30,9 @@ fn bench_strings_heap_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(Strings::from(black_box(data)).ok());
+            black_box(
+                Strings::from(black_box(data)).expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -69,7 +74,11 @@ fn bench_strings_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &offset in black_box(&offsets) {
-                let _ = black_box(strings.get(offset));
+                black_box(
+                    strings
+                        .get(offset)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });
@@ -85,7 +94,9 @@ fn bench_blob_heap_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(Blob::from(black_box(data)).ok());
+            black_box(
+                Blob::from(black_box(data)).expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -127,7 +138,10 @@ fn bench_blob_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &offset in black_box(&offsets) {
-                let _ = black_box(blob.get(offset));
+                black_box(
+                    blob.get(offset)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });
@@ -143,7 +157,10 @@ fn bench_userstrings_heap_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(UserStrings::from(black_box(data)).ok());
+            black_box(
+                UserStrings::from(black_box(data))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -185,7 +202,10 @@ fn bench_userstrings_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &offset in black_box(&offsets) {
-                let _ = black_box(us.get(offset));
+                black_box(
+                    us.get(offset)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });
@@ -201,7 +221,9 @@ fn bench_guid_heap_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(Guid::from(black_box(data)).ok());
+            black_box(
+                Guid::from(black_box(data)).expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -243,7 +265,10 @@ fn bench_guid_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &index in black_box(&indices) {
-                let _ = black_box(guid.get(index));
+                black_box(
+                    guid.get(index)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });

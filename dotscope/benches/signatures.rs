@@ -8,6 +8,9 @@
 //! - Type specification signatures
 //! - Method specification signatures
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
 use std::hint::black_box;
@@ -26,7 +29,10 @@ fn bench_method_signature_void_no_params(c: &mut Criterion) {
 
     c.bench_function("sig_method_void_no_params", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -39,7 +45,10 @@ fn bench_method_signature_primitives(c: &mut Criterion) {
 
     c.bench_function("sig_method_primitives", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -52,7 +61,10 @@ fn bench_method_signature_instance(c: &mut Criterion) {
 
     c.bench_function("sig_method_instance", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -65,7 +77,10 @@ fn bench_method_signature_generic(c: &mut Criterion) {
 
     c.bench_function("sig_method_generic", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -78,7 +93,10 @@ fn bench_method_signature_multi_generic(c: &mut Criterion) {
 
     c.bench_function("sig_method_multi_generic", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -91,7 +109,10 @@ fn bench_method_signature_byref(c: &mut Criterion) {
 
     c.bench_function("sig_method_byref", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -104,7 +125,10 @@ fn bench_method_signature_array_return(c: &mut Criterion) {
 
     c.bench_function("sig_method_array_return", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -119,7 +143,10 @@ fn bench_method_signature_many_params(c: &mut Criterion) {
 
     c.bench_function("sig_method_many_params", |b| {
         b.iter(|| {
-            black_box(parse_method_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -132,7 +159,10 @@ fn bench_field_signature_primitive(c: &mut Criterion) {
 
     c.bench_function("sig_field_primitive", |b| {
         b.iter(|| {
-            black_box(parse_field_signature(black_box(&signature)).ok());
+            black_box(
+                parse_field_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -145,7 +175,10 @@ fn bench_field_signature_string(c: &mut Criterion) {
 
     c.bench_function("sig_field_string", |b| {
         b.iter(|| {
-            black_box(parse_field_signature(black_box(&signature)).ok());
+            black_box(
+                parse_field_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -158,7 +191,10 @@ fn bench_field_signature_array(c: &mut Criterion) {
 
     c.bench_function("sig_field_array", |b| {
         b.iter(|| {
-            black_box(parse_field_signature(black_box(&signature)).ok());
+            black_box(
+                parse_field_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -171,7 +207,10 @@ fn bench_field_signature_generic_param(c: &mut Criterion) {
 
     c.bench_function("sig_field_generic_param", |b| {
         b.iter(|| {
-            black_box(parse_field_signature(black_box(&signature)).ok());
+            black_box(
+                parse_field_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -184,7 +223,10 @@ fn bench_field_signature_class(c: &mut Criterion) {
 
     c.bench_function("sig_field_class", |b| {
         b.iter(|| {
-            black_box(parse_field_signature(black_box(&signature)).ok());
+            black_box(
+                parse_field_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -197,7 +239,10 @@ fn bench_property_signature_simple(c: &mut Criterion) {
 
     c.bench_function("sig_property_simple", |b| {
         b.iter(|| {
-            black_box(parse_property_signature(black_box(&signature)).ok());
+            black_box(
+                parse_property_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -210,7 +255,10 @@ fn bench_property_signature_indexer(c: &mut Criterion) {
 
     c.bench_function("sig_property_indexer", |b| {
         b.iter(|| {
-            black_box(parse_property_signature(black_box(&signature)).ok());
+            black_box(
+                parse_property_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -223,7 +271,10 @@ fn bench_property_signature_static(c: &mut Criterion) {
 
     c.bench_function("sig_property_static", |b| {
         b.iter(|| {
-            black_box(parse_property_signature(black_box(&signature)).ok());
+            black_box(
+                parse_property_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -236,7 +287,10 @@ fn bench_local_var_signature_single(c: &mut Criterion) {
 
     c.bench_function("sig_localvar_single", |b| {
         b.iter(|| {
-            black_box(parse_local_var_signature(black_box(&signature)).ok());
+            black_box(
+                parse_local_var_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -249,7 +303,10 @@ fn bench_local_var_signature_multiple(c: &mut Criterion) {
 
     c.bench_function("sig_localvar_multiple", |b| {
         b.iter(|| {
-            black_box(parse_local_var_signature(black_box(&signature)).ok());
+            black_box(
+                parse_local_var_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -262,7 +319,10 @@ fn bench_local_var_signature_byref(c: &mut Criterion) {
 
     c.bench_function("sig_localvar_byref", |b| {
         b.iter(|| {
-            black_box(parse_local_var_signature(black_box(&signature)).ok());
+            black_box(
+                parse_local_var_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -275,7 +335,10 @@ fn bench_local_var_signature_pinned(c: &mut Criterion) {
 
     c.bench_function("sig_localvar_pinned", |b| {
         b.iter(|| {
-            black_box(parse_local_var_signature(black_box(&signature)).ok());
+            black_box(
+                parse_local_var_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -300,7 +363,10 @@ fn bench_local_var_signature_many(c: &mut Criterion) {
 
     c.bench_function("sig_localvar_many", |b| {
         b.iter(|| {
-            black_box(parse_local_var_signature(black_box(&signature)).ok());
+            black_box(
+                parse_local_var_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -313,7 +379,10 @@ fn bench_type_spec_generic_simple(c: &mut Criterion) {
 
     c.bench_function("sig_typespec_generic_simple", |b| {
         b.iter(|| {
-            black_box(parse_type_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_type_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -326,7 +395,10 @@ fn bench_type_spec_generic_multi_arg(c: &mut Criterion) {
 
     c.bench_function("sig_typespec_generic_multi_arg", |b| {
         b.iter(|| {
-            black_box(parse_type_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_type_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -339,7 +411,10 @@ fn bench_type_spec_array(c: &mut Criterion) {
 
     c.bench_function("sig_typespec_array", |b| {
         b.iter(|| {
-            black_box(parse_type_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_type_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -352,7 +427,10 @@ fn bench_type_spec_pointer(c: &mut Criterion) {
 
     c.bench_function("sig_typespec_pointer", |b| {
         b.iter(|| {
-            black_box(parse_type_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_type_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -365,7 +443,10 @@ fn bench_type_spec_generic_param(c: &mut Criterion) {
 
     c.bench_function("sig_typespec_generic_param", |b| {
         b.iter(|| {
-            black_box(parse_type_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_type_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -378,7 +459,10 @@ fn bench_method_spec_single(c: &mut Criterion) {
 
     c.bench_function("sig_methodspec_single", |b| {
         b.iter(|| {
-            black_box(parse_method_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -391,7 +475,10 @@ fn bench_method_spec_multiple(c: &mut Criterion) {
 
     c.bench_function("sig_methodspec_multiple", |b| {
         b.iter(|| {
-            black_box(parse_method_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }
@@ -404,7 +491,10 @@ fn bench_method_spec_nested_generic(c: &mut Criterion) {
 
     c.bench_function("sig_methodspec_nested_generic", |b| {
         b.iter(|| {
-            black_box(parse_method_spec_signature(black_box(&signature)).ok());
+            black_box(
+                parse_method_spec_signature(black_box(&signature))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }

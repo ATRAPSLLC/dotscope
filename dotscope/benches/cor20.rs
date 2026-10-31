@@ -4,6 +4,9 @@
 //! metadata about .NET assemblies including runtime version, metadata
 //! location, and runtime flags.
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
 use std::{fs, hint::black_box};
@@ -36,7 +39,10 @@ fn bench_cor20_header_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(Cor20Header::read(black_box(&data)).ok());
+            black_box(
+                Cor20Header::read(black_box(&data))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();

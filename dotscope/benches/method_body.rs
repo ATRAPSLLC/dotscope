@@ -1,16 +1,22 @@
-//! Benchmarks for method body parsing.
+//! Benchmarks for method body parsing, header and exception sections then the code decoded
+//! into blocks, as a load reads a body.
 //!
 //! Tests parsing performance for various method body formats:
 //! - Tiny headers (1 byte, up to 63 bytes code)
 //! - Fat headers (12+ bytes, complex methods)
 //! - Exception handlers (try/catch/finally blocks)
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use dotscope::{metadata::method::MethodBody, testkit::fixture_bytes};
+use dotscope::{
+    assembly::decode_blocks_with_handlers, metadata::method::MethodBody, testkit::fixture_bytes,
+};
 
 /// Run a method-body parsing benchmark over fixture `sample`.
 fn bench_method_file(c: &mut Criterion, group_name: &str, sample: &str) {
@@ -21,7 +27,24 @@ fn bench_method_file(c: &mut Criterion, group_name: &str, sample: &str) {
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(MethodBody::from(black_box(data)).ok());
+            let body = MethodBody::from(black_box(data)).expect("the body parses");
+            let end = body
+                .size_header
+                .checked_add(body.size_code)
+                .expect("the body's size fits");
+            let code = data
+                .get(body.size_header..end)
+                .expect("the body's code is in the file");
+            black_box(
+                decode_blocks_with_handlers(
+                    code,
+                    0,
+                    0x2000,
+                    Some(code.len()),
+                    &body.exception_handlers,
+                )
+                .expect("the code decodes"),
+            );
         });
     });
     group.finish();

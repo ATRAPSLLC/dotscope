@@ -79,10 +79,9 @@ fn bench_confuserex(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(label), &path, |b, path| {
             b.iter(|| {
                 let engine = DeobfuscationEngine::new(EngineConfig::default());
-                // Errors are expected on some protected samples depending on
-                // pipeline state; we measure the work, not the verdict.
+                // A sample that fails part-way would time as a speed-up: it must succeed
                 let result = engine.process_file(black_box(path));
-                black_box(result.is_ok())
+                black_box(result.expect("the sample deobfuscates"))
             });
         });
     }
@@ -105,7 +104,7 @@ fn bench_netreactor(c: &mut Criterion) {
             b.iter(|| {
                 let engine = DeobfuscationEngine::new(EngineConfig::default());
                 let result = engine.process_file(black_box(path));
-                black_box(result.is_ok())
+                black_box(result.expect("the sample deobfuscates"))
             });
         });
     }
