@@ -26,9 +26,8 @@
 //! # Key Functions
 //!
 //! - [`encode_custom_attribute_value`] - Main encoding function for complete custom attributes
-//! - [`encode_fixed_arguments`] - Constructor arguments encoding
-//! - [`encode_named_arguments`] - Field/property assignments encoding
 //! - [`encode_custom_attribute_argument`] - Individual argument value encoding
+//! - [`encode_field_or_prop_type`] - A named argument's or boxed value's type
 //!
 //! # Usage Examples
 //!
@@ -99,7 +98,7 @@
 use crate::{
     metadata::customattributes::{
         CustomAttributeArgument, CustomAttributeNamedArgument, CustomAttributeValue,
-        NAMED_ARG_TYPE, SERIALIZATION_TYPE,
+        FieldOrPropType, NAMED_ARG_TYPE, SERIALIZATION_TYPE,
     },
     utils::write_compressed_uint,
     Result,
@@ -113,11 +112,11 @@ use crate::{
 ///
 /// # Binary Format
 ///
-/// The output follows the ECMA-335 II.23.3 specification:
+/// The output follows ECMA-335 II.23.3:
 /// 1. Prolog: 0x0001 (little-endian)
 /// 2. Fixed arguments: Constructor parameters in order
-/// 3. Named argument count: Compressed integer
-/// 4. Named arguments: Field/property assignments with type tags
+/// 3. Named argument count: unsigned int16
+/// 4. Named arguments: FIELD or PROPERTY, the `FieldOrPropType`, the name, the value
 ///
 /// # Arguments
 ///
@@ -131,10 +130,9 @@ use crate::{
 ///
 /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] in the following cases:
 /// - Too many named arguments (exceeds u16 maximum of 65535)
-/// - Array length exceeds u32 maximum
-/// - String length exceeds compressed uint maximum (0x1FFFFFFF bytes)
-/// - Character outside the Basic Multilingual Plane (code point > 0xFFFF)
-/// - Void argument in a context where a value is required
+/// - An array of more than `u32::MAX - 1` elements
+/// - A string longer than a compressed uint can state (0x1FFFFFFF bytes)
+/// - A boxed value holding a boxed value, which the grammar has no type for
 ///
 /// # Examples
 ///
@@ -145,7 +143,7 @@ use crate::{
 /// use dotscope::metadata::typesystem::CilTypeReference;
 ///
 /// let custom_attr = CustomAttributeValue {
-///     fixed_args: vec![CustomAttributeArgument::String("Test".to_string())],
+///     fixed_args: vec![CustomAttributeArgument::String(Some("Test".to_string()))],
 ///     named_args: vec![],
 ///     constructor: CilTypeReference::None,
 ///     blob_index: 0,
@@ -160,7 +158,9 @@ pub fn encode_custom_attribute_value(value: &CustomAttributeValue) -> Result<Vec
     // Write prolog (0x0001 in little-endian)
     buffer.extend_from_slice(&[0x01, 0x00]);
 
-    encode_fixed_arguments(&value.fixed_args, &mut buffer)?;
+    for arg in &value.fixed_args {
+        encode_custom_attribute_argument(arg, &mut buffer)?;
+    }
 
     // ECMA-335 §II.23.3: NumNamed is encoded as unsigned int16
     let named_count = u16::try_from(value.named_args.len()).map_err(|_| {
@@ -176,41 +176,7 @@ pub fn encode_custom_attribute_value(value: &CustomAttributeValue) -> Result<Vec
     Ok(buffer)
 }
 
-/// Encodes the fixed arguments (constructor parameters) of a custom attribute.
-///
-/// Fixed arguments are encoded in the order they appear in the constructor signature,
-/// using type-specific binary formats for each argument type.
-///
-/// # Arguments
-///
-/// * `args` - The fixed arguments to encode
-/// * `buffer` - The output buffer to write encoded data to
-///
-/// # ECMA-335 Reference
-///
-/// According to ECMA-335 II.23.3, fixed arguments are encoded as:
-/// ```text
-/// FixedArgs ::= Argument*
-/// Argument  ::= <type-specific binary data>
-/// ```
-fn encode_fixed_arguments(args: &[CustomAttributeArgument], buffer: &mut Vec<u8>) -> Result<()> {
-    for arg in args {
-        encode_custom_attribute_argument(arg, buffer)?;
-    }
-    Ok(())
-}
-
-/// Encodes the named arguments (field/property assignments) of a custom attribute.
-///
-/// Named arguments include explicit type information via SERIALIZATION_TYPE tags,
-/// enabling self-describing parsing without external type resolution.
-///
-/// # Arguments
-///
-/// * `args` - The named arguments to encode
-/// * `buffer` - The output buffer to write encoded data to
-///
-/// # ECMA-335 Reference
+/// Encodes named arguments (field/property assignments) into binary format.
 ///
 /// According to ECMA-335 II.23.3, named arguments are encoded as:
 /// ```text
@@ -218,173 +184,106 @@ fn encode_fixed_arguments(args: &[CustomAttributeArgument], buffer: &mut Vec<u8>
 /// FIELD    ::= NAMED_ARG_TYPE::FIELD (0x53)
 /// PROPERTY ::= NAMED_ARG_TYPE::PROPERTY (0x54)
 /// ```
-fn encode_named_arguments(
+pub(crate) fn encode_named_arguments(
     args: &[CustomAttributeNamedArgument],
     buffer: &mut Vec<u8>,
 ) -> Result<()> {
     for arg in args {
-        match &arg.value {
-            CustomAttributeArgument::Array(_) => {
-                return Err(malformed_error!(
-                    "Array arguments are not supported in named arguments"
-                ));
-            }
-            CustomAttributeArgument::Enum(_, _) => {
-                return Err(malformed_error!(
-                    "Enum arguments are not supported in named arguments"
-                ));
-            }
-            _ => {} // Other types are supported
-        }
-
-        if arg.is_field {
-            buffer.push(NAMED_ARG_TYPE::FIELD);
+        buffer.push(if arg.is_field {
+            NAMED_ARG_TYPE::FIELD
         } else {
-            buffer.push(NAMED_ARG_TYPE::PROPERTY);
-        }
-
-        let type_tag = get_serialization_type_tag(&arg.value)?;
-        buffer.push(type_tag);
-
-        write_string(buffer, &arg.name)?;
-
+            NAMED_ARG_TYPE::PROPERTY
+        });
+        encode_field_or_prop_type(&arg.arg_type, buffer)?;
+        write_string(buffer, Some(&arg.name))?;
         encode_custom_attribute_argument(&arg.value, buffer)?;
     }
     Ok(())
 }
 
-/// Encodes a single custom attribute argument value into binary format.
+/// Encodes a `FieldOrPropType`: its serialization tag, with an enum's type name or an
+/// array's element type after it (ECMA-335 II.23.3).
 ///
-/// This function handles all supported .NET types according to the ECMA-335 specification,
-/// using the appropriate binary encoding for each type variant.
+/// # Errors
+///
+/// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] when an enum's
+/// type name is too long to encode.
+pub fn encode_field_or_prop_type(
+    argument_type: &FieldOrPropType,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    match argument_type {
+        FieldOrPropType::Bool => buffer.push(SERIALIZATION_TYPE::BOOLEAN),
+        FieldOrPropType::Char => buffer.push(SERIALIZATION_TYPE::CHAR),
+        FieldOrPropType::I1 => buffer.push(SERIALIZATION_TYPE::I1),
+        FieldOrPropType::U1 => buffer.push(SERIALIZATION_TYPE::U1),
+        FieldOrPropType::I2 => buffer.push(SERIALIZATION_TYPE::I2),
+        FieldOrPropType::U2 => buffer.push(SERIALIZATION_TYPE::U2),
+        FieldOrPropType::I4 => buffer.push(SERIALIZATION_TYPE::I4),
+        FieldOrPropType::U4 => buffer.push(SERIALIZATION_TYPE::U4),
+        FieldOrPropType::I8 => buffer.push(SERIALIZATION_TYPE::I8),
+        FieldOrPropType::U8 => buffer.push(SERIALIZATION_TYPE::U8),
+        FieldOrPropType::R4 => buffer.push(SERIALIZATION_TYPE::R4),
+        FieldOrPropType::R8 => buffer.push(SERIALIZATION_TYPE::R8),
+        FieldOrPropType::String => buffer.push(SERIALIZATION_TYPE::STRING),
+        FieldOrPropType::Type => buffer.push(SERIALIZATION_TYPE::TYPE),
+        FieldOrPropType::Boxed => buffer.push(SERIALIZATION_TYPE::TAGGED_OBJECT),
+        FieldOrPropType::Enum(name) => {
+            buffer.push(SERIALIZATION_TYPE::ENUM);
+            write_string(buffer, Some(name))?;
+        }
+        FieldOrPropType::SzArray(element) => {
+            buffer.push(SERIALIZATION_TYPE::SZARRAY);
+            encode_field_or_prop_type(element, buffer)?;
+        }
+    }
+    Ok(())
+}
+
+/// Encodes a single custom attribute argument value into binary format (ECMA-335 II.23.3
+/// `Elem`, or for a boxed value its type and then its value).
 ///
 /// # Arguments
 ///
 /// * `arg` - The argument to encode
 /// * `buffer` - The output buffer to write encoded data to
 ///
-/// # Type Encoding
-///
-/// Each type is encoded according to its specific format:
-/// - **Primitives**: Little-endian binary representation
-/// - **Strings**: Compressed length + UTF-8 data (or 0xFF for null)
-/// - **Arrays**: Compressed length + encoded elements
-/// - **Enums**: Underlying type value (type name encoded separately in named args)
-///
 /// # Errors
 ///
 /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] in the following cases:
-/// - `Char`: Character code point exceeds 0xFFFF (outside Basic Multilingual Plane)
-/// - `String`: String length exceeds compressed uint maximum (0x1FFFFFFF bytes)
-/// - `Array`: Array length exceeds u32 maximum (4,294,967,295 elements)
-/// - Recursive errors from nested array element encoding
+/// - `String` or `Type`: longer than a compressed uint can state (0x1FFFFFFF bytes)
+/// - `Array`: `u32::MAX` elements or more (`u32::MAX` is the null array)
+/// - `Boxed`: holding a boxed value
 pub fn encode_custom_attribute_argument(
     arg: &CustomAttributeArgument,
     buffer: &mut Vec<u8>,
 ) -> Result<()> {
     match arg {
-        CustomAttributeArgument::Void => {
-            // Void arguments are typically not used in custom attributes
-        }
-        CustomAttributeArgument::Bool(value) => {
-            buffer.push(u8::from(*value));
-        }
-        CustomAttributeArgument::Char(value) => {
-            // .NET's System.Char is a 16-bit UTF-16 code unit per ECMA-335 §II.23.3.
-            // Characters outside the Basic Multilingual Plane (U+10000 and above) cannot
-            // be represented in a single .NET char - they require surrogate pairs.
-            // Since this is a fundamental .NET limitation, we reject such characters
-            // rather than silently corrupting data.
-            let code_point = *value as u32;
-            if code_point > 0xFFFF {
-                return Err(malformed_error!(
-                    "Character U+{:04X} is outside the Basic Multilingual Plane and cannot be \
-                     encoded as a .NET char (which is limited to U+0000..U+FFFF)",
-                    code_point
-                ));
-            }
-            #[allow(clippy::cast_possible_truncation)] // Safe: validated above
-            let utf16_val = *value as u16;
-            buffer.extend_from_slice(&utf16_val.to_le_bytes());
-        }
-        CustomAttributeArgument::I1(value) => {
-            // Safe: i8 to u8 preserves the bit pattern which is correct for serialization
-            #[allow(clippy::cast_sign_loss)]
-            buffer.push(*value as u8);
-        }
-        CustomAttributeArgument::U1(value) => {
-            buffer.push(*value);
-        }
-        CustomAttributeArgument::I2(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::U2(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::I4(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::U4(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::I8(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::U8(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::R4(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::R8(value) => {
-            buffer.extend_from_slice(&value.to_le_bytes());
-        }
-        CustomAttributeArgument::I(value) => {
-            // Native integers (IntPtr/nint) are platform-dependent per ECMA-335:
-            // - 32-bit platforms: encoded as 4 bytes (i32)
-            // - 64-bit platforms: encoded as 8 bytes (i64)
-            //
-            // LIMITATION: This uses the HOST platform size, not the TARGET assembly's
-            // platform. Cross-platform encoding (e.g., encoding a 32-bit assembly on
-            // a 64-bit host) is not currently supported. The assembly would need to
-            // specify its target platform, which is not available in this context.
-            #[cfg(target_pointer_width = "32")]
-            {
-                buffer.extend_from_slice(
-                    &i32::try_from(*value).unwrap_or(*value as i32).to_le_bytes(),
-                );
-            }
-            #[cfg(not(target_pointer_width = "32"))]
-            {
-                buffer.extend_from_slice(&(*value as i64).to_le_bytes());
-            }
-        }
-        CustomAttributeArgument::U(value) => {
-            // Native integers (UIntPtr/nuint) are platform-dependent per ECMA-335:
-            // - 32-bit platforms: encoded as 4 bytes (u32)
-            // - 64-bit platforms: encoded as 8 bytes (u64)
-            //
-            // LIMITATION: Same cross-platform limitation as I (signed native int).
-            #[cfg(target_pointer_width = "32")]
-            {
-                buffer.extend_from_slice(
-                    &u32::try_from(*value).unwrap_or(*value as u32).to_le_bytes(),
-                );
-            }
-            #[cfg(not(target_pointer_width = "32"))]
-            {
-                buffer.extend_from_slice(&(*value as u64).to_le_bytes());
-            }
-        }
+        CustomAttributeArgument::Bool(value) => buffer.push(u8::from(*value)),
+        CustomAttributeArgument::Char(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::I1(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::U1(value) => buffer.push(*value),
+        CustomAttributeArgument::I2(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::U2(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::I4(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::U4(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::I8(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::U8(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::R4(value) => buffer.extend_from_slice(&value.to_le_bytes()),
+        CustomAttributeArgument::R8(value) => buffer.extend_from_slice(&value.to_le_bytes()),
         CustomAttributeArgument::String(value) | CustomAttributeArgument::Type(value) => {
-            write_string(buffer, value)?;
+            write_string(buffer, value.as_deref())?;
         }
-        CustomAttributeArgument::Array(elements) => {
-            // Array length is encoded as compressed uint (max ~2^29 per ECMA-335 §II.23.2)
-            let len = u32::try_from(elements.len()).map_err(|_| {
-                malformed_error!("Array too large: {} exceeds u32 maximum", elements.len())
-            })?;
-            write_compressed_uint(len, buffer);
+        CustomAttributeArgument::Array(_, None) => {
+            buffer.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        CustomAttributeArgument::Array(_, Some(elements)) => {
+            // NumElem: a little-endian uint32, with u32::MAX standing for the null array
+            let len = u32::try_from(elements.len())
+                .ok()
+                .filter(|len| *len != u32::MAX)
+                .ok_or_else(|| malformed_error!("Array too large: {} elements", elements.len()))?;
+            buffer.extend_from_slice(&len.to_le_bytes());
             for element in elements {
                 encode_custom_attribute_argument(element, buffer)?;
             }
@@ -392,125 +291,56 @@ pub fn encode_custom_attribute_argument(
         CustomAttributeArgument::Enum(_, underlying_value) => {
             encode_custom_attribute_argument(underlying_value, buffer)?;
         }
+        CustomAttributeArgument::Boxed(value) => {
+            let Some(held) = value.field_or_prop_type() else {
+                return Err(malformed_error!("A boxed value cannot hold a boxed value"));
+            };
+            encode_field_or_prop_type(&held, buffer)?;
+            encode_custom_attribute_argument(value, buffer)?;
+        }
     }
     Ok(())
 }
 
-/// Gets the SERIALIZATION_TYPE tag for a custom attribute argument.
-///
-/// This function maps custom attribute argument types to their corresponding
-/// SERIALIZATION_TYPE constants used in the binary format for named arguments.
-///
-/// # Arguments
-///
-/// * `arg` - The argument to get the type tag for
-///
-/// # Returns
-///
-/// The SERIALIZATION_TYPE constant corresponding to the argument type.
-fn get_serialization_type_tag(arg: &CustomAttributeArgument) -> Result<u8> {
-    let tag = match arg {
-        CustomAttributeArgument::Void => {
-            return Err(malformed_error!(
-                "Void arguments are not supported in custom attributes"
-            ));
-        }
-        CustomAttributeArgument::Bool(_) => SERIALIZATION_TYPE::BOOLEAN,
-        CustomAttributeArgument::Char(_) => SERIALIZATION_TYPE::CHAR,
-        CustomAttributeArgument::I1(_) => SERIALIZATION_TYPE::I1,
-        CustomAttributeArgument::U1(_) => SERIALIZATION_TYPE::U1,
-        CustomAttributeArgument::I2(_) => SERIALIZATION_TYPE::I2,
-        CustomAttributeArgument::U2(_) => SERIALIZATION_TYPE::U2,
-        CustomAttributeArgument::I4(_) => SERIALIZATION_TYPE::I4,
-        CustomAttributeArgument::U4(_) => SERIALIZATION_TYPE::U4,
-        CustomAttributeArgument::I8(_) => SERIALIZATION_TYPE::I8,
-        CustomAttributeArgument::U8(_) => SERIALIZATION_TYPE::U8,
-        CustomAttributeArgument::R4(_) => SERIALIZATION_TYPE::R4,
-        CustomAttributeArgument::R8(_) => SERIALIZATION_TYPE::R8,
-        CustomAttributeArgument::I(_) => {
-            // Native integers use I4 on 32-bit, I8 on 64-bit.
-            // LIMITATION: This uses the host platform's pointer width, not the target assembly's.
-            // Cross-platform encoding is not supported - see MED-001 in refactoring doc.
-            if cfg!(target_pointer_width = "32") {
-                SERIALIZATION_TYPE::I4
-            } else {
-                SERIALIZATION_TYPE::I8
-            }
-        }
-        CustomAttributeArgument::U(_) => {
-            // Native unsigned integers use U4 on 32-bit, U8 on 64-bit.
-            // LIMITATION: This uses the host platform's pointer width, not the target assembly's.
-            // Cross-platform encoding is not supported - see MED-001 in refactoring doc.
-            if cfg!(target_pointer_width = "32") {
-                SERIALIZATION_TYPE::U4
-            } else {
-                SERIALIZATION_TYPE::U8
-            }
-        }
-        CustomAttributeArgument::String(_) => SERIALIZATION_TYPE::STRING,
-        CustomAttributeArgument::Type(_) => SERIALIZATION_TYPE::TYPE,
-        CustomAttributeArgument::Array(_) => SERIALIZATION_TYPE::SZARRAY,
-        CustomAttributeArgument::Enum(_, _) => SERIALIZATION_TYPE::ENUM,
+/// Writes a `SerString`: 0xFF for the null string, otherwise a compressed length and the
+/// UTF-8 bytes.
+fn write_string(buffer: &mut Vec<u8>, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        buffer.push(0xFF);
+        return Ok(());
     };
-    Ok(tag)
-}
-
-/// Writes a string to the buffer using the .NET custom attribute string format.
-///
-/// # ECMA-335 String Encoding
-///
-/// Per ECMA-335, strings can be encoded as:
-/// - **Null strings**: Single byte 0xFF
-/// - **Empty strings**: Compressed uint 0 (single byte 0x00)
-/// - **Non-empty strings**: Compressed length + UTF-8 data
-///
-/// # Design Decision
-///
-/// Since Rust's `String` cannot represent null (unlike .NET's `string?`), this function
-/// encodes empty strings as length 0, not as the null marker 0xFF. This means:
-/// - Parsing a null string (0xFF) returns an empty `String`
-/// - Re-encoding that empty `String` produces length 0, not 0xFF
-///
-/// This round-trip asymmetry is acceptable because both representations have equivalent
-/// semantics in the Rust API context.
-///
-/// # Arguments
-///
-/// * `buffer` - The output buffer to write to
-/// * `value` - The string value to encode
-///
-/// # Errors
-///
-/// Returns an error if the string length exceeds the compressed uint maximum (0x1FFFFFFF bytes).
-fn write_string(buffer: &mut Vec<u8>, value: &str) -> Result<()> {
-    if value.is_empty() {
-        write_compressed_uint(0, buffer);
-    } else {
-        let utf8_bytes = value.as_bytes();
-        let len = u32::try_from(utf8_bytes.len()).map_err(|_| {
-            malformed_error!(
-                "String too long: {} bytes exceeds u32 maximum",
-                utf8_bytes.len()
-            )
-        })?;
-        write_compressed_uint(len, buffer);
-        buffer.extend_from_slice(utf8_bytes);
-    }
+    let utf8_bytes = value.as_bytes();
+    let len = u32::try_from(utf8_bytes.len()).map_err(|_| {
+        malformed_error!(
+            "String too long: {} bytes exceeds a compressed length",
+            utf8_bytes.len()
+        )
+    })?;
+    write_compressed_uint(len, buffer)?;
+    buffer.extend_from_slice(utf8_bytes);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::{collection::vec, prop_assert_eq, test_runner::TestCaseError};
+
     use super::*;
-    use crate::metadata::{
-        customattributes::{CustomAttributeNamedArgument, CustomAttributeValue},
-        typesystem::CilTypeReference,
+    use crate::{
+        metadata::{
+            customattributes::{
+                parse_custom_attribute_data, CustomAttributeNamedArgument, CustomAttributeValue,
+            },
+            tables::ParamList,
+            typesystem::CilTypeReference,
+        },
+        testkit::{arb, arb::check},
     };
 
     #[test]
     fn test_encode_simple_custom_attribute() {
         let custom_attr = CustomAttributeValue {
-            fixed_args: vec![CustomAttributeArgument::String("Test".to_string())],
+            fixed_args: vec![CustomAttributeArgument::String(Some("Test".to_string()))],
             named_args: vec![],
             constructor: CilTypeReference::None,
             blob_index: 0,
@@ -575,7 +405,7 @@ mod tests {
     #[test]
     fn test_encode_string_argument() {
         let mut buffer = Vec::new();
-        let arg = CustomAttributeArgument::String("Hello".to_string());
+        let arg = CustomAttributeArgument::String(Some("Hello".to_string()));
 
         let result = encode_custom_attribute_argument(&arg, &mut buffer);
         assert!(result.is_ok(), "String encoding should succeed");
@@ -588,17 +418,20 @@ mod tests {
     #[test]
     fn test_encode_array_argument() {
         let mut buffer = Vec::new();
-        let arg = CustomAttributeArgument::Array(vec![
-            CustomAttributeArgument::I4(1),
-            CustomAttributeArgument::I4(2),
-        ]);
+        let arg = CustomAttributeArgument::Array(
+            FieldOrPropType::I4,
+            Some(vec![
+                CustomAttributeArgument::I4(1),
+                CustomAttributeArgument::I4(2),
+            ]),
+        );
 
         let result = encode_custom_attribute_argument(&arg, &mut buffer);
         assert!(result.is_ok(), "Array encoding should succeed");
 
-        // Should be: length (2) + two I4 values
+        // NumElem as a little-endian uint32, then the two I4 values
         let expected = vec![
-            2, // length
+            2, 0, 0, 0, // NumElem
             1, 0, 0, 0, // I4(1) little-endian
             2, 0, 0, 0, // I4(2) little-endian
         ];
@@ -613,8 +446,8 @@ mod tests {
         let named_args = vec![CustomAttributeNamedArgument {
             is_field: false, // property
             name: "Value".to_string(),
-            arg_type: "String".to_string(),
-            value: CustomAttributeArgument::String("Test".to_string()),
+            arg_type: FieldOrPropType::String,
+            value: CustomAttributeArgument::String(Some("Test".to_string())),
         }];
 
         let mut buffer = Vec::new();
@@ -635,12 +468,12 @@ mod tests {
         let mut buffer = Vec::new();
 
         // Test single byte encoding
-        write_compressed_uint(42, &mut buffer);
+        write_compressed_uint(42, &mut buffer).unwrap();
         assert_eq!(buffer, vec![42], "Small values should use single byte");
 
         // Test two byte encoding
         buffer.clear();
-        write_compressed_uint(0x1234, &mut buffer);
+        write_compressed_uint(0x1234, &mut buffer).unwrap();
         assert_eq!(
             buffer,
             vec![0x80 | 0x12, 0x34],
@@ -649,7 +482,7 @@ mod tests {
 
         // Test four byte encoding
         buffer.clear();
-        write_compressed_uint(0x12345678, &mut buffer);
+        write_compressed_uint(0x12345678, &mut buffer).unwrap();
         assert_eq!(
             buffer,
             vec![0xC0 | 0x12, 0x34, 0x56, 0x78],
@@ -657,32 +490,60 @@ mod tests {
         );
     }
 
+    /// A type the blob names: an enum by its name, an array by its element type.
     #[test]
-    fn test_get_serialization_type_tag() {
-        assert_eq!(
-            get_serialization_type_tag(&CustomAttributeArgument::Bool(true)).unwrap(),
-            SERIALIZATION_TYPE::BOOLEAN
-        );
-        assert_eq!(
-            get_serialization_type_tag(&CustomAttributeArgument::String("test".to_string()))
-                .unwrap(),
-            SERIALIZATION_TYPE::STRING
-        );
-        assert_eq!(
-            get_serialization_type_tag(&CustomAttributeArgument::I4(42)).unwrap(),
-            SERIALIZATION_TYPE::I4
-        );
+    fn a_field_or_prop_type_encodes_as_the_grammar_writes_it() {
+        let mut buffer = Vec::new();
+        encode_field_or_prop_type(
+            &FieldOrPropType::SzArray(Box::new(FieldOrPropType::Enum("E.Ty".to_string()))),
+            &mut buffer,
+        )
+        .unwrap();
+        assert_eq!(buffer, [0x1D, 0x55, 4, b'E', b'.', b'T', b'y']);
+    }
+
+    /// A boxed value names its type before it, and null strings and arrays have markers of
+    /// their own.
+    #[test]
+    fn boxed_values_and_nulls_encode_as_the_grammar_writes_them() {
+        let cases: [(CustomAttributeArgument, &[u8]); 4] = [
+            (
+                CustomAttributeArgument::Boxed(Box::new(CustomAttributeArgument::I4(7))),
+                &[0x08, 7, 0, 0, 0],
+            ),
+            (
+                CustomAttributeArgument::Boxed(Box::new(CustomAttributeArgument::Enum(
+                    "E".to_string(),
+                    Box::new(CustomAttributeArgument::U1(3)),
+                ))),
+                &[0x55, 1, b'E', 3],
+            ),
+            (CustomAttributeArgument::String(None), &[0xFF]),
+            (
+                CustomAttributeArgument::Array(FieldOrPropType::I4, None),
+                &[0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+        ];
+        for (argument, bytes) in cases {
+            let mut buffer = Vec::new();
+            encode_custom_attribute_argument(&argument, &mut buffer).unwrap();
+            assert_eq!(buffer, bytes, "{argument:?}");
+        }
+        let nested = CustomAttributeArgument::Boxed(Box::new(CustomAttributeArgument::Boxed(
+            Box::new(CustomAttributeArgument::I4(1)),
+        )));
+        assert!(encode_custom_attribute_argument(&nested, &mut Vec::new()).is_err());
     }
 
     #[test]
     fn test_encode_complete_custom_attribute_with_named_args() {
         let custom_attr = CustomAttributeValue {
-            fixed_args: vec![CustomAttributeArgument::String("Debug".to_string())],
+            fixed_args: vec![CustomAttributeArgument::String(Some("Debug".to_string()))],
             named_args: vec![CustomAttributeNamedArgument {
                 is_field: false,
                 name: "Name".to_string(),
-                arg_type: "String".to_string(),
-                value: CustomAttributeArgument::String("TestName".to_string()),
+                arg_type: FieldOrPropType::String,
+                value: CustomAttributeArgument::String(Some("TestName".to_string())),
             }],
             constructor: CilTypeReference::None,
             blob_index: 0,
@@ -712,7 +573,7 @@ mod tests {
             named_args: vec![CustomAttributeNamedArgument {
                 is_field: true,
                 name: "FieldValue".to_string(),
-                arg_type: "I4".to_string(),
+                arg_type: FieldOrPropType::I4,
                 value: CustomAttributeArgument::I4(42),
             }],
             constructor: CilTypeReference::None,
@@ -745,7 +606,9 @@ mod tests {
     #[test]
     fn test_debug_type_args_encoding() {
         let custom_attr = CustomAttributeValue {
-            fixed_args: vec![CustomAttributeArgument::Type("System.String".to_string())],
+            fixed_args: vec![CustomAttributeArgument::Type(Some(
+                "System.String".to_string(),
+            ))],
             named_args: vec![],
             constructor: CilTypeReference::None,
             blob_index: 0,
@@ -782,5 +645,34 @@ mod tests {
             assert_eq!(encoded[pos], 0x00);
             assert_eq!(encoded[pos + 1], 0x00);
         }
+    }
+
+    /// Every value the encoder writes decodes back to itself: the arguments are compared by
+    /// what they print, which tells every value apart but a NaN's payload, and by their bytes
+    /// written again, which tells that apart too.
+    #[test]
+    fn every_attribute_value_decodes_to_what_was_encoded() {
+        check(vec(arb::named_argument(), 0..5), |named_args| {
+            let value = CustomAttributeValue {
+                fixed_args: Vec::new(),
+                named_args,
+                constructor: CilTypeReference::None,
+                blob_index: 0,
+            };
+            let bytes = encode_custom_attribute_value(&value)
+                .map_err(|error| TestCaseError::fail(format!("does not encode: {error}")))?;
+            let decoded =
+                parse_custom_attribute_data(&bytes, &ParamList::new()).map_err(|error| {
+                    TestCaseError::fail(format!("{bytes:02x?} does not decode: {error}"))
+                })?;
+            prop_assert_eq!(
+                format!("{:?}", decoded.named_args),
+                format!("{:?}", value.named_args),
+                "encoded as {:02x?}",
+                bytes
+            );
+            prop_assert_eq!(encode_custom_attribute_value(&decoded).ok(), Some(bytes));
+            Ok(())
+        });
     }
 }

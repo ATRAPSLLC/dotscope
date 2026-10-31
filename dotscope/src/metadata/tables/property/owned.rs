@@ -5,9 +5,13 @@
 
 use std::sync::OnceLock;
 
-use crate::metadata::{
-    customattributes::CustomAttributeValueList, method::MethodRef, signatures::SignatureProperty,
-    tables::PropertyAttributes, token::Token, typesystem::CilPrimitive,
+use crate::{
+    metadata::{
+        customattributes::CustomAttributeValueList, method::MethodRef,
+        signatures::SignatureProperty, tables::PropertyAttributes, token::Token,
+        typesystem::CilPrimitive,
+    },
+    utils::RowList,
 };
 
 /// Owned representation of a Property table entry with complete metadata context.
@@ -94,12 +98,9 @@ pub struct Property {
     /// when property method access is required.
     pub fn_getter: OnceLock<MethodRef>,
 
-    /// Other associated method for this property (lazy-loaded).
-    ///
-    /// Reference to additional methods associated with this property beyond
-    /// the standard getter/setter pattern. Loaded on-demand from the
-    /// `MethodSemantics` table when complete property method information is needed.
-    pub fn_other: OnceLock<MethodRef>,
+    /// The property's other methods, beyond its getter and setter, in `MethodSemantics`
+    /// table order. ECMA-335 II.22.28 allows any number of them.
+    pub fn_other: RowList<MethodRef>,
 
     /// Custom attributes applied to this property.
     ///

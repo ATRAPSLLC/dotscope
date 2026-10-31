@@ -24,6 +24,7 @@
 use crate::{
     cilassembly::{ChangeRefRc, CilAssembly},
     metadata::{
+        pdb::LocalConstantSig,
         tables::{LocalConstantRaw, TableDataOwned, TableId},
         token::Token,
     },
@@ -67,6 +68,8 @@ pub struct LocalConstantBuilder {
     name: Option<String>,
     /// Raw signature bytes for the constant type
     signature: Option<Vec<u8>>,
+    /// The signature, decoded: encoded when the entry is built
+    parsed: Option<LocalConstantSig>,
 }
 
 impl LocalConstantBuilder {
@@ -90,6 +93,7 @@ impl LocalConstantBuilder {
         Self {
             name: None,
             signature: None,
+            parsed: None,
         }
     }
 
@@ -152,6 +156,44 @@ impl LocalConstantBuilder {
     #[must_use]
     pub fn signature(mut self, signature: &[u8]) -> Self {
         self.signature = Some(signature.to_vec());
+        self.parsed = None;
+        self
+    }
+
+    /// Sets the constant's type and value, decoded: the LocalConstantSig blob is encoded when
+    /// [`build`](Self::build) runs.
+    ///
+    /// The types it names are TypeDef, TypeRef or TypeSpec tokens of the input, or of rows a
+    /// change adds, named by their placeholders; the writer renumbers them with the rows.
+    ///
+    /// # Arguments
+    ///
+    /// * `signature` - The constant's custom modifiers, type and value
+    ///
+    /// # Errors
+    ///
+    /// [`build`](Self::build) fails when the signature cannot be encoded
+    /// ([`LocalConstantSig::encode`]).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::{
+    ///     metadata::pdb::{LocalConstantSig, LocalConstantValue, PrimitiveConstant},
+    ///     prelude::*,
+    /// };
+    ///
+    /// let builder = LocalConstantBuilder::new()
+    ///     .name("answer")
+    ///     .signature_parsed(LocalConstantSig {
+    ///         modifiers: Vec::new(),
+    ///         value: LocalConstantValue::Primitive(PrimitiveConstant::I4(42)),
+    ///     });
+    /// ```
+    #[must_use]
+    pub fn signature_parsed(mut self, signature: LocalConstantSig) -> Self {
+        self.parsed = Some(signature);
+        self.signature = None;
         self
     }
 
@@ -195,11 +237,15 @@ impl LocalConstantBuilder {
             )
         })?;
 
-        let signature = self.signature.ok_or_else(|| {
-            Error::ModificationInvalid(
-                "Constant signature is required for LocalConstant".to_string(),
-            )
-        })?;
+        let signature = match (self.signature, &self.parsed) {
+            (Some(signature), _) => signature,
+            (None, Some(parsed)) => parsed.encode()?,
+            (None, None) => {
+                return Err(Error::ModificationInvalid(
+                    "Constant signature is required for LocalConstant".to_string(),
+                ))
+            }
+        };
 
         let name_index = if name.is_empty() {
             0

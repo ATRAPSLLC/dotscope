@@ -478,25 +478,6 @@ impl TypeResolver {
         self.resolve_with_depth(signature, 0)
     }
 
-    /// Formats a type name with generic arity marker.
-    ///
-    /// If the name doesn't already contain a backtick (`), appends the generic arity
-    /// in the format `Name`N` where N is the number of type arguments.
-    ///
-    /// # Arguments
-    /// * `base_name` - The original type name
-    /// * `arg_count` - The number of generic type arguments
-    ///
-    /// # Returns
-    /// The name with generic arity marker, or the original name if already present.
-    fn format_generic_name(base_name: &str, arg_count: usize) -> String {
-        if base_name.contains('`') {
-            base_name.to_string()
-        } else {
-            format!("{base_name}`{arg_count}")
-        }
-    }
-
     /// Formats a stable name for function pointer types based on signature characteristics.
     ///
     /// Generates a deterministic name based on the function signature's calling convention,
@@ -806,8 +787,11 @@ impl TypeResolver {
 
                 let base_type = self.resolve_with_depth(base_sig, depth.saturating_add(1))?;
 
+                // An instance is named as its definition is: the arity suffix is a compiler's
+                // naming convention, and a nested type that only inherits its enclosing type's
+                // parameters has none
                 let namespace = base_type.namespace.clone();
-                let name = Self::format_generic_name(&base_type.name, type_args.len());
+                let name = base_type.name.clone();
 
                 // Use the base type's source instead of the current assembly source
                 // Generic instantiations should inherit the source from their base type
@@ -867,10 +851,10 @@ impl TypeResolver {
                     generic_inst.generic_args.push(method_spec);
                 }
 
-                if let Some(definition_base) = base_type.base() {
-                    generic_inst.set_base(&definition_base.into())?;
-                }
-
+                // The instance's base is its definition's with the arguments substituted, which
+                // is not computed here; the definition's own base is set after the type
+                // specifications load, so a copy of it would depend on load order. Nesting is
+                // known by now (the loaders that resolve signatures run after `NestedClass`).
                 if let Some(enclosing) = base_type.enclosing_type.get() {
                     let _ = generic_inst.set_enclosing_type(enclosing);
                 }
@@ -1283,6 +1267,46 @@ mod tests {
         } else {
             panic!("Expected GenericParameter flavor");
         };
+    }
+
+    /// An instance is named as its definition is and nested where it is: a nested type that
+    /// only inherits its enclosing type's parameters (`Outer`1/Inner`) has no arity suffix to
+    /// add. Its base is not its definition's, which is unsubstituted and, while loading, set
+    /// or not depending on what loaded first.
+    #[test]
+    fn an_instance_is_named_and_nested_as_its_definition() {
+        let test_identity = AssemblyIdentity::parse("TestAssembly, Version=1.0.0.0").unwrap();
+        let registry = Arc::new(TypeRegistry::new(test_identity).unwrap());
+        let class = |token: u32, name: &str| {
+            registry
+                .get_or_create_type(&CompleteTypeSpec {
+                    token_init: Some(Token::new(token)),
+                    flavor: CilFlavor::Class,
+                    namespace: String::new(),
+                    name: name.to_string(),
+                    source: TypeSource::Unknown,
+                    generic_args: None,
+                    base_type: None,
+                    flags: None,
+                })
+                .unwrap()
+        };
+        let outer = class(0x0200_0010, "Outer`1");
+        let inner = class(0x0200_0011, "Inner");
+        let base = class(0x0200_0012, "Base");
+        inner.set_enclosing_type(&outer.clone().into()).unwrap();
+        inner.set_base(&base.into()).unwrap();
+
+        let instance = TypeResolver::new(registry.clone())
+            .resolve(&TypeSignature::GenericInst(
+                Box::new(TypeSignature::Class(inner.token)),
+                vec![TypeSignature::I4],
+            ))
+            .unwrap();
+
+        assert_eq!(instance.name, "Inner");
+        assert_eq!(&*instance.fullname(), "Outer`1/Inner");
+        assert!(instance.base().is_none());
     }
 
     #[test]

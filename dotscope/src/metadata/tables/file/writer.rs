@@ -294,8 +294,9 @@ mod tests {
                 token: Token::new(0x26000001),
                 offset: 0,
                 flags: 0x12345678,
-                name: 0x12345678,
-                hash_value: 0x12345678,
+                // An index has to fit its column: a two-byte one holds at most 0xFFFF
+                name: if large_str { 0x12345678 } else { 0x1234 },
+                hash_value: if large_blob { 0x12345678 } else { 0x1234 },
             };
 
             // Verify row size matches expected

@@ -10,6 +10,7 @@
 use std::{
     fmt,
     io::Read,
+    path::Path,
     process::{Child, Command, Output, Stdio},
     sync::OnceLock,
     thread,
@@ -32,6 +33,9 @@ pub enum ToolKind {
     Verifier,
     /// Mono, which runs .NET Framework executables such as the packer samples.
     Mono,
+    /// Mono's C# compiler, `mcs`, with Mono to run what it builds: the System.Reflection.Metadata
+    /// oracle builds against Mono's framework assemblies.
+    MonoCompiler,
 }
 
 impl fmt::Display for ToolKind {
@@ -41,6 +45,7 @@ impl fmt::Display for ToolKind {
             ToolKind::Disassembler => "an IL disassembler",
             ToolKind::Verifier => "Mono's peverify",
             ToolKind::Mono => "Mono",
+            ToolKind::MonoCompiler => "Mono's C# compiler (mcs) and Mono",
         })
     }
 }
@@ -138,6 +143,33 @@ fn wait(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus
             }
         }
     }
+}
+
+/// What Mono's metadata verifier, `peverify`, says about an assembly: its findings, empty
+/// when it found none.
+///
+/// Only the metadata check is used: it reads the file and runs nothing, while Mono's IL check
+/// needs the assembly's references loaded into a runtime and cannot open most samples.
+///
+/// # Arguments
+///
+/// * `path` - The assembly.
+/// * `references` - The directory its references are looked up in.
+///
+/// # Errors
+///
+/// When `peverify` cannot be started or does not finish within five minutes.
+pub fn peverify_metadata_findings(path: &Path, references: &Path) -> Result<String> {
+    let output = run_with_timeout(
+        Command::new("peverify")
+            .args(["--verify", "metadata,error"])
+            .arg(path)
+            .env("MONO_PATH", references),
+        Duration::from_secs(300),
+    )?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(text.trim().to_string())
 }
 
 #[cfg(test)]

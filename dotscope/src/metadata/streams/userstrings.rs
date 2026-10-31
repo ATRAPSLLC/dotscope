@@ -42,10 +42,7 @@
 
 use widestring::U16String;
 
-use crate::{
-    utils::{read_compressed_int, read_compressed_int_at},
-    Error, HeapKind, ParseFailure, Result,
-};
+use crate::{utils::read_compressed_int_at, Error, HeapKind, ParseFailure, Result};
 
 /// The `UserStrings` object provides helper methods to access the data within the '#US' heap.
 ///
@@ -187,11 +184,10 @@ impl<'a> UserStrings<'a> {
             .checked_add(compressed_length_size)
             .ok_or_else(|| corrupt(format!("offset overflow at index {index}")))?;
 
-        if total_bytes == 0 {
-            return Err(corrupt(format!("zero-length entry at index {index}")).into());
-        }
-
-        if total_bytes == 1 {
+        // The empty blob - the heap's first entry, ECMA-335 II.24.2.4 - and an
+        // entry of no characters (its terminal byte alone) are both the empty
+        // string: `ldstr` of offset 0 is how a compiler spells `""`.
+        if total_bytes <= 1 {
             return Ok(U16String::new());
         }
 
@@ -449,68 +445,31 @@ impl<'a> UserStringsIterator<'a> {
 impl<'a> Iterator for UserStringsIterator<'a> {
     type Item = (usize, U16String);
 
-    /// Get the next user string from the heap
+    /// The next entry that holds a string, as `(offset, string)`.
     ///
-    /// Returns `(offset, string)` for valid entries, `None` when the heap is exhausted
-    /// or when malformed string data is encountered.
-    ///
-    /// # Implementation Notes
-    /// This method uses a loop instead of recursion to handle malformed data gracefully.
-    /// On corrupted heaps, the previous recursive implementation could cause stack overflow.
-    /// The loop-based approach bounds recovery attempts to prevent unbounded iteration.
+    /// Entries follow one another by their lengths (ECMA-335 II.24.2.4). One that holds no
+    /// string (a zero length, as alignment padding has, or an even one, which leaves no room
+    /// for the terminal byte) is passed over; iteration ends where the heap does, or where a
+    /// length cannot be read or runs past it, since no entry after that point can be found.
     fn next(&mut self) -> Option<Self::Item> {
-        // Maximum number of recovery attempts to prevent infinite loops on severely corrupted data.
-        // This allows the iterator to skip over small corrupted regions while bounding worst-case behavior.
-        const MAX_RECOVERY_ATTEMPTS: usize = 10;
-        let mut recovery_attempts = 0;
-
         loop {
-            if self.position >= self.user_strings.data.len() {
+            let start = self.position;
+            if start >= self.user_strings.data.len() {
                 return None;
             }
-
-            // Bound recovery attempts to prevent unbounded iteration on corrupted heaps
-            if recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+            let (length, length_size) =
+                read_compressed_int_at(self.user_strings.data, start).ok()?;
+            let next = start.checked_add(length_size)?.checked_add(length)?;
+            if next > self.user_strings.data.len() {
                 return None;
             }
-
-            let start_position = self.position;
-
-            // Read compressed length according to ECMA-335 II.24.2.4 and .NET runtime implementation
-            let (total_bytes, compressed_length_size) = if let Ok((length, consumed)) =
-                read_compressed_int(self.user_strings.data, &mut self.position)
-            {
-                // Reset position since read_compressed_int advanced it
-                self.position = self.position.saturating_sub(consumed);
-                (length, consumed)
-            } else {
-                // Try to skip over bad data by advancing one byte and trying again
-                self.position = self.position.saturating_add(1);
-                recovery_attempts = recovery_attempts.saturating_add(1);
-                continue;
-            };
-
-            // Handle zero-length entries (invalid according to .NET spec, but may exist in malformed data)
-            if total_bytes == 0 {
-                self.position = self.position.saturating_add(compressed_length_size);
-                recovery_attempts = recovery_attempts.saturating_add(1);
+            self.position = next;
+            if length == 0 {
                 continue;
             }
-
-            let Ok(string) = self.user_strings.get(start_position) else {
-                // Skip over the malformed entry. On overflow, bail out cleanly.
-                let skip = compressed_length_size.checked_add(total_bytes)?;
-                let next = self.position.checked_add(skip)?;
-                self.position = next;
-                recovery_attempts = recovery_attempts.saturating_add(1);
-                continue;
-            };
-
-            let skip = compressed_length_size.checked_add(total_bytes)?;
-            let new_position = self.position.checked_add(skip)?;
-            self.position = new_position;
-
-            return Some((start_position, string));
+            if let Ok(string) = self.user_strings.get(start) {
+                return Some((start, string));
+            }
         }
     }
 }
@@ -583,6 +542,20 @@ mod tests {
 
         assert_eq!(s.as_slice(), &[0x3042, 0x3044]);
         assert_eq!(s.to_string_lossy(), "\u{3042}\u{3044}");
+    }
+
+    /// **The heap's first entry is the empty string.** ECMA-335 II.24.2.4
+    /// makes it the empty blob, a single zero byte, and `ldstr` of offset 0 is
+    /// how a compiler spells `""` (`crossgen2`'s `StringHandle` fixups of
+    /// `System.Drawing.Primitives.dll` name it so); an entry of its terminal
+    /// byte alone is empty too.
+    #[test]
+    fn the_first_entry_is_the_empty_string() {
+        let data = [0x00, 0x01, 0x00, 0x05, 0x48, 0x00, 0x69, 0x00, 0x00];
+        let heap = UserStrings::from(&data).unwrap();
+        assert_eq!(heap.get(0).unwrap(), u16str!(""));
+        assert_eq!(heap.get(1).unwrap(), u16str!(""));
+        assert_eq!(heap.get(3).unwrap(), u16str!("Hi"));
     }
 
     #[test]
@@ -727,5 +700,31 @@ mod tests {
 
         // Iterator should stop on malformed data
         assert!(iter.next().is_none());
+    }
+
+    /// Entries follow one another by their lengths: zero-length padding, however long, and an
+    /// entry with no room for its terminal byte are passed over, and what follows them is
+    /// still found.
+    #[test]
+    fn entries_after_padding_and_malformed_ones_are_found() {
+        let mut data = vec![0x00, 0x03, b'A', 0x00, 0x00];
+        data.extend_from_slice(&[0x00; 12]); // zero-length entries
+        data.extend_from_slice(&[0x02, b'X', 0x00]); // even length: no terminal byte
+        data.extend_from_slice(&[0x03, b'B', 0x00, 0x00]);
+        let heap = UserStrings::from(&data).unwrap();
+
+        let found: Vec<(usize, String)> = heap
+            .iter()
+            .map(|(offset, text)| (offset, text.to_string_lossy()))
+            .collect();
+        assert_eq!(found, [(1, "A".to_string()), (20, "B".to_string())]);
+    }
+
+    /// A length that runs past the heap ends iteration: nothing after it can be located.
+    #[test]
+    fn a_length_past_the_heap_ends_iteration() {
+        let data = [0x00, 0x03, b'A', 0x00, 0x00, 0x7F, b'Z'];
+        let heap = UserStrings::from(&data).unwrap();
+        assert_eq!(heap.iter().count(), 1);
     }
 }

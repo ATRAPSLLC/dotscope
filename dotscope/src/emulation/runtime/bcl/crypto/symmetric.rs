@@ -41,7 +41,7 @@ use crate::{
         EmValue,
     },
     metadata::token::Token,
-    utils::{apply_crypto_transform, base64_decode, verify_rsa_pkcs1v15},
+    utils::{apply_crypto_transform, base64_decode, rsa_verify_work, verify_rsa_pkcs1v15},
     Result,
 };
 
@@ -1278,6 +1278,10 @@ fn rsa_verify_hash_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
+    // The key came from emulated code, of any size
+    if !thread.charge_work(rsa_verify_work(&modulus, &exponent)) {
+        return PreHookResult::Bypass(None);
+    }
     let result = verify_rsa_pkcs1v15(
         &modulus,
         &exponent,

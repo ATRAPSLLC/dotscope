@@ -45,7 +45,7 @@
 //!
 //! ```rust,no_run
 //! use dotscope::File;
-//! use std::path::Path;
+//! use std::{borrow::Cow, path::Path};
 //!
 //! // Load a .NET assembly from disk
 //! let file = File::from_path(Path::new("tests/samples/WindowsBase.dll"))?;
@@ -118,20 +118,27 @@
 //! - Microsoft PE/COFF Specification
 //! - ECMA-335 6th Edition, Partition II - PE File Format
 
+pub mod debug;
+mod native;
 pub mod parser;
 pub mod pe;
 pub mod repair;
+pub mod sectionmap;
 
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 use cowfile::CowFile;
-use goblin::pe::{options::ParseOptions, PE};
+use goblin::pe::{
+    options::{ParseMode, ParseOptions},
+    PE,
+};
 use pe::{DataDirectory, DataDirectoryType, Pe};
 
 use crate::{
     file::{
         pe::constants::COR20_HEADER_SIZE,
         repair::{repair_pe_cow, RepairAction},
+        sectionmap::{RvaMapping, SectionMap},
     },
     utils::align_to,
     Error::{self, LayoutFailed, Other},
@@ -396,18 +403,30 @@ impl File {
         }
 
         // Resources are parsed off. Nothing here reads them: `Pe::from_goblin_pe`
-        // takes the headers, sections, imports, exports, libraries and data
-        // directories, and a .NET assembly's own resources live in the managed
-        // metadata (`ManifestResource` / the `.resources` streams), not in the
-        // PE resource directory. What the directory does hold for an assembly is
+        // takes the headers, sections and data directories, and a .NET assembly's
+        // own resources live in the managed metadata (`ManifestResource` / the
+        // `.resources` streams), not in the PE resource directory. What the directory does hold for an assembly is
         // `VS_VERSIONINFO`, dialogs and string tables - and goblin walks that
         // tree in `ParseMode::Strict` by default, so one malformed
         // `ResourceString` in any of it aborts the whole parse and takes every
         // bit of CIL metadata with it. The relocation-side directory walk this
-        // crate needs is its own, in `file::pe`.
-        let opts = ParseOptions::default().with_parse_resources(false);
+        // crate needs is its own, in `file::pe`. Imports are parsed off too: the
+        // import table is read entry by entry in `file::native`, which records what
+        // it cannot read instead of failing the load over it.
+        //
+        // And the rest of goblin's walk is permissive: this crate takes only the
+        // headers, the sections and the data directories from it
+        // (`Pe::from_goblin_pe`), so a malformed part it does not read - a base
+        // relocation table that runs past the end of the file, a debug directory,
+        // TLS data, a certificate table - is dropped by goblin instead of
+        // failing the load, where strict parsing took the whole of the CIL
+        // metadata with it. The headers and sections still parse strictly.
+        let opts = ParseOptions::default()
+            .with_parse_resources(false)
+            .with_parse_imports(false)
+            .with_parse_mode(ParseMode::Permissive);
         let goblin_pe = PE::parse_with_opts(cowfile.data(), &opts).map_err(Error::from)?;
-        let pe = Pe::from_goblin_pe(&goblin_pe)?;
+        let pe = Pe::from_goblin_pe(&goblin_pe, cowfile.data())?;
 
         Ok(File {
             data: cowfile,
@@ -945,7 +964,11 @@ impl File {
     /// Converts a relative virtual address (RVA) to a file offset.
     ///
     /// RVAs are addresses relative to the image base. This is the most common
-    /// address format used within PE files for referencing data and code.
+    /// address format used within PE files for referencing data and code. An RVA has a file
+    /// offset when it lies in a section's raw data within the section's `VirtualSize` (see
+    /// [`SectionMap`]); to read bytes at an RVA, use [`File::rva_slice`] or
+    /// [`File::section_bounded`], which keep the read inside the section and give the zeros
+    /// of its zero-filled part.
     ///
     /// # Arguments
     ///
@@ -953,7 +976,8 @@ impl File {
     ///
     /// # Errors
     ///
-    /// Returns an error if the RVA cannot be mapped to a file offset.
+    /// Returns an error if the RVA has no file offset: it lies past its section's
+    /// `VirtualSize`, in its zero-filled part, or in no section.
     ///
     /// # Examples
     ///
@@ -975,41 +999,62 @@ impl File {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn rva_to_offset(&self, rva: usize) -> Result<usize> {
-        let invalid = |field: &'static str, reason: String| ParseFailure::InvalidField {
+        let invalid = |reason: String| ParseFailure::InvalidField {
             stage: ParseStage::SectionTable,
-            field,
+            field: "rva",
             reason,
         };
-        for section in &self.pe.sections {
-            let Some(section_max) = section.virtual_address.checked_add(section.virtual_size)
-            else {
-                return Err(invalid(
-                    "section_extent",
-                    format!(
-                        "section malformed, causing integer overflow - {} + {}",
-                        section.virtual_address, section.virtual_size
-                    ),
-                )
-                .into());
-            };
-
-            let rva_u32 = u32::try_from(rva)
-                .map_err(|_| invalid("rva", format!("RVA too large to fit in u32: {rva}")))?;
-            if section.virtual_address <= rva_u32 && section_max > rva_u32 {
-                let delta = rva
-                    .checked_sub(section.virtual_address as usize)
-                    .ok_or_else(|| invalid("rva", "RVA underflow vs section base".into()))?;
-                return delta
-                    .checked_add(section.pointer_to_raw_data as usize)
-                    .ok_or_else(|| Error::from(invalid("rva", "RVA-to-offset overflow".into())));
+        let rva_u32 = u32::try_from(rva)
+            .map_err(|_| invalid(format!("RVA too large to fit in u32: {rva}")))?;
+        match self.section_map().map(rva_u32) {
+            RvaMapping::File(offset) => Ok(offset),
+            RvaMapping::ZeroFill => Err(invalid(format!(
+                "RVA {rva:#x} is in a section's zero-filled part, which the file does not hold"
+            ))
+            .into()),
+            RvaMapping::Unmapped => {
+                Err(invalid(format!("RVA {rva:#x} is not a byte the image defines")).into())
             }
         }
+    }
 
-        Err(invalid(
-            "rva",
-            format!("RVA could not be converted to offset - {rva}"),
-        )
-        .into())
+    /// The image's RVA mapping: each section's `VirtualSize` bytes, its raw data then zeros
+    /// (see [`SectionMap`]).
+    #[must_use]
+    pub fn section_map(&self) -> SectionMap<'_> {
+        SectionMap::new(&self.pe.sections, self.data().len())
+    }
+
+    /// The `len` bytes the loaded image holds at `rva`, within one section:
+    /// borrowed from the file, or with the zeros of a section's zero-filled part.
+    ///
+    /// # Errors
+    ///
+    /// When a byte of the range is not the image's: past its section's `VirtualSize`, or
+    /// raw data the file lacks.
+    pub fn rva_slice(&self, rva: usize, len: usize) -> Result<Cow<'_, [u8]>> {
+        let rva = u32::try_from(rva).map_err(|_| ParseFailure::InvalidField {
+            stage: ParseStage::SectionTable,
+            field: "rva",
+            reason: format!("RVA too large to fit in u32: {rva}"),
+        })?;
+        self.section_map().read(self.data(), rva, len)
+    }
+
+    /// The file bytes from `rva` to the end of what the file holds of its section, within the
+    /// section's `VirtualSize`: where a structure of unknown length, such as a method body, is
+    /// read from.
+    ///
+    /// # Errors
+    ///
+    /// When `rva` is not a byte of the image.
+    pub fn section_bounded(&self, rva: usize) -> Result<&[u8]> {
+        let rva = u32::try_from(rva).map_err(|_| ParseFailure::InvalidField {
+            stage: ParseStage::SectionTable,
+            field: "rva",
+            reason: format!("RVA too large to fit in u32: {rva}"),
+        })?;
+        self.section_map().section_bounded(self.data(), rva)
     }
 
     /// Converts a file offset to a relative virtual address (RVA).
@@ -1024,7 +1069,8 @@ impl File {
     ///
     /// # Errors
     ///
-    /// Returns an error if the offset cannot be mapped to an RVA.
+    /// Returns an error if the offset is not loaded: it is in no section's raw data within
+    /// the section's `VirtualSize`.
     ///
     /// # Examples
     ///
@@ -1044,49 +1090,20 @@ impl File {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn offset_to_rva(&self, offset: usize) -> Result<usize> {
-        let invalid = |field: &'static str, reason: String| ParseFailure::InvalidField {
-            stage: ParseStage::SectionTable,
-            field,
-            reason,
-        };
-        for section in &self.pe.sections {
-            let Some(section_max) = section
-                .pointer_to_raw_data
-                .checked_add(section.size_of_raw_data)
-            else {
-                return Err(invalid(
-                    "section_extent",
-                    format!(
-                        "section malformed, causing integer overflow - {} + {}",
-                        section.pointer_to_raw_data, section.size_of_raw_data
+        self.section_map()
+            .offset_to_rva(offset)
+            .map(|rva| rva as usize)
+            .ok_or_else(|| {
+                ParseFailure::InvalidField {
+                    stage: ParseStage::SectionTable,
+                    field: "offset",
+                    reason: format!(
+                        "file offset {offset:#x} is not loaded: it is in no section's data within \
+                         its VirtualSize"
                     ),
-                )
-                .into());
-            };
-
-            let offset_u32 = u32::try_from(offset).map_err(|_| {
-                invalid(
-                    "offset",
-                    format!("offset too large to fit in u32: {offset}"),
-                )
-            })?;
-            if section.pointer_to_raw_data <= offset_u32 && section_max > offset_u32 {
-                let delta = offset
-                    .checked_sub(section.pointer_to_raw_data as usize)
-                    .ok_or_else(|| invalid("offset", "offset underflow vs section base".into()))?;
-                return delta
-                    .checked_add(section.virtual_address as usize)
-                    .ok_or_else(|| {
-                        Error::from(invalid("offset", "offset-to-RVA overflow".into()))
-                    });
-            }
-        }
-
-        Err(invalid(
-            "offset",
-            format!("offset could not be converted to RVA - {offset}"),
-        )
-        .into())
+                }
+                .into()
+            })
     }
 
     /// Determines if a section contains .NET metadata by checking the actual metadata RVA.
@@ -1126,11 +1143,7 @@ impl File {
             _ => return false, // No CLR header means no .NET metadata
         };
 
-        let Ok(clr_offset) = self.rva_to_offset(clr_rva as usize) else {
-            return false;
-        };
-
-        let Ok(clr_data) = self.data_slice(clr_offset, COR20_HEADER_SIZE as usize) else {
+        let Ok(clr_data) = self.rva_slice(clr_rva as usize, COR20_HEADER_SIZE as usize) else {
             return false;
         };
 
@@ -1500,6 +1513,32 @@ mod tests {
         let data = fs::read(&path).unwrap();
         let file = File::from_mem(data).unwrap();
 
+        verify_file(&file);
+    }
+
+    /// **A malformed part the load does not read does not refuse the file.**
+    /// A base relocation directory that runs past the end of the file (a .NET
+    /// sample on a release corpus: offset 0x1f1200 and size 0xc in a 0x1efe6f
+    /// byte file) failed the whole load in goblin's strict mode, and with it
+    /// every table of the CIL metadata; the file now loads with its metadata.
+    #[test]
+    fn a_relocation_directory_past_the_end_does_not_refuse_the_file() {
+        let path = fixture("WindowsBase.dll");
+        let mut data = fs::read(&path).unwrap();
+        let pe = goblin::pe::PE::parse(&data).unwrap();
+        let optional = pe.header.coff_header.size_of_optional_header as usize;
+        let header_end = pe.header.dos_header.pe_pointer as usize + 4 + 20 + optional;
+        // The base relocation entry (index 5) of the data directories, which
+        // close the optional header: 16 entries of 8 bytes.
+        let entry = header_end - 16 * 8 + 5 * 8;
+        let past_the_end = u32::try_from(data.len()).unwrap();
+        data[entry + 4..entry + 8].copy_from_slice(&past_the_end.to_le_bytes());
+        assert!(
+            goblin::pe::PE::parse(&data).is_err(),
+            "strict goblin refuses the corrupted directory"
+        );
+
+        let file = File::from_mem(data).unwrap();
         verify_file(&file);
     }
 

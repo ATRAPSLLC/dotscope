@@ -121,12 +121,52 @@ impl MetadataLoader for TypeSpecLoader {
     ///
     /// Type specifications often reference other types through `TypeRef` or `TypeDef`
     /// entries, so these tables must be processed first to ensure all type references
-    /// can be resolved during `TypeSpec` loading.
+    /// can be resolved during `TypeSpec` loading. `NestedClass` comes first too: a generic
+    /// instance of a nested type is nested in its definition's enclosing type, which must be
+    /// known when the instance is made. Every loader that resolves a signature to types
+    /// (`StandAloneSig`, `MethodSpec`, `CustomAttribute`) depends on `TypeSpec`, so it holds
+    /// for theirs as well.
     ///
     /// ## Returns
     ///
     /// A static slice containing the required table dependencies.
     fn dependencies(&self) -> &'static [TableId] {
-        &[TableId::TypeRef, TableId::TypeDef]
+        &[TableId::TypeRef, TableId::TypeDef, TableId::NestedClass]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rayon::ThreadPoolBuilder;
+
+    use super::*;
+    use crate::{metadata::typesystem::CilFlavor, testkit::fixture, CilObject};
+
+    /// A generic instance of a nested type is nested where its definition is, however the
+    /// loaders are scheduled. On one thread, type specifications loaded before nesting was
+    /// known, so `DerivedClass/NestedGeneric`1<!0>` lost its enclosing type there and kept it
+    /// on several threads.
+    #[test]
+    fn an_instance_of_a_nested_type_is_nested_on_one_thread() {
+        let pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let object = pool.install(|| CilObject::from_path(fixture("crafted_2.exe")).unwrap());
+        let instances: Vec<_> = object
+            .types()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .filter(|cil_type| {
+                cil_type.token.is_table(TableId::TypeSpec)
+                    && matches!(*cil_type.flavor(), CilFlavor::GenericInstance)
+                    && cil_type.name == "NestedGeneric`1"
+            })
+            .collect();
+        assert!(!instances.is_empty());
+        for instance in instances {
+            let enclosing = instance.enclosing_type().map(|outer| outer.name.clone());
+            assert_eq!(enclosing.as_deref(), Some("DerivedClass"));
+            assert!(instance
+                .fullname()
+                .ends_with("DerivedClass/NestedGeneric`1"));
+        }
     }
 }

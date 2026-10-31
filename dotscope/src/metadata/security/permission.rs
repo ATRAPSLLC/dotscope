@@ -1,1049 +1,289 @@
-//! Individual security permissions in .NET Code Access Security.
+//! One permission of a permission set: its class and the properties it sets.
 //!
-//! This module provides the [`Permission`] type, which represents individual security permissions
-//! within .NET permission sets. Each permission corresponds to a specific .NET Framework security
-//! class that defines access controls for system resources such as files, network, registry,
-//! reflection capabilities, and other protected operations.
+//! A binary permission set names each permission by its permission attribute's class
+//! (`System.Security.Permissions.SecurityPermissionAttribute, mscorlib, ...`) and holds the
+//! attribute's properties as custom attribute named arguments; an XML one names the
+//! permission class (`System.Security.Permissions.SecurityPermission, mscorlib, ...`) and holds
+//! its attributes as strings. [`Permission`] keeps the name as the set writes it and its
+//! properties as [`CustomAttributeNamedArgument`]s.
 //!
-//! # Architecture
-//!
-//! The .NET Code Access Security model uses strongly-typed permission classes to grant or restrict
-//! access to system resources. The architecture follows a hierarchical structure:
-//!
-//! ```text
-//! Permission Set
-//! ├── Permission 1 (e.g., FileIOPermission)
-//! │   ├── Class Name: System.Security.Permissions.FileIOPermission
-//! │   ├── Assembly: mscorlib
-//! │   └── Named Arguments: [Read="path", Write="path"]
-//! ├── Permission 2 (e.g., SecurityPermission)
-//! │   ├── Class Name: System.Security.Permissions.SecurityPermission
-//! │   ├── Assembly: mscorlib
-//! │   └── Named Arguments: [Flags=0x0002]
-//! └── ...
-//! ```
-//!
-//! Each permission encapsulates:
-//! - **Class Identity**: Fully qualified type name and assembly
-//! - **Configuration**: Named arguments defining specific access rules
-//! - **Type Safety**: Strongly typed argument validation
-//!
-//! # Key Components
-//!
-//! ## Permission Classes
-//! The .NET Framework provides numerous permission classes, each controlling specific resource access:
-//!
-//! ### File System Permissions
-//! - **`FileIOPermission`**: Controls file system access (read, write, append, path discovery)
-//! - **`IsolatedStoragePermission`**: Controls isolated storage access
-//!
-//! ### System Access Permissions
-//! - **`SecurityPermission`**: Controls security-sensitive operations (unmanaged code, reflection)
-//! - **`RegistryPermission`**: Controls Windows registry access
-//! - **`EnvironmentPermission`**: Controls environment variable access
-//!
-//! ### Network and Communication
-//! - **`SocketPermission`**: Controls network socket operations
-//! - **`WebPermission`**: Controls HTTP web access
-//! - **`DnsPermission`**: Controls DNS resolution
-//!
-//! ### Code Access Permissions
-//! - **`ReflectionPermission`**: Controls reflection and code analysis capabilities
-//! - **`FileDialogPermission`**: Controls file dialog operations
-//! - **`UIPermission`**: Controls user interface operations
-//!
-//! ## Named Arguments Structure
-//! Each permission can have multiple named arguments that configure its behavior:
-//! - **Name**: Property or field identifier
-//! - **Type**: Argument data type ([`crate::metadata::security::ArgumentType`])
-//! - **Value**: Typed value ([`crate::metadata::security::ArgumentValue`])
-//!
-//! # Usage Examples
-//!
-//! ## File IO Permission Configuration
+//! # Examples
 //!
 //! ```rust
-//! use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
+//! use dotscope::metadata::{
+//!     customattributes::{CustomAttributeArgument, CustomAttributeNamedArgument, FieldOrPropType},
+//!     security::Permission,
+//! };
 //!
-//! // Represents: [FileIOPermission(Read = "C:\\Data", Write = "C:\\Logs")]
-//! let file_permission = Permission::new(
-//!     "System.Security.Permissions.FileIOPermission".to_string(),
-//!     "mscorlib".to_string(),
-//!     vec![
-//!         NamedArgument::new(
-//!             "Read".to_string(),
-//!             ArgumentType::String,
-//!             ArgumentValue::String("C:\\Data".to_string())
-//!         ),
-//!         NamedArgument::new(
-//!             "Write".to_string(),
-//!             ArgumentType::String,
-//!             ArgumentValue::String("C:\\Logs".to_string())
-//!         ),
-//!     ]
+//! let permission = Permission::new(
+//!     "System.Security.Permissions.FileIOPermissionAttribute, mscorlib, Version=4.0.0.0, \
+//!      Culture=neutral, PublicKeyToken=b77a5c561934e089",
+//!     vec![CustomAttributeNamedArgument {
+//!         is_field: false,
+//!         name: "Read".to_string(),
+//!         arg_type: FieldOrPropType::String,
+//!         value: CustomAttributeArgument::String(Some("C:\\Data;C:\\Logs".to_string())),
+//!     }],
 //! );
 //!
-//! assert!(file_permission.is_file_io());
-//! println!("Permission: {}", file_permission);
-//! ```
-//!
-//! ## Security Permission with Flags
-//!
-//! ```rust
-//! use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-//!
-//! // Represents: [SecurityPermission(UnmanagedCode = true)]
-//! let security_permission = Permission::new(
-//!     "System.Security.Permissions.SecurityPermission".to_string(),
-//!     "mscorlib".to_string(),
-//!     vec![
-//!         NamedArgument::new(
-//!             "Flags".to_string(),
-//!             ArgumentType::Int32,
-//!             ArgumentValue::Int32(0x0002) // UnmanagedCode flag
-//!         ),
-//!     ]
+//! assert!(permission.is_file_io());
+//! assert_eq!(permission.assembly_name(), Some("mscorlib"));
+//! assert_eq!(
+//!     permission.get_file_read_paths(),
+//!     Some(vec!["C:\\Data".to_string(), "C:\\Logs".to_string()])
 //! );
-//!
-//! assert!(security_permission.is_security());
 //! ```
-//!
-//! ## Permission Analysis and Introspection
-//!
-//! ```rust
-//! use dotscope::metadata::security::Permission;
-//!
-//! # fn get_permission() -> Permission {
-//! #     Permission::new(
-//! #         "System.Security.Permissions.FileIOPermission".to_string(),
-//! #         "mscorlib".to_string(),
-//! #         vec![]
-//! #     )
-//! # }
-//! let permission = get_permission();
-//!
-//! // Check permission type
-//! if permission.is_file_io() {
-//!     println!("This permission controls file access");
-//!     
-//!     // Check for specific arguments
-//!     if let Some(read_arg) = permission.get_argument("Read") {
-//!         println!("Read access granted to: {:?}", read_arg.value());
-//!     }
-//! }
-//!
-//! // Display full permission details
-//! println!("Permission class: {}", permission.class_name);
-//! println!("From assembly: {}", permission.assembly_name);
-//! println!("Argument count: {}", permission.named_arguments.len());
-//! ```
-//!
-//! ## Extracting File Paths from `FileIOPermission`
-//!
-//! ```rust,no_run
-//! use dotscope::metadata::security::Permission;
-//!
-//! # fn get_file_permission() -> Permission {
-//! #     Permission::new(
-//! #         "System.Security.Permissions.FileIOPermission".to_string(),
-//! #         "mscorlib".to_string(),
-//! #         vec![]
-//! #     )
-//! # }
-//! let permission = get_file_permission();
-//!
-//! if permission.is_file_io() {
-//!     // Extract specific file access paths
-//!     let read_paths = permission.get_file_read_paths();
-//!     let write_paths = permission.get_file_write_paths();
-//!     let discovery_paths = permission.get_file_path_discovery();
-//!     
-//!     println!("Read access: {:?}", read_paths);
-//!     println!("Write access: {:?}", write_paths);
-//!     println!("Path discovery: {:?}", discovery_paths);
-//! }
-//! ```
-//!
-//! # Integration
-//!
-//! Permissions integrate with the broader .NET security infrastructure:
-//!
-//! ## With Permission Sets
-//! - Individual permissions are grouped into [`crate::metadata::security::PermissionSet`]
-//! - Each permission set can contain multiple permissions of different types
-//! - Permission sets define complete security policies for assemblies, types, or methods
-//!
-//! ## With Security Attributes
-//! - Permissions are created from declarative security attributes in .NET metadata
-//! - Custom attribute blobs are parsed to extract permission configurations
-//! - Support both property and field-based argument specification
-//!
-//! ## With Assembly Analysis
-//! - Used for security policy analysis and compliance checking
-//! - Enable detection of privileged operations in .NET assemblies
-//! - Support both static analysis and runtime security enforcement
-//!
-//! ## With Security Actions
-//! - Permissions work with security actions like Demand, Assert, Deny, `PermitOnly`
-//! - Each action modifies how the permission is enforced at runtime
-//! - Actions determine whether permissions grant or restrict access
-//!
-//! # Binary Format
-//!
-//! Permissions are stored in `DeclSecurity` metadata using a custom binary format:
-//! ```text
-//! - Permission class name (string)
-//! - Assembly name (string)  
-//! - Named argument count (compressed integer)
-//! - Named arguments array (see NamedArgument format)
-//! ```
-//!
-//! The format is defined by the .NET Framework security infrastructure and follows
-//! the custom attribute serialization specification.
-//!
-//! # Error Handling
-//!
-//! The module handles various error conditions related to permission processing:
-//! - **Invalid Class Names**: Malformed or unrecognized permission class names
-//! - **Assembly Resolution**: Missing or incorrect assembly references
-//! - **Argument Validation**: Type mismatches or invalid argument configurations
-//! - **Serialization Errors**: Corrupted binary data in security metadata
-//!
-//! Common error scenarios include:
-//! - Permissions referencing custom assemblies not available during analysis
-//! - Malformed argument blobs due to metadata corruption
-//! - Version mismatches between permission classes and runtime expectations
-//!
-//! # Legacy Support
-//!
-//! Code Access Security was deprecated in .NET Framework 4.0 and removed in .NET Core.
-//! This implementation primarily supports analysis of legacy .NET Framework assemblies
-//! that use declarative security attributes.
-//!
-//! # Thread Safety
-//!
-//! [`Permission`] instances are immutable after creation and safe to share across threads.
 
 use std::fmt;
 
-use crate::metadata::security::{
-    security_classes, ArgumentValue, NamedArgument, SecurityPermissionFlags,
+use crate::metadata::{
+    customattributes::{CustomAttributeArgument, CustomAttributeNamedArgument},
+    security::{security_classes, SecurityPermissionFlags},
 };
 
-/// Represents a .NET security permission within a permission set.
-///
-/// A Permission represents a single security permission in the .NET Code Access Security (CAS) system.
-/// Each permission corresponds to a specific .NET Framework security class that defines access
-/// controls for system resources (like file I/O, network access, reflection capabilities, etc.).
-///
-/// # Structure
-///
-/// Each permission contains:
-/// - **Class Name**: The fully qualified .NET type name (e.g., "System.Security.Permissions.FileIOPermission")
-/// - **Assembly Name**: The assembly containing the permission class (typically "mscorlib" or "System")
-/// - **Named Arguments**: Collection of property/field configurations specific to the permission type
-///
-/// # Examples
-///
-/// ## Creating a File I/O Permission
-///
-/// ```rust
-/// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-///
-/// let permission = Permission::new(
-///     "System.Security.Permissions.FileIOPermission".to_string(),
-///     "mscorlib".to_string(),
-///     vec![
-///         NamedArgument::new(
-///             "Read".to_string(),
-///             ArgumentType::String,
-///             ArgumentValue::String("C:\\Data".to_string())
-///         ),
-///     ]
-/// );
-///
-/// assert!(permission.is_file_io());
-/// ```
-///
-/// ## Analyzing Permission Properties
-///
-/// ```rust
-/// # use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-/// # let permission = Permission::new(
-/// #     "System.Security.Permissions.FileIOPermission".to_string(),
-/// #     "mscorlib".to_string(),
-/// #     vec![NamedArgument::new("Read".to_string(), ArgumentType::String, ArgumentValue::String("C:\\Data".to_string()))]
-/// # );
-/// // Check permission type
-/// if permission.is_file_io() {
-///     if let Some(paths) = permission.get_file_read_paths() {
-///         println!("Read access to: {:?}", paths);
-///     }
-/// }
-///
-/// // Get specific arguments
-/// if let Some(arg) = permission.get_argument("Read") {
-///     println!("Read argument: {}", arg);
-/// }
-/// ```
-///
-/// # Binary Format Support
-///
-/// Permissions are parsed from `DeclSecurity` metadata using the binary format defined
-/// in ECMA-335. The format includes the permission class name, assembly name, and
-/// a variable number of named arguments with their types and values.
-///
-/// # Thread Safety
-///
-/// [`Permission`] instances are immutable after creation and safe to share across threads.
-/// All accessor methods are read-only and do not modify the internal state.
-///
-/// * `class_name` - The full name of the permission class (e.g., "System.Security.Permissions.FileIOPermission")
-/// * `assembly_name` - The assembly containing the permission class (e.g., "mscorlib")
-/// * `named_arguments` - Collection of named property or field settings for this permission
-///
-/// # Notes
-///
-/// In older .NET Framework versions, these permissions were extensively used to control security.
-/// While less common in modern .NET, they may still be encountered in legacy assemblies.
-#[derive(Debug, Clone)]
+/// A permission in a permission set.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Permission {
-    /// The fully qualified .NET type name of the permission class.
-    ///
-    /// Examples include:
-    /// - `"System.Security.Permissions.FileIOPermission"`
-    /// - `"System.Security.Permissions.SecurityPermission"`
-    /// - `"System.Security.Permissions.ReflectionPermission"`
-    /// - `"System.Security.Permissions.RegistryPermission"`
+    /// The class the set names the permission by, as it writes it: in a binary set the
+    /// permission attribute's assembly-qualified name, in an XML set the permission's class.
     pub class_name: String,
 
-    /// The assembly containing the permission class.
-    ///
-    /// Typically "mscorlib" for core .NET Framework permissions, but may be
-    /// "System" or other assemblies for specialized permission types.
-    pub assembly_name: String,
-
-    /// Collection of named property/field arguments that configure this permission.
-    ///
-    /// Each named argument represents a property or field setting on the permission
-    /// instance, such as file paths for `FileIOPermission` or flags for `SecurityPermission`.
-    /// The collection may be empty for permissions that grant unrestricted access.
-    pub named_arguments: Vec<NamedArgument>,
+    /// The properties (or fields) the permission sets, in the order the set writes them.
+    pub named_arguments: Vec<CustomAttributeNamedArgument>,
 }
 
 impl Permission {
-    /// Creates a new permission instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `class_name` - The fully qualified .NET type name of the permission class
-    /// * `assembly_name` - The assembly containing the permission class
-    /// * `named_arguments` - Collection of named property/field settings for this permission
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-    ///
-    /// let permission = Permission::new(
-    ///     "System.Security.Permissions.FileIOPermission".to_string(),
-    ///     "mscorlib".to_string(),
-    ///     vec![
-    ///         NamedArgument::new(
-    ///             "Read".to_string(),
-    ///             ArgumentType::String,
-    ///             ArgumentValue::String("C:\\Data".to_string())
-    ///         ),
-    ///     ]
-    /// );
-    /// ```
+    /// A permission of class `class_name` that sets `named_arguments`.
     #[must_use]
     pub fn new(
-        class_name: String,
-        assembly_name: String,
-        named_arguments: Vec<NamedArgument>,
+        class_name: impl Into<String>,
+        named_arguments: Vec<CustomAttributeNamedArgument>,
     ) -> Self {
         Permission {
-            class_name,
-            assembly_name,
+            class_name: class_name.into(),
             named_arguments,
         }
     }
 
-    /// Checks if this is a `FileIOPermission`.
-    ///
-    /// `FileIOPermissions` control access to file system resources including read, write,
-    /// append, and path discovery operations.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this permission's class name matches the `FileIOPermission` type.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::Permission;
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.FileIOPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![]
-    /// # );
-    /// if permission.is_file_io() {
-    ///     println!("This permission controls file system access");
-    /// }
-    /// ```
+    /// The class's full name without its assembly: what precedes the first comma outside
+    /// brackets (a generic type's arguments are bracketed, and qualified in turn).
     #[must_use]
-    pub fn is_file_io(&self) -> bool {
-        self.class_name == security_classes::FILE_IO_PERMISSION
+    pub fn type_name(&self) -> &str {
+        let end = self.qualifier_start().unwrap_or(self.class_name.len());
+        self.class_name.get(..end).unwrap_or_default().trim()
     }
 
-    /// Checks if this is a `SecurityPermission`.
-    ///
-    /// `SecurityPermissions` control access to security-sensitive operations such as
-    /// executing unmanaged code, skipping verification, controlling threads, and
-    /// other runtime security features.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this permission's class name matches the `SecurityPermission` type.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::Permission;
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.SecurityPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![]
-    /// # );
-    /// if permission.is_security() {
-    ///     if let Some(flags) = permission.get_security_flags() {
-    ///         println!("Security flags: {:?}", flags);
-    ///     }
-    /// }
-    /// ```
+    /// The simple name of the assembly that qualifies the class, when it is qualified.
     #[must_use]
-    pub fn is_security(&self) -> bool {
-        self.class_name == security_classes::SECURITY_PERMISSION
+    pub fn assembly_name(&self) -> Option<&str> {
+        let start = self.qualifier_start()?.saturating_add(1);
+        let qualifier = self.class_name.get(start..)?;
+        let name = qualifier.split(',').next().unwrap_or_default().trim();
+        (!name.is_empty()).then_some(name)
     }
 
-    /// Checks if this is a `ReflectionPermission`.
-    ///
-    /// `ReflectionPermissions` control access to reflection capabilities such as
-    /// emitting IL code, invoking non-public members, and accessing type information.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this permission's class name matches the `ReflectionPermission` type.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::Permission;
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.ReflectionPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![]
-    /// # );
-    /// if permission.is_reflection() {
-    ///     println!("This permission controls reflection operations");
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_reflection(&self) -> bool {
-        self.class_name == security_classes::REFLECTION_PERMISSION
-    }
-
-    /// Checks if this is a `RegistryPermission`.
-    ///
-    /// `RegistryPermissions` control access to Windows registry operations including
-    /// reading and writing registry keys and values.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this permission's class name matches the `RegistryPermission` type.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::Permission;
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.RegistryPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![]
-    /// # );
-    /// if permission.is_registry() {
-    ///     println!("This permission controls registry access");
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_registry(&self) -> bool {
-        self.class_name == security_classes::REGISTRY_PERMISSION
-    }
-
-    /// Checks if this is a `UIPermission`.
-    ///
-    /// `UIPermissions` control access to user interface operations such as
-    /// clipboard access, safe printing, and window manipulation.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this permission's class name matches the `UIPermission` type.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::Permission;
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.UIPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![]
-    /// # );
-    /// if permission.is_ui() {
-    ///     println!("This permission controls UI operations");
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_ui(&self) -> bool {
-        self.class_name == security_classes::UI_PERMISSION
-    }
-
-    /// Checks if this is an `EnvironmentPermission`.
-    ///
-    /// `EnvironmentPermissions` control access to environment variable operations
-    /// including reading and writing system and user environment variables.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this permission's class name matches the `EnvironmentPermission` type.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::Permission;
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.EnvironmentPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![]
-    /// # );
-    /// if permission.is_environment() {
-    ///     println!("This permission controls environment variable access");
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_environment(&self) -> bool {
-        self.class_name == security_classes::ENVIRONMENT_PERMISSION
-    }
-
-    /// Retrieves a named argument by name.
-    ///
-    /// Named arguments represent property or field assignments on the permission instance.
-    /// Common argument names include "Read", "Write", "Unrestricted", "Flags", etc.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the argument to search for (case-sensitive)
-    ///
-    /// # Returns
-    ///
-    /// `Some(&NamedArgument)` if an argument with the specified name exists,
-    /// `None` otherwise.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.FileIOPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![NamedArgument::new("Read".to_string(), ArgumentType::String, ArgumentValue::String("C:\\Data".to_string()))]
-    /// # );
-    /// if let Some(read_arg) = permission.get_argument("Read") {
-    ///     println!("Read argument: {}", read_arg);
-    /// }
-    ///
-    /// assert!(permission.get_argument("NonExistent").is_none());
-    /// ```
-    #[must_use]
-    pub fn get_argument(&self, name: &str) -> Option<&NamedArgument> {
-        self.named_arguments.iter().find(|arg| arg.name == name)
-    }
-
-    /// Extracts file paths granted read access from a `FileIOPermission`.
-    ///
-    /// This method specifically looks for the "Read" argument in `FileIOPermissions`
-    /// and extracts the file paths specified for read access. The paths can be
-    /// specified as a single string or an array of strings.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Vec<String>)` containing the read paths if this is a `FileIOPermission` with a "Read" argument
-    /// - `None` if this is not a `FileIOPermission` or has no "Read" argument
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-    ///
-    /// # let permission = Permission::new(
-    /// #     "System.Security.Permissions.FileIOPermission".to_string(),
-    /// #     "mscorlib".to_string(),
-    /// #     vec![NamedArgument::new("Read".to_string(), ArgumentType::String, ArgumentValue::String("C:\\Data".to_string()))]
-    /// # );
-    /// if let Some(paths) = permission.get_file_read_paths() {
-    ///     for path in paths {
-    ///         println!("Read access to: {}", path);
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// # Path Format
-    ///
-    /// The returned paths are exactly as specified in the permission metadata,
-    /// which may include wildcards, UNC paths, or relative paths depending on
-    /// how the permission was originally configured.
-    #[must_use]
-    pub fn get_file_read_paths(&self) -> Option<Vec<String>> {
-        self.extract_file_io_paths("Read")
-    }
-
-    /// Extracts file paths granted write access from a `FileIOPermission`.
-    ///
-    /// This method specifically looks for the "Write" argument in `FileIOPermissions`
-    /// and extracts the file paths specified for write access. The paths can be
-    /// specified as a single string or an array of strings.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Vec<String>)` containing the write paths if this is a `FileIOPermission` with a "Write" argument
-    /// - `None` if this is not a `FileIOPermission` or has no "Write" argument
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-    ///
-    /// let permission = Permission::new(
-    ///     "System.Security.Permissions.FileIOPermission".to_string(),
-    ///     "mscorlib".to_string(),
-    ///     vec![NamedArgument::new(
-    ///         "Write".to_string(),
-    ///         ArgumentType::String,
-    ///         ArgumentValue::String("C:\\Logs".to_string())
-    ///     )]
-    /// );
-    ///
-    /// if let Some(paths) = permission.get_file_write_paths() {
-    ///     for path in paths {
-    ///         println!("Write access to: {}", path);
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// # Security Implications
-    ///
-    /// Write permissions are more sensitive than read permissions as they allow
-    /// modification of the file system. The paths should be carefully validated
-    /// in security-sensitive contexts.
-    #[must_use]
-    pub fn get_file_write_paths(&self) -> Option<Vec<String>> {
-        self.extract_file_io_paths("Write")
-    }
-
-    /// Extracts file paths granted path discovery access from a `FileIOPermission`.
-    ///
-    /// Path discovery permission allows code to determine if a file or directory exists
-    /// and to retrieve path information, but not to read the actual contents.
-    /// This method looks for the "`PathDiscovery`" argument in `FileIOPermissions`.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Vec<String>)` containing the path discovery paths if this is a `FileIOPermission` with a "`PathDiscovery`" argument
-    /// - `None` if this is not a `FileIOPermission` or has no "`PathDiscovery`" argument
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-    ///
-    /// let permission = Permission::new(
-    ///     "System.Security.Permissions.FileIOPermission".to_string(),
-    ///     "mscorlib".to_string(),
-    ///     vec![NamedArgument::new(
-    ///         "PathDiscovery".to_string(),
-    ///         ArgumentType::String,
-    ///         ArgumentValue::String("C:\\Program Files".to_string())
-    ///     )]
-    /// );
-    ///
-    /// if let Some(paths) = permission.get_file_path_discovery() {
-    ///     for path in paths {
-    ///         println!("Path discovery access to: {}", path);
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// # Use Cases
-    ///
-    /// Path discovery is often used by applications that need to check for the
-    /// existence of files or directories without actually reading their contents,
-    /// such as installers or configuration utilities.
-    #[must_use]
-    pub fn get_file_path_discovery(&self) -> Option<Vec<String>> {
-        self.extract_file_io_paths("PathDiscovery")
-    }
-
-    /// Internal helper to extract file paths from a `FileIOPermission` argument.
-    ///
-    /// This method consolidates the common logic for extracting file paths from
-    /// various `FileIOPermission` arguments (Read, Write, PathDiscovery, Append).
-    /// It handles both single string values and arrays of strings.
-    ///
-    /// # Arguments
-    ///
-    /// * `arg_name` - The name of the argument to extract paths from
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Vec<String>)` if this is a `FileIOPermission` with the specified argument
-    /// - `None` if this is not a `FileIOPermission` or the argument is missing/invalid
-    fn extract_file_io_paths(&self, arg_name: &str) -> Option<Vec<String>> {
-        if !self.is_file_io() {
-            return None;
-        }
-
-        self.get_argument(arg_name)
-            .and_then(|arg| match &arg.value {
-                ArgumentValue::String(s) => Some(vec![s.clone()]),
-                ArgumentValue::Array(arr) => {
-                    let paths: Vec<String> = arr
-                        .iter()
-                        .filter_map(|value| {
-                            if let ArgumentValue::String(s) = value {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    Some(paths)
-                }
-                _ => None,
-            })
-    }
-
-    /// Determines if this permission grants unrestricted access.
-    ///
-    /// Many .NET permission classes support an "Unrestricted" property that, when set to `true`,
-    /// grants full access to the protected resource without any limitations. This effectively
-    /// bypasses all specific permission checks for that resource type.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the permission has an "Unrestricted" argument set to `true`, `false` otherwise.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue};
-    ///
-    /// let unrestricted_permission = Permission::new(
-    ///     "System.Security.Permissions.FileIOPermission".to_string(),
-    ///     "mscorlib".to_string(),
-    ///     vec![NamedArgument::new(
-    ///         "Unrestricted".to_string(),
-    ///         ArgumentType::Boolean,
-    ///         ArgumentValue::Boolean(true)
-    ///     )]
-    /// );
-    ///
-    /// if unrestricted_permission.is_unrestricted() {
-    ///     println!("This permission grants unrestricted access");
-    /// }
-    /// ```
-    ///
-    /// # Security Implications
-    ///
-    /// Unrestricted permissions are very powerful and should be carefully monitored
-    /// in security audits, as they effectively disable all access controls for
-    /// the associated resource type.
-    #[must_use]
-    pub fn is_unrestricted(&self) -> bool {
-        if let Some(arg) = self.get_argument("Unrestricted") {
-            if let ArgumentValue::Boolean(b) = &arg.value {
-                return *b;
-            }
-        }
-        false
-    }
-
-    /// Extracts security permission flags from a `SecurityPermission`.
-    ///
-    /// `SecurityPermissions` use a flags enumeration to specify which security-sensitive
-    /// operations are allowed. This method parses the "Flags" argument and returns
-    /// the corresponding [`crate::metadata::security::SecurityPermissionFlags`].
-    ///
-    /// # Returns
-    ///
-    /// - `Some(SecurityPermissionFlags)` if this is a `SecurityPermission` with valid flags
-    /// - `None` if this is not a `SecurityPermission` or has no flags argument
-    ///
-    /// # Supported Flag Formats
-    ///
-    /// The method supports multiple flag formats commonly found in .NET metadata:
-    /// - **Integer values**: Direct bitwise flag values
-    /// - **Enum values**: Typed enum representations
-    /// - **String values**: Comma-separated flag names (e.g., "Execution,UnmanagedCode")
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use dotscope::metadata::security::{Permission, NamedArgument, ArgumentType, ArgumentValue, SecurityPermissionFlags};
-    ///
-    /// let permission = Permission::new(
-    ///     "System.Security.Permissions.SecurityPermission".to_string(),
-    ///     "mscorlib".to_string(),
-    ///     vec![NamedArgument::new(
-    ///         "Flags".to_string(),
-    ///         ArgumentType::Int32,
-    ///         ArgumentValue::Int32(0x0002) // UnmanagedCode flag
-    ///     )]
-    /// );
-    ///
-    /// if let Some(flags) = permission.get_security_flags() {
-    ///     if flags.contains(SecurityPermissionFlags::SECURITY_FLAG_UNSAFE_CODE) {
-    ///         println!("This permission allows unsafe code execution");
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// # Common Security Flags
-    ///
-    /// - **Execution**: Allows code execution
-    /// - **`UnmanagedCode`**: Allows calling unmanaged code
-    /// - **`SkipVerification`**: Allows skipping IL verification
-    /// - **Assertion**: Allows asserting permissions
-    /// - **`ControlThread`**: Allows thread manipulation
-    /// - **`ControlPolicy`**: Allows security policy control
-    #[must_use]
-    pub fn get_security_flags(&self) -> Option<SecurityPermissionFlags> {
-        if !self.is_security() {
-            return None;
-        }
-
-        if let Some(arg) = self.get_argument("Flags") {
-            if let ArgumentValue::Int32(flags) = &arg.value {
-                return Some(SecurityPermissionFlags::new(*flags));
-            } else if let ArgumentValue::Enum(_, flags) = &arg.value {
-                return Some(SecurityPermissionFlags::new(*flags));
-            } else if let ArgumentValue::String(flags_str) = &arg.value {
-                // Handle string representations of security flags
-                return Some(Self::parse_flags_from_string(flags_str));
+    /// The position of the comma that ends the type name, outside any brackets.
+    fn qualifier_start(&self) -> Option<usize> {
+        let mut depth = 0usize;
+        for (position, character) in self.class_name.char_indices() {
+            match character {
+                '[' => depth = depth.saturating_add(1),
+                ']' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => return Some(position),
+                _ => {}
             }
         }
         None
     }
 
-    /// Parses security permission flags from a string representation.
-    ///
-    /// This internal method handles the conversion of string-based flag specifications
-    /// to the corresponding [`crate::metadata::security::SecurityPermissionFlags`] bitfield.
-    /// It supports both individual flag names and the special "`AllFlags`" value.
-    ///
-    /// # Arguments
-    ///
-    /// * `flags_str` - A string containing comma-separated flag names or "`AllFlags`"
-    ///
-    /// # Returns
-    ///
-    /// A [`crate::metadata::security::SecurityPermissionFlags`] value representing the parsed flags.
-    ///
-    /// # Supported Flag Names
-    ///
-    /// The following flag names are recognized (case-sensitive):
-    ///
-    /// | Flag Name | Description | Maps To |
-    /// |-----------|-------------|---------|
-    /// | `"NoFlags"` | No permissions | Empty flags |
-    /// | `"Execution"` | Basic code execution rights | `SECURITY_FLAG_EXECUTION` |
-    /// | `"SkipVerification"` | Ability to skip IL verification | `SECURITY_FLAG_SKIP_VERIFICATION` |
-    /// | `"Assertion"` | Permission assertion capabilities | `SECURITY_FLAG_ASSERTION` |
-    /// | `"UnmanagedCode"` | Unmanaged code execution | `SECURITY_FLAG_UNSAFE_CODE` + `SECURITY_FLAG_SKIP_VERIFICATION` |
-    /// | `"UnsafeCode"` | Direct unsafe code execution | `SECURITY_FLAG_UNSAFE_CODE` |
-    /// | `"ControlAppDomains"` | Application domain control | `SECURITY_FLAG_CONTROL_APPDOMAINS` |
-    /// | `"ControlPolicy"` | Security policy manipulation | `SECURITY_FLAG_CONTROL_POLICY` |
-    /// | `"Serialization"` | Object serialization rights | `SECURITY_FLAG_SERIALIZATION` |
-    /// | `"ControlThread"` | Thread lifecycle control | `SECURITY_FLAG_CONTROL_THREAD` |
-    /// | `"ControlEvidence"` | Evidence manipulation | `SECURITY_FLAG_CONTROL_EVIDENCE` |
-    /// | `"ControlPrincipal"` | Principal object control | `SECURITY_FLAG_CONTROL_PRINCIPAL` |
-    /// | `"Infrastructure"` | Infrastructure services access | `SECURITY_FLAG_INFRASTRUCTURE` |
-    /// | `"BindingRedirects"` | Assembly binding redirects | `SECURITY_FLAG_BINDING` |
-    /// | `"Binding"` | Assembly binding control (legacy) | `SECURITY_FLAG_BINDING` |
-    /// | `"Remoting"` | Remoting infrastructure access | `SECURITY_FLAG_REMOTING` |
-    /// | `"RemotingConfiguration"` | Remoting configuration | `SECURITY_FLAG_REMOTING` |
-    /// | `"ControlDomainPolicy"` | Domain-level policy control | `SECURITY_FLAG_CONTROL_DOMAIN` |
-    /// | `"ControlDomain"` | Domain-level control (legacy) | `SECURITY_FLAG_CONTROL_DOMAIN` |
-    /// | `"Reflection"` | Reflection capabilities | `SECURITY_FLAG_REFLECTION` |
-    /// | `"AllFlags"` | All available permissions | All flags set |
-    ///
-    /// # UnmanagedCode Flag Combination Rationale
-    ///
-    /// The `"UnmanagedCode"` flag maps to both `SECURITY_FLAG_UNSAFE_CODE` and
-    /// `SECURITY_FLAG_SKIP_VERIFICATION` because in the .NET Framework security model,
-    /// executing unmanaged code inherently requires the ability to bypass IL verification.
-    /// Unmanaged code operates outside the CLR's type safety guarantees, so granting
-    /// unmanaged code permission implicitly grants verification skip permission.
-    /// This combination reflects the actual security implications in .NET Framework 1.0-4.x.
-    ///
-    /// # Format Examples
-    ///
-    /// - `"Execution"` - Single flag
-    /// - `"Execution, UnmanagedCode"` - Multiple flags (whitespace around commas is trimmed)
-    /// - `"AllFlags"` - All permissions
-    /// - `"NoFlags"` - Empty permission set
-    ///
-    /// # Unknown Flag Handling
-    ///
-    /// Unknown flag names are silently ignored to maintain compatibility with
-    /// future .NET Framework versions that may introduce new flags. This is intentional:
-    /// when analyzing assemblies built with newer .NET versions, we want to parse
-    /// what we can rather than fail entirely.
-    fn parse_flags_from_string(flags_str: &str) -> SecurityPermissionFlags {
-        /// Lookup table for flag name to SecurityPermissionFlags mapping.
-        /// Using a static array for O(n) lookup is acceptable here since:
-        /// 1. The table is small (20 entries)
-        /// 2. This function is not called in hot paths
-        /// 3. Linear search has good cache locality for small arrays
-        const FLAG_MAPPINGS: &[(&str, SecurityPermissionFlags)] = &[
-            ("NoFlags", SecurityPermissionFlags::ZERO),
-            (
-                "Execution",
-                SecurityPermissionFlags::SECURITY_FLAG_EXECUTION,
-            ),
-            (
-                "SkipVerification",
-                SecurityPermissionFlags::SECURITY_FLAG_SKIP_VERIFICATION,
-            ),
-            (
-                "Assertion",
-                SecurityPermissionFlags::SECURITY_FLAG_ASSERTION,
-            ),
-            (
-                "UnsafeCode",
-                SecurityPermissionFlags::SECURITY_FLAG_UNSAFE_CODE,
-            ),
-            (
-                "ControlAppDomain",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_APPDOMAINS,
-            ),
-            (
-                "ControlAppDomains",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_APPDOMAINS,
-            ),
-            (
-                "ControlPolicy",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_POLICY,
-            ),
-            (
-                "SerializationFormatter",
-                SecurityPermissionFlags::SECURITY_FLAG_SERIALIZATION,
-            ),
-            (
-                "Serialization",
-                SecurityPermissionFlags::SECURITY_FLAG_SERIALIZATION,
-            ),
-            (
-                "ControlThread",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_THREAD,
-            ),
-            (
-                "ControlEvidence",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_EVIDENCE,
-            ),
-            (
-                "ControlPrincipal",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_PRINCIPAL,
-            ),
-            (
-                "Infrastructure",
-                SecurityPermissionFlags::SECURITY_FLAG_INFRASTRUCTURE,
-            ),
-            (
-                "BindingRedirects",
-                SecurityPermissionFlags::SECURITY_FLAG_BINDING,
-            ),
-            ("Binding", SecurityPermissionFlags::SECURITY_FLAG_BINDING),
-            (
-                "RemotingConfiguration",
-                SecurityPermissionFlags::SECURITY_FLAG_REMOTING,
-            ),
-            ("Remoting", SecurityPermissionFlags::SECURITY_FLAG_REMOTING),
-            (
-                "ControlDomainPolicy",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_DOMAIN,
-            ),
-            (
-                "ControlDomain",
-                SecurityPermissionFlags::SECURITY_FLAG_CONTROL_DOMAIN,
-            ),
-            (
-                "Reflection",
-                SecurityPermissionFlags::SECURITY_FLAG_REFLECTION,
-            ),
-        ];
+    /// Whether this is a permission of class `permission_class` (a full name without its
+    /// assembly, such as [`security_classes::SECURITY_PERMISSION`]): named by that class, as
+    /// in an XML set, or by its attribute class, as in a binary one.
+    #[must_use]
+    pub fn is_class(&self, permission_class: &str) -> bool {
+        let type_name = self.type_name();
+        type_name == permission_class
+            || type_name
+                .strip_suffix("Attribute")
+                .is_some_and(|stem| stem == permission_class)
+    }
 
-        let mut flags = SecurityPermissionFlags::ZERO;
+    /// Whether this is a `FileIOPermission`.
+    #[must_use]
+    pub fn is_file_io(&self) -> bool {
+        self.is_class(security_classes::FILE_IO_PERMISSION)
+    }
 
-        // Handle special "AllFlags" case
-        if flags_str == "AllFlags" {
-            return SecurityPermissionFlags::ALL;
+    /// Whether this is a `SecurityPermission`.
+    #[must_use]
+    pub fn is_security(&self) -> bool {
+        self.is_class(security_classes::SECURITY_PERMISSION)
+    }
+
+    /// Whether this is a `ReflectionPermission`.
+    #[must_use]
+    pub fn is_reflection(&self) -> bool {
+        self.is_class(security_classes::REFLECTION_PERMISSION)
+    }
+
+    /// Whether this is a `RegistryPermission`.
+    #[must_use]
+    pub fn is_registry(&self) -> bool {
+        self.is_class(security_classes::REGISTRY_PERMISSION)
+    }
+
+    /// Whether this is a `UIPermission`.
+    #[must_use]
+    pub fn is_ui(&self) -> bool {
+        self.is_class(security_classes::UI_PERMISSION)
+    }
+
+    /// Whether this is an `EnvironmentPermission`.
+    #[must_use]
+    pub fn is_environment(&self) -> bool {
+        self.is_class(security_classes::ENVIRONMENT_PERMISSION)
+    }
+
+    /// The property named `name`.
+    #[must_use]
+    pub fn get_argument(&self, name: &str) -> Option<&CustomAttributeNamedArgument> {
+        self.named_arguments.iter().find(|arg| arg.name == name)
+    }
+
+    /// The paths a `FileIOPermission` grants read access to: its `Read` property, a list
+    /// separated by semicolons. `None` for another permission or one without the property.
+    #[must_use]
+    pub fn get_file_read_paths(&self) -> Option<Vec<String>> {
+        self.file_io_paths("Read")
+    }
+
+    /// The paths a `FileIOPermission` grants write access to: its `Write` property.
+    #[must_use]
+    pub fn get_file_write_paths(&self) -> Option<Vec<String>> {
+        self.file_io_paths("Write")
+    }
+
+    /// The paths a `FileIOPermission` lets code discover: its `PathDiscovery` property.
+    #[must_use]
+    pub fn get_file_path_discovery(&self) -> Option<Vec<String>> {
+        self.file_io_paths("PathDiscovery")
+    }
+
+    /// The paths a `FileIOPermission`'s property `name` lists: a string of paths separated by
+    /// semicolons, or an array of such strings.
+    fn file_io_paths(&self, name: &str) -> Option<Vec<String>> {
+        if !self.is_file_io() {
+            return None;
         }
-
-        // Parse comma-separated flag names
-        for flag_name in flags_str.split(',').map(str::trim) {
-            // Skip empty segments (e.g., from "Flag1,,Flag2")
-            if flag_name.is_empty() {
-                continue;
-            }
-
-            // Special case: UnmanagedCode maps to multiple flags
-            // See documentation above for rationale
-            if flag_name == "UnmanagedCode" {
-                flags |= SecurityPermissionFlags::SECURITY_FLAG_UNSAFE_CODE;
-                flags |= SecurityPermissionFlags::SECURITY_FLAG_SKIP_VERIFICATION;
-                continue;
-            }
-
-            // Look up flag in the mapping table
-            if let Some((_, flag_value)) = FLAG_MAPPINGS.iter().find(|(name, _)| *name == flag_name)
-            {
-                flags |= *flag_value;
-            }
-            // Unknown flags are silently ignored for forward compatibility
+        let split = |list: &str| {
+            list.split(';')
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        match &self.get_argument(name)?.value {
+            CustomAttributeArgument::String(Some(list)) => Some(split(list)),
+            CustomAttributeArgument::Array(_, Some(lists)) => Some(
+                lists
+                    .iter()
+                    .filter_map(|list| match list {
+                        CustomAttributeArgument::String(Some(list)) => Some(split(list)),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect(),
+            ),
+            _ => None,
         }
+    }
 
-        flags
+    /// Whether the permission's `Unrestricted` property is true: it grants all the access
+    /// its class controls.
+    #[must_use]
+    pub fn is_unrestricted(&self) -> bool {
+        self.get_argument("Unrestricted")
+            .is_some_and(|arg| match &arg.value {
+                CustomAttributeArgument::Bool(value) => *value,
+                CustomAttributeArgument::String(Some(text)) => text.eq_ignore_ascii_case("true"),
+                _ => false,
+            })
+    }
+
+    /// The flags a `SecurityPermission` grants: its `Flags` property, an enum (binary sets)
+    /// or flag names (XML sets), and the boolean property per flag (`SkipVerification =
+    /// true`), each applied in the order the set writes them as the attribute's setters
+    /// apply them, from no flags.
+    ///
+    /// `None` for another permission, one that sets neither, or flags that do not parse.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dotscope::metadata::{
+    ///     customattributes::{CustomAttributeArgument, CustomAttributeNamedArgument, FieldOrPropType},
+    ///     security::{Permission, SecurityPermissionFlags},
+    /// };
+    ///
+    /// let flag = "System.Security.Permissions.SecurityPermissionFlag, mscorlib".to_string();
+    /// let permission = Permission::new(
+    ///     "System.Security.Permissions.SecurityPermissionAttribute, mscorlib",
+    ///     vec![CustomAttributeNamedArgument {
+    ///         is_field: false,
+    ///         name: "Flags".to_string(),
+    ///         arg_type: FieldOrPropType::Enum(flag.clone()),
+    ///         value: CustomAttributeArgument::Enum(flag, Box::new(CustomAttributeArgument::I4(2))),
+    ///     }],
+    /// );
+    ///
+    /// let flags = permission.get_security_flags().unwrap();
+    /// assert!(flags.contains(SecurityPermissionFlags::SECURITY_FLAG_UNMANAGED_CODE));
+    /// ```
+    #[must_use]
+    pub fn get_security_flags(&self) -> Option<SecurityPermissionFlags> {
+        if !self.is_security() {
+            return None;
+        }
+        let flags = |value: &CustomAttributeArgument| match value {
+            CustomAttributeArgument::I4(bits) => Some(SecurityPermissionFlags::new(*bits)),
+            CustomAttributeArgument::String(Some(names)) => SecurityPermissionFlags::parse(names),
+            _ => None,
+        };
+        let mut granted = None;
+        for arg in &self.named_arguments {
+            match (arg.name.as_str(), &arg.value) {
+                ("Flags", CustomAttributeArgument::Enum(_, underlying)) => {
+                    granted = Some(flags(underlying)?);
+                }
+                ("Flags", value) => granted = Some(flags(value)?),
+                (name, CustomAttributeArgument::Bool(set)) => {
+                    let Some(flag) = SecurityPermissionFlags::parse(name)
+                        .filter(|flag| !flag.is_empty() && !flag.is_all())
+                    else {
+                        continue;
+                    };
+                    let bits = granted.unwrap_or(SecurityPermissionFlags::ZERO).bits();
+                    granted = Some(SecurityPermissionFlags::new(if *set {
+                        bits | flag.bits()
+                    } else {
+                        bits & !flag.bits()
+                    }));
+                }
+                _ => {}
+            }
+        }
+        granted
     }
 }
 
 impl fmt::Display for Permission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}(", self.class_name)?;
-
         for (i, arg) in self.named_arguments.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{arg}")?;
+            write!(f, "{} = {}", arg.name, arg.value)?;
         }
-
         write!(f, ")")
     }
 }
@@ -1051,329 +291,186 @@ impl fmt::Display for Permission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::security::{ArgumentType, ArgumentValue};
+    use crate::metadata::customattributes::FieldOrPropType;
 
-    fn create_test_permission() -> Permission {
-        let named_args = vec![
-            NamedArgument::new(
-                "Read".to_string(),
-                ArgumentType::String,
-                ArgumentValue::String("C:\\Data".to_string()),
-            ),
-            NamedArgument::new(
-                "Unrestricted".to_string(),
-                ArgumentType::Boolean,
-                ArgumentValue::Boolean(false),
-            ),
-        ];
+    const ATTRIBUTE_QUALIFIER: &str =
+        ", mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
 
-        Permission::new(
-            security_classes::FILE_IO_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            named_args,
-        )
+    fn property(name: &str, value: CustomAttributeArgument) -> CustomAttributeNamedArgument {
+        let arg_type = value.field_or_prop_type().unwrap();
+        CustomAttributeNamedArgument {
+            is_field: false,
+            name: name.to_string(),
+            arg_type,
+            value,
+        }
+    }
+
+    fn string(text: &str) -> CustomAttributeArgument {
+        CustomAttributeArgument::String(Some(text.to_string()))
     }
 
     #[test]
-    fn test_permission_new() {
-        let permission = create_test_permission();
-        assert_eq!(permission.class_name, security_classes::FILE_IO_PERMISSION);
-        assert_eq!(permission.assembly_name, "mscorlib");
-        assert_eq!(permission.named_arguments.len(), 2);
-    }
-
-    #[test]
-    fn test_is_file_io() {
-        let file_io_perm = create_test_permission();
-        assert!(file_io_perm.is_file_io());
-
-        let security_perm = Permission::new(
-            security_classes::SECURITY_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            vec![],
+    fn a_class_is_named_by_its_attribute_or_itself_with_or_without_an_assembly() {
+        let binary = Permission::new(
+            format!("System.Security.Permissions.SecurityPermissionAttribute{ATTRIBUTE_QUALIFIER}"),
+            Vec::new(),
         );
-        assert!(!security_perm.is_file_io());
-    }
-
-    #[test]
-    fn test_is_security() {
-        let security_perm = Permission::new(
-            security_classes::SECURITY_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            vec![],
+        assert_eq!(
+            binary.type_name(),
+            "System.Security.Permissions.SecurityPermissionAttribute"
         );
-        assert!(security_perm.is_security());
+        assert_eq!(binary.assembly_name(), Some("mscorlib"));
+        assert!(binary.is_security());
+        assert!(!binary.is_file_io());
 
-        let file_io_perm = create_test_permission();
-        assert!(!file_io_perm.is_security());
-    }
+        let xml = Permission::new("System.Security.Permissions.FileIOPermission", Vec::new());
+        assert_eq!(xml.assembly_name(), None);
+        assert!(xml.is_file_io());
+        assert!(!xml.is_security());
 
-    #[test]
-    fn test_is_reflection() {
-        let reflection_perm = Permission::new(
-            security_classes::REFLECTION_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            vec![],
+        // Commas inside a generic type's brackets do not end its name
+        let generic = Permission::new(
+            "Ns.Permission`1[[System.Int32, mscorlib]], Lib, Version=1.0.0.0",
+            Vec::new(),
         );
-        assert!(reflection_perm.is_reflection());
-
-        let file_io_perm = create_test_permission();
-        assert!(!file_io_perm.is_reflection());
-    }
-
-    #[test]
-    fn test_is_registry() {
-        let registry_perm = Permission::new(
-            security_classes::REGISTRY_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            vec![],
+        assert_eq!(
+            generic.type_name(),
+            "Ns.Permission`1[[System.Int32, mscorlib]]"
         );
-        assert!(registry_perm.is_registry());
-
-        let file_io_perm = create_test_permission();
-        assert!(!file_io_perm.is_registry());
+        assert_eq!(generic.assembly_name(), Some("Lib"));
     }
 
     #[test]
-    fn test_is_ui() {
-        let ui_perm = Permission::new(
-            security_classes::UI_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            vec![],
-        );
-        assert!(ui_perm.is_ui());
-
-        let file_io_perm = create_test_permission();
-        assert!(!file_io_perm.is_ui());
-    }
-
-    #[test]
-    fn test_is_environment() {
-        let env_perm = Permission::new(
-            security_classes::ENVIRONMENT_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            vec![],
-        );
-        assert!(env_perm.is_environment());
-
-        let file_io_perm = create_test_permission();
-        assert!(!file_io_perm.is_environment());
-    }
-
-    #[test]
-    fn test_get_argument() {
-        let permission = create_test_permission();
-
-        let read_arg = permission.get_argument("Read");
-        assert!(read_arg.is_some());
-        assert_eq!(read_arg.unwrap().name, "Read");
-
-        let nonexistent = permission.get_argument("NonExistent");
-        assert!(nonexistent.is_none());
-    }
-
-    #[test]
-    fn test_get_file_read_paths_string() {
-        let permission = create_test_permission();
-        let paths = permission.get_file_read_paths();
-        assert!(paths.is_some());
-
-        let paths = paths.unwrap();
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0], "C:\\Data");
-    }
-
-    #[test]
-    fn test_get_file_read_paths_array() {
-        let named_args = vec![NamedArgument::new(
-            "Read".to_string(),
-            ArgumentType::Array(Box::new(ArgumentType::String)),
-            ArgumentValue::Array(vec![
-                ArgumentValue::String("C:\\Data1".to_string()),
-                ArgumentValue::String("C:\\Data2".to_string()),
-            ]),
-        )];
-
+    fn file_io_paths_are_the_semicolon_separated_lists_of_its_properties() {
         let permission = Permission::new(
-            security_classes::FILE_IO_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            named_args,
+            format!("System.Security.Permissions.FileIOPermissionAttribute{ATTRIBUTE_QUALIFIER}"),
+            vec![
+                property("Read", string("C:\\Data;C:\\Config")),
+                property(
+                    "Write",
+                    CustomAttributeArgument::Array(
+                        FieldOrPropType::String,
+                        Some(vec![string("C:\\Logs"), string("D:\\Out;")]),
+                    ),
+                ),
+            ],
         );
+        assert_eq!(
+            permission.get_file_read_paths(),
+            Some(vec!["C:\\Data".to_string(), "C:\\Config".to_string()])
+        );
+        assert_eq!(
+            permission.get_file_write_paths(),
+            Some(vec!["C:\\Logs".to_string(), "D:\\Out".to_string()])
+        );
+        assert_eq!(permission.get_file_path_discovery(), None);
 
-        let paths = permission.get_file_read_paths();
-        assert!(paths.is_some());
-
-        let paths = paths.unwrap();
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0], "C:\\Data1");
-        assert_eq!(paths[1], "C:\\Data2");
+        let other = Permission::new(
+            security_classes::REGISTRY_PERMISSION,
+            vec![property("Read", string("HKEY_LOCAL_MACHINE"))],
+        );
+        assert_eq!(other.get_file_read_paths(), None);
     }
 
     #[test]
-    fn test_get_file_read_paths_non_file_io() {
-        let security_perm = Permission::new(
-            security_classes::SECURITY_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            vec![],
+    fn unrestricted_is_a_true_property_in_either_format() {
+        let binary = Permission::new(
+            security_classes::FILE_IO_PERMISSION,
+            vec![property(
+                "Unrestricted",
+                CustomAttributeArgument::Bool(true),
+            )],
         );
-
-        let paths = security_perm.get_file_read_paths();
-        assert!(paths.is_none());
+        assert!(binary.is_unrestricted());
+        let xml = Permission::new(
+            security_classes::FILE_IO_PERMISSION,
+            vec![property("Unrestricted", string("true"))],
+        );
+        assert!(xml.is_unrestricted());
+        let restricted = Permission::new(
+            security_classes::FILE_IO_PERMISSION,
+            vec![property(
+                "Unrestricted",
+                CustomAttributeArgument::Bool(false),
+            )],
+        );
+        assert!(!restricted.is_unrestricted());
     }
 
     #[test]
-    fn test_get_file_write_paths() {
-        let named_args = vec![NamedArgument::new(
-            "Write".to_string(),
-            ArgumentType::String,
-            ArgumentValue::String("C:\\Logs".to_string()),
-        )];
+    fn security_flags_come_from_the_flags_enum_or_its_names() {
+        let enum_name =
+            format!("System.Security.Permissions.SecurityPermissionFlag{ATTRIBUTE_QUALIFIER}");
+        let binary = Permission::new(
+            format!("System.Security.Permissions.SecurityPermissionAttribute{ATTRIBUTE_QUALIFIER}"),
+            vec![property(
+                "Flags",
+                CustomAttributeArgument::Enum(
+                    enum_name,
+                    Box::new(CustomAttributeArgument::I4(0x0200)),
+                ),
+            )],
+        );
+        assert_eq!(
+            binary.get_security_flags(),
+            Some(SecurityPermissionFlags::SECURITY_FLAG_CONTROL_PRINCIPAL)
+        );
 
+        let xml = Permission::new(
+            security_classes::SECURITY_PERMISSION,
+            vec![property("Flags", string("UnmanagedCode, SkipVerification"))],
+        );
+        assert_eq!(
+            xml.get_security_flags().map(SecurityPermissionFlags::bits),
+            Some(6)
+        );
+
+        // crafted_2 and most compilers' output: a boolean property per flag, folded in order
+        let booleans = Permission::new(
+            security_classes::SECURITY_PERMISSION,
+            vec![
+                property("Assertion", CustomAttributeArgument::Bool(true)),
+                property("Flags", CustomAttributeArgument::I4(0x0C)),
+                property("SkipVerification", CustomAttributeArgument::Bool(false)),
+                property("UnmanagedCode", CustomAttributeArgument::Bool(true)),
+                property("Unrestricted", CustomAttributeArgument::Bool(false)),
+            ],
+        );
+        assert_eq!(
+            booleans
+                .get_security_flags()
+                .map(SecurityPermissionFlags::bits),
+            Some(0x0A)
+        );
+        let unset = Permission::new(
+            security_classes::SECURITY_PERMISSION,
+            vec![property(
+                "Unrestricted",
+                CustomAttributeArgument::Bool(true),
+            )],
+        );
+        assert_eq!(unset.get_security_flags(), None);
+
+        let other = Permission::new(
+            security_classes::REFLECTION_PERMISSION,
+            vec![property("Flags", CustomAttributeArgument::I4(1))],
+        );
+        assert_eq!(other.get_security_flags(), None);
+    }
+
+    #[test]
+    fn display_lists_the_properties() {
         let permission = Permission::new(
-            security_classes::FILE_IO_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            named_args,
+            security_classes::SECURITY_PERMISSION,
+            vec![
+                property("Unrestricted", CustomAttributeArgument::Bool(true)),
+                property("Flags", string("Execution")),
+            ],
         );
-
-        let paths = permission.get_file_write_paths();
-        assert!(paths.is_some());
-
-        let paths = paths.unwrap();
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0], "C:\\Logs");
-    }
-
-    #[test]
-    fn test_get_file_path_discovery() {
-        let named_args = vec![NamedArgument::new(
-            "PathDiscovery".to_string(),
-            ArgumentType::String,
-            ArgumentValue::String("C:\\Discovery".to_string()),
-        )];
-
-        let permission = Permission::new(
-            security_classes::FILE_IO_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            named_args,
+        assert_eq!(
+            permission.to_string(),
+            "System.Security.Permissions.SecurityPermission(Unrestricted = bool(true), Flags = \"Execution\")"
         );
-
-        let paths = permission.get_file_path_discovery();
-        assert!(paths.is_some());
-
-        let paths = paths.unwrap();
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0], "C:\\Discovery");
-    }
-
-    #[test]
-    fn test_is_unrestricted_true() {
-        let named_args = vec![NamedArgument::new(
-            "Unrestricted".to_string(),
-            ArgumentType::Boolean,
-            ArgumentValue::Boolean(true),
-        )];
-
-        let permission = Permission::new(
-            security_classes::FILE_IO_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            named_args,
-        );
-
-        assert!(permission.is_unrestricted());
-    }
-
-    #[test]
-    fn test_is_unrestricted_false() {
-        let permission = create_test_permission();
-        assert!(!permission.is_unrestricted());
-    }
-
-    #[test]
-    fn test_get_security_flags() {
-        let named_args = vec![NamedArgument::new(
-            "Flags".to_string(),
-            ArgumentType::Int32,
-            ArgumentValue::Int32(0x1), // ASSERTION flag
-        )];
-
-        let permission = Permission::new(
-            security_classes::SECURITY_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            named_args,
-        );
-
-        let flags = permission.get_security_flags();
-        assert!(flags.is_some());
-
-        let flags = flags.unwrap();
-        assert!(flags.contains(SecurityPermissionFlags::SECURITY_FLAG_ASSERTION));
-    }
-
-    #[test]
-    fn test_get_security_flags_enum() {
-        let named_args = vec![NamedArgument::new(
-            "Flags".to_string(),
-            ArgumentType::Enum("SecurityPermissionFlag".to_string()),
-            ArgumentValue::Enum("SecurityPermissionFlag".to_string(), 0x20), // UNSAFE_CODE
-        )];
-
-        let permission = Permission::new(
-            security_classes::SECURITY_PERMISSION.to_string(),
-            "mscorlib".to_string(),
-            named_args,
-        );
-
-        let flags = permission.get_security_flags();
-        assert!(flags.is_some());
-
-        let flags = flags.unwrap();
-        assert!(flags.contains(SecurityPermissionFlags::SECURITY_FLAG_UNSAFE_CODE));
-    }
-
-    #[test]
-    fn test_get_security_flags_non_security() {
-        let permission = create_test_permission();
-        let flags = permission.get_security_flags();
-        assert!(flags.is_none());
-    }
-
-    #[test]
-    fn test_display_formatting() {
-        let permission = create_test_permission();
-        let formatted = format!("{permission}");
-
-        assert!(formatted.starts_with(security_classes::FILE_IO_PERMISSION));
-        assert!(formatted.contains("Read = \"C:\\Data\""));
-        assert!(formatted.contains("Unrestricted = false"));
-        assert!(formatted.contains("("));
-        assert!(formatted.contains(")"));
-    }
-
-    #[test]
-    fn test_display_formatting_empty_args() {
-        let permission =
-            Permission::new("TestPermission".to_string(), "mscorlib".to_string(), vec![]);
-
-        let formatted = format!("{permission}");
-        assert_eq!(formatted, "TestPermission()");
-    }
-
-    #[test]
-    fn test_clone() {
-        let original = create_test_permission();
-        let cloned = original.clone();
-
-        assert_eq!(cloned.class_name, original.class_name);
-        assert_eq!(cloned.assembly_name, original.assembly_name);
-        assert_eq!(cloned.named_arguments.len(), original.named_arguments.len());
-    }
-
-    #[test]
-    fn test_debug_formatting() {
-        let permission = create_test_permission();
-        let debug_str = format!("{permission:?}");
-
-        assert!(debug_str.contains("Permission"));
-        assert!(debug_str.contains(security_classes::FILE_IO_PERMISSION));
     }
 }

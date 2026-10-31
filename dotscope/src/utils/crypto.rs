@@ -246,25 +246,32 @@ pub fn compute_hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Upper bound on the PBKDF2 iteration count accepted by [`derive_pbkdf2_key`].
+/// The work [`derive_pbkdf2_key`] does, in PRF (HMAC) invocations: `iterations` for each
+/// hash-sized block of the `key_len` bytes asked for.
 ///
-/// The iteration count reaching this function is a constant lifted out of an attacker-supplied
-/// method body, so it is bounded only by `i32::MAX` (~2.1×10⁹) at the source. PBKDF2 runs its
-/// full iteration loop once per output block, so iterations and key length multiply, and this
-/// is native computation with no instruction budget or cancellation attached to it.
+/// The count and the length come from emulated or analysed code, bounded only by `i32::MAX`,
+/// and the derivation is native work with nothing to interrupt it, so callers charge this to
+/// their budget before deriving.
 ///
-/// Real-world obfuscators use 100–100 000. Ten million leaves three orders of magnitude of
-/// headroom over observed usage while keeping the worst case to seconds rather than days.
+/// # Errors
+///
+/// Returns [`crate::Error::TypeError`] for a hash algorithm PBKDF2 is not derived with here.
 #[cfg(feature = "emulation")]
-pub(crate) const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
-
-/// Upper bound on the derived key length accepted by [`derive_pbkdf2_key`], in bytes.
-///
-/// Symmetric keys and IVs in the formats this crate handles are at most 32 and 16 bytes.
-/// 1 KiB accommodates any plausible combined key+IV request and rejects the ~2 GB one that an
-/// unvalidated `int32` allows.
-#[cfg(feature = "emulation")]
-pub(crate) const MAX_DERIVED_KEY_LEN: usize = 1024;
+pub fn pbkdf2_work(iterations: u32, key_len: usize, hash_algorithm: &str) -> Result<u64> {
+    let block: usize = match hash_algorithm.to_uppercase().as_str() {
+        "SHA1" => 20,
+        "SHA256" => 32,
+        "SHA384" => 48,
+        "SHA512" => 64,
+        other => {
+            return Err(TypeError(format!(
+                "Unsupported PBKDF2 hash algorithm: {other}"
+            )))
+        }
+    };
+    let blocks = u64::try_from(key_len.div_ceil(block)).unwrap_or(u64::MAX);
+    Ok(u64::from(iterations).saturating_mul(blocks))
+}
 
 /// Derives a key using PBKDF2 (RFC 2898 Section 5.2).
 ///
@@ -275,9 +282,10 @@ pub(crate) const MAX_DERIVED_KEY_LEN: usize = 1024;
 ///
 /// * `password` - The password bytes
 /// * `salt` - The salt bytes
-/// * `iterations` - Number of iterations (minimum 1000 recommended), capped at
-///   [`MAX_PBKDF2_ITERATIONS`]
-/// * `key_len` - Desired length of the derived key, capped at [`MAX_DERIVED_KEY_LEN`]
+/// * `iterations` - Number of iterations, at least 1
+/// * `key_len` - Desired length of the derived key
+///
+/// It runs [`pbkdf2_work`] PRF invocations, which callers bound.
 /// * `hash_algorithm` - Hash algorithm: "SHA1", "SHA256", "SHA384", "SHA512"
 ///
 /// # Returns
@@ -288,7 +296,7 @@ pub(crate) const MAX_DERIVED_KEY_LEN: usize = 1024;
 ///
 /// Returns [`crate::Error::NotSupported`] if `hash_algorithm` is not one of the recognised
 /// names, or if it is "SHA1" in a build without the `legacy-crypto` feature. Returns
-/// [`crate::Error::TypeError`] if `iterations` or `key_len` exceeds its ceiling.
+/// [`crate::Error::TypeError`] if `iterations` is 0.
 ///
 /// Unknown algorithms are an error rather than a silent fallback on purpose: substituting a
 /// different hash yields plausible-looking bytes of the right length and the wrong value, which
@@ -305,16 +313,8 @@ pub fn derive_pbkdf2_key(
     key_len: usize,
     hash_algorithm: &str,
 ) -> Result<Vec<u8>> {
-    if iterations > MAX_PBKDF2_ITERATIONS {
-        return Err(TypeError(format!(
-            "PBKDF2 iteration count {iterations} exceeds maximum {MAX_PBKDF2_ITERATIONS}"
-        )));
-    }
-
-    if key_len > MAX_DERIVED_KEY_LEN {
-        return Err(TypeError(format!(
-            "PBKDF2 derived key length {key_len} exceeds maximum {MAX_DERIVED_KEY_LEN}"
-        )));
+    if iterations == 0 {
+        return Err(TypeError("PBKDF2 needs at least one iteration".to_string()));
     }
 
     let mut key = vec![0u8; key_len];
@@ -702,7 +702,8 @@ fn tdes_ecb_transform(key: &[u8], is_encryptor: bool, data: &[u8], padding: u8) 
 /// modular exponentiation, avoiding the `rsa` crate (which has an unpatched
 /// Marvin Attack CVE on PKCS#1 v1.5 decryption).
 ///
-/// Used by the emulator to implement `RSACryptoServiceProvider.VerifyHash()`.
+/// Used by the emulator to implement `RSACryptoServiceProvider.VerifyHash()`. It does
+/// [`rsa_verify_work`] work, which callers bound.
 ///
 /// # Arguments
 ///
@@ -719,6 +720,24 @@ fn tdes_ecb_transform(key: &[u8], is_encryptor: bool, data: &[u8], padding: u8) 
 /// # Feature Requirements
 ///
 /// This function requires the `emulation` feature.
+/// The work [`verify_rsa_pkcs1v15`] does, in units of 64 limb products: the modular
+/// exponentiation squares, and may multiply, once per exponent bit, each a product of two
+/// numbers the modulus's size.
+///
+/// The key comes from emulated code (`RSA.FromXmlString`), of any size, and the
+/// exponentiation is native work with nothing to interrupt it, so callers charge this to
+/// their budget before verifying.
+#[cfg(feature = "emulation")]
+#[must_use]
+pub fn rsa_verify_work(modulus: &[u8], exponent: &[u8]) -> u64 {
+    let limbs = BigUint::from_bytes_be(modulus).bits().div_ceil(64);
+    BigUint::from_bytes_be(exponent)
+        .bits()
+        .saturating_mul(2)
+        .saturating_mul(limbs.saturating_mul(limbs))
+        / 64
+}
+
 #[cfg(feature = "emulation")]
 pub fn verify_rsa_pkcs1v15(
     modulus: &[u8],
@@ -850,6 +869,8 @@ impl Default for CryptoParameters {
 /// * `password` - Raw key material (e.g., from a FieldRVA entry).
 /// * `salt` - Raw salt (e.g., from a FieldRVA entry).
 /// * `params` - PBKDF2 and cipher parameters (iterations, key/IV sizes, hash algorithm).
+/// * `max_work` - The most [`pbkdf2_work`] the derivation may take, 0 for no bound: `params`
+///   is extracted from an attacker-supplied decryptor body.
 ///
 /// # Returns
 ///
@@ -857,19 +878,26 @@ impl Default for CryptoParameters {
 ///
 /// # Errors
 ///
-/// Propagates any error from [`derive_pbkdf2_key`] — an iteration count or output length past
-/// its ceiling, or an unsupported hash algorithm. Both are reachable from a crafted assembly,
-/// since `params` is extracted from an attacker-supplied decryptor body.
+/// When the derivation's work is more than `max_work`, and any error from
+/// [`derive_pbkdf2_key`]: no iterations, or an unsupported hash algorithm.
 #[cfg(all(feature = "deobfuscation", feature = "legacy-crypto"))]
 pub fn derive_key_iv(
     password: &[u8],
     salt: &[u8],
     params: &CryptoParameters,
+    max_work: u64,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    // Sizes come from configuration extracted via SSA from a decryptor body.
-    // Saturating addition avoids overflow on absurd values; the resulting length is then
-    // bounds-checked by `derive_pbkdf2_key` rather than being allocated on trust.
+    // Sizes and the iteration count are constants lifted from a decryptor body: the work is
+    // checked against the budget before any of it is done
     let output_len = params.key_size.saturating_add(params.iv_size);
+    let work = pbkdf2_work(params.iterations, output_len, params.hash_algorithm)?;
+    if max_work != 0 && work > max_work {
+        return Err(TypeError(format!(
+            "deriving {output_len} bytes in {} iterations is {work} PRF invocations, \
+             more than the budget of {max_work}",
+            params.iterations
+        )));
+    }
     let derived = derive_pbkdf2_key(
         password,
         salt,
@@ -987,44 +1015,47 @@ mod tests {
         }
     }
 
-    /// The iteration ceiling is what stops a crafted decryptor body from wedging the process:
-    /// the count is an `i32` constant lifted straight out of attacker-supplied CIL.
+    /// The work is the iteration count for each hash-sized block asked for, so a count and
+    /// a length that each look small multiply.
     #[test]
-    fn test_pbkdf2_rejects_excessive_iterations() {
-        let password = b"password";
-        let salt = b"salt";
-
-        assert!(derive_pbkdf2_key(password, salt, MAX_PBKDF2_ITERATIONS, 1, "SHA256").is_ok());
-        assert!(derive_pbkdf2_key(
-            password,
-            salt,
-            MAX_PBKDF2_ITERATIONS.saturating_add(1),
-            32,
-            "SHA256"
-        )
-        .is_err());
-        // The value an unvalidated i32 allows.
-        assert!(derive_pbkdf2_key(password, salt, 2_147_483_647, 32, "SHA256").is_err());
+    fn test_pbkdf2_work_is_iterations_times_blocks() {
+        assert_eq!(pbkdf2_work(1000, 32, "SHA256").unwrap(), 1000);
+        assert_eq!(pbkdf2_work(1000, 33, "SHA256").unwrap(), 2000);
+        assert_eq!(pbkdf2_work(1000, 48, "SHA1").unwrap(), 3000);
+        assert_eq!(pbkdf2_work(7, 0, "sha512").unwrap(), 0);
+        assert_eq!(
+            pbkdf2_work(i32::MAX.unsigned_abs(), 1 << 31, "SHA256").unwrap(),
+            u64::from(i32::MAX.unsigned_abs()) * (1 << 26)
+        );
+        assert!(pbkdf2_work(1, 32, "MD5").is_err());
     }
 
-    /// The length ceiling bounds the output buffer and, with it, the number of PBKDF2 blocks —
-    /// the loop runs once per block, so length and iterations multiply.
+    /// The exponentiation's work grows with the exponent's bits and the square of the
+    /// modulus's limbs, leading zeros aside: a 2048-bit key with e = 65537 is small, a
+    /// 16384-bit modulus raised to a 16384-bit exponent is not.
     #[test]
-    fn test_pbkdf2_rejects_excessive_key_length() {
-        let password = b"password";
-        let salt = b"salt";
+    fn test_rsa_verify_work() {
+        let modulus = [0xFFu8; 256];
+        assert_eq!(
+            rsa_verify_work(&modulus, &[0x01, 0x00, 0x01]),
+            17 * 2 * 32 * 32 / 64
+        );
+        let mut padded = vec![0u8; 100];
+        padded.extend_from_slice(&modulus);
+        assert_eq!(
+            rsa_verify_work(&padded, &[0, 0, 0x01, 0x00, 0x01]),
+            rsa_verify_work(&modulus, &[0x01, 0x00, 0x01])
+        );
+        assert_eq!(
+            rsa_verify_work(&[0xFF; 2048], &[0xFF; 2048]),
+            16384 * 2 * 256 * 256 / 64
+        );
+    }
 
-        assert!(derive_pbkdf2_key(password, salt, 1, MAX_DERIVED_KEY_LEN, "SHA256").is_ok());
-        assert!(derive_pbkdf2_key(
-            password,
-            salt,
-            1,
-            MAX_DERIVED_KEY_LEN.saturating_add(1),
-            "SHA256"
-        )
-        .is_err());
-        // Roughly what a maximal i32 key size would request.
-        assert!(derive_pbkdf2_key(password, salt, 1, 2_000_000_000, "SHA256").is_err());
+    /// A derivation of no iterations is refused rather than handed to the PRF loop.
+    #[test]
+    fn test_pbkdf2_rejects_zero_iterations() {
+        assert!(derive_pbkdf2_key(b"password", b"salt", 0, 32, "SHA256").is_err());
     }
 
     // NOTE: PBKDF1 tests are in the legacy_tests module below

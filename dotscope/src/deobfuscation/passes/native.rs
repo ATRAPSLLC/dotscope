@@ -253,13 +253,7 @@ impl NativeMethodConversionPass {
         }
 
         // Step 2: Get x86 bytes from the RVA
-        let offset = file.rva_to_offset(method_row.rva as usize)?;
-        let x86_bytes = file.data().get(offset..).ok_or_else(|| {
-            Error::X86Error(format!(
-                "Method 0x{:08x}: file offset {offset} out of bounds",
-                token.value()
-            ))
-        })?;
+        let x86_bytes = file.section_bounded(method_row.rva as usize)?;
 
         // Step 3: Detect prologue and adjust bytes if needed
         let (decode_bytes, base_offset) = if self.skip_prologue {

@@ -494,8 +494,9 @@ impl Resource {
         // Step 5: Parse type table
         Self::parse_type_table(&mut parser, &mut res)?;
 
-        // Step 6: Handle padding/alignment
-        res.padding = Self::skip_padding(&mut parser, data)?;
+        // Step 6: Handle padding/alignment, counted from the magic as the runtime counts it
+        let magic = if is_embedded_resource { 4 } else { 0 };
+        res.padding = Self::skip_padding(&mut parser, magic)?;
 
         // Step 7: Parse hash and position tables
         Self::parse_lookup_tables(&mut parser, &mut res)?;
@@ -737,113 +738,24 @@ impl Resource {
         Ok(())
     }
 
-    /// Skip padding bytes to align to 8-byte boundary, plus any explicit PAD patterns.
+    /// Skip the padding that aligns the hash table to 8 bytes from the magic at `magic`.
     ///
-    /// .NET resource files require 8-byte alignment after the type table before the
-    /// hash/position arrays. Some implementations also include explicit "PAD" byte
-    /// patterns for additional alignment or debugging purposes.
-    ///
-    /// # Alignment Strategy
-    ///
-    /// 1. First, skip bytes to reach 8-byte alignment boundary
-    /// 2. Then, skip any explicit "PAD" patterns that may follow
-    ///
-    /// # Arguments
-    ///
-    /// * `parser` - Parser positioned after the type table
-    /// * `data` - Complete resource data buffer (used for PAD pattern detection)
+    /// `ResourceReader` skips the bytes to the boundary without looking at them, and the
+    /// alignment is counted from the stream's start, the magic: in an embedded resource, 4
+    /// bytes past its length prefix. Counted from the prefix, a stream whose type table ends
+    /// 2 bytes past a boundary had 6 bytes skipped, 4 of them the first hash.
     ///
     /// # Returns
     ///
-    /// The total number of padding bytes skipped (alignment + PAD patterns).
-    fn skip_padding(parser: &mut Parser, data: &[u8]) -> Result<usize> {
-        let mut padding_count: usize = 0;
-
-        // Standard 8-byte alignment
-        let align_bytes = parser.pos() & 7;
-        if align_bytes != 0 {
-            let padding_to_skip = 8usize.wrapping_sub(align_bytes);
-            padding_count = padding_count
-                .checked_add(padding_to_skip)
-                .ok_or_else(|| malformed_error!("padding count overflow"))?;
-            parser.advance_by(padding_to_skip)?;
+    /// The number of padding bytes skipped.
+    fn skip_padding(parser: &mut Parser, magic: usize) -> Result<usize> {
+        let misalignment = parser.pos().saturating_sub(magic) & 7;
+        if misalignment == 0 {
+            return Ok(0);
         }
-
-        // Check for additional explicit PAD patterns (some .NET implementations add these)
-        let pad_pattern_count = Self::skip_pad_patterns(parser, data)?;
-        padding_count = padding_count
-            .checked_add(pad_pattern_count)
-            .ok_or_else(|| malformed_error!("padding count overflow"))?;
-
-        Ok(padding_count)
-    }
-
-    /// Skip any explicit "PAD" byte patterns in the resource file.
-    ///
-    /// Some .NET resource file implementations include explicit "PAD" ASCII patterns
-    /// beyond standard 8-byte alignment. This method detects and skips these patterns.
-    ///
-    /// # Supported Patterns
-    ///
-    /// - `"PAD"` (3 bytes) - Basic padding marker
-    /// - `"PADP"` (4 bytes) - Extended padding with 'P' continuation
-    /// - `"PAD\0"` (4 bytes) - Null-terminated padding marker
-    ///
-    /// Multiple consecutive PAD patterns are handled (the loop continues until
-    /// a non-PAD sequence is encountered).
-    ///
-    /// # Arguments
-    ///
-    /// * `parser` - Parser positioned where PAD patterns might begin
-    /// * `data` - Complete resource data buffer (used for pattern detection)
-    ///
-    /// # Returns
-    ///
-    /// The total number of PAD pattern bytes skipped.
-    fn skip_pad_patterns(parser: &mut Parser, data: &[u8]) -> Result<usize> {
-        let mut padding_count: usize = 0;
-
-        loop {
-            let pos = parser.pos();
-            let Some(end4) = pos.checked_add(4) else {
-                break;
-            };
-            if end4 > data.len() {
-                break;
-            }
-            let remaining = data.len().saturating_sub(pos);
-
-            // Need at least 3 bytes to check for "PAD"
-            if remaining < 3 {
-                break;
-            }
-
-            // Check for "PAD" pattern
-            let p0 = data.get(pos).copied();
-            let p1 = pos.checked_add(1).and_then(|i| data.get(i).copied());
-            let p2 = pos.checked_add(2).and_then(|i| data.get(i).copied());
-            if p0 == Some(b'P') && p1 == Some(b'A') && p2 == Some(b'D') {
-                parser.advance_by(3)?;
-                padding_count = padding_count
-                    .checked_add(3)
-                    .ok_or_else(|| malformed_error!("PAD pattern padding overflow"))?;
-
-                // Check for additional padding byte after PAD ('P' or '\0')
-                if parser.pos() < data.len() {
-                    let next_byte = data.get(parser.pos()).copied();
-                    if next_byte == Some(b'P') || next_byte == Some(0) {
-                        parser.advance()?;
-                        padding_count = padding_count
-                            .checked_add(1)
-                            .ok_or_else(|| malformed_error!("PAD pattern padding overflow"))?;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-
-        Ok(padding_count)
+        let padding = 8usize.saturating_sub(misalignment);
+        parser.advance_by(padding)?;
+        Ok(padding)
     }
 
     /// Parse the name hash and position lookup tables.

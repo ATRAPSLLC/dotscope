@@ -27,7 +27,9 @@ use crate::{
         validation::ValidationConfig,
     },
     testkit::{
-        build_ssa_with_handlers, engine_with, factories::table::assemblyref::get_test_assembly,
+        build_ssa_with_handlers, engine_with,
+        equivalence::{regenerate_and_compare, Equivalence},
+        factories::table::assemblyref::get_test_assembly,
         fixture, TestTypeProvider,
     },
     CilAssemblyView, CilObject, Error, Parser,
@@ -49,6 +51,17 @@ fn assert_generates(ssa: &SsaFunction, expected: &[&str]) {
         "Mnemonic mismatch.\nExpected: {:?}\nGot: {:?}",
         expected, mnemonics
     );
+}
+
+/// Asserts that the code generated for `ssa`, lifted again, returns what `ssa` returns on
+/// every argument vector the evaluator finishes, and that it finishes at least one.
+fn assert_equivalent(ssa: &SsaFunction) {
+    match regenerate_and_compare(ssa) {
+        Equivalence::Equivalent { conclusive, .. } => {
+            assert!(conclusive > 0, "no run of the function finished");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Registers values `v0..count` in `ssa`, for functions built by naming
@@ -98,7 +111,7 @@ fn test_void_return() {
             f.block(0, |b| b.ret());
         })
         .unwrap();
-    assert_generates(&ssa, &["ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -116,26 +129,27 @@ fn test_simple_codegen() {
 
 #[test]
 fn test_optimized_return() {
-    // Create: v0 = arg0 + arg1; return v0
-    let mut ssa = SsaFunction::new(2, 0);
+    // Create: local0 = arg0 + arg1; return local0. A local read once, right where it is
+    // written, is not stored to its slot.
+    let mut ssa = SsaFunction::new(2, 1);
 
     let v0 = ssa.create_variable(
         VariableOrigin::Argument(0),
         0,
-        DefSite::phi(0),
-        SsaType::Unknown,
+        DefSite::entry(),
+        SsaType::I32,
     );
     let v1 = ssa.create_variable(
         VariableOrigin::Argument(1),
         0,
-        DefSite::phi(0),
-        SsaType::Unknown,
+        DefSite::entry(),
+        SsaType::I32,
     );
     let v2 = ssa.create_variable(
         VariableOrigin::Local(0),
-        0,
+        1,
         DefSite::instruction(0, 0),
-        SsaType::Unknown,
+        SsaType::I32,
     );
 
     let mut block = SsaBlock::new(0);
@@ -147,6 +161,7 @@ fn test_optimized_return() {
     }));
     block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v2) }));
     ssa.add_block(block);
+    ssa.recompute_uses();
 
     assert_generates(&ssa, &["ldarg.0", "ldarg.1", "add", "ret"]);
 }
@@ -218,7 +233,7 @@ fn test_const_i64() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldc.i8", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -231,7 +246,7 @@ fn test_const_null() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldnull", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -245,7 +260,7 @@ fn test_const_true_false() {
             });
         })
         .unwrap();
-    assert_generates(&ssa_true, &["ldc.i4.1", "ret"]);
+    assert_equivalent(&ssa_true);
 
     // false = ldc.i4.0
     let ssa_false = SsaFunctionBuilder::new(0, 0)
@@ -256,7 +271,7 @@ fn test_const_true_false() {
             });
         })
         .unwrap();
-    assert_generates(&ssa_false, &["ldc.i4.0", "ret"]);
+    assert_equivalent(&ssa_false);
 }
 
 #[test]
@@ -269,7 +284,7 @@ fn test_const_floats() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldc.r4", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -282,7 +297,7 @@ fn test_const_f64() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldc.r8", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -296,7 +311,7 @@ fn test_add() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "add", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -310,7 +325,7 @@ fn test_sub() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "sub", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -324,7 +339,7 @@ fn test_mul() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "mul", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -338,7 +353,7 @@ fn test_div_signed() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "div", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -352,7 +367,7 @@ fn test_div_unsigned() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "div.un", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -366,7 +381,7 @@ fn test_rem_signed() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "rem", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -380,7 +395,7 @@ fn test_rem_unsigned() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "rem.un", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -520,7 +535,7 @@ fn test_neg() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "neg", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -534,7 +549,7 @@ fn test_not() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "not", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -548,7 +563,7 @@ fn test_and() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "and", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -562,7 +577,7 @@ fn test_or() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "or", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -576,7 +591,7 @@ fn test_xor() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "xor", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -590,7 +605,7 @@ fn test_shl() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "shl", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -604,7 +619,7 @@ fn test_shr_signed() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "shr", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -618,7 +633,7 @@ fn test_shr_unsigned() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "shr.un", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -632,7 +647,7 @@ fn test_ceq() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "ceq", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -646,7 +661,7 @@ fn test_clt_signed() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "clt", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -660,7 +675,7 @@ fn test_clt_unsigned() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "clt.un", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -674,7 +689,7 @@ fn test_cgt_signed() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "cgt", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -688,7 +703,7 @@ fn test_cgt_unsigned() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "cgt.un", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -769,7 +784,7 @@ fn test_conversion_i8() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.i1", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -783,7 +798,7 @@ fn test_conversion_i16() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.i2", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -797,7 +812,7 @@ fn test_conversion_i32() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.i4", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -811,7 +826,7 @@ fn test_conversion_i64() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.i8", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -825,7 +840,7 @@ fn test_conversion_u8() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.u1", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -839,7 +854,7 @@ fn test_conversion_u16() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.u2", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -853,7 +868,7 @@ fn test_conversion_u32() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.u4", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -867,7 +882,7 @@ fn test_conversion_f32() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.r4", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -881,7 +896,7 @@ fn test_conversion_f64() {
             });
         })
         .unwrap();
-    assert_generates(&ssa, &["ldarg.0", "conv.r8", "ret"]);
+    assert_equivalent(&ssa);
 }
 
 #[test]
@@ -2157,8 +2172,7 @@ fn test_fibonacci_deobfuscation_preserves_semantics() {
         }
 
         let file = output.file();
-        let offset = file.rva_to_offset(rva).expect("rva to offset");
-        let data = &file.data()[offset..];
+        let data = file.section_bounded(rva).expect("the body's section");
         let body = MethodBody::from(data).expect("method body");
         let bytecode = &data[body.size_header..body.size_header + body.size_code];
 
@@ -2273,8 +2287,7 @@ fn test_fibonacci_pass_combinations() {
             }
 
             let file = output.file();
-            let offset = file.rva_to_offset(rva).expect("rva to offset");
-            let data = &file.data()[offset..];
+            let data = file.section_bounded(rva).expect("the body's section");
             let body = MethodBody::from(data).expect("method body");
             let bytecode = &data[body.size_header..body.size_header + body.size_code];
 
@@ -3148,8 +3161,7 @@ fn single_op_function(
     result_type: SsaType,
     make_op: impl FnOnce(SsaVarId, &[SsaVarId]) -> SsaOp,
 ) -> SsaFunction {
-    let mut result = None;
-    let mut ssa = SsaFunctionBuilder::new(arg_types.len(), 0)
+    SsaFunctionBuilder::new(arg_types.len(), 0)
         .build_with(|f| {
             let args: Vec<SsaVarId> = arg_types
                 .iter()
@@ -3157,16 +3169,12 @@ fn single_op_function(
                 .map(|(index, ty)| f.arg(index, ty.clone()))
                 .collect();
             let dest = f.var();
-            result = Some(dest);
             f.block(0, |b| {
-                b.op(make_op(dest, &args));
+                b.op_typed(make_op(dest, &args), result_type);
                 b.ret_val(dest);
             });
         })
-        .unwrap();
-    let dest = result.unwrap();
-    ssa.variable_mut(dest).unwrap().set_type(result_type);
-    ssa
+        .unwrap()
 }
 
 #[test]
@@ -3547,7 +3555,7 @@ fn a_rotate_idiom_folded_by_the_algebraic_pass_still_computes_the_rotate() {
         &mut ssa,
         &MethodRef::new(Token::new(0x0600_0001)),
         &NullListener,
-        PointerSize::Bit64,
+        algebraic::Machine::new(PointerSize::Bit64, None),
     );
     assert!(changed, "the idiom should fold");
     assert!(

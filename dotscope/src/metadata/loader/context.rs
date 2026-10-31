@@ -71,20 +71,19 @@ use crate::{
         exports::Exports,
         imports::Imports,
         method::MethodMap,
+        pdb::PortablePdb,
         resources::Resources,
         root::Root,
         streams::{Blob, Guid, Strings, TablesHeader, UserStrings},
         tables::{
             AssemblyOsRc, AssemblyProcessorRc, AssemblyRc, AssemblyRefMap, AssemblyRefOsMap,
             AssemblyRefProcessorMap, ClassLayoutMap, CodedIndex, ConstantMap, CustomAttributeMap,
-            CustomDebugInformationMap, DeclSecurityMap, DocumentMap, EncLogMap, EncMapMap,
-            EventMap, EventMapEntryMap, EventPtrMap, FieldLayoutMap, FieldMap, FieldMarshalMap,
-            FieldPtrMap, FieldRVAMap, FileMap, GenericParamConstraintMap, GenericParamMap,
-            ImportScopeMap, InterfaceImplMap, LocalConstantMap, LocalScopeMap, LocalVariableMap,
-            MemberRefMap, MethodDebugInformationMap, MethodImplMap, MethodPtrMap,
-            MethodSemanticsMap, MethodSpecMap, ModuleRc, ModuleRefMap, NestedClassMap, ParamMap,
-            ParamPtrMap, PropertyMap, PropertyMapEntryMap, PropertyPtrMap, RowReadable,
-            StandAloneSigMap, StateMachineMethodMap, TableId, TypeSpecMap,
+            DeclSecurityMap, EncLogMap, EncMapMap, EventMap, EventMapEntryMap, EventPtrMap,
+            FieldLayoutMap, FieldMap, FieldMarshalMap, FieldPtrMap, FieldRVAMap, FileMap,
+            GenericParamConstraintMap, GenericParamMap, InterfaceImplMap, MemberRefMap,
+            MethodImplMap, MethodPtrMap, MethodSemanticsMap, MethodSpecMap, ModuleRc, ModuleRefMap,
+            NestedClassMap, ParamMap, ParamPtrMap, PropertyMap, PropertyMapEntryMap,
+            PropertyPtrMap, RowReadable, StandAloneSigMap, TableId, TypeSpecMap,
         },
         typesystem::{CilTypeReference, TypeRegistry},
     },
@@ -207,23 +206,9 @@ pub(crate) struct LoaderContext<'a> {
     /// Edit-and-Continue token mapping for debugging scenarios.
     pub enc_map: EncMapMap,
 
-    // Portable PDB Debug Tables
-    /// Document information for source file mapping in Portable PDB format.
-    pub document: DocumentMap,
-    /// Method debugging information including sequence points.
-    pub method_debug_information: MethodDebugInformationMap,
-    /// Local variable scope information for debugging.
-    pub local_scope: LocalScopeMap,
-    /// Local variable information for debugging.
-    pub local_variable: LocalVariableMap,
-    /// Local constant information for debugging.
-    pub local_constant: LocalConstantMap,
-    /// Import scope information for debugging.
-    pub import_scope: ImportScopeMap,
-    /// State machine method mapping for async/iterator debugging.
-    pub state_machine_method: StateMachineMethodMap,
-    /// Custom debug information for extensible debugging metadata.
-    pub custom_debug_information: CustomDebugInformationMap,
+    // Portable PDB
+    /// The Portable PDB the debug-table loaders read and fill, when the assembly has one.
+    pub pdb: Option<PdbSource<'a>>,
 
     // Parameter and Generic Tables
     /// Parameter definitions for methods.
@@ -263,7 +248,7 @@ pub(crate) struct LoaderContext<'a> {
     /// Constant values for fields, parameters, and properties.
     pub constant: ConstantMap,
     /// Custom attribute definitions.
-    pub custom_attribute: CustomAttributeMap,
+    pub custom_attribute: &'a CustomAttributeMap,
     /// Declarative security attributes.
     pub decl_security: &'a DeclSecurityMap,
     /// File definitions for multi-file assemblies.
@@ -280,6 +265,28 @@ pub(crate) struct LoaderContext<'a> {
     pub resources: &'a Resources,
     /// Central type registry for all loaded types.
     pub types: &'a Arc<TypeRegistry>,
+}
+
+/// The metadata the Portable PDB's tables are read from, and the PDB they fill.
+///
+/// For debug tables in the image's own metadata these are the image's tables and heaps; for
+/// an embedded or standalone PDB, the PDB's own. Either way their columns index the image's
+/// tables, which the loaders resolve through the [`LoaderContext`].
+pub(crate) struct PdbSource<'a> {
+    /// The tables stream holding the debug tables
+    pub meta: Option<&'a TablesHeader<'a>>,
+    /// The `#Strings` heap
+    pub strings: Option<&'a Strings<'a>>,
+    /// The `#Blob` heap
+    pub blobs: Option<&'a Blob<'a>>,
+    /// The `#GUID` heap
+    pub guids: Option<&'a Guid<'a>>,
+    /// Whether a malformed row is a diagnostic rather than an error. The runtime never reads
+    /// debug information to load an assembly, so the PDB found in the image is always read
+    /// leniently; a standalone PDB follows the load's mode.
+    pub lenient: bool,
+    /// The PDB the loaders fill
+    pub target: &'a PortablePdb,
 }
 
 impl LoaderContext<'_> {
@@ -513,11 +520,23 @@ impl LoaderContext<'_> {
         category: DiagnosticCategory,
         context_msg: F,
     ) -> Result<Option<T>> {
+        self.handle_result_in(self.lenient, result, category, context_msg)
+    }
+
+    /// [`handle_result`](Self::handle_result) in the mode `lenient` rather than the load's,
+    /// for metadata read in a mode of its own (a [`PdbSource`]).
+    pub fn handle_result_in<T, E: Display, F: FnOnce() -> String>(
+        &self,
+        lenient: bool,
+        result: StdResult<T, E>,
+        category: DiagnosticCategory,
+        context_msg: F,
+    ) -> Result<Option<T>> {
         match result {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
                 let msg = context_msg();
-                if self.lenient {
+                if lenient {
                     self.diagnostics
                         .warning(category, format!("Failed to load {msg}: {e}"));
                     Ok(None)
@@ -564,12 +583,23 @@ impl LoaderContext<'_> {
     ///
     /// Returns [`crate::Error::Malformed`] when a row fails to parse in strict mode.
     pub fn handle_row<T: RowReadable>(&self, row: Result<T>, index: usize) -> Result<Option<T>> {
+        self.handle_row_in(self.lenient, row, index)
+    }
+
+    /// [`handle_row`](Self::handle_row) in the mode `lenient` rather than the load's, for
+    /// metadata read in a mode of its own (a [`PdbSource`]).
+    pub fn handle_row_in<T: RowReadable>(
+        &self,
+        lenient: bool,
+        row: Result<T>,
+        index: usize,
+    ) -> Result<Option<T>> {
         match row {
             Ok(row) => Ok(Some(row)),
             Err(e) => {
                 let table = T::TABLE_ID;
                 let rid = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
-                if self.lenient {
+                if lenient {
                     self.diagnostics.push(
                         Diagnostic::new(
                             DiagnosticSeverity::Warning,

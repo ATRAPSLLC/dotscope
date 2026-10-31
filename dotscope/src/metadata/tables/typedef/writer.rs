@@ -75,11 +75,7 @@ impl RowWritable for TypeDefRaw {
         write_le_at_dyn(data, offset, self.type_namespace, sizes.is_large_str())?;
 
         // Write extends coded index (2 or 4 bytes)
-        let extends_value = sizes.encode_coded_index(
-            self.extends.tag,
-            self.extends.row,
-            CodedIndexType::TypeDefOrRef,
-        )?;
+        let extends_value = self.extends.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

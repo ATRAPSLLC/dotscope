@@ -41,6 +41,7 @@ use crate::{
         tables::{TableId, TableInfoRef},
     },
     utils::{read_le_at_dyn, write_le_at_dyn},
+    Result,
 };
 
 /// Patches heap references in a table row buffer.
@@ -69,6 +70,10 @@ use crate::{
 /// 2. Looks up the old value in the appropriate remapping table
 /// 3. If found, writes the new value back to the row bytes
 /// 4. If not found, leaves the value unchanged
+///
+/// # Errors
+///
+/// When a heap field lies outside the row, or its new value does not fit the field.
 pub fn patch_row_heap_refs(
     table_id: TableId,
     row_data: &mut [u8],
@@ -76,10 +81,10 @@ pub fn patch_row_heap_refs(
     string_remap: &HashMap<u32, u32>,
     blob_remap: &HashMap<u32, u32>,
     guid_remap: &HashMap<u32, u32>,
-) {
+) -> Result<()> {
     // Skip if no remapping needed
     if string_remap.is_empty() && blob_remap.is_empty() && guid_remap.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Get heap field descriptors from the centralized schema
@@ -99,8 +104,9 @@ pub fn patch_row_heap_refs(
         }
 
         // Patch the field
-        patch_heap_field(row_data, field.offset, field.size, remap);
+        patch_heap_field(row_data, field.offset, field.size, remap)?;
     }
+    Ok(())
 }
 
 /// Patches a single heap reference field in row data.
@@ -114,20 +120,25 @@ pub fn patch_row_heap_refs(
 /// * `offset` - Byte offset of the field within the row
 /// * `size` - Size of the field (2 or 4 bytes)
 /// * `remap` - Mapping from old heap offsets/indices to new values
-fn patch_heap_field(row_data: &mut [u8], offset: usize, size: usize, remap: &HashMap<u32, u32>) {
-    if offset.saturating_add(size) > row_data.len() {
-        return;
-    }
-
+///
+/// # Errors
+///
+/// When the field lies outside the row, or the new value does not fit it: the row would keep
+/// a reference to the entry's old place.
+fn patch_heap_field(
+    row_data: &mut [u8],
+    offset: usize,
+    size: usize,
+    remap: &HashMap<u32, u32>,
+) -> Result<()> {
     let is_large = size == 4;
     let mut read_offset = offset;
-
-    if let Ok(old_value) = read_le_at_dyn(row_data, &mut read_offset, is_large) {
-        if let Some(&new_value) = remap.get(&old_value) {
-            let mut write_offset = offset;
-            let _ = write_le_at_dyn(row_data, &mut write_offset, new_value, is_large);
-        }
+    let old_value = read_le_at_dyn(row_data, &mut read_offset, is_large)?;
+    if let Some(&new_value) = remap.get(&old_value) {
+        let mut write_offset = offset;
+        write_le_at_dyn(row_data, &mut write_offset, new_value, is_large)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -140,7 +151,7 @@ mod tests {
         let mut remap = HashMap::new();
         remap.insert(100, 200);
 
-        patch_heap_field(&mut data, 2, 2, &remap);
+        patch_heap_field(&mut data, 2, 2, &remap).unwrap();
 
         assert_eq!(data[2], 0xC8); // 200 = 0xC8
         assert_eq!(data[3], 0x00);
@@ -152,7 +163,7 @@ mod tests {
         let mut remap = HashMap::new();
         remap.insert(100, 0x12345678);
 
-        patch_heap_field(&mut data, 4, 4, &remap);
+        patch_heap_field(&mut data, 4, 4, &remap).unwrap();
 
         assert_eq!(data[4], 0x78);
         assert_eq!(data[5], 0x56);
@@ -166,7 +177,7 @@ mod tests {
         let mut data = original.clone();
         let remap = HashMap::new(); // Empty remap
 
-        patch_heap_field(&mut data, 2, 2, &remap);
+        patch_heap_field(&mut data, 2, 2, &remap).unwrap();
 
         assert_eq!(data, original); // Unchanged
     }
@@ -177,8 +188,18 @@ mod tests {
         let mut remap = HashMap::new();
         remap.insert(100, 200);
 
-        // Should not panic - just silently skip
-        patch_heap_field(&mut data, 10, 2, &remap);
+        // A field outside the row is refused, not skipped: its reference would stay unpatched
+        assert!(patch_heap_field(&mut data, 10, 2, &remap).is_err());
+    }
+
+    #[test]
+    fn a_new_value_too_wide_for_the_field_is_refused() {
+        let mut data = vec![0x00, 0x00, 0x64, 0x00];
+        let mut remap = HashMap::new();
+        remap.insert(100, 0x1_0000);
+
+        assert!(patch_heap_field(&mut data, 2, 2, &remap).is_err());
+        assert_eq!(data, [0x00, 0x00, 0x64, 0x00], "nothing is written");
     }
 }
 
@@ -187,7 +208,7 @@ mod examples {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::{testkit::fixture, CilAssemblyView, Result};
+    use crate::{testkit::fixture, CilAssemblyView};
 
     /// A TypeDef row whose name string moved from offset 0x10 to 0x20: the name column is
     /// patched, the namespace column, whose string did not move, is left alone.
@@ -209,7 +230,7 @@ mod examples {
             &string_remapping,
             &HashMap::new(),
             &HashMap::new(),
-        );
+        )?;
 
         assert_eq!(row_bytes[4..6], 0x20u16.to_le_bytes());
         assert_eq!(row_bytes[6..8], 0x30u16.to_le_bytes());

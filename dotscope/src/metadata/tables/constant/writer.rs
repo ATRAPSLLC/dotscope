@@ -32,10 +32,7 @@ use crate::{
 
 impl RowWritable for ConstantRaw {
     fn sort_key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
-        Ok(Some((
-            sizes.encode_coded_index(self.parent.tag, self.parent.row, self.parent.ci_type)?,
-            0,
-        )))
+        Ok(Some((self.parent.encode(sizes)?, 0)))
     }
 
     /// Serialize a Constant table row to binary format
@@ -64,15 +61,11 @@ impl RowWritable for ConstantRaw {
         // Write element type (1 byte)
         write_le_at(data, offset, self.base)?;
 
-        // Write padding byte (1 byte, must be zero)
-        write_le_at(data, offset, 0u8)?;
+        // Write padding byte (1 byte, zero unless the row was read with another)
+        write_le_at(data, offset, self.padding)?;
 
         // Write HasConstant coded index for parent
-        let parent_value = sizes.encode_coded_index(
-            self.parent.tag,
-            self.parent.row,
-            CodedIndexType::HasConstant,
-        )?;
+        let parent_value = self.parent.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,
@@ -155,6 +148,7 @@ mod tests {
             token: Token::new(0x0B000001),
             offset: 0,
             base: 0x01,
+            padding: 0,
             parent: CodedIndex::new(TableId::Property, 128, CodedIndexType::HasConstant), // Property(128) = (128 << 2) | 2 = 514
             value: 0x0303,
         };
@@ -197,6 +191,7 @@ mod tests {
             token: Token::new(0x0B000001),
             offset: 0,
             base: 0x01,
+            padding: 0,
             parent: CodedIndex::new(TableId::Property, 0x808080, CodedIndexType::HasConstant), // Property(0x808080) = (0x808080 << 2) | 2 = 0x2020202
             value: 0x03030303,
         };
@@ -239,6 +234,7 @@ mod tests {
             token: Token::new(0x0B00002A),
             offset: 0,
             base: 0x08, // ELEMENT_TYPE_I4
+            padding: 0,
             parent: CodedIndex::new(TableId::Field, 25, CodedIndexType::HasConstant), // Field(25) = (25 << 2) | 0 = 100
             value: 128, // Blob index 128
         };
@@ -290,6 +286,7 @@ mod tests {
                 token: Token::new(0x0B000001),
                 offset: 0,
                 base: element_type,
+                padding: 0,
                 parent: CodedIndex::new(parent_tag, parent_row, CodedIndexType::HasConstant),
                 value: blob_index,
             };
@@ -347,6 +344,7 @@ mod tests {
                 token: Token::new(0x0B000001),
                 offset: 0,
                 base: element_type,
+                padding: 0,
                 parent: CodedIndex::new(TableId::Field, 1, CodedIndexType::HasConstant),
                 value: 100,
             };
@@ -383,6 +381,7 @@ mod tests {
             token: Token::new(0x0B000001),
             offset: 0,
             base: 0,
+            padding: 0,
             parent: CodedIndex::new(TableId::Field, 0, CodedIndexType::HasConstant), // Field(0) = (0 << 2) | 0 = 0
             value: 0,
         };
@@ -408,6 +407,7 @@ mod tests {
             token: Token::new(0x0B000001),
             offset: 0,
             base: 0xFF,
+            padding: 0,
             parent: CodedIndex::new(TableId::Property, 0x3FFF, CodedIndexType::HasConstant), // Max for 2-byte coded index
             value: 0xFFFF,
         };
@@ -448,6 +448,7 @@ mod tests {
                 token: Token::new(0x0B000001),
                 offset: 0,
                 base: element_type,
+                padding: 0,
                 parent: CodedIndex::new(parent_tag, parent_row, CodedIndexType::HasConstant),
                 value: blob_index,
             };
@@ -478,6 +479,7 @@ mod tests {
             token: Token::new(0x0B000001),
             offset: 0,
             base: 0x01,
+            padding: 0,
             parent: CodedIndex::new(TableId::Property, 128, CodedIndexType::HasConstant), // Property(128) = (128 << 2) | 2 = 514 = 0x0202
             value: 0x0303,
         };

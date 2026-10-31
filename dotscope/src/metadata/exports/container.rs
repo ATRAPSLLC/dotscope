@@ -417,10 +417,8 @@ impl UnifiedExportContainer {
     /// println!("Total exports: {}", container.total_count());
     /// ```
     pub fn total_count(&self) -> usize {
-        self.cil
-            .len()
-            .saturating_add(self.native.function_count())
-            .saturating_add(self.native.forwarder_count())
+        // `function_count` counts the forwarders as well
+        self.cil.len().saturating_add(self.native.function_count())
     }
 
     /// Add a native function export.
@@ -1102,6 +1100,7 @@ mod tests {
         // Verify counts
         assert_eq!(container.native().function_count(), 3);
         assert_eq!(container.native().forwarder_count(), 1);
+        assert_eq!(container.total_count(), 3, "a forwarder counts once");
 
         // Verify named function is findable
         let named_results = container.find_by_name("NamedFunc");

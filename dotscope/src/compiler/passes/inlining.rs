@@ -1120,10 +1120,13 @@ mod tests {
             .build_with(|f| {
                 let loaded = f.var();
                 f.block(0, |blk| {
-                    blk.op(SsaOp::LoadArg {
-                        dest: loaded,
-                        arg_index: 0,
-                    });
+                    blk.op_typed(
+                        SsaOp::LoadArg {
+                            dest: loaded,
+                            arg_index: 0,
+                        },
+                        SsaType::I32,
+                    );
                     blk.ret_val(loaded);
                 });
             })

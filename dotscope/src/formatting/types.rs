@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use crate::{
     formatting::{
         generics,
-        helpers::{assembly_scoped_name, format_typespec_from_blob, quote_identifier},
+        helpers::{assembly_scoped_name, quote_identifier},
     },
     metadata::{tables::TypeAttributes, typesystem::CilType},
     CilObject,
@@ -113,7 +113,7 @@ pub(super) fn format_type_begin(
     // including System.Object. Only types with no base (like <Module> and
     // System.Object itself) omit this clause.
     if let Some(base) = cil_type.base() {
-        let base_name = format_type_ref(&base, asm);
+        let base_name = assembly_scoped_name(&base, asm);
         write!(w, "\n       extends {base_name}")?;
     }
 
@@ -126,7 +126,7 @@ pub(super) fn format_type_begin(
                 write!(w, ", ")?;
             }
             if let Some(iface_type) = entry.interface.upgrade() {
-                write!(w, "{}", format_type_ref(&iface_type, asm))?;
+                write!(w, "{}", assembly_scoped_name(&iface_type, asm))?;
             }
         }
     }
@@ -147,22 +147,6 @@ pub(super) fn format_type_begin(
     }
 
     Ok(())
-}
-
-/// Format a type reference for `extends`/`implements` clauses.
-///
-/// For TypeSpec entries (generic instantiations, arrays, etc.), reads the raw
-/// signature blob to produce the full ILAsm type specification including
-/// `class`/`valuetype` prefix, assembly-scoped name, and generic arguments.
-/// Falls back to [`assembly_scoped_name`] for TypeDef/TypeRef entries.
-fn format_type_ref(cil_type: &CilType, asm: &CilObject) -> String {
-    // For TypeSpec entries, prefer the raw blob which preserves generic args
-    if cil_type.token.table() == 0x1B {
-        if let Some(formatted) = format_typespec_from_blob(asm, &cil_type.token) {
-            return formatted;
-        }
-    }
-    assembly_scoped_name(cil_type, asm)
 }
 
 /// Write the closing brace and end-of-class comment for a type.

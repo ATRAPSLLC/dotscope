@@ -408,9 +408,11 @@ fn format_parsed_value(val: &CustomAttributeValue) -> (Vec<String>, Vec<String>)
 /// Format a single CustomAttributeArgument for display.
 fn format_arg(arg: &CustomAttributeArgument) -> String {
     match arg {
-        CustomAttributeArgument::Void => "void".to_string(),
         CustomAttributeArgument::Bool(b) => b.to_string(),
-        CustomAttributeArgument::Char(c) => format!("'{c}'"),
+        CustomAttributeArgument::Char(c) => match char::from_u32(u32::from(*c)) {
+            Some(c) => format!("'{c}'"),
+            None => format!("'\\u{c:04X}'"),
+        },
         CustomAttributeArgument::I1(v) => v.to_string(),
         CustomAttributeArgument::U1(v) => v.to_string(),
         CustomAttributeArgument::I2(v) => v.to_string(),
@@ -421,11 +423,12 @@ fn format_arg(arg: &CustomAttributeArgument) -> String {
         CustomAttributeArgument::U8(v) => v.to_string(),
         CustomAttributeArgument::R4(v) => v.to_string(),
         CustomAttributeArgument::R8(v) => v.to_string(),
-        CustomAttributeArgument::I(v) => v.to_string(),
-        CustomAttributeArgument::U(v) => v.to_string(),
-        CustomAttributeArgument::String(s) => format!("\"{s}\""),
-        CustomAttributeArgument::Type(t) => format!("typeof({t})"),
-        CustomAttributeArgument::Array(items) => {
+        CustomAttributeArgument::String(Some(s)) => format!("\"{s}\""),
+        CustomAttributeArgument::Type(Some(t)) => format!("typeof({t})"),
+        CustomAttributeArgument::String(None)
+        | CustomAttributeArgument::Type(None)
+        | CustomAttributeArgument::Array(_, None) => "null".to_string(),
+        CustomAttributeArgument::Array(_, Some(items)) => {
             let inner: Vec<String> = items.iter().map(format_arg).collect();
             format!("[{}]", inner.join(", "))
         }
@@ -434,6 +437,7 @@ fn format_arg(arg: &CustomAttributeArgument) -> String {
             let short = type_name.rsplit('.').next().unwrap_or(type_name);
             format!("{}({})", short, format_arg(value))
         }
+        CustomAttributeArgument::Boxed(value) => format_arg(value),
     }
 }
 

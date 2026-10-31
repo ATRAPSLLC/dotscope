@@ -818,6 +818,7 @@ fn parse_variant_a_blob(data: &[u8], assembly: &CilObject) -> Result<Vec<(Token,
                 is_init_local,
                 is_exception_data: !exception_handlers.is_empty(),
                 exception_handlers,
+                exception_format: None,
             };
 
             let mut buf = Vec::with_capacity(12_usize.saturating_add(il_size).saturating_add(64));
@@ -842,6 +843,7 @@ fn parse_variant_a_blob(data: &[u8], assembly: &CilObject) -> Result<Vec<(Token,
                 is_init_local: false,
                 is_exception_data: false,
                 exception_handlers: Vec::new(),
+                exception_format: None,
             };
             let mut buf = Vec::with_capacity(1_usize.saturating_add(il_size));
             new_body
@@ -910,11 +912,7 @@ fn resolve_fat_header_metadata(
 /// Returns an empty `Vec` for tiny bodies, fat bodies without MoreSects, or
 /// any parse failure (callers treat that as "no EH").
 fn read_on_disk_exception_handlers(assembly: &CilObject, method_rva: u32) -> Vec<ExceptionHandler> {
-    let file = assembly.file();
-    let Some(offset) = file.rva_to_offset(method_rva as usize).ok() else {
-        return Vec::new();
-    };
-    let Some(body_data) = file.data().get(offset..) else {
+    let Ok(body_data) = assembly.file().section_bounded(method_rva as usize) else {
         return Vec::new();
     };
     MethodBody::from_raw(body_data)

@@ -146,7 +146,15 @@ impl std::fmt::Display for EmulationError {
 /// ```
 #[macro_export]
 macro_rules! malformed_error {
-    // Single string version
+    // A format string literal: its inline arguments (`{name}`) are formatted
+    ($msg:literal) => {
+        $crate::Error::Parse($crate::ParseFailure::Other {
+            stage: $crate::ParseStage::Generic,
+            message: format!("{} ({}:{})", format!($msg), file!(), line!()),
+        })
+    };
+
+    // A message built elsewhere
     ($msg:expr) => {
         $crate::Error::Parse($crate::ParseFailure::Other {
             stage: $crate::ParseStage::Generic,
@@ -718,6 +726,8 @@ pub enum ParseStage {
     StreamHeader,
     /// Tilde (`#~`) stream containing metadata table rows.
     TildeStream,
+    /// A Portable PDB's `#Pdb` stream.
+    PdbStream,
     /// Per-table row layout/decoding within the tilde stream.
     TableRow,
     /// One of the heap streams (`#Strings`, `#US`, `#Blob`, `#GUID`).
@@ -770,6 +780,7 @@ impl std::fmt::Display for ParseStage {
             ParseStage::MetadataRoot => "metadata root",
             ParseStage::StreamHeader => "stream header",
             ParseStage::TildeStream => "tilde (#~) stream",
+            ParseStage::PdbStream => "#Pdb stream",
             ParseStage::TableRow => "metadata table row",
             ParseStage::Heap => "heap",
             ParseStage::DataDirectory => "data directory",
@@ -1044,6 +1055,24 @@ impl From<Error> for analyssa::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message's inline arguments are formatted: the single-literal form printed `{name}`
+    /// as it is written.
+    #[test]
+    fn malformed_error_formats_inline_arguments() {
+        let value = 0x1234;
+        let name = "column";
+        let error = malformed_error!("{value:#x} does not fit the {name}");
+        assert!(
+            error.to_string().contains("0x1234 does not fit the column"),
+            "{error}"
+        );
+        let built = format!("built {}", 7);
+        assert!(malformed_error!(built).to_string().contains("built 7"));
+        assert!(malformed_error!("{} and {}", 1, 2)
+            .to_string()
+            .contains("1 and 2"));
+    }
 
     /// `Clone` must preserve the variant.
     ///

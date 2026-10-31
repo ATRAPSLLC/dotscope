@@ -32,7 +32,6 @@ pub fn owned_security_validator_file_factory() -> Result<Vec<TestAssembly>> {
     Ok(vec![
         TestAssembly::new(get_testfile_mscorlib()),
         create_assembly_with_invalid_security_action()?,
-        create_assembly_with_malformed_permission_set()?,
         create_assembly_with_conflicting_security_attributes()?,
         create_assembly_with_security_transparency_violations()?,
     ])
@@ -91,28 +90,11 @@ fn mark(assembly: &mut CilAssembly, target: u32, attribute: &str) -> Result<()> 
 pub fn create_assembly_with_invalid_security_action() -> Result<TestAssembly> {
     create_test_assembly(
         get_testfile_mscorlib,
-        Expect::fail("Security declaration has invalid action: Unknown(99)"),
+        Expect::fail("Security declaration has invalid action: 0x0063"),
         |assembly| declare_security(assembly, 99, PERMISSION_SET),
     )
 }
 
-/// A Demand whose XML permission set has no `PermissionSet` element: a lone `Permission`,
-/// which the loader reads as XML.
-pub fn create_assembly_with_malformed_permission_set() -> Result<TestAssembly> {
-    create_test_assembly(
-        get_testfile_mscorlib,
-        Expect::fail("Permission set missing PermissionSet element"),
-        |assembly| {
-            declare_security(
-                assembly,
-                2, // Demand
-                b"<Permission class=\"System.Security.Permissions.SecurityPermission\" version=\"1\"/>",
-            )
-        },
-    )
-}
-
-/// A type marked both SecurityCritical and SecurityTransparent.
 pub fn create_assembly_with_conflicting_security_attributes() -> Result<TestAssembly> {
     create_test_assembly(
         get_testfile_mscorlib,

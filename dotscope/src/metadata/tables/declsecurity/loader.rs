@@ -145,3 +145,55 @@ impl MetadataLoader for DeclSecurityLoader {
         &[TableId::TypeDef, TableId::MethodDef, TableId::Assembly]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::{
+        metadata::{
+            security::SecurityAction,
+            tables::{DeclSecurityRaw, TableId},
+        },
+        testkit::fixture_bytes,
+        CilObject,
+    };
+
+    /// Every DeclSecurity row of a type is kept, in table order: Mono's System.Web.Routing
+    /// gives its types a link demand and an inheritance demand each, of which a single slot
+    /// kept one, whichever thread set it first.
+    #[test]
+    fn every_declaration_of_a_parent_is_kept_in_table_order() {
+        let assembly =
+            CilObject::from_mem(fixture_bytes("mono_2.0/System.Web.Routing.dll").to_vec()).unwrap();
+        let mut by_type: BTreeMap<u32, Vec<SecurityAction>> = BTreeMap::new();
+        for row in assembly
+            .tables()
+            .unwrap()
+            .table::<DeclSecurityRaw>()
+            .unwrap()
+            .iter()
+            .flatten()
+        {
+            if row.parent.tag == TableId::TypeDef {
+                by_type
+                    .entry(row.parent.row)
+                    .or_default()
+                    .push(SecurityAction::from(row.action));
+            }
+        }
+        assert!(by_type.values().any(|actions| actions.len() > 1));
+
+        for (row, expected) in by_type {
+            let ty = assembly
+                .types()
+                .all_types()
+                .iter()
+                .find(|ty| ty.token.table() == 0x02 && ty.token.row() == row)
+                .cloned()
+                .unwrap();
+            let actions: Vec<_> = ty.security.iter().map(|(_, sec)| sec.action).collect();
+            assert_eq!(actions, expected, "{}", ty.name);
+        }
+    }
+}

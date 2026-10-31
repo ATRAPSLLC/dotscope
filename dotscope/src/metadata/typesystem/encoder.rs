@@ -181,56 +181,56 @@ impl TypeSignatureEncoder {
 
         match signature {
             // Primitive types - direct element type encoding
-            TypeSignature::Void => buffer.push(0x01),
-            TypeSignature::Boolean => buffer.push(0x02),
-            TypeSignature::Char => buffer.push(0x03),
-            TypeSignature::I1 => buffer.push(0x04),
-            TypeSignature::U1 => buffer.push(0x05),
-            TypeSignature::I2 => buffer.push(0x06),
-            TypeSignature::U2 => buffer.push(0x07),
-            TypeSignature::I4 => buffer.push(0x08),
-            TypeSignature::U4 => buffer.push(0x09),
-            TypeSignature::I8 => buffer.push(0x0A),
-            TypeSignature::U8 => buffer.push(0x0B),
-            TypeSignature::R4 => buffer.push(0x0C),
-            TypeSignature::R8 => buffer.push(0x0D),
-            TypeSignature::String => buffer.push(0x0E),
-            TypeSignature::Object => buffer.push(0x1C),
-            TypeSignature::I => buffer.push(0x18),
-            TypeSignature::U => buffer.push(0x19),
-            TypeSignature::TypedByRef => buffer.push(0x16),
+            TypeSignature::Void => buffer.push(ELEMENT_TYPE::VOID),
+            TypeSignature::Boolean => buffer.push(ELEMENT_TYPE::BOOLEAN),
+            TypeSignature::Char => buffer.push(ELEMENT_TYPE::CHAR),
+            TypeSignature::I1 => buffer.push(ELEMENT_TYPE::I1),
+            TypeSignature::U1 => buffer.push(ELEMENT_TYPE::U1),
+            TypeSignature::I2 => buffer.push(ELEMENT_TYPE::I2),
+            TypeSignature::U2 => buffer.push(ELEMENT_TYPE::U2),
+            TypeSignature::I4 => buffer.push(ELEMENT_TYPE::I4),
+            TypeSignature::U4 => buffer.push(ELEMENT_TYPE::U4),
+            TypeSignature::I8 => buffer.push(ELEMENT_TYPE::I8),
+            TypeSignature::U8 => buffer.push(ELEMENT_TYPE::U8),
+            TypeSignature::R4 => buffer.push(ELEMENT_TYPE::R4),
+            TypeSignature::R8 => buffer.push(ELEMENT_TYPE::R8),
+            TypeSignature::String => buffer.push(ELEMENT_TYPE::STRING),
+            TypeSignature::Object => buffer.push(ELEMENT_TYPE::OBJECT),
+            TypeSignature::I => buffer.push(ELEMENT_TYPE::I),
+            TypeSignature::U => buffer.push(ELEMENT_TYPE::U),
+            TypeSignature::TypedByRef => buffer.push(ELEMENT_TYPE::TYPEDBYREF),
 
             // Reference types with token encoding
             TypeSignature::ValueType(token) => {
-                buffer.push(0x11); // ELEMENT_TYPE_VALUETYPE
+                buffer.push(ELEMENT_TYPE::VALUETYPE);
                 Self::encode_typedefref_token(*token, buffer)?;
             }
 
             TypeSignature::Class(token) => {
-                buffer.push(0x12); // ELEMENT_TYPE_CLASS
+                buffer.push(ELEMENT_TYPE::CLASS);
                 Self::encode_typedefref_token(*token, buffer)?;
             }
 
             // Generic parameters
             TypeSignature::GenericParamType(index) => {
-                buffer.push(0x13); // ELEMENT_TYPE_VAR
-                write_compressed_uint(*index, buffer);
+                buffer.push(ELEMENT_TYPE::VAR);
+                write_compressed_uint(*index, buffer)?;
             }
 
             TypeSignature::GenericParamMethod(index) => {
-                buffer.push(0x1E); // ELEMENT_TYPE_MVAR
-                write_compressed_uint(*index, buffer);
+                buffer.push(ELEMENT_TYPE::MVAR);
+                write_compressed_uint(*index, buffer)?;
             }
 
             // Reference and pointer types
             TypeSignature::ByRef(inner) => {
-                buffer.push(0x10); // ELEMENT_TYPE_BYREF
+                buffer.push(ELEMENT_TYPE::BYREF);
                 Self::encode_type_signature_internal(inner, buffer, depth.saturating_add(1))?;
             }
 
             TypeSignature::Ptr(pointer) => {
-                buffer.push(0x0F); // ELEMENT_TYPE_PTR
-                                   // Encode custom modifiers
+                buffer.push(ELEMENT_TYPE::PTR);
+                // Encode custom modifiers
                 Self::encode_custom_modifiers(&pointer.modifiers, buffer)?;
                 Self::encode_type_signature_internal(
                     &pointer.base,
@@ -240,22 +240,22 @@ impl TypeSignatureEncoder {
             }
 
             TypeSignature::Pinned(inner) => {
-                buffer.push(0x45); // ELEMENT_TYPE_PINNED
+                buffer.push(ELEMENT_TYPE::PINNED);
                 Self::encode_type_signature_internal(inner, buffer, depth.saturating_add(1))?;
             }
 
             // Array types
             TypeSignature::SzArray(array) => {
-                buffer.push(0x1D); // ELEMENT_TYPE_SZARRAY
-                                   // Encode custom modifiers
+                buffer.push(ELEMENT_TYPE::SZARRAY);
+                // Encode custom modifiers
                 Self::encode_custom_modifiers(&array.modifiers, buffer)?;
                 Self::encode_type_signature_internal(&array.base, buffer, depth.saturating_add(1))?;
             }
 
             TypeSignature::Array(array) => {
-                buffer.push(0x14); // ELEMENT_TYPE_ARRAY
+                buffer.push(ELEMENT_TYPE::ARRAY);
                 Self::encode_type_signature_internal(&array.base, buffer, depth.saturating_add(1))?;
-                write_compressed_uint(array.rank, buffer);
+                write_compressed_uint(array.rank, buffer)?;
 
                 // Collect sizes and lower bounds from dimensions
                 let mut sizes = Vec::new();
@@ -276,9 +276,9 @@ impl TypeSignatureEncoder {
                         malformed_error!("Array sizes length out of range: {}", sizes.len())
                     })?,
                     buffer,
-                );
+                )?;
                 for size in sizes {
-                    write_compressed_uint(size, buffer);
+                    write_compressed_uint(size, buffer)?;
                 }
 
                 // Encode NumLoBounds and LoBounds
@@ -290,7 +290,7 @@ impl TypeSignatureEncoder {
                         )
                     })?,
                     buffer,
-                );
+                )?;
                 for lower_bound in lower_bounds {
                     write_compressed_int(lower_bound, buffer)?;
                 }
@@ -298,7 +298,7 @@ impl TypeSignatureEncoder {
 
             // Generic type instantiation
             TypeSignature::GenericInst(base_type, type_args) => {
-                buffer.push(0x15); // ELEMENT_TYPE_GENERICINST
+                buffer.push(ELEMENT_TYPE::GENERICINST);
                 Self::encode_type_signature_internal(base_type, buffer, depth.saturating_add(1))?;
                 write_compressed_uint(
                     u32::try_from(type_args.len()).map_err(|_| {
@@ -308,7 +308,7 @@ impl TypeSignatureEncoder {
                         )
                     })?,
                     buffer,
-                );
+                )?;
                 for type_arg in type_args {
                     Self::encode_type_signature_internal(
                         type_arg,
@@ -320,7 +320,7 @@ impl TypeSignatureEncoder {
 
             // Function pointer
             TypeSignature::FnPtr(method_sig) => {
-                buffer.push(0x1B); // ELEMENT_TYPE_FNPTR
+                buffer.push(ELEMENT_TYPE::FNPTR);
                 Self::encode_method_signature(
                     method_sig.as_ref(),
                     buffer,
@@ -355,8 +355,8 @@ impl TypeSignatureEncoder {
                     "Cannot encode internal type signature".to_string(),
                 ));
             }
-            TypeSignature::Modifier => buffer.push(0x22), // Modifier sentinel
-            TypeSignature::Sentinel => buffer.push(0x41), // Vararg sentinel
+            TypeSignature::Modifier => buffer.push(ELEMENT_TYPE::MODIFIER),
+            TypeSignature::Sentinel => buffer.push(ELEMENT_TYPE::SENTINEL),
             TypeSignature::Reserved => {
                 return Err(Error::ModificationInvalid(
                     "Cannot encode reserved type signature".to_string(),
@@ -398,7 +398,7 @@ impl TypeSignatureEncoder {
 
         buffer.push(method_sig.calling_convention());
         if method_sig.param_count_generic > 0 {
-            write_compressed_uint(method_sig.param_count_generic, buffer);
+            write_compressed_uint(method_sig.param_count_generic, buffer)?;
         }
 
         let total = method_sig
@@ -410,7 +410,7 @@ impl TypeSignatureEncoder {
                 malformed_error!("Method parameters length out of range: {}", total)
             })?,
             buffer,
-        );
+        )?;
 
         let depth = depth.saturating_add(1);
         Self::encode_parameter(&method_sig.return_type, buffer, depth)?;
@@ -513,7 +513,7 @@ impl TypeSignatureEncoder {
             }
         };
 
-        write_compressed_uint(coded_index, buffer);
+        write_compressed_uint(coded_index, buffer)?;
         Ok(())
     }
 }
@@ -522,7 +522,9 @@ impl TypeSignatureEncoder {
 mod tests {
     use super::*;
     use crate::metadata::{
-        signatures::{SignatureArray, SignaturePointer, SignatureSzArray},
+        signatures::{
+            parse_type_spec_signature, SignatureArray, SignaturePointer, SignatureSzArray,
+        },
         typesystem::ArrayDimensions,
     };
 
@@ -816,6 +818,38 @@ mod tests {
         assert_eq!(encoded, vec![0x45, 0x08]); // ELEMENT_TYPE_PINNED + ELEMENT_TYPE_I4
     }
 
+    /// Every element type the parser reads on its own encodes back to its own byte: the
+    /// encoder wrote `ELEMENT_TYPE_MODIFIER` (0x40) as 0x22, which nothing reads.
+    #[test]
+    fn every_element_type_encodes_to_the_byte_it_is_read_from() {
+        for byte in [
+            ELEMENT_TYPE::VOID,
+            ELEMENT_TYPE::BOOLEAN,
+            ELEMENT_TYPE::CHAR,
+            ELEMENT_TYPE::I1,
+            ELEMENT_TYPE::U1,
+            ELEMENT_TYPE::I2,
+            ELEMENT_TYPE::U2,
+            ELEMENT_TYPE::I4,
+            ELEMENT_TYPE::U4,
+            ELEMENT_TYPE::I8,
+            ELEMENT_TYPE::U8,
+            ELEMENT_TYPE::R4,
+            ELEMENT_TYPE::R8,
+            ELEMENT_TYPE::STRING,
+            ELEMENT_TYPE::TYPEDBYREF,
+            ELEMENT_TYPE::I,
+            ELEMENT_TYPE::U,
+            ELEMENT_TYPE::OBJECT,
+            ELEMENT_TYPE::MODIFIER,
+            ELEMENT_TYPE::SENTINEL,
+        ] {
+            let read = parse_type_spec_signature(&[ELEMENT_TYPE::BYREF, byte]).unwrap();
+            let encoded = TypeSignatureEncoder::encode(&read.base).unwrap();
+            assert_eq!(encoded, [ELEMENT_TYPE::BYREF, byte], "{:?}", read.base);
+        }
+    }
+
     #[test]
     fn test_encode_special_types() {
         // Test custom attribute special types
@@ -829,7 +863,7 @@ mod tests {
         );
         assert_eq!(
             TypeSignatureEncoder::encode(&TypeSignature::Modifier).unwrap(),
-            vec![0x22]
+            vec![0x40]
         );
         assert_eq!(
             TypeSignatureEncoder::encode(&TypeSignature::Sentinel).unwrap(),

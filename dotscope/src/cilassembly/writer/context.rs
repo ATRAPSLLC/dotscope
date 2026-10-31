@@ -34,9 +34,7 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     cilassembly::{
         changes::AssemblyChanges,
-        writer::{
-            heaps::HeapRemapping, output::Output, remapper::TokenRemap, signatures::SignatureBlob,
-        },
+        writer::{blobs::TypedBlob, heaps::HeapRemapping, output::Output, remapper::TokenRemap},
         CilAssembly,
     },
     file::pe::{OptionalHeader, SectionTable},
@@ -274,10 +272,13 @@ pub struct WriteContext<'a> {
     /// Serialized export table bytes for mixed-mode assemblies with native exports.
     pub export_table_bytes: Option<Vec<u8>>,
 
-    /// Original debug directory location (RVA, size). Stored but not used since
-    /// debug data becomes invalid after assembly modification. The directory
-    /// entry is zeroed during generation.
+    /// Original debug directory location (RVA, size). A write that changes nothing copies
+    /// the directory and its data; any other write drops them, since the debug data no
+    /// longer describes the code.
     pub original_debug_dir: Option<(u32, u32)>,
+
+    /// Where the copied debug directory sits in the output (RVA, size), when it was kept.
+    pub debug_dir: Option<(u32, u32)>,
 
     /// Original certificate directory location (file offset, size). Certificates
     /// are invalidated by any modification. Unlike other directories, this uses
@@ -321,9 +322,23 @@ pub struct WriteContext<'a> {
     /// types, the entry point) are renumbered once rows are deleted or deduplicated.
     pub tokens: TokenRemap,
 
-    /// The blobs signature columns reference, by the index the blob heap writer meets them
-    /// at; their type tokens are renumbered with [`tokens`](Self::tokens).
-    pub signature_blobs: HashMap<u32, SignatureBlob>,
+    /// The blobs whose content names rows or blobs (signatures, and the Portable PDB blobs),
+    /// by the index the blob heap writer meets them at: the rows they name are renumbered
+    /// with [`tokens`](Self::tokens), and the blobs they name follow the rebuilt heap.
+    pub typed_blobs: HashMap<u32, TypedBlob>,
+
+    /// Every `#Strings` offset a row of the written tables names, an offset inside another
+    /// string's bytes (a shared tail) among them: the heap writer keeps each one pointing at
+    /// the same string when the heap is rebuilt.
+    pub referenced_string_offsets: HashSet<u32>,
+
+    /// Every `#Blob` offset a row of the written tables names: the heap writer writes each one
+    /// that is not an entry of the heap's own walk (an offset inside another blob) as an entry
+    /// of its own, so it keeps naming the same bytes.
+    pub referenced_blob_offsets: HashSet<u32>,
+
+    /// Every `#US` offset an `ldstr` of a written body names, kept the same way.
+    pub referenced_userstring_offsets: HashSet<u32>,
 
     /// StandAloneSig RIDs to skip during table writing (duplicates).
     /// When multiple StandAloneSig entries have identical blob content,
@@ -496,6 +511,7 @@ impl<'a> WriteContext<'a> {
             export_table_bytes: None,
 
             original_debug_dir: None,
+            debug_dir: None,
             original_certificate_dir: None,
             pe_resource_offset: 0,
             pe_resource_size: 0,
@@ -506,7 +522,10 @@ impl<'a> WriteContext<'a> {
             resource_offset_remap: HashMap::new(),
             heap_remapping: HeapRemapping::default(),
             tokens: TokenRemap::default(),
-            signature_blobs: HashMap::new(),
+            typed_blobs: HashMap::new(),
+            referenced_string_offsets: HashSet::new(),
+            referenced_blob_offsets: HashSet::new(),
+            referenced_userstring_offsets: HashSet::new(),
             standalonesig_skip: HashSet::new(),
 
             entry_point_token,

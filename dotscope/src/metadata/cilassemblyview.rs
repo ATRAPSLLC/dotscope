@@ -206,14 +206,14 @@ impl<'a> CilAssemblyViewData<'a> {
             return Err(Error::NotSupported);
         }
 
+        // Each structure lies within its section's data, where the runtime reads it
         let clr_offset = file.rva_to_offset(clr_rva)?;
+        if clr_size > file.section_bounded(clr_rva)?.len() {
+            return Err(out_of_bounds_error!());
+        }
         let clr_end = clr_offset
             .checked_add(clr_size)
             .ok_or(out_of_bounds_error!())?;
-
-        if clr_size > data.len() || clr_offset > data.len() || clr_end > data.len() {
-            return Err(out_of_bounds_error!());
-        }
 
         let cor20_header = Cor20Header::read(
             data.get(clr_offset..clr_end)
@@ -227,13 +227,16 @@ impl<'a> CilAssemblyViewData<'a> {
         );
 
         let metadata_offset = file.rva_to_offset(cor20_header.meta_data_rva as usize)?;
+        if cor20_header.meta_data_size as usize
+            > file
+                .section_bounded(cor20_header.meta_data_rva as usize)?
+                .len()
+        {
+            return Err(out_of_bounds_error!());
+        }
         let metadata_end = metadata_offset
             .checked_add(cor20_header.meta_data_size as usize)
             .ok_or(out_of_bounds_error!())?;
-
-        if metadata_end > data.len() {
-            return Err(out_of_bounds_error!());
-        }
 
         let metadata_slice = data
             .get(metadata_offset..metadata_end)
@@ -744,7 +747,10 @@ impl CilAssemblyView {
     ///
     /// Returns a fully constructed `CilAssemblyView` with parsed metadata structures
     /// or an error if parsing or validation fails.
-    fn load_with_validation(file: Arc<File>, validation_config: ValidationConfig) -> Result<Self> {
+    pub(crate) fn load_with_validation(
+        file: Arc<File>,
+        validation_config: ValidationConfig,
+    ) -> Result<Self> {
         let view = CilAssemblyView::try_new(file, |file| {
             CilAssemblyViewData::from_dotscope_file(file.clone(), file.data())
         })?;

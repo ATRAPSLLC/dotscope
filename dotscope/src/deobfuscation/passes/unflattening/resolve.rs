@@ -49,8 +49,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     analysis::{
-        CmpKind, ConstValue, PhiNode, SsaCfg, SsaFunction, SsaInstruction, SsaOp, SsaVarId,
-        VariableOrigin,
+        CmpKind, ConstValue, DefSite, PhiNode, SsaCfg, SsaFunction, SsaInstruction, SsaOp,
+        SsaVarId, VariableOrigin,
     },
     deobfuscation::passes::unflattening::dispatcher::Dispatcher,
     metadata::{token::Token, typesystem::PointerSize},
@@ -1530,10 +1530,27 @@ pub fn clear_unreachable(ssa: &mut SsaFunction) -> usize {
 /// and the now-dead constants that encoded the state are cleaned up by the
 /// caller's `rebuild_ssa` and the ordinary dead-code passes.
 ///
+/// An edge whose merge point is not the dispatcher (a case's two branches meeting before
+/// the jump to it) skips the blocks from that merge to the dispatcher, and what they did
+/// has to happen on the new edge: [`carry_skipped_chain`].
+///
+/// # Arguments
+///
+/// * `ssa` - The function, its cross-block values already given slots.
+/// * `rewires` - The edges to rewire.
+/// * `dispatchers` - The dispatcher blocks, where a skipped chain ends.
+///
 /// Returns the number of edges actually rewired.
-pub fn apply_rewires(ssa: &mut SsaFunction, rewires: &[Rewire]) -> usize {
+pub fn apply_rewires(
+    ssa: &mut SsaFunction,
+    rewires: &[Rewire],
+    dispatchers: &BTreeSet<usize>,
+) -> usize {
     let mut applied: usize = 0;
     for rewire in rewires {
+        if !dispatchers.contains(&rewire.old) && !carry_skipped_chain(ssa, rewire, dispatchers) {
+            continue;
+        }
         let changed = ssa
             .block_mut(rewire.from)
             .and_then(|block| block.instructions_mut().last_mut())
@@ -1543,6 +1560,107 @@ pub fn apply_rewires(ssa: &mut SsaFunction, rewires: &[Rewire]) -> usize {
         }
     }
     applied
+}
+
+/// Does at the end of `rewire.from` what the blocks it now skips did on its behalf.
+///
+/// The chain from `rewire.old` to the dispatcher is state plumbing (the resolver only skips
+/// such a chain) plus what giving cross-block values slots wrote at its end: the values the
+/// dispatcher's phis took on the chain's edge. After copy propagation that is where a case
+/// hands the next case a program value, as in a loop whose case computes `lower =
+/// char.ToLower(c)` and the cases after it read `lower`: skipping the chain without its
+/// writes left them reading the value `lower` had on entry.
+///
+/// Each chain instruction is written again at the end of `from`, its definitions given fresh
+/// names in their own storage groups, and each chain phi read as the operand on the edge the
+/// replica stands for. The instructions are pure, so running them on every path that skips
+/// the chain changes nothing else.
+///
+/// # Returns
+///
+/// `false`, leaving the function unchanged, when the chain does not end at a dispatcher,
+/// holds an instruction with an effect, or has a phi with no operand for the edge taken.
+fn carry_skipped_chain(
+    ssa: &mut SsaFunction,
+    rewire: &Rewire,
+    dispatchers: &BTreeSet<usize>,
+) -> bool {
+    let mut chain: Vec<usize> = Vec::new();
+    let mut current = rewire.old;
+    while !dispatchers.contains(&current) {
+        if chain.len() >= MAX_CHAIN_LEN {
+            return false;
+        }
+        let Some(SsaOp::Jump { target }) = ssa.block(current).and_then(|b| b.last_op()) else {
+            return false;
+        };
+        chain.push(current);
+        current = *target;
+    }
+
+    // The replicas, with the names they read and write remapped: a chain phi to what its
+    // edge brings, a chain definition to its replica
+    let mut renamed: BTreeMap<SsaVarId, SsaVarId> = BTreeMap::new();
+    let mut replicas: Vec<SsaInstruction> = Vec::new();
+    let mut previous = rewire.from;
+    for &block_id in &chain {
+        let Some(block) = ssa.block(block_id) else {
+            return false;
+        };
+        for phi in block.phi_nodes() {
+            let Some(operand) = phi
+                .operands()
+                .iter()
+                .find(|operand| operand.predecessor() == previous && !operand.is_exceptional())
+            else {
+                return false;
+            };
+            let value = renamed
+                .get(&operand.value())
+                .copied()
+                .unwrap_or(operand.value());
+            renamed.insert(phi.result(), value);
+        }
+        let body: Vec<SsaInstruction> = block
+            .instructions()
+            .iter()
+            .filter(|instruction| !instruction.is_terminator())
+            .cloned()
+            .collect();
+        for instruction in body {
+            if !instruction.is_pure() {
+                return false;
+            }
+            for def in instruction.op().defs() {
+                let Some(variable) = ssa.variable(def) else {
+                    return false;
+                };
+                let (origin, var_type) = (variable.origin(), variable.var_type().clone());
+                let group = ssa.rename_group(def);
+                let fresh = ssa.create_variable(origin, 0, DefSite::entry(), var_type);
+                ssa.set_rename_group(fresh, group);
+                renamed.insert(def, fresh);
+            }
+            let op = instruction
+                .op()
+                .remap_variables(|var| renamed.get(&var).copied());
+            replicas.push(SsaInstruction::synthetic(op));
+        }
+        previous = block_id;
+    }
+
+    let Some(from) = ssa.block_mut(rewire.from) else {
+        return false;
+    };
+    let instructions = from.instructions_mut();
+    let at = instructions
+        .iter()
+        .position(SsaInstruction::is_terminator)
+        .unwrap_or(instructions.len());
+    for (offset, replica) in replicas.into_iter().enumerate() {
+        instructions.insert(at.saturating_add(offset), replica);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1792,7 +1910,10 @@ mod tests {
         let (mut ssa, dispatcher) = constant_state_cff();
         let (rewires, _) = resolve_dispatch_edges(&ssa, &dispatcher, None);
 
-        assert_eq!(apply_rewires(&mut ssa, &rewires), 2);
+        assert_eq!(
+            apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block])),
+            2
+        );
         assert!(
             SsaCfg::from_ssa(&ssa).block_predecessors(2).is_empty(),
             "no edge should still reach the dispatcher"
@@ -1830,7 +1951,7 @@ mod tests {
         // husk's own edge, whose state the emptying took with it.
         assert_eq!(stats.unresolved, 2, "those edges keep using the dispatcher");
 
-        apply_rewires(&mut ssa, &rewires);
+        apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block]));
 
         // The dispatcher's own switch still names the husk - that is the input
         // condition, and leaving it is what keeps the edge safe. What must not
@@ -1900,7 +2021,7 @@ mod tests {
         let (rewires, stats) = resolve_dispatch_edges(&ssa, &dispatcher, None);
         assert_eq!(stats.unresolved, 1, "the entry edge no longer folds");
 
-        apply_rewires(&mut ssa, &rewires);
+        apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block]));
         assert_eq!(
             SsaCfg::from_ssa(&ssa).block_predecessors(2),
             [0],

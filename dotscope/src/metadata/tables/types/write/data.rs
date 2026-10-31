@@ -433,28 +433,26 @@ impl TableDataOwned {
             Self::GenericParam(row) => row.resolve_placeholders(changes),
             Self::MethodSpec(row) => row.resolve_placeholders(changes),
             Self::GenericParamConstraint(row) => row.resolve_placeholders(changes),
-            // Tables without heap refs - these don't need resolution
-            Self::FieldPtr(_)
-            | Self::MethodPtr(_)
-            | Self::ParamPtr(_)
-            | Self::Document(_)
-            | Self::MethodDebugInformation(_)
-            | Self::LocalScope(_)
-            | Self::LocalVariable(_)
-            | Self::LocalConstant(_)
-            | Self::ImportScope(_)
-            | Self::StateMachineMethod(_)
-            | Self::CustomDebugInformation(_)
-            | Self::EncLog(_)
+            Self::FieldPtr(row) => row.resolve_placeholders(changes),
+            Self::MethodPtr(row) => row.resolve_placeholders(changes),
+            Self::ParamPtr(row) => row.resolve_placeholders(changes),
+            Self::EventPtr(row) => row.resolve_placeholders(changes),
+            Self::PropertyPtr(row) => row.resolve_placeholders(changes),
+            Self::AssemblyRefProcessor(row) => row.resolve_placeholders(changes),
+            Self::AssemblyRefOS(row) => row.resolve_placeholders(changes),
+            Self::Document(row) => row.resolve_placeholders(changes),
+            Self::MethodDebugInformation(row) => row.resolve_placeholders(changes),
+            Self::LocalScope(row) => row.resolve_placeholders(changes),
+            Self::LocalVariable(row) => row.resolve_placeholders(changes),
+            Self::LocalConstant(row) => row.resolve_placeholders(changes),
+            Self::ImportScope(row) => row.resolve_placeholders(changes),
+            Self::StateMachineMethod(row) => row.resolve_placeholders(changes),
+            Self::CustomDebugInformation(row) => row.resolve_placeholders(changes),
+            // Tables whose columns are constants and tokens, never placeholders
+            Self::EncLog(_)
             | Self::EncMap(_)
-            | Self::EventPtr(_)
-            | Self::PropertyPtr(_)
             | Self::AssemblyProcessor(_)
-            | Self::AssemblyOS(_)
-            | Self::AssemblyRefProcessor(_)
-            | Self::AssemblyRefOS(_) => {
-                // These tables don't have heap references that use placeholders
-            }
+            | Self::AssemblyOS(_) => {}
         }
     }
 }

@@ -6,9 +6,7 @@
 
 use crate::{
     file::parser::Parser,
-    metadata::marshalling::types::{
-        MarshallingInfo, NativeType, MAX_RECURSION_DEPTH, NATIVE_TYPE, VARIANT_TYPE,
-    },
+    metadata::marshalling::types::{MarshallingInfo, NativeType, MAX_RECURSION_DEPTH, NATIVE_TYPE},
     Error::RecursionLimit,
     Result,
 };
@@ -186,7 +184,9 @@ impl<'a> MarshallingParser<'a> {
     /// * `Ok(None)` - If no more data or next byte is END marker
     /// * `Err(...)` - If reading fails
     fn parse_optional_compressed_uint(&mut self) -> Result<Option<u32>> {
-        if self.parser.has_more_data() && self.parser.peek_byte()? != NATIVE_TYPE::END {
+        // The descriptor is a blob of its own length: an optional field is present when
+        // bytes remain, a 0 among them (a parameter index of 0) too
+        if self.parser.has_more_data() {
             Ok(Some(self.parser.read_compressed_uint()?))
         } else {
             Ok(None)
@@ -201,7 +201,7 @@ impl<'a> MarshallingParser<'a> {
     /// * `Ok(None)` - If no more data or next byte is END marker
     /// * `Err(...)` - If reading fails
     fn parse_optional_byte(&mut self) -> Result<Option<u8>> {
-        if self.parser.has_more_data() && self.parser.peek_byte()? != NATIVE_TYPE::END {
+        if self.parser.has_more_data() {
             Ok(Some(self.parser.read_le::<u8>()?))
         } else {
             Ok(None)
@@ -210,7 +210,7 @@ impl<'a> MarshallingParser<'a> {
 
     /// Checks if more optional data is available (not at END and has more bytes).
     fn has_optional_data(&mut self) -> Result<bool> {
-        Ok(self.parser.has_more_data() && self.parser.peek_byte()? != NATIVE_TYPE::END)
+        Ok(self.parser.has_more_data())
     }
 
     /// Parses a single native type from the current position
@@ -233,7 +233,8 @@ impl<'a> MarshallingParser<'a> {
     fn parse_native_type_inner(&mut self) -> Result<NativeType> {
         let head_byte = self.parser.read_le::<u8>()?;
         match head_byte {
-            NATIVE_TYPE::END | NATIVE_TYPE::MAX => Ok(NativeType::End),
+            NATIVE_TYPE::END => Ok(NativeType::End),
+            NATIVE_TYPE::MAX => Ok(NativeType::Unspecified),
             NATIVE_TYPE::VOID => Ok(NativeType::Void),
             NATIVE_TYPE::BOOLEAN => Ok(NativeType::Boolean),
             NATIVE_TYPE::I1 => Ok(NativeType::I1),
@@ -292,23 +293,21 @@ impl<'a> MarshallingParser<'a> {
                 Ok(NativeType::Interface { iid_param_index })
             }
             NATIVE_TYPE::SAFEARRAY => {
-                // Optional<Element_Type> -> VT_TYPE; If none, VT_EMPTY
-                // Optional<String> -> User defined name/string
-
-                let mut variant_type = VARIANT_TYPE::EMPTY;
-                let mut user_defined_name = None;
-
-                // Always try to read variant type if there's more data
-                // The variant type can be 0 (EMPTY), which is different from END marker context
-                if self.parser.has_more_data() {
-                    variant_type = u16::from(self.parser.read_le::<u8>()?) & VARIANT_TYPE::TYPEMASK;
-
-                    // Check if there's more data for a string
-                    // Only skip reading if we hit an explicit END marker
-                    if self.parser.has_more_data() && self.parser.peek_byte()? != NATIVE_TYPE::END {
-                        user_defined_name = Some(self.parser.read_string_utf8()?);
-                    }
-                }
+                // SAFEARRAY Opt<VARTYPE> Opt<user-defined type name>: a compressed VARTYPE
+                // and a length-prefixed name, each present when bytes remain
+                let variant_type = if self.parser.has_more_data() {
+                    let value = self.parser.read_compressed_uint()?;
+                    Some(u16::try_from(value).map_err(|_| {
+                        malformed_error!("SAFEARRAY element VARTYPE 0x{:X} exceeds 16 bits", value)
+                    })?)
+                } else {
+                    None
+                };
+                let user_defined_name = if self.parser.has_more_data() {
+                    Some(self.parser.read_compressed_string_utf8()?)
+                } else {
+                    None
+                };
 
                 Ok(NativeType::SafeArray {
                     variant_type,
@@ -318,23 +317,28 @@ impl<'a> MarshallingParser<'a> {
             NATIVE_TYPE::FIXEDARRAY => {
                 let size = self.parser.read_compressed_uint()?;
                 // Optional element type
+                // The element is its type's tag alone, as CoreCLR reads it
                 let element_type = if self.has_optional_data()? {
-                    Some(Box::new(self.parse_native_type()?))
+                    Some(self.parser.read_le::<u8>()?)
                 } else {
                     None
                 };
                 Ok(NativeType::FixedArray { size, element_type })
             }
             NATIVE_TYPE::ARRAY => {
-                // ARRAY Type Opt<ParamNumber> Opt<NumElement>
-                let array_type = self.parse_native_type()?;
+                // ARRAY Type Opt<ParamNumber> Opt<NumElement> Opt<Flags>
+                // The element is its type's tag alone (ECMA-335 II.23.4): an array of LPSTR
+                // is followed by the array's parameter index, not the string's
+                let array_type = self.parser.read_le::<u8>()?;
                 let num_param = self.parse_optional_compressed_uint()?;
                 let num_element = self.parse_optional_compressed_uint()?;
+                let flags = self.parse_optional_compressed_uint()?;
 
                 Ok(NativeType::Array {
-                    element_type: Box::new(array_type),
+                    element_type: array_type,
                     num_param,
                     num_element,
+                    flags,
                 })
             }
             NATIVE_TYPE::NESTEDSTRUCT => Ok(NativeType::NestedStruct),
@@ -349,10 +353,12 @@ impl<'a> MarshallingParser<'a> {
             NATIVE_TYPE::ASANY => Ok(NativeType::AsAny),
             NATIVE_TYPE::LPSTRUCT => Ok(NativeType::LPStruct),
             NATIVE_TYPE::CUSTOMMARSHALER => {
-                let guid = self.parser.read_string_utf8()?;
-                let native_type_name = self.parser.read_string_utf8()?;
-                let cookie = self.parser.read_string_utf8()?;
-                let type_reference = self.parser.read_string_utf8()?;
+                // Four length-prefixed strings: the GUID, the unmanaged type name, the
+                // managed type of the marshaler, and the cookie (ECMA-335 II.23.4)
+                let guid = self.parser.read_compressed_string_utf8()?;
+                let native_type_name = self.parser.read_compressed_string_utf8()?;
+                let type_reference = self.parser.read_compressed_string_utf8()?;
+                let cookie = self.parser.read_compressed_string_utf8()?;
 
                 Ok(NativeType::CustomMarshaler {
                     guid,
@@ -365,7 +371,7 @@ impl<'a> MarshallingParser<'a> {
             NATIVE_TYPE::PTR => {
                 // Optional referenced type
                 let ref_type = if self.has_optional_data()? {
-                    Some(Box::new(self.parse_native_type()?))
+                    Some(self.parser.read_le::<u8>()?)
                 } else {
                     None
                 };
@@ -380,25 +386,11 @@ impl<'a> MarshallingParser<'a> {
     /// # Errors
     /// Returns an error if the marshalling descriptor is malformed or cannot be parsed
     pub fn parse_descriptor(&mut self) -> Result<MarshallingInfo> {
-        let native_type = self.parse_native_type()?;
-
-        let mut descriptor = MarshallingInfo {
-            primary_type: native_type,
-            additional_types: Vec::new(),
-        };
-
-        // Parse additional types if present
-        while self.parser.has_more_data() {
-            if self.parser.peek_byte()? == NATIVE_TYPE::END {
-                self.parser.read_le::<u8>()?; // Consume the end marker
-                break;
-            }
-
-            let additional_type = self.parse_native_type()?;
-            descriptor.additional_types.push(additional_type);
-        }
-
-        Ok(descriptor)
+        // A descriptor is one native type (ECMA-335 II.23.4). Its optional fields take the bytes
+        // that remain, so only a type without them can leave any, which the runtime ignores.
+        Ok(MarshallingInfo {
+            primary_type: self.parse_native_type()?,
+        })
     }
 }
 
@@ -450,7 +442,7 @@ mod tests {
         );
 
         // LPSTR without size parameter
-        let input = vec![NATIVE_TYPE::LPSTR, NATIVE_TYPE::END];
+        let input = vec![NATIVE_TYPE::LPSTR];
         let mut parser = MarshallingParser::new(&input);
         let result = parser.parse_native_type().unwrap();
         assert_eq!(
@@ -475,7 +467,7 @@ mod tests {
         );
 
         // LPUTF8STR without size parameter
-        let input = vec![NATIVE_TYPE::LPUTF8STR, NATIVE_TYPE::END];
+        let input = vec![NATIVE_TYPE::LPUTF8STR];
         let mut parser = MarshallingParser::new(&input);
         let result = parser.parse_native_type().unwrap();
         assert_eq!(
@@ -495,9 +487,10 @@ mod tests {
         assert_eq!(
             result,
             NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_element: Some(1),
-                num_param: Some(3)
+                num_param: Some(3),
+                flags: None
             }
         );
 
@@ -508,9 +501,10 @@ mod tests {
         assert_eq!(
             result,
             NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_element: None,
-                num_param: Some(3)
+                num_param: Some(3),
+                flags: None
             }
         );
 
@@ -521,9 +515,10 @@ mod tests {
         assert_eq!(
             result,
             NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_element: None,
-                num_param: None
+                num_param: None,
+                flags: None
             }
         );
     }
@@ -538,12 +533,12 @@ mod tests {
             result,
             NativeType::FixedArray {
                 size: 10,
-                element_type: Some(Box::new(NativeType::I4))
+                element_type: Some(NATIVE_TYPE::I4)
             }
         );
 
         // Fixed array with size but no element type
-        let input = vec![NATIVE_TYPE::FIXEDARRAY, 0x0A, NATIVE_TYPE::END];
+        let input = vec![NATIVE_TYPE::FIXEDARRAY, 0x0A];
         let mut parser = MarshallingParser::new(&input);
         let result = parser.parse_native_type().unwrap();
         assert_eq!(
@@ -558,33 +553,19 @@ mod tests {
     #[test]
     fn test_parse_complete_descriptor() {
         // Simple descriptor with just one type
-        let input = vec![NATIVE_TYPE::I4, NATIVE_TYPE::END];
+        let input = vec![NATIVE_TYPE::I4];
         let descriptor = parse_marshalling_descriptor(&input).unwrap();
         assert_eq!(descriptor.primary_type, NativeType::I4);
-        assert_eq!(descriptor.additional_types.len(), 0);
 
-        // Descriptor with primary type and additional types
-        let input = vec![
-            NATIVE_TYPE::LPSTR,
-            0x01,                 // LPSTR with size param 1
-            NATIVE_TYPE::BOOLEAN, // Additional type Boolean
-            NATIVE_TYPE::END,     // End marker
-        ];
+        // Bytes after a type without optional fields are not part of the descriptor
+        let input = vec![NATIVE_TYPE::BOOLEAN, NATIVE_TYPE::I4, NATIVE_TYPE::END];
         let descriptor = parse_marshalling_descriptor(&input).unwrap();
-        assert_eq!(
-            descriptor.primary_type,
-            NativeType::LPStr {
-                size_param_index: Some(1)
-            }
-        );
-        assert_eq!(descriptor.additional_types.len(), 1);
-        assert_eq!(descriptor.additional_types[0], NativeType::Boolean);
+        assert_eq!(descriptor.primary_type, NativeType::Boolean);
 
         // Descriptor with only END marker
         let input = vec![NATIVE_TYPE::END];
         let descriptor = parse_marshalling_descriptor(&input).unwrap();
         assert_eq!(descriptor.primary_type, NativeType::End);
-        assert_eq!(descriptor.additional_types.len(), 0);
     }
 
     #[test]
@@ -616,7 +597,7 @@ mod tests {
     #[test]
     fn test_parse_struct() {
         // Struct with packing size and class size
-        let input = vec![NATIVE_TYPE::STRUCT, 0x04, 0x20, NATIVE_TYPE::END];
+        let input = vec![NATIVE_TYPE::STRUCT, 0x04, 0x20];
         let mut parser = MarshallingParser::new(&input);
         let result = parser.parse_native_type().unwrap();
         assert_eq!(
@@ -628,7 +609,7 @@ mod tests {
         );
 
         // Struct with packing size but no class size
-        let input = vec![NATIVE_TYPE::STRUCT, 0x04, NATIVE_TYPE::END];
+        let input = vec![NATIVE_TYPE::STRUCT, 0x04];
         let mut parser = MarshallingParser::new(&input);
         let result = parser.parse_native_type().unwrap();
         assert_eq!(
@@ -640,7 +621,7 @@ mod tests {
         );
 
         // Struct with no packing size or class size
-        let input = vec![NATIVE_TYPE::STRUCT, NATIVE_TYPE::END];
+        let input = vec![NATIVE_TYPE::STRUCT];
         let mut parser = MarshallingParser::new(&input);
         let result = parser.parse_native_type().unwrap();
         assert_eq!(
@@ -654,38 +635,13 @@ mod tests {
 
     #[test]
     fn test_parse_custom_marshaler() {
-        // CustomMarshaler with GUID, native type name, cookie, and type reference
-        let input = vec![
-            NATIVE_TYPE::CUSTOMMARSHALER,
-            // GUID
-            0x41,
-            0x42,
-            0x43,
-            0x44,
-            0x00,
-            // Native type name
-            0x4E,
-            0x61,
-            0x74,
-            0x69,
-            0x76,
-            0x65,
-            0x00,
-            // Cookie
-            0x43,
-            0x6F,
-            0x6F,
-            0x6B,
-            0x69,
-            0x65,
-            0x00,
-            // Type reference
-            0x54,
-            0x79,
-            0x70,
-            0x65,
-            0x00,
-        ];
+        // CUSTOMMARSHALER, then four length-prefixed strings: GUID, unmanaged type name,
+        // the marshaler's managed type, and the cookie (ECMA-335 II.23.4)
+        let mut input = vec![NATIVE_TYPE::CUSTOMMARSHALER];
+        for text in ["ABCD", "Native", "Type", "Cookie"] {
+            input.push(u8::try_from(text.len()).unwrap());
+            input.extend_from_slice(text.as_bytes());
+        }
         let mut parser = MarshallingParser::new(&input);
         let result = parser.parse_native_type().unwrap();
         assert_eq!(

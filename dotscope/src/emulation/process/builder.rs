@@ -134,7 +134,6 @@ fn populate_fieldrva_statics(assembly: &CilObject, address_space: &AddressSpace)
 
     let types = assembly.types();
     let file = assembly.file();
-    let pe_data = file.data();
     let ptr_size = PointerSize::from_is_64bit(file.pe().is_64bit);
 
     for row in fieldrva_table {
@@ -151,17 +150,11 @@ fn populate_fieldrva_statics(assembly: &CilObject, address_space: &AddressSpace)
             continue;
         };
 
-        // Convert RVA to file offset
-        let Ok(file_offset) = file.rva_to_offset(row.rva as usize) else {
+        // The field's bytes as the loaded image holds them
+        let Ok(data) = file.rva_slice(row.rva as usize, field_type_size) else {
             continue;
         };
-
-        let Some(end) = file_offset.checked_add(field_type_size) else {
-            continue;
-        };
-        let Some(data) = pe_data.get(file_offset..end) else {
-            continue;
-        };
+        let data = data.as_ref();
 
         // Convert to EmValue based on size
         let value = match field_type_size {

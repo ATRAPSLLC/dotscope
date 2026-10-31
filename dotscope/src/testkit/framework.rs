@@ -12,13 +12,16 @@ use std::{
 
 use crate::{
     deobfuscation::{DeobfuscationEngine, DeobfuscationResult, EngineConfig},
-    metadata::validation::ValidationConfig,
+    metadata::{
+        method::{exception_structure_defects, Method},
+        validation::ValidationConfig,
+    },
     testkit::{
         fixtures::fixture,
         verification::{
-            assert_deobfuscation_diagnostics, assert_structural_match,
-            verify_semantic_preservation, AssemblyStats, SemanticVerificationResult,
-            StructuralConfig, VerificationLevel,
+            assert_structural_match, inlined_away, pure_methods_of, run_pure_methods,
+            verify_semantic_preservation, AssemblyStats, PureMethod, SemanticVerificationResult,
+            StructuralConfig, PURE_TEST_METHODS,
         },
     },
     CilObject, Error,
@@ -67,30 +70,58 @@ pub fn deobfuscated(sample: &str) -> &'static DeobOutcome {
     run.get_or_init(|| engine().process_file(fixture(sample)))
 }
 
-/// The 17 standard methods used for semantic preservation checks across all
-/// obfuscator test suites. Each obfuscator's original.exe contains these
-/// methods and every deobfuscated output is compared against them.
-pub const SEMANTIC_TEST_METHODS: &[&str] = &[
-    // Original TestApp methods
-    "DemoIfElse",
-    "DemoSwitch",
-    "DemoLoop",
-    "Add",
-    "Subtract",
-    "Multiply",
-    "Divide",
-    "Factorial",
-    "Fibonacci",
-    "SayHello",
-    "SayGoodbye",
-    // Extended pattern methods
-    "DemoCharOperations",
-    "DemoEnumArguments",
-    "DemoTypeOf",
-    "DemoStaticArrayInit",
-    "DemoLockAndUsing",
-    "DemoEmbeddedResources",
-];
+/// A family's unprotected original, what the harness compares each of its samples against.
+pub struct Original {
+    /// The assembly.
+    pub assembly: Arc<CilObject>,
+    /// Its structure.
+    pub stats: AssemblyStats,
+    /// Its [`PURE_TEST_METHODS`], each with the method it is.
+    pub pure_methods: Vec<(&'static PureMethod, Arc<Method>)>,
+    /// What they returned, run by [`run_pure_methods`].
+    pub pure_results: HashMap<&'static str, Vec<String>>,
+}
+
+impl Debug for Original {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Original")
+            .field("stats", &self.stats)
+            .field("pure_results", &self.pure_results)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `original.exe` of `samples_dir`, a fixture directory, loaded and run once per test
+/// binary.
+///
+/// # Panics
+///
+/// When it does not load: every sample family has one, and its samples are compared with it.
+pub fn original(samples_dir: &str) -> &'static Original {
+    static ORIGINALS: OnceLock<Mutex<HashMap<String, &'static OnceLock<Original>>>> =
+        OnceLock::new();
+    let slot: &'static OnceLock<Original> = ORIGINALS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(samples_dir.to_owned())
+        .or_insert_with(|| Box::leak(Box::default()));
+    slot.get_or_init(|| {
+        let path = fixture(&format!("{samples_dir}/original.exe"));
+        let assembly = Arc::new(
+            load_sample(samples_dir, "original.exe")
+                .unwrap_or_else(|error| panic!("{samples_dir}: {error}")),
+        );
+        let pure_methods = pure_methods_of(&assembly, PURE_TEST_METHODS);
+        let pure_results = run_pure_methods(&assembly, &pure_methods);
+        Original {
+            stats: AssemblyStats::from_file(&path),
+            assembly,
+            pure_methods,
+            pure_results,
+        }
+    })
+}
 
 /// Description of a sample and its expected characteristics.
 ///
@@ -107,8 +138,6 @@ pub struct SampleSpec<P: Clone + Debug> {
     pub is_original: bool,
     /// Check semantic preservation against original.exe.
     pub check_semantic_preservation: bool,
-    /// Verification strictness level.
-    pub verification_level: VerificationLevel,
     /// Check structural match against original.exe.
     pub check_structural_match: bool,
     /// Structural match configuration overrides.
@@ -237,8 +266,6 @@ pub struct TestResult<P: Clone + Debug> {
     pub error: Option<String>,
     pub methods_before: usize,
     pub methods_after: usize,
-    pub warning_count: usize,
-    pub error_count: usize,
     pub assembly_valid: bool,
     pub has_valid_entry_point: bool,
     pub roundtrip_ok: bool,
@@ -250,6 +277,11 @@ pub struct TestResult<P: Clone + Debug> {
     pub stats: Option<PipelineStats>,
     pub semantic_result: Option<SemanticVerificationResult>,
     pub deobfuscated_stats: Option<AssemblyStats>,
+    /// The family's unprotected original, compared with.
+    pub original: &'static Original,
+    /// The output's methods whose exception clauses do not structure their code as ECMA-335
+    /// requires, a defect each (see [`exception_structure_defects`]).
+    pub structure_defects: Vec<String>,
 }
 
 /// Load sample `filename` from `samples_dir`, a fixture directory under `tests/samples`.
@@ -264,8 +296,6 @@ pub fn load_sample(samples_dir: &str, filename: &str) -> Result<CilObject, Strin
 pub fn run_deobfuscation_test<P: Clone + Debug>(
     spec: &SampleSpec<P>,
     samples_dir: &str,
-    original_asm: Option<&CilObject>,
-    semantic_methods: &[&str],
     mode: ProcessMode,
 ) -> TestResult<P> {
     let mut result = TestResult {
@@ -274,8 +304,6 @@ pub fn run_deobfuscation_test<P: Clone + Debug>(
         error: None,
         methods_before: 0,
         methods_after: 0,
-        warning_count: 0,
-        error_count: 0,
         assembly_valid: false,
         has_valid_entry_point: false,
         roundtrip_ok: false,
@@ -285,16 +313,22 @@ pub fn run_deobfuscation_test<P: Clone + Debug>(
         stats: None,
         semantic_result: None,
         deobfuscated_stats: None,
+        original: original(samples_dir),
+        structure_defects: Vec::new(),
     };
 
     let sample = format!("{samples_dir}/{}", spec.filename);
 
     // For File mode, try to load the assembly for pre-deobfuscation method count
-    // (it may fail for PE-corrupted samples — that's fine).
-    if mode == ProcessMode::File {
-        if let Ok(input_asm) = load_sample(samples_dir, spec.filename) {
-            result.methods_before = input_asm.methods().iter().count();
-        }
+    // (it may fail for PE-corrupted samples: then nothing can be said about the methods the
+    // run inlined away, and the semantic check counts them as lost).
+    let file_input = if mode == ProcessMode::File {
+        load_sample(samples_dir, spec.filename).ok()
+    } else {
+        None
+    };
+    if let Some(input) = &file_input {
+        result.methods_before = input.methods().iter().count();
     }
 
     // For Assembly mode, load normally
@@ -325,14 +359,7 @@ pub fn run_deobfuscation_test<P: Clone + Debug>(
 
         match deobfuscated(&sample) {
             Ok((output, deob_result)) => {
-                populate_success_result(
-                    &mut result,
-                    output,
-                    deob_result,
-                    spec,
-                    original_asm,
-                    semantic_methods,
-                );
+                populate_success_result(&mut result, output, deob_result, spec, Some(&assembly));
             }
             Err(e) => {
                 result.error = Some(format!("Deobfuscation failed: {}", e));
@@ -364,8 +391,7 @@ pub fn run_deobfuscation_test<P: Clone + Debug>(
                     output,
                     deob_result,
                     spec,
-                    original_asm,
-                    semantic_methods,
+                    file_input.as_ref(),
                 );
             }
             Err(e) => {
@@ -383,8 +409,7 @@ fn populate_success_result<P: Clone + Debug>(
     output: &CilObject,
     deob_result: &DeobfuscationResult,
     spec: &SampleSpec<P>,
-    original_asm: Option<&CilObject>,
-    semantic_methods: &[&str],
+    input: Option<&CilObject>,
 ) {
     result.success = true;
     result.methods_after = output.methods().iter().count();
@@ -402,8 +427,6 @@ fn populate_success_result<P: Clone + Debug>(
         branches_simplified: stats.branches_simplified,
         artifacts_removed: stats.artifacts_removed,
     });
-    result.warning_count = 0;
-    result.error_count = 0;
 
     // Entry point
     result.has_valid_entry_point = output.cor20header().entry_point_token != 0;
@@ -429,39 +452,51 @@ fn populate_success_result<P: Clone + Debug>(
         }
     }
 
+    // Every rewritten body's exception clauses still structure its code
+    for entry in output.methods().iter() {
+        let method = entry.value();
+        if let (Some(body), Some(blocks)) = (method.body.get(), method.blocks.get()) {
+            let instructions: Vec<_> = blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter().cloned())
+                .collect();
+            for defect in exception_structure_defects(&instructions, &body.exception_handlers) {
+                result
+                    .structure_defects
+                    .push(format!("{:?} {}: {defect}", method.token, method.name));
+            }
+        }
+    }
+
     // Collect structural stats
     let output_size = output.file().data().len() as u64;
     result.deobfuscated_stats = Some(AssemblyStats::from_assembly(output, output_size));
 
-    // Semantic preservation
+    // Semantic preservation: the output's pure methods run against the original's. An
+    // output that does not load for it leaves no result, which the assertion reports.
     if spec.check_semantic_preservation && !spec.is_original {
-        if let Some(orig) = original_asm {
-            // Need to reload output from bytes for Arc ownership
-            let output_bytes = output.file().data().to_vec();
-            if let Ok(output_copy) =
-                CilObject::from_mem_with_validation(output_bytes, ValidationConfig::analysis())
-            {
-                result.semantic_result = Some(verify_semantic_preservation(
-                    orig,
-                    Arc::new(output_copy),
-                    semantic_methods,
-                    spec.verification_level,
-                ));
-            }
+        let output_bytes = output.file().data().to_vec();
+        if let Ok(output_copy) =
+            CilObject::from_mem_with_validation(output_bytes, ValidationConfig::analysis())
+        {
+            let original = result.original;
+            result.semantic_result = Some(verify_semantic_preservation(
+                &original.pure_methods,
+                &original.pure_results,
+                &Arc::new(output_copy),
+                &input
+                    .map(|input| inlined_away(input, deob_result))
+                    .unwrap_or_default(),
+            ));
         }
     }
 }
 
-/// Assert common requirements that apply to all deobfuscated samples.
-///
-/// `semantic_threshold` is the minimum preservation ratio (e.g. 0.95).
-/// `require_all_preserved` controls whether `methods_preserved == methods_checked` is asserted.
-pub fn assert_common_requirements<P: Clone + Debug>(
-    result: &TestResult<P>,
-    original_stats: Option<&AssemblyStats>,
-    semantic_threshold: f64,
-    require_all_preserved: bool,
-) {
+/// Assert common requirements that apply to all deobfuscated samples: the output is valid,
+/// round-trips and has its entry point; its exception clauses structure its code; every pure
+/// method computes what the original's does, where the spec checks semantics; and the
+/// structure matches the original's, where the spec checks it.
+pub fn assert_common_requirements<P: Clone + Debug>(result: &TestResult<P>) {
     let filename = result.sample.filename;
 
     // Core: must succeed
@@ -489,55 +524,40 @@ pub fn assert_common_requirements<P: Clone + Debug>(
         filename, result.error
     );
 
+    assert!(
+        result.structure_defects.is_empty(),
+        "{}: exception clauses misstructure the output's code:\n{}",
+        filename,
+        result.structure_defects.join("\n")
+    );
+
     // Semantic preservation (skip for original/unobfuscated samples)
     if result.sample.check_semantic_preservation && !result.sample.is_original {
-        if let Some(ref sem) = result.semantic_result {
-            let preservation_ratio = if sem.methods_checked > 0 {
-                sem.methods_preserved as f64 / sem.methods_checked as f64
-            } else {
-                1.0
-            };
-
-            if require_all_preserved {
-                assert_eq!(
-                    sem.methods_preserved,
-                    sem.methods_checked,
-                    "{}: Not all methods preserved ({}/{} methods, avg similarity {:.0}%)",
-                    filename,
-                    sem.methods_preserved,
-                    sem.methods_checked,
-                    sem.average_similarity * 100.0
-                );
-            }
-
-            assert!(
-                preservation_ratio >= semantic_threshold,
-                "{}: Semantic preservation too low ({}/{} = {:.0}%, expected >= {:.0}%)",
-                filename,
-                sem.methods_preserved,
-                sem.methods_checked,
-                preservation_ratio * 100.0,
-                semantic_threshold * 100.0
-            );
-        }
+        let Some(semantic) = &result.semantic_result else {
+            panic!("{filename}: the output does not load for the semantic check");
+        };
+        assert!(
+            semantic.failures.is_empty() && semantic.methods_checked > 0,
+            "{filename}: {}/{} pure methods compute what the original's do ({} inlined):\n{}",
+            semantic.methods_preserved,
+            semantic.methods_checked,
+            semantic.methods_inlined,
+            semantic.failures.join("\n")
+        );
     }
 
     // Structural match against original
     if result.sample.check_structural_match {
-        if let (Some(orig_stats), Some(ref deob_stats)) =
-            (original_stats, &result.deobfuscated_stats)
-        {
-            assert_structural_match(
-                orig_stats,
-                deob_stats,
-                filename,
-                &result.sample.structural_config,
-            );
-        }
+        let Some(deobfuscated_stats) = &result.deobfuscated_stats else {
+            panic!("{filename}: the output has no structural statistics");
+        };
+        assert_structural_match(
+            &result.original.stats,
+            deobfuscated_stats,
+            filename,
+            &result.sample.structural_config,
+        );
     }
-
-    // Diagnostics
-    assert_deobfuscation_diagnostics(filename, result.warning_count, result.error_count);
 }
 
 /// Print a summary of test results.
@@ -573,8 +593,8 @@ where
 
         // Stats line
         eprintln!(
-            "       Methods: {} -> {} (warnings={} errors={})",
-            result.methods_before, result.methods_after, result.warning_count, result.error_count,
+            "       Methods: {} -> {}",
+            result.methods_before, result.methods_after,
         );
 
         // Post-deobfuscation line
@@ -591,11 +611,12 @@ where
         // Semantic preservation line
         if let Some(ref sem) = result.semantic_result {
             eprintln!(
-                "       Semantic: {}/{} preserved, similarity={:.0}%",
-                sem.methods_preserved,
-                sem.methods_checked,
-                sem.average_similarity * 100.0
+                "       Semantic: {}/{} preserved, {} inlined into their callers",
+                sem.methods_preserved, sem.methods_checked, sem.methods_inlined,
             );
+            for failure in &sem.failures {
+                eprintln!("         {failure}");
+            }
         }
 
         if let Some(ref err) = result.error {

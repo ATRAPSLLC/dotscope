@@ -13,7 +13,7 @@ use crate::{
         customattributes::CustomAttributeValueList,
         marshalling::MarshallingInfo,
         signatures::{SignatureMethod, SignatureParameter},
-        tables::{ParamAttributes, ParamRc},
+        tables::{ParamAttributes, ParamList},
         token::Token,
         typesystem::{CilPrimitive, CilTypeRef, CilTypeRefList, TypeRegistry, TypeResolver},
     },
@@ -221,10 +221,8 @@ impl Param {
     pub fn from_signature(
         signature: &SignatureMethod,
         types: &Arc<TypeRegistry>,
-    ) -> Result<Arc<boxcar::Vec<ParamRc>>> {
-        let params = Arc::new(boxcar::Vec::with_capacity(
-            signature.params.len().saturating_add(1),
-        ));
+    ) -> Result<ParamList> {
+        let params = ParamList::new();
         let param_count = Some(signature.params.len());
         for (sequence, param_signature) in std::iter::once(&signature.return_type)
             .chain(&signature.params)

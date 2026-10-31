@@ -350,6 +350,7 @@ pub fn build_call_site_skeleton(ssa: &SsaFunction, assembly: &CilObject) -> Opti
                 dest,
                 operand,
                 target,
+                ..
             } => {
                 lines.push(format!(
                     "    var_{} = ({target})var_{};",

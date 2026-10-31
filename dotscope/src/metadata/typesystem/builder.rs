@@ -869,21 +869,22 @@ impl TypeBuilder {
         Ok(self)
     }
 
-    /// Create a generic instance of the current type
+    /// Create a generic instance of the current type, named as the type is and nested where it
+    /// is.
     ///
     /// ## Arguments
     /// * `arg_count`   - Argument count for the generic instance
     /// * `arg_builder` - Builder function for the arguments
     ///
     /// # Errors
-    /// Returns an error if no current type is set, if the argument builder fails,
-    /// or if the generic instance type cannot be created.
+    /// Returns an error if the argument builder fails or builds other than `arg_count`
+    /// arguments, or if the generic instance type cannot be created.
     pub fn generic_instance<F>(mut self, arg_count: usize, arg_builder: F) -> Result<Self>
     where
         F: FnOnce(Arc<TypeRegistry>) -> Result<Vec<CilTypeRc>>,
     {
         if let Some(base_type) = self.current_type.take() {
-            let name = Self::format_generic_name(&base_type.name, arg_count);
+            let name = base_type.name.clone();
             let namespace = base_type.namespace.clone();
             let generic_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                 token_init: self.token_init.take(),
@@ -897,6 +898,13 @@ impl TypeBuilder {
             })?;
 
             let args = arg_builder(self.registry.clone())?;
+            if args.len() != arg_count {
+                return Err(malformed_error!(
+                    "Generic instance of {} takes {arg_count} arguments, {} were built",
+                    base_type.name,
+                    args.len()
+                ));
+            }
             if !args.is_empty() {
                 // For type-level generic instances, create MethodSpec instances that wrap the resolved types
                 for (index, arg) in args.iter().enumerate() {
@@ -931,38 +939,12 @@ impl TypeBuilder {
                     generic_type.generic_args.push(method_spec);
                 }
             }
-
-            generic_type
-                .base
-                .set(base_type.into())
-                .map_err(|_| malformed_error!("Generic type base already set"))?;
+            if let Some(enclosing) = base_type.enclosing_type.get() {
+                let _ = generic_type.set_enclosing_type(enclosing);
+            }
             self.current_type = Some(generic_type);
         }
         Ok(self)
-    }
-
-    /// Formats a type name with generic arity marker.
-    ///
-    /// If the name doesn't already contain a backtick (`), appends the generic arity
-    /// in the format `Name`N` where N is the number of type arguments.
-    ///
-    /// # Arguments
-    /// * `base_name` - The original type name
-    /// * `arg_count` - The number of generic type arguments
-    ///
-    /// # Returns
-    /// The name with generic arity marker, or the original name if already present.
-    ///
-    /// # Examples
-    /// - `"List"` with 1 arg becomes `"List`1"`
-    /// - `"Dictionary"` with 2 args becomes `"Dictionary`2"`
-    /// - `"List`1"` with 1 arg stays `"List`1"`
-    fn format_generic_name(base_name: &str, arg_count: usize) -> String {
-        if base_name.contains('`') {
-            base_name.to_string()
-        } else {
-            format!("{base_name}`{arg_count}")
-        }
     }
 
     /// Finalizes the type construction and returns the built type.

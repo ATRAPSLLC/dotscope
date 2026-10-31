@@ -47,9 +47,10 @@ impl EmValue {
             )));
         }
 
+        let value = self.on_stack();
         let result = match op {
-            UnaryOp::Neg => self.neg(),
-            UnaryOp::Not => self.not(),
+            UnaryOp::Neg => value.neg(),
+            UnaryOp::Not => value.not(),
         }?;
 
         // Mask native int/uint results to the target pointer width

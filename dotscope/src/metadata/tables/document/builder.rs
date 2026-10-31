@@ -46,8 +46,9 @@
 //! - **Heap Management**: Strings, blobs, and GUIDs are added to appropriate heaps
 
 use crate::{
-    cilassembly::{ChangeRefRc, CilAssembly},
+    cilassembly::{BlobComposite, ChangeRefRc, CilAssembly},
     metadata::{
+        pdb::{guids, split_document_name},
         tables::{DocumentRaw, TableDataOwned, TableId},
         token::Token,
     },
@@ -149,6 +150,11 @@ impl DocumentBuilder {
     /// the source document. This is the primary identifier for the document
     /// and is required for building the document entry.
     ///
+    /// The name is stored as a DocumentNameBlob, split into parts at its separator as
+    /// System.Reflection.Metadata splits it ([`split_document_name`]): each part is a blob of
+    /// its own, shared with every other document that names it, and the writer encodes the
+    /// name with the offsets the parts are given.
+    ///
     /// # Arguments
     ///
     /// * `name` - The document name or path
@@ -173,18 +179,17 @@ impl DocumentBuilder {
     ///
     /// # Arguments
     ///
-    /// * `guid` - 16-byte GUID identifying the hash algorithm
+    /// * `guid` - The GUID identifying the hash algorithm, as the `#GUID` heap stores it: its
+    ///   first three fields little-endian ([`uguid::Guid::to_bytes`])
     ///
     /// # Examples
     ///
     /// ```rust
     /// # use dotscope::prelude::*;
-    /// let sha256_guid = [
-    ///     0x8b, 0x12, 0xd6, 0x2a, 0x37, 0x7a, 0x42, 0x8c,
-    ///     0x9b, 0x8c, 0x41, 0x09, 0xc8, 0x5e, 0x29, 0xc6
-    /// ];
+    /// use dotscope::metadata::pdb::guids;
+    ///
     /// let builder = DocumentBuilder::new()
-    ///     .hash_algorithm(&sha256_guid);
+    ///     .hash_algorithm(&guids::HASH_SHA256.to_bytes());
     /// ```
     #[must_use]
     pub fn hash_algorithm(mut self, guid: &[u8; 16]) -> Self {
@@ -195,7 +200,8 @@ impl DocumentBuilder {
     /// Sets the hash algorithm to SHA-1.
     ///
     /// Convenience method that sets the hash algorithm GUID to the standard
-    /// SHA-1 algorithm identifier used in Portable PDB files.
+    /// SHA-1 algorithm identifier used in Portable PDB files,
+    /// `{FF1816EC-AA5E-4D10-87F7-6F4963833460}` ([`guids::HASH_SHA1`]).
     ///
     /// # Examples
     ///
@@ -206,18 +212,15 @@ impl DocumentBuilder {
     /// ```
     #[must_use]
     pub fn sha1_hash_algorithm(mut self) -> Self {
-        // SHA-1 algorithm GUID: ff1816ec-aa5e-4d10-87f7-6f4963833460
-        self.hash_algorithm = Some([
-            0xff, 0x18, 0x16, 0xec, 0xaa, 0x5e, 0x4d, 0x10, 0x87, 0xf7, 0x6f, 0x49, 0x63, 0x83,
-            0x34, 0x60,
-        ]);
+        self.hash_algorithm = Some(guids::HASH_SHA1.to_bytes());
         self
     }
 
     /// Sets the hash algorithm to SHA-256.
     ///
     /// Convenience method that sets the hash algorithm GUID to the standard
-    /// SHA-256 algorithm identifier used in Portable PDB files.
+    /// SHA-256 algorithm identifier used in Portable PDB files,
+    /// `{8829D00F-11B8-4213-878B-770E8597AC16}` ([`guids::HASH_SHA256`]).
     ///
     /// # Examples
     ///
@@ -228,11 +231,7 @@ impl DocumentBuilder {
     /// ```
     #[must_use]
     pub fn sha256_hash_algorithm(mut self) -> Self {
-        // SHA-256 algorithm GUID: 8b12d62a-377a-428c-9b8c-4109c85e29c6
-        self.hash_algorithm = Some([
-            0x8b, 0x12, 0xd6, 0x2a, 0x37, 0x7a, 0x42, 0x8c, 0x9b, 0x8c, 0x41, 0x09, 0xc8, 0x5e,
-            0x29, 0xc6,
-        ]);
+        self.hash_algorithm = Some(guids::HASH_SHA256.to_bytes());
         self
     }
 
@@ -267,18 +266,17 @@ impl DocumentBuilder {
     ///
     /// # Arguments
     ///
-    /// * `guid` - 16-byte GUID identifying the source language
+    /// * `guid` - The GUID identifying the source language, as the `#GUID` heap stores it:
+    ///   its first three fields little-endian ([`uguid::Guid::to_bytes`])
     ///
     /// # Examples
     ///
     /// ```rust
     /// # use dotscope::prelude::*;
-    /// let csharp_guid = [
-    ///     0x3f, 0x5f, 0x6f, 0x40, 0x15, 0x5c, 0x11, 0xd4,
-    ///     0x95, 0x68, 0x00, 0x80, 0xc7, 0x05, 0x06, 0x26
-    /// ];
+    /// use dotscope::metadata::pdb::guids;
+    ///
     /// let builder = DocumentBuilder::new()
-    ///     .language(&csharp_guid);
+    ///     .language(&guids::LANGUAGE_CSHARP.to_bytes());
     /// ```
     #[must_use]
     pub fn language(mut self, guid: &[u8; 16]) -> Self {
@@ -289,7 +287,8 @@ impl DocumentBuilder {
     /// Sets the language to C#.
     ///
     /// Convenience method that sets the language GUID to the standard
-    /// C# language identifier used in Portable PDB files.
+    /// C# language identifier used in Portable PDB files,
+    /// `{3F5162F8-07C6-11D3-9053-00C04FA302A1}` ([`guids::LANGUAGE_CSHARP`]).
     ///
     /// # Examples
     ///
@@ -300,18 +299,15 @@ impl DocumentBuilder {
     /// ```
     #[must_use]
     pub fn csharp_language(mut self) -> Self {
-        // C# language GUID: 3f5f6f40-155c-11d4-9568-0080c7050626
-        self.language = Some([
-            0x3f, 0x5f, 0x6f, 0x40, 0x15, 0x5c, 0x11, 0xd4, 0x95, 0x68, 0x00, 0x80, 0xc7, 0x05,
-            0x06, 0x26,
-        ]);
+        self.language = Some(guids::LANGUAGE_CSHARP.to_bytes());
         self
     }
 
     /// Sets the language to Visual Basic.
     ///
     /// Convenience method that sets the language GUID to the standard
-    /// Visual Basic language identifier used in Portable PDB files.
+    /// Visual Basic language identifier used in Portable PDB files,
+    /// `{3A12D0B8-C26C-11D0-B442-00A0244A1DD2}` ([`guids::LANGUAGE_VISUAL_BASIC`]).
     ///
     /// # Examples
     ///
@@ -322,18 +318,15 @@ impl DocumentBuilder {
     /// ```
     #[must_use]
     pub fn vb_language(mut self) -> Self {
-        // VB.NET language GUID: 3a12d0b8-c26c-11d0-b442-00a0244a1dd2
-        self.language = Some([
-            0x3a, 0x12, 0xd0, 0xb8, 0xc2, 0x6c, 0x11, 0xd0, 0xb4, 0x42, 0x00, 0xa0, 0x24, 0x4a,
-            0x1d, 0xd2,
-        ]);
+        self.language = Some(guids::LANGUAGE_VISUAL_BASIC.to_bytes());
         self
     }
 
     /// Sets the language to F#.
     ///
     /// Convenience method that sets the language GUID to the standard
-    /// F# language identifier used in Portable PDB files.
+    /// F# language identifier used in Portable PDB files,
+    /// `{AB4F38C9-B6E6-43BA-BE3B-58080B2CCCE3}` ([`guids::LANGUAGE_FSHARP`]).
     ///
     /// # Examples
     ///
@@ -344,11 +337,7 @@ impl DocumentBuilder {
     /// ```
     #[must_use]
     pub fn fsharp_language(mut self) -> Self {
-        // F# language GUID: ab4f38c9-b6e6-43ba-be3b-58080b2ccce3
-        self.language = Some([
-            0xab, 0x4f, 0x38, 0xc9, 0xb6, 0xe6, 0x43, 0xba, 0xbe, 0x3b, 0x58, 0x08, 0x0b, 0x2c,
-            0xcc, 0xe3,
-        ]);
+        self.language = Some(guids::LANGUAGE_FSHARP.to_bytes());
         self
     }
 
@@ -401,7 +390,21 @@ impl DocumentBuilder {
             ));
         }
 
-        let name_index = assembly.blob_add(document_name.as_bytes())?.placeholder();
+        // A DocumentNameBlob: the separator, then each part's blob; an empty part is index 0
+        let (separator, parts) = split_document_name(&document_name);
+        let parts = parts
+            .into_iter()
+            .map(|part| {
+                if part.is_empty() {
+                    Ok(None)
+                } else {
+                    assembly.blob_add(part.as_bytes()).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let name_index = assembly
+            .blob_add_composite(BlobComposite::DocumentName { separator, parts })
+            .placeholder();
 
         let hash_algorithm_index = if let Some(guid) = self.hash_algorithm {
             assembly.guid_add(&guid)?.placeholder()
@@ -567,6 +570,47 @@ mod tests {
         assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Document));
 
         Ok(())
+    }
+
+    /// The convenience setters store the specification's GUIDs as the `#GUID` heap holds
+    /// them: the first three fields little-endian, as a reader decodes them.
+    #[test]
+    fn convenience_guids_are_stored_as_the_heap_holds_them() {
+        let csharp = DocumentBuilder::new().csharp_language().language.unwrap();
+        assert_eq!(
+            csharp,
+            [
+                0xF8, 0x62, 0x51, 0x3F, 0xC6, 0x07, 0xD3, 0x11, 0x90, 0x53, 0x00, 0xC0, 0x4F, 0xA3,
+                0x02, 0xA1
+            ]
+        );
+        let sha256 = DocumentBuilder::new()
+            .sha256_hash_algorithm()
+            .hash_algorithm
+            .unwrap();
+        assert_eq!(
+            sha256,
+            [
+                0x0F, 0xD0, 0x29, 0x88, 0xB8, 0x11, 0x13, 0x42, 0x87, 0x8B, 0x77, 0x0E, 0x85, 0x97,
+                0xAC, 0x16
+            ]
+        );
+        for (stored, expected) in [
+            (
+                DocumentBuilder::new().sha1_hash_algorithm().hash_algorithm,
+                guids::HASH_SHA1,
+            ),
+            (
+                DocumentBuilder::new().vb_language().language,
+                guids::LANGUAGE_VISUAL_BASIC,
+            ),
+            (
+                DocumentBuilder::new().fsharp_language().language,
+                guids::LANGUAGE_FSHARP,
+            ),
+        ] {
+            assert_eq!(uguid::Guid::from_bytes(stored.unwrap()), expected);
+        }
     }
 
     #[test]

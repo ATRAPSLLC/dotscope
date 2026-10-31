@@ -52,8 +52,11 @@ pub struct DocumentLoader;
 
 impl MetadataLoader for DocumentLoader {
     fn load(&self, context: &LoaderContext) -> Result<()> {
+        let Some(pdb) = &context.pdb else {
+            return Ok(());
+        };
         let (Some(header), Some(strings), Some(blob), Some(guid)) =
-            (context.meta, context.strings, context.blobs, context.guids)
+            (pdb.meta, pdb.strings, pdb.blobs, pdb.guids)
         else {
             return Ok(());
         };
@@ -65,12 +68,13 @@ impl MetadataLoader for DocumentLoader {
             .par_iter()
             .enumerate()
             .map(|(index, row)| {
-                let Some(row) = context.handle_row(row, index)? else {
+                let Some(row) = context.handle_row_in(pdb.lenient, row, index)? else {
                     return Ok(());
                 };
                 let token_msg = || format!("document 0x{:08x}", row.token.value());
 
-                let Some(document) = context.handle_result(
+                let Some(document) = context.handle_result_in(
+                    pdb.lenient,
                     row.to_owned(strings, blob, guid),
                     DiagnosticCategory::Table,
                     token_msg,
@@ -79,7 +83,7 @@ impl MetadataLoader for DocumentLoader {
                     return Ok(());
                 };
 
-                context.document.insert(document.token, document);
+                pdb.target.documents.insert(document.token, document);
                 Ok(())
             })
             .collect::<Result<Vec<_>>>()?;

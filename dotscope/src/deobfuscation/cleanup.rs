@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    analysis::{SsaOpCilExt, TypeContext},
+    analysis::{SsaOpCilExt, SsaVarId, TypeContext, VariableOrigin},
     assembly::Operand,
     cilassembly::{
         compute_entry_points, expand_type_tokens, find_unreferenced_types, CleanupRequest,
@@ -41,6 +41,12 @@ use crate::{
     },
     CilObject, Result,
 };
+
+/// The message of the [`EventKind::ArtifactRemoved`] event for a method that goes because a
+/// pass inlined every call to it (folded a constant it returns, forwarded a stub, dropped a
+/// call to a method that does nothing): a method of the program whose code now lives in its
+/// callers, rather than one of the protection's. Default cleanup removes these too.
+pub const INLINED_METHOD_REMOVED: &str = "Removing method: every call to it was inlined";
 
 /// Returns the registered decryptors that still have call sites in the
 /// post-pass call graph.
@@ -420,18 +426,33 @@ fn slots_of_survivors(
 
 /// Records the types each method's local variables are declared with.
 ///
-/// A regenerated body gets its locals from its SSA: the original declarations
-/// it keeps and the types of its variables. A body that never converted keeps
-/// the signature it was read with.
+/// A regenerated body declares a local for each variable its code still defines
+/// or reads, of the variable's type or, for one of the method's own locals, its
+/// original declaration. A variable the passes left without a definition or a
+/// read declares nothing: the SSA keeps it until canonicalization, and a type
+/// only such variables carry (a protection's state the decryption removed) is
+/// named by nothing. A body that never converted keeps the signature it was
+/// read with.
 fn add_local_type_names(assembly: &CilObject, ctx: &AnalysisContext, names: &mut TypeNames) {
     for entry in assembly.methods().iter() {
         let token = *entry.key();
         if let Some(ssa) = ctx.ssa_functions.get(&token) {
-            for local in ssa.original_local_types().unwrap_or_default() {
-                names.add_signature(Some(token), &local.base);
-            }
+            let live: HashSet<SsaVarId> = ssa
+                .blocks()
+                .iter()
+                .flat_map(|block| block.defined_variables().chain(block.used_variables()))
+                .collect();
+            let original = ssa.original_local_types().unwrap_or_default();
             for var in ssa.variables() {
+                if !live.contains(&var.id()) {
+                    continue;
+                }
                 names.add_signature(Some(token), &var.var_type().to_type_signature());
+                if let VariableOrigin::Local(idx) = var.origin() {
+                    if let Some(local) = original.get(usize::from(idx)) {
+                        names.add_signature(Some(token), &local.base);
+                    }
+                }
             }
         } else {
             let method = entry.value();
@@ -687,12 +708,17 @@ fn log_cleanup_request(request: &CleanupRequest, assembly: &CilObject, ctx: &Ana
         }
     }
 
-    // Log method removals
+    // Log method removals, saying when the method goes because every call to it was inlined:
+    // that is a method of the program, not of the protection
     for method_token in request.methods() {
         ctx.events
             .record(EventKind::ArtifactRemoved)
             .method(*method_token)
-            .message("Removing method");
+            .message(if ctx.was_inlined(*method_token) {
+                INLINED_METHOD_REMOVED
+            } else {
+                "Removing method"
+            });
     }
 
     // Log field removals
@@ -1046,10 +1072,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        analysis::CallGraph,
+        analysis::{CallGraph, SsaFunction, SsaOp, SsaVariable},
         cilassembly::CleanupRequest,
         deobfuscation::utils::{is_obfuscated_name, is_special_name},
-        metadata::token::Token,
+        metadata::{signatures::TypeSignature, token::Token},
         testkit::helpers::{load_sample, test_assembly_arc},
     };
 
@@ -1175,6 +1201,92 @@ mod tests {
             !request.fields().any(|&token| token == field),
             "{field} removed while {} reads it",
             method.0
+        );
+    }
+
+    #[test]
+    fn a_converted_method_names_the_local_types_its_code_still_uses() {
+        // ConfuserEx's CFG-mode constants: methods keep their decryption state in a local of
+        // a value type with `uint Next(byte, uint)`. Once the decryption removes every use of
+        // that state, the regenerated body declares no such local, though the SSA still lists
+        // the variables and the original declaration.
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_constants_cfg.exe");
+        let context_type = assembly
+            .types()
+            .iter()
+            .find(|entry| {
+                entry.value().methods().any(|method| {
+                    let signature = &method.signature;
+                    signature.return_type.base == TypeSignature::U4
+                        && signature.params.len() == 2
+                        && signature.params[0].base == TypeSignature::U1
+                        && signature.params[1].base == TypeSignature::U4
+                })
+            })
+            .map(|entry| *entry.key())
+            .expect("the CFG-mode state type");
+        let names_context = |var: &SsaVariable| {
+            let mut named = HashSet::new();
+            var.var_type().to_type_signature().type_tokens(&mut named);
+            named.contains(&context_type)
+        };
+        let (method, mut ssa) = assembly
+            .methods()
+            .iter()
+            .filter(|entry| {
+                entry.value().declaring_type_rc().map(|t| t.token) != Some(context_type)
+            })
+            .find_map(|entry| {
+                let ssa = entry.value().ssa(&assembly).ok()?;
+                ssa.variables()
+                    .iter()
+                    .any(names_context)
+                    .then_some((*entry.key(), ssa))
+            })
+            .expect("a method keeping its decryption state in a local");
+        let others: HashSet<Token> = assembly
+            .methods()
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|&token| token != method)
+            .collect();
+        let named_by_method = |ssa: SsaFunction| {
+            let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+            ctx.ssa_functions.insert(method, ssa);
+            let mut names = TypeNames::default();
+            add_local_type_names(&assembly, &ctx, &mut names);
+            let named = names
+                .named_by_survivors(&others)
+                .any(|named| named == context_type);
+            named
+        };
+        assert!(named_by_method(ssa.clone()), "the state's local is in use");
+
+        // What the decryption leaves: nothing defines or reads a value of the state's type
+        let state: HashSet<SsaVarId> = ssa
+            .variables()
+            .iter()
+            .filter(|var| names_context(var))
+            .map(SsaVariable::id)
+            .collect();
+        for block_idx in 0..ssa.block_count() {
+            let Some(block) = ssa.block_mut(block_idx) else {
+                continue;
+            };
+            block
+                .phi_nodes_mut()
+                .retain(|phi| !state.contains(&phi.result()));
+            for instr in block.instructions_mut() {
+                let touches = instr.def().is_some_and(|def| state.contains(&def))
+                    || instr.uses().iter().any(|used| state.contains(used));
+                if touches {
+                    instr.set_op(SsaOp::Nop);
+                }
+            }
+        }
+        assert!(
+            !named_by_method(ssa),
+            "a local nothing uses names {context_type:?}"
         );
     }
 

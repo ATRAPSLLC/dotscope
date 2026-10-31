@@ -64,26 +64,27 @@ impl EmValue {
             )));
         }
 
+        let (left, right) = (self.on_stack(), other.on_stack());
         let result = match op {
-            BinaryOp::Add => self.add(other),
-            BinaryOp::AddOvf => self.add_ovf(other, false),
-            BinaryOp::AddOvfUn => self.add_ovf(other, true),
-            BinaryOp::Sub => self.sub(other),
-            BinaryOp::SubOvf => self.sub_ovf(other, false),
-            BinaryOp::SubOvfUn => self.sub_ovf(other, true),
-            BinaryOp::Mul => self.mul(other),
-            BinaryOp::MulOvf => self.mul_ovf(other, false),
-            BinaryOp::MulOvfUn => self.mul_ovf(other, true),
-            BinaryOp::Div => self.div(other, false),
-            BinaryOp::DivUn => self.div(other, true),
-            BinaryOp::Rem => self.rem(other, false),
-            BinaryOp::RemUn => self.rem(other, true),
-            BinaryOp::And => self.bitand(other),
-            BinaryOp::Or => self.bitor(other),
-            BinaryOp::Xor => self.bitxor(other),
-            BinaryOp::Shl => self.shl(other),
-            BinaryOp::Shr => self.shr(other, false),
-            BinaryOp::ShrUn => self.shr(other, true),
+            BinaryOp::Add => left.add(&right),
+            BinaryOp::AddOvf => left.add_ovf(&right, false),
+            BinaryOp::AddOvfUn => left.add_ovf(&right, true),
+            BinaryOp::Sub => left.sub(&right),
+            BinaryOp::SubOvf => left.sub_ovf(&right, false),
+            BinaryOp::SubOvfUn => left.sub_ovf(&right, true),
+            BinaryOp::Mul => left.mul(&right),
+            BinaryOp::MulOvf => left.mul_ovf(&right, false),
+            BinaryOp::MulOvfUn => left.mul_ovf(&right, true),
+            BinaryOp::Div => left.div(&right, false),
+            BinaryOp::DivUn => left.div(&right, true),
+            BinaryOp::Rem => left.rem(&right, false),
+            BinaryOp::RemUn => left.rem(&right, true),
+            BinaryOp::And => left.bitand(&right),
+            BinaryOp::Or => left.bitor(&right),
+            BinaryOp::Xor => left.bitxor(&right),
+            BinaryOp::Shl => left.shl(&right),
+            BinaryOp::Shr => left.shr(&right, false),
+            BinaryOp::ShrUn => left.shr(&right, true),
         }?;
 
         // Mask native int/uint results to the target pointer width

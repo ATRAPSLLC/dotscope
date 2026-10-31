@@ -70,7 +70,7 @@ pub(super) fn format_events(
         }
 
         // .other
-        if let Some(other_ref) = event.fn_on_other.get() {
+        for (_, other_ref) in event.fn_on_other.iter() {
             if let Some(other_method) = other_ref.upgrade() {
                 writeln!(w, "    .other {}", format_method_ref(&other_method, asm))?;
             }

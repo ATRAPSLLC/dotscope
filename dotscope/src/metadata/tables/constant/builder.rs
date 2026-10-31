@@ -393,6 +393,7 @@ impl ConstantBuilder {
             token,
             offset: 0, // Will be set during binary generation
             base: element_type,
+            padding: 0,
             parent,
             value: value_index,
         };

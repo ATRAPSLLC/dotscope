@@ -200,8 +200,10 @@ pub struct CilType {
     pub spec: OnceLock<CilFlavor>,
     /// Type modifiers from `TypeSpec` (required/optional modifiers, pinned types, etc.)
     pub modifiers: Arc<boxcar::Vec<CilModifier>>,
-    /// Security declarations and permissions associated with this type
-    pub security: OnceLock<Security>,
+    /// The type's declarative security, a `DeclSecurity` row each, in table order: a type may
+    /// demand permissions under several actions (a link demand and an inheritance demand,
+    /// say).
+    pub security: RowList<Security>,
     /// Enclosing type for nested types - used for reverse lookup to build hierarchical names
     pub enclosing_type: OnceLock<CilTypeRef>,
     /// Cached full name to avoid expensive recomputation.
@@ -310,7 +312,7 @@ impl CilType {
             class_size: OnceLock::new(),
             spec: OnceLock::new(),
             modifiers: Arc::new(boxcar::Vec::new()),
-            security: OnceLock::new(),
+            security: RowList::new(),
             enclosing_type: OnceLock::new(),
             fullname: RwLock::new(None),
         }

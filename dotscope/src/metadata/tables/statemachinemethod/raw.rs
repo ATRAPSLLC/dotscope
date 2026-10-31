@@ -13,7 +13,6 @@ use crate::{
         tables::{StateMachineMethod, StateMachineMethodRc, TableId, TableInfoRef, TableRow},
         token::Token,
     },
-    Error::TypeNotFound,
     Result,
 };
 
@@ -114,13 +113,13 @@ impl StateMachineMethodRaw {
 
         let move_next_method = method_map
             .get(&move_next_token)
-            .ok_or(TypeNotFound(move_next_token))?
+            .ok_or_else(|| malformed_error!("Failed to resolve method token - {move_next_token}"))?
             .value()
             .clone();
 
         let kickoff_method = method_map
             .get(&kickoff_token)
-            .ok_or(TypeNotFound(kickoff_token))?
+            .ok_or_else(|| malformed_error!("Failed to resolve method token - {kickoff_token}"))?
             .value()
             .clone();
 

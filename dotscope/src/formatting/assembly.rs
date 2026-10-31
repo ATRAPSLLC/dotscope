@@ -9,9 +9,10 @@
 use std::io::{self, Write};
 
 use crate::{
+    file::sectionmap::RvaMapping,
     formatting::{
         attributes,
-        helpers::{data_label_for_rva, find_section_for_rva, hex_bytes, quote_identifier},
+        helpers::{data_label_for_rva, hex_bytes, quote_identifier},
         security, FormatterOptions,
     },
     metadata::{
@@ -70,7 +71,7 @@ pub(super) fn format_header(
             attributes::format_custom_attributes(w, &asm_meta.custom_attributes, "  ", asm)?;
         }
         if opts.show_security {
-            if let Some(sec) = asm_meta.security.get() {
+            for (_, sec) in asm_meta.security.iter() {
                 security::format_security(w, sec, "  ")?;
             }
         }
@@ -123,8 +124,7 @@ pub(super) fn format_assembly_refs(w: &mut dyn Write, asm: &CilObject) -> io::Re
         if let Some(ref ident) = aref.identifier {
             match ident {
                 Identity::Token(token) => {
-                    let bytes = token.to_le_bytes();
-                    writeln!(w, "  .publickeytoken = ({})", hex_bytes(&bytes))?;
+                    writeln!(w, "  .publickeytoken = ({})", hex_bytes(token))?;
                 }
                 Identity::PubKey(key) => {
                     writeln!(w, "  .publickey = ({})", hex_bytes(key))?;
@@ -321,24 +321,16 @@ pub(super) fn format_data_directives(w: &mut dyn Write, asm: &CilObject) -> io::
                 continue;
             }
 
-            // Check whether the RVA points to initialized or uninitialized data.
-            // Uninitialized (BSS) data lives beyond the section's raw data but
-            // within its virtual size.
-            let is_initialized = find_section_for_rva(sections, rva).is_none_or(|s| {
-                (rva as u64)
-                    < u64::from(s.virtual_address).saturating_add(u64::from(s.size_of_raw_data))
-            });
-
-            if is_initialized {
-                let Ok(offset) = file.rva_to_offset(rva as usize) else {
-                    continue;
-                };
-                let Ok(bytes) = file.data_slice(offset, size) else {
-                    continue;
-                };
-                data_entries.push((rva, size, Some(bytes.to_vec())));
-            } else {
-                data_entries.push((rva, size, None));
+            // Uninitialized (BSS) data lives in a section's zero-filled part, past its raw data
+            match file.section_map().map(rva) {
+                RvaMapping::ZeroFill => data_entries.push((rva, size, None)),
+                RvaMapping::File(_) => {
+                    let Ok(bytes) = file.rva_slice(rva as usize, size) else {
+                        continue;
+                    };
+                    data_entries.push((rva, size, Some(bytes.into_owned())));
+                }
+                RvaMapping::Unmapped => {}
             }
         }
     }

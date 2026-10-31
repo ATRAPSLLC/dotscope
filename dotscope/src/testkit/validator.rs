@@ -8,9 +8,8 @@
 //! up fails the test whichever way it was expected to go, because the validator never ran.
 //! Every case runs, and every mismatch is reported together.
 
-use std::{fmt::Write as _, io::Write, panic::Location, path::PathBuf, sync::OnceLock};
+use std::{fmt::Write as _, io::Write, panic::Location, path::PathBuf};
 
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -165,16 +164,6 @@ enum Outcome {
     Rejected(Error),
 }
 
-/// The validators' thread pool, shared by every case of the test binary.
-fn thread_pool() -> &'static ThreadPool {
-    static POOL: OnceLock<ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        ThreadPoolBuilder::new()
-            .build()
-            .expect("the validation thread pool")
-    })
-}
-
 /// Runs every case of `file_factory` through `run` and checks each outcome against its
 /// expectation.
 fn run_cases(
@@ -261,12 +250,7 @@ where
             Ok(scanner) => scanner,
             Err(e) => return Outcome::SetupFailed(e),
         };
-        let context = RawValidationContext::new_for_loading(
-            &view,
-            &scanner,
-            &validation_config,
-            thread_pool(),
-        );
+        let context = RawValidationContext::new_for_loading(&view, &scanner, &validation_config);
         match run_validator(&context) {
             Ok(()) => Outcome::Accepted,
             Err(e) => Outcome::Rejected(e),
@@ -339,7 +323,7 @@ where
         .ok_or_else(|| Error::Other("the project has no primary assembly".to_string()))?;
 
     let scanner = ReferenceScanner::from_view(&assembly_view)?;
-    let context = OwnedValidationContext::new(object.as_ref(), &scanner, config, thread_pool());
+    let context = OwnedValidationContext::new(object.as_ref(), &scanner, config);
     Ok(match run_validator(&context) {
         Ok(()) => Outcome::Accepted,
         Err(e) => Outcome::Rejected(e),

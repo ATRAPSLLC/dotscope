@@ -320,6 +320,7 @@ mod tests {
             is_init_local: false,
             is_exception_data: false,
             exception_handlers: vec![],
+            exception_format: None,
         };
 
         let bytes_written = write_method_body(&mut output, 0, &body, &il_code).unwrap();
@@ -357,6 +358,7 @@ mod tests {
             is_init_local: true,
             is_exception_data: false,
             exception_handlers: vec![],
+            exception_format: None,
         };
 
         let bytes_written = write_method_body(&mut output, 0, &body, &il_code).unwrap();

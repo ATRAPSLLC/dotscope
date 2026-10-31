@@ -42,11 +42,23 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    cilassembly::{operation::Operation, ChangeRef, HeapChanges, TableModifications},
+    cilassembly::{
+        changes::BlobComposite, operation::Operation, ChangeIds, ChangeRef, HeapChanges,
+        TableModifications,
+    },
     metadata::{exports::UnifiedExportContainer, imports::UnifiedImportContainer, tables::TableId},
 };
 #[cfg(feature = "compiler")]
 use crate::{Error, Result};
+
+/// The first placeholder RVA a new method body is stored under. A MethodDef row's RVA at or
+/// above it names a body in [`AssemblyChanges`], which the writer lays out; one below it is
+/// the RVA of a body in the input file, wherever in the file that is.
+pub(crate) const METHOD_BODY_PLACEHOLDER_BASE: u32 = 0xF000_0000;
+
+/// The first placeholder RVA new field data is stored under, below
+/// [`METHOD_BODY_PLACEHOLDER_BASE`].
+pub(crate) const FIELD_DATA_PLACEHOLDER_BASE: u32 = 0xE000_0000;
 
 /// Internal structure for tracking all modifications to an assembly.
 ///
@@ -113,6 +125,13 @@ pub struct AssemblyChanges {
     /// Tracks user strings that have been added to the #US heap. User strings
     /// are typically Unicode string literals used by IL instructions.
     pub userstring_heap_changes: HeapChanges<String>,
+
+    /// The ids the assembly's changes take: its heaps' and its new rows'
+    pub(crate) change_ids: ChangeIds,
+
+    /// The appended blobs whose content names other blobs, by the change id of their
+    /// placeholder blob: the writer encodes each once the blobs it names have offsets
+    pub(crate) blob_composites: HashMap<u64, BlobComposite>,
 
     /// Referenced string heap offsets for substring remapping.
     ///
@@ -192,20 +211,23 @@ impl AssemblyChanges {
     ///
     /// Initializes all heap change trackers and table change maps to empty state.
     pub fn new() -> Self {
+        let change_ids = ChangeIds::new();
         Self {
             table_changes: HashMap::new(),
-            string_heap_changes: HeapChanges::new_strings(),
-            blob_heap_changes: HeapChanges::new_blobs(),
-            guid_heap_changes: HeapChanges::new_guids(),
-            userstring_heap_changes: HeapChanges::new_userstrings(),
+            string_heap_changes: HeapChanges::new_strings(change_ids.clone()),
+            blob_heap_changes: HeapChanges::new_blobs(change_ids.clone()),
+            guid_heap_changes: HeapChanges::new_guids(change_ids.clone()),
+            userstring_heap_changes: HeapChanges::new_userstrings(change_ids.clone()),
+            change_ids,
+            blob_composites: HashMap::new(),
             referenced_string_offsets: HashSet::new(),
             native_imports: UnifiedImportContainer::new(),
             native_exports: UnifiedExportContainer::new(),
             method_bodies: HashMap::new(),
-            next_method_placeholder: 0xF000_0000, // Start placeholders at high address range
+            next_method_placeholder: METHOD_BODY_PLACEHOLDER_BASE,
             resource_data: Vec::new(),
             field_data: HashMap::new(),
-            next_field_placeholder: 0xE000_0000, // Different range than method bodies
+            next_field_placeholder: FIELD_DATA_PLACEHOLDER_BASE,
         }
     }
 
@@ -218,7 +240,8 @@ impl AssemblyChanges {
 
     /// Returns true if any changes have been made to the assembly.
     ///
-    /// This checks if any table changes exist or if any heap has changes (additions, modifications, or removals).
+    /// This checks if any table changes exist, if any heap has changes (additions, modifications, or removals),
+    /// and whether method bodies, field data or resource data were stored.
     /// Native containers are checked for emptiness since they always exist but start empty.
     pub fn has_changes(&self) -> bool {
         !self.table_changes.is_empty()
@@ -229,6 +252,8 @@ impl AssemblyChanges {
             || !self.native_imports.is_empty()
             || !self.native_exports.is_empty()
             || !self.resource_data.is_empty()
+            || !self.method_bodies.is_empty()
+            || !self.field_data.is_empty()
     }
 
     /// Returns the number of tables that have been modified.
@@ -526,6 +551,12 @@ impl AssemblyChanges {
         let [strings, blobs, guids, userstrings] = savepoint.heaps;
         self.string_heap_changes.truncate_appended(strings);
         self.blob_heap_changes.truncate_appended(blobs);
+        let appended: HashSet<u64> = self
+            .blob_heap_changes
+            .appended_iter()
+            .map(|(_, change_ref)| change_ref.id())
+            .collect();
+        self.blob_composites.retain(|id, _| appended.contains(id));
         self.guid_heap_changes.truncate_appended(guids);
         self.userstring_heap_changes.truncate_appended(userstrings);
         self.method_bodies
@@ -647,7 +678,7 @@ impl AssemblyChanges {
     ///
     /// True if this RVA is a placeholder managed by the method body system.
     pub fn is_method_body_placeholder(&self, rva: u32) -> bool {
-        rva >= 0xF000_0000 && self.method_bodies.contains_key(&rva)
+        rva >= METHOD_BODY_PLACEHOLDER_BASE && self.method_bodies.contains_key(&rva)
     }
 
     /// Stores resource data in the CLR resources section and returns its offset.
@@ -785,7 +816,8 @@ impl AssemblyChanges {
     ///
     /// True if this RVA is a field data placeholder managed by this system.
     pub fn is_field_data_placeholder(&self, rva: u32) -> bool {
-        (0xE000_0000..0xF000_0000).contains(&rva) && self.field_data.contains_key(&rva)
+        (FIELD_DATA_PLACEHOLDER_BASE..METHOD_BODY_PLACEHOLDER_BASE).contains(&rva)
+            && self.field_data.contains_key(&rva)
     }
 
     /// Returns true if there is any field data to write.
@@ -910,19 +942,19 @@ mod tests {
         assert_eq!(userstring_size, 0);
 
         // Add some string heap changes
-        let mut string_changes = HeapChanges::new_strings();
+        let mut string_changes = HeapChanges::new_strings(ChangeIds::new());
         let _ = string_changes.append("Hello".to_string()); // 5 + 1 = 6 bytes
         let _ = string_changes.append("World".to_string()); // 5 + 1 = 6 bytes
         changes.string_heap_changes = string_changes;
 
         // Add some blob heap changes
-        let mut blob_changes = HeapChanges::new_blobs();
+        let mut blob_changes = HeapChanges::new_blobs(ChangeIds::new());
         let _ = blob_changes.append(vec![1, 2, 3]); // 1 + 3 = 4 bytes (length < 128)
         let _ = blob_changes.append(vec![4, 5, 6, 7, 8]); // 1 + 5 = 6 bytes
         changes.blob_heap_changes = blob_changes;
 
         // Add some GUID heap changes
-        let mut guid_changes = HeapChanges::new_guids();
+        let mut guid_changes = HeapChanges::new_guids(ChangeIds::new());
         let _ = guid_changes.append([1; 16]); // 16 bytes
         let _ = guid_changes.append([2; 16]); // 16 bytes
         changes.guid_heap_changes = guid_changes;

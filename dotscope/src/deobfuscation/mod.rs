@@ -113,6 +113,7 @@ pub(crate) mod utils;
 mod workqueue;
 
 // Public API - used by CLI, tests, examples, and external consumers
+pub use cleanup::INLINED_METHOD_REMOVED;
 pub use config::{
     CleanupConfig, DecryptorHeuristics, DetectionWeights, EmulationConfig, EngineConfig,
     IterationConfig, PassConfig, UnflatteningThresholds,

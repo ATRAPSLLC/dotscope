@@ -63,9 +63,25 @@ mod comparison;
 mod conversion;
 mod unary;
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
-use crate::metadata::typesystem::CilFlavor;
+use crate::{emulation::value::EmValue, metadata::typesystem::CilFlavor};
+
+impl EmValue {
+    /// The value as the evaluation stack holds it (ECMA-335 I.12.1): a `bool` or a `char` is
+    /// an `int32` there, whatever type the value was loaded as. Every operation reads its
+    /// operands in this form; a value keeps its own type until then, for the calls that
+    /// take it.
+    pub(crate) fn on_stack(&self) -> Cow<'_, EmValue> {
+        match self {
+            EmValue::Bool(value) => Cow::Owned(EmValue::I32(i32::from(*value))),
+            EmValue::Char(value) => Cow::Owned(EmValue::I32(i32::from_ne_bytes(
+                u32::from(*value).to_ne_bytes(),
+            ))),
+            other => Cow::Borrowed(other),
+        }
+    }
+}
 
 /// Binary operations for CIL arithmetic and bitwise instructions.
 ///
@@ -717,13 +733,46 @@ impl fmt::Display for ConversionType {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        emulation::{
-            engine::EmulationError,
-            value::{BinaryOp, CompareOp, ConversionType, UnaryOp},
-        },
-        metadata::typesystem::CilFlavor,
-    };
+    use super::*;
+    use crate::{emulation::engine::EmulationError, metadata::typesystem::PointerSize};
+
+    /// A `char` or `bool` operand is the `int32` the evaluation stack holds, for every kind
+    /// of operation: `input[i] ^ key` in a loop over a string, `c >= 'a'`, a flag summed.
+    #[test]
+    fn a_char_or_bool_operand_is_its_int32() {
+        let bits = PointerSize::Bit64;
+        let h = EmValue::Char('H');
+        assert_eq!(
+            h.binary_op(&EmValue::I32(42), BinaryOp::Xor, bits).unwrap(),
+            EmValue::I32(i32::from(b'H') ^ 42)
+        );
+        assert_eq!(
+            EmValue::Bool(true)
+                .binary_op(&EmValue::I32(1), BinaryOp::Add, bits)
+                .unwrap(),
+            EmValue::I32(2)
+        );
+        assert_eq!(
+            h.compare(&EmValue::I32(i32::from(b'a')), CompareOp::Lt)
+                .unwrap(),
+            EmValue::I32(1)
+        );
+        assert_eq!(
+            EmValue::I32(i32::from(b'z'))
+                .compare(&EmValue::Char('z'), CompareOp::Gt)
+                .unwrap(),
+            EmValue::I32(0)
+        );
+        assert_eq!(
+            h.compare(&EmValue::I32(i32::from(b'H')), CompareOp::Eq)
+                .unwrap(),
+            EmValue::I32(1)
+        );
+        assert_eq!(
+            h.unary_op(UnaryOp::Neg, bits).unwrap(),
+            EmValue::I32(-i32::from(b'H'))
+        );
+    }
 
     #[test]
     fn test_binary_op_is_checked() {

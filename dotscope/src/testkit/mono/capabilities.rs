@@ -195,6 +195,7 @@ impl TestCapabilities {
             ToolKind::Disassembler => self.can_disassemble(),
             ToolKind::Verifier => self.peverify,
             ToolKind::Mono => self.mono,
+            ToolKind::MonoCompiler => self.compiler == Some(Compiler::Mcs) && self.mono,
         }
     }
 

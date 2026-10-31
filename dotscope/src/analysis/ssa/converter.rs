@@ -39,7 +39,11 @@ use std::collections::BTreeMap;
 
 use analyssa::{
     graph::NodeId,
-    ir::function::{SsaConstructOptions, SsaEditOptions},
+    ir::{
+        function::{SsaConstructOptions, SsaEditOptions},
+        ops::convert::ConversionIntent,
+        FloatFormat,
+    },
     BitSet,
 };
 
@@ -226,14 +230,19 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                 ConstValue::U64(_) => SsaType::U64,
                 ConstValue::NativeInt(_) => SsaType::NativeInt,
                 ConstValue::NativeUInt(_) => SsaType::NativeUInt,
-                ConstValue::F32(_) => SsaType::F32,
-                ConstValue::F64(_) => SsaType::F64,
                 ConstValue::String(_) | ConstValue::DecryptedString(_) => SsaType::String,
                 ConstValue::DecryptedArray { .. } => SsaType::Object,
                 // Uninhabited for this target: CIL has no symbol space.
                 ConstValue::Symbol(symbol) => match *symbol {},
                 // SIMD vector constant from the native substrate — no CIL type.
                 ConstValue::Vector(_) => SsaType::Unknown,
+                // binary32 and binary64 are CIL's floats; the other formats only native
+                // code produces
+                ConstValue::Float(bits) => match bits.format() {
+                    FloatFormat::Single => SsaType::F32,
+                    FloatFormat::Double => SsaType::F64,
+                    _ => SsaType::Unknown,
+                },
                 ConstValue::Null => SsaType::Null,
                 ConstValue::True | ConstValue::False => SsaType::Bool,
                 // Runtime handle types (`ldtoken` results). Each handle
@@ -309,9 +318,6 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             | SsaOp::BitScanReverse { .. }
             | SsaOp::Popcount { .. }
             | SsaOp::Parity { .. }
-            // Atomic read-modify-write operations
-            | SsaOp::CmpXchg { .. }
-            | SsaOp::AtomicRmw { .. }
             // Select produces values of varying types
             | SsaOp::Select { .. }
             // ReadFlags reads flag bits into an integer
@@ -514,8 +520,8 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             SsaType::U64 => ConstValue::U64(0),
             SsaType::NativeInt => ConstValue::NativeInt(0),
             SsaType::NativeUInt => ConstValue::NativeUInt(0),
-            SsaType::F32 => ConstValue::F32(0.0),
-            SsaType::F64 => ConstValue::F64(0.0),
+            SsaType::F32 => ConstValue::from(0.0_f32),
+            SsaType::F64 => ConstValue::from(0.0_f64),
             SsaType::Object
             | SsaType::String
             | SsaType::Null
@@ -705,8 +711,13 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         // Phi types follow from the operands construction gave them.
         builder.resolve_phi_types();
 
-        // Conversions are chosen once the values they convert have types.
-        builder.select_conversions();
+        // Conversions are chosen once the values they convert have types. A CIL `conv.*` names
+        // only its destination (`conv.i8` truncates a `float64` and widens an `int32`), so
+        // decomposition chose from the destination alone; each conversion, of every kind, is
+        // restated for the type its operand turned out to have.
+        builder
+            .function
+            .settle_conversions(ConversionIntent::Values);
 
         // A store into a slot narrower than four bytes truncates; stated as the
         // conversion it is, once the stored values have types.
@@ -1666,82 +1677,6 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                 _ => None,
             },
             _ => None,
-        }
-    }
-
-    /// Re-chooses every conversion from the type of the value it converts.
-    ///
-    /// A CIL `conv.*` names only its destination: `conv.i8` truncates a
-    /// `float64` and widens an `int32`, and `conv.r8` widens a `float32` and
-    /// converts an integer. Decomposition happens before operand types exist,
-    /// so it chose from the destination alone, and every conversion *from* a
-    /// float came out as an integer conversion of it. That is not only
-    /// imprecise: an analysis that reads `IntConv` as moving bits sees a
-    /// same-width "integer" conversion of a `float64` as a bit-for-bit
-    /// reinterpretation, and rewrote a truncation into one. Chosen here, from
-    /// both endpoints, through analyssa's own classification.
-    fn select_conversions(&mut self) {
-        for block_idx in 0..self.function.blocks().len() {
-            let instr_count = self
-                .function
-                .block(block_idx)
-                .map_or(0, |block| block.instructions().len());
-            for instr_idx in 0..instr_count {
-                let Some(op) = self
-                    .function
-                    .block(block_idx)
-                    .and_then(|block| block.instruction(instr_idx))
-                    .map(|instr| instr.op().clone())
-                else {
-                    continue;
-                };
-                let (dest, operand, target, unsigned, overflow_check) = match &op {
-                    SsaOp::IntConv {
-                        dest,
-                        operand,
-                        target,
-                        overflow_check,
-                        unsigned,
-                    }
-                    | SsaOp::FloatToInt {
-                        dest,
-                        operand,
-                        target,
-                        overflow_check,
-                        unsigned,
-                    } => (*dest, *operand, target.clone(), *unsigned, *overflow_check),
-                    SsaOp::IntToFloat {
-                        dest,
-                        operand,
-                        target,
-                        unsigned,
-                    } => (*dest, *operand, target.clone(), *unsigned, false),
-                    _ => continue,
-                };
-                let from = self
-                    .function
-                    .variable(operand)
-                    .map(|var| var.var_type().clone())
-                    .filter(|ty| *ty != SsaType::Unknown);
-                let chosen = SsaOp::conversion_between(
-                    dest,
-                    operand,
-                    target,
-                    from.as_ref(),
-                    unsigned,
-                    overflow_check,
-                );
-                if chosen == op {
-                    continue;
-                }
-                if let Some(instr) = self
-                    .function
-                    .block_mut(block_idx)
-                    .and_then(|block| block.instructions_mut().get_mut(instr_idx))
-                {
-                    instr.set_op(chosen);
-                }
-            }
         }
     }
 

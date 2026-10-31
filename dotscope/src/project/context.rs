@@ -210,7 +210,7 @@ impl ProjectContext {
         for (_, (other_identity, other_registry)) in &self.registries {
             // Don't link a registry to itself
             if !Arc::ptr_eq(current_registry, other_registry) {
-                current_registry.registry_link(other_identity.clone(), other_registry.clone());
+                current_registry.registry_link(other_identity.clone(), other_registry);
             }
         }
     }

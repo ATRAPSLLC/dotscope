@@ -70,14 +70,19 @@ use crossbeam_skiplist::SkipMap;
 use crate::{
     metadata::{
         cilassemblyview::CilAssemblyView,
+        diagnostics::DiagnosticCategory,
         exports::{NativeExports, UnifiedExportContainer},
         imports::{NativeImports, UnifiedImportContainer},
-        loader::{execute_loaders_in_parallel, LoaderContext},
+        loader::{execute_loaders_in_parallel, LoaderContext, PdbSource},
         method::MethodMap,
+        pdb::{
+            codeview_pdb_id, embedded_portable_pdb, PdbMetadata, PdbOrigin, PortablePdb, PDB_TABLES,
+        },
         resources::Resources,
         tables::{
-            AssemblyOsRc, AssemblyProcessorRc, AssemblyRc, AssemblyRefMap, DeclSecurityMap,
-            FieldMap, FileMap, MemberRefMap, MethodSpecMap, ModuleRc, ModuleRefMap,
+            AssemblyOsRc, AssemblyProcessorRc, AssemblyRc, AssemblyRefMap, CustomAttributeMap,
+            DeclSecurityMap, FieldMap, FileMap, MemberRefMap, MethodSpecMap, ModuleRc,
+            ModuleRefMap,
         },
         typesystem::TypeRegistry,
     },
@@ -162,8 +167,13 @@ pub(crate) struct CilObjectData {
     pub method_specs: MethodSpecMap,
     /// Field definitions, by token.
     pub fields: FieldMap,
+    /// Custom attributes, by their CustomAttribute row's token.
+    pub custom_attributes: CustomAttributeMap,
     /// Embedded resource management and access.
     pub resources: Resources,
+    /// The assembly's Portable PDB: an attached standalone one, else the one the image
+    /// embeds, else the debug tables in the image's own metadata; `None` without any.
+    pub pdb: Option<PortablePdb>,
 }
 
 impl CilObjectData {
@@ -187,6 +197,9 @@ impl CilObjectData {
     /// * `view` - Reference to the CilAssemblyView containing parsed raw metadata
     /// * `project_context` - Optional ProjectContext for coordinating multi-assembly parallel loading
     ///   with barrier synchronization to handle circular dependencies.
+    /// * `lenient` - Whether a malformed row is a diagnostic rather than an error
+    /// * `standalone_pdb` - A standalone Portable PDB to read the debug information from,
+    ///   instead of the one the image embeds or its own debug tables
     ///
     /// # Returns
     /// A fully loaded [`CilObjectData`] instance ready for metadata queries and analysis.
@@ -197,6 +210,9 @@ impl CilObjectData {
     /// - **Version Support**: Unsupported metadata format version
     /// - **Memory**: Insufficient memory for loading large assemblies
     /// - **Corruption**: Inconsistent or damaged metadata structures
+    /// - **Standalone PDB**: In strict mode, a `standalone_pdb` that does not read, or was
+    ///   written for an image with other row counts. The image's own PDB never fails the
+    ///   load: the runtime never reads it, so a malformed one is a diagnostic.
     ///
     /// # Examples
     ///
@@ -210,6 +226,7 @@ impl CilObjectData {
         view: &CilAssemblyView,
         project_context: Option<&ProjectContext>,
         lenient: bool,
+        standalone_pdb: Option<&[u8]>,
     ) -> Result<Self> {
         // Get real assembly identity (None for netmodules)
         let real_identity = view.identity()?;
@@ -233,7 +250,75 @@ impl CilObjectData {
             methods: SkipMap::default(),
             method_specs: SkipMap::default(),
             fields: SkipMap::default(),
+            custom_attributes: SkipMap::default(),
             resources: Resources::new(view.file().clone()),
+            pdb: None,
+        };
+
+        // The PDB: an attached standalone one, else the one the image embeds, else debug
+        // tables in the image's own metadata. The image's own PDB is read leniently whatever
+        // the load's mode, since the runtime never reads it to load the assembly; a broken
+        // embedded PDB leaves the image's own tables, if it has any.
+        let diagnostics = view.diagnostics();
+        let embedded = if standalone_pdb.is_some() {
+            None
+        } else {
+            embedded_portable_pdb(view.file()).unwrap_or_else(|e| {
+                diagnostics.warning(
+                    DiagnosticCategory::General,
+                    format!("Skipped the embedded Portable PDB: {e}"),
+                );
+                None
+            })
+        };
+        let mut pdb_metadata = None;
+        let attached = standalone_pdb
+            .map(|data| (data, PdbOrigin::Standalone, lenient))
+            .or_else(|| {
+                embedded
+                    .as_deref()
+                    .map(|data| (data, PdbOrigin::Embedded, true))
+            });
+        if let Some((data, origin, pdb_lenient)) = attached {
+            match PdbMetadata::read(data).and_then(|pdb| {
+                pdb.check_rows(view.tables())?;
+                Ok(pdb)
+            }) {
+                Ok(pdb) => {
+                    match codeview_pdb_id(view.file()) {
+                        Ok(Some(id)) if id != pdb.pdb_stream.id => diagnostics.warning(
+                            DiagnosticCategory::General,
+                            format!(
+                                "The {origin} Portable PDB's id is not the one the image's \
+                                 CodeView entry names: it is from another build"
+                            ),
+                        ),
+                        Err(e) => diagnostics.warning(
+                            DiagnosticCategory::General,
+                            format!("Could not read the CodeView entry's PDB id: {e}"),
+                        ),
+                        _ => {}
+                    }
+                    pdb_metadata = Some((pdb, origin, pdb_lenient));
+                }
+                Err(e) if pdb_lenient => diagnostics.warning(
+                    DiagnosticCategory::General,
+                    format!("Skipped the {origin} Portable PDB: {e}"),
+                ),
+                Err(e) => return Err(e),
+            }
+        }
+        cil_object.pdb = match &pdb_metadata {
+            Some((pdb, origin, _)) => Some(PortablePdb::new(*origin, Some(pdb.pdb_stream.clone()))),
+            None if view.tables().is_some_and(|tables| {
+                PDB_TABLES
+                    .iter()
+                    .any(|&table| tables.table_row_count(table) > 0)
+            }) =>
+            {
+                Some(PortablePdb::new(PdbOrigin::InImage, None))
+            }
+            None => None,
         };
 
         let (native_imports, native_exports) = load_native_tables(view)?;
@@ -282,14 +367,24 @@ impl CilObjectData {
                 field_rva: SkipMap::default(),
                 enc_log: SkipMap::default(),
                 enc_map: SkipMap::default(),
-                document: SkipMap::default(),
-                method_debug_information: SkipMap::default(),
-                local_scope: SkipMap::default(),
-                local_variable: SkipMap::default(),
-                local_constant: SkipMap::default(),
-                import_scope: SkipMap::default(),
-                state_machine_method: SkipMap::default(),
-                custom_debug_information: SkipMap::default(),
+                pdb: cil_object.pdb.as_ref().map(|target| match &pdb_metadata {
+                    Some((pdb, _, pdb_lenient)) => PdbSource {
+                        meta: pdb.tables.as_ref(),
+                        strings: pdb.strings.as_ref(),
+                        blobs: pdb.blobs.as_ref(),
+                        guids: pdb.guids.as_ref(),
+                        lenient: *pdb_lenient,
+                        target,
+                    },
+                    None => PdbSource {
+                        meta: view.tables(),
+                        strings: view.strings(),
+                        blobs: view.blobs(),
+                        guids: view.guids(),
+                        lenient: true,
+                        target,
+                    },
+                }),
                 param: SkipMap::default(),
                 param_ptr: SkipMap::default(),
                 generic_param: SkipMap::default(),
@@ -305,7 +400,7 @@ impl CilObjectData {
                 nested_class: SkipMap::default(),
                 interface_impl: SkipMap::default(),
                 constant: SkipMap::default(),
-                custom_attribute: SkipMap::default(),
+                custom_attribute: &cil_object.custom_attributes,
                 decl_security: &cil_object.decl_security,
                 file: &cil_object.refs_file,
                 exported_type: cil_object.export_container.cil(),
@@ -358,14 +453,14 @@ fn load_native_tables(view: &CilAssemblyView) -> Result<(NativeImports, NativeEx
         NativeImports::default()
     };
 
-    let native_exports = if let Some(owned_exports) = view.file().exports() {
-        if owned_exports.is_empty() {
-            NativeExports::default()
-        } else {
-            NativeExports::from_pe_exports(owned_exports)?
-        }
-    } else {
-        NativeExports::default()
+    // The runtime does not read a managed assembly's native exports, so a table the model
+    // cannot hold (a name exported twice) does not fail the load: the view is empty, the
+    // entries stay on `File::pe().exports`, and the writer refuses to rebuild the table
+    let pe = view.file().pe();
+    let native_exports = match &pe.export_header {
+        Some(header) => NativeExports::from_pe_exports(header, &pe.exports)
+            .unwrap_or_else(|_| NativeExports::new(&header.name)),
+        None => NativeExports::default(),
     };
 
     Ok((native_imports, native_exports))
@@ -383,7 +478,7 @@ mod examples {
         let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))?;
 
         // Load single assembly without ProjectContext
-        let cil_data = CilObjectData::from_assembly_view(&view, None, false)?;
+        let cil_data = CilObjectData::from_assembly_view(&view, None, false, None)?;
 
         // Metadata is now ready for use
         assert!(cil_data.types.len() > 1);

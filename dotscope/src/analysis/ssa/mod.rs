@@ -99,6 +99,7 @@ mod value;
 pub use analyssa::ir::{
     function::{AddressTakenSlots, MethodPurity},
     instruction::InstrId,
+    FloatBits, FloatFormat,
 };
 pub use builder::SsaFunctionBuilder;
 pub use converter::SsaConverter;

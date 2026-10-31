@@ -28,7 +28,7 @@
 //! use dotscope::Pe;
 //!
 //! let goblin_pe = PE::parse(data)?;
-//! let owned_pe = Pe::from_goblin_pe(&goblin_pe)?;
+//! let owned_pe = Pe::from_goblin_pe(&goblin_pe, data)?;
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -41,6 +41,7 @@
 //! ```
 
 use crate::{
+    file::{native, sectionmap::SectionMap},
     utils::{read_le_at, write_le_at},
     Error, ParseFailure, ParseStage, Result,
 };
@@ -54,7 +55,12 @@ fn pe_invalid(field: &'static str, reason: String) -> Error {
     }
     .into()
 }
-use std::{collections::HashMap, fmt, io::Write};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    io::Write,
+    sync::Arc,
+};
 
 metadata_flags! {
     /// PE machine type identifier.
@@ -260,11 +266,22 @@ pub struct Pe {
     /// Whether this is a 64-bit PE file
     pub is_64bit: bool,
 
-    /// Imported symbols and DLLs
+    /// Imported symbols and DLLs, in import table order
     pub imports: Vec<Import>,
 
-    /// Exported symbols
+    /// Why the import table could not be read in full, when it could not: `imports` holds
+    /// the entries before the one that could not be read.
+    pub import_error: Option<String>,
+
+    /// The export directory's header, when the image has one
+    pub export_header: Option<ExportHeader>,
+
+    /// Exported symbols, by ordinal
     pub exports: Vec<Export>,
+
+    /// Why the export table could not be read in full, when it could not: `exports` holds
+    /// what was read before it.
+    pub export_error: Option<String>,
 
     /// List of imported library names
     pub libraries: Vec<String>,
@@ -512,36 +529,64 @@ pub struct SectionTable {
 /// - `name` and `ordinal` are mutually exclusive (one will be None)
 /// - `rva` points to the slot in the Import Address Table
 /// - `hint` optimizes name lookups in the target DLL's export table
-/// - `ilt_value` preserves the original Import Lookup Table entry value
+/// - `ilt_value` preserves the original Import Lookup Table entry value (the import address
+///   table's, for a descriptor without a lookup table)
 #[derive(Debug, Clone)]
 pub struct Import {
-    /// Name of the DLL containing the imported function (e.g., "kernel32.dll")
-    pub dll: String,
+    /// Name of the DLL containing the imported function (e.g., "kernel32.dll"), one string
+    /// shared by the imports of a descriptor
+    pub dll: Arc<str>,
     /// Function name if imported by name (None for ordinal-only imports)
     pub name: Option<String>,
     /// Ordinal number if imported by ordinal (None for name-only imports)
     pub ordinal: Option<u16>,
     /// Relative Virtual Address of the Import Address Table slot for this import
     pub rva: u32,
-    /// Hint value for optimizing name lookups in the target DLL's export table (0 if unavailable)
+    /// Hint value for optimizing name lookups in the target DLL's export table (0 for an
+    /// import by ordinal)
     pub hint: u16,
-    /// Original Import Lookup Table entry value preserving import metadata (0 if unavailable)
+    /// Original Import Lookup Table entry value preserving import metadata (0 for an import
+    /// a change adds)
     pub ilt_value: u64,
 }
 
-/// Owned export entry.
+/// Owned export entry: one exported ordinal, under one of its names. An ordinal with
+/// several names is an entry per name.
 #[derive(Debug, Clone)]
 pub struct Export {
     /// Function name (None for ordinal-only exports)
     pub name: Option<String>,
-    /// Export RVA
+    /// The export's ordinal: the directory's ordinal base plus its slot in the export address
+    /// table
+    pub ordinal: u16,
+    /// Export RVA: the exported code or data, or for a forwarder its forwarder string
     pub rva: u32,
-    /// Ordinal offset for ordinal calculation
+    /// The file offset `rva` is read from, when the file holds it
     pub offset: Option<u32>,
+    /// What a forwarder forwards to (`"DLL.Function"` or `"DLL.#ordinal"`), for an export
+    /// whose address is inside the export directory
+    pub forwarder: Option<String>,
+}
+
+/// The export directory's own fields: the DLL's name and where its ordinals start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportHeader {
+    /// The name the DLL exports under
+    pub name: String,
+    /// The ordinal of the export address table's first slot
+    pub base: u32,
+    /// The directory's time stamp
+    pub timestamp: u32,
+    /// The directory's major version
+    pub major_version: u16,
+    /// The directory's minor version
+    pub minor_version: u16,
 }
 
 impl Pe {
-    /// Create Pe from goblin PE structure.
+    /// Create Pe from goblin PE structure, with `data`, the bytes goblin parsed, for the
+    /// import and export tables, which are read entry by entry from them (see
+    /// `file::native`): goblin's lists leave out what they cannot read.
     ///
     /// # Errors
     ///
@@ -549,7 +594,7 @@ impl Pe {
     /// Validation includes:
     /// - Presence of optional header
     /// - Image base is non-zero
-    pub fn from_goblin_pe(goblin_pe: &goblin::pe::PE) -> Result<Self> {
+    pub fn from_goblin_pe(goblin_pe: &goblin::pe::PE, data: &[u8]) -> Result<Self> {
         let dos_header = DosHeader::from_goblin(&goblin_pe.header.dos_header);
         let coff_header = CoffHeader::from_goblin(&goblin_pe.header.coff_header);
         let optional_header = goblin_pe
@@ -579,23 +624,26 @@ impl Pe {
             .map(SectionTable::from_goblin)
             .collect::<Result<Vec<_>>>()?;
 
-        let imports = goblin_pe
-            .imports
-            .iter()
-            .map(Import::from_goblin)
-            .collect::<Result<Vec<_>>>()?;
-
-        let exports = goblin_pe
-            .exports
-            .iter()
-            .map(Export::from_goblin)
-            .collect::<Result<Vec<_>>>()?;
-
-        let libraries = goblin_pe.libraries.iter().map(|&s| s.to_string()).collect();
-
         let data_directories = optional_header
             .as_ref()
             .map_or_else(DataDirectories::new, |oh| oh.data_directories.clone());
+
+        let map = SectionMap::new(&sections, data.len());
+        let imports = native::read_imports(
+            map,
+            data,
+            data_directories
+                .directories
+                .get(&DataDirectoryType::ImportTable),
+            goblin_pe.is_64,
+        );
+        let exports = native::read_exports(
+            map,
+            data,
+            data_directories
+                .directories
+                .get(&DataDirectoryType::ExportTable),
+        );
 
         Ok(Pe {
             dos_header,
@@ -604,9 +652,12 @@ impl Pe {
             sections,
             image_base: goblin_pe.image_base,
             is_64bit: goblin_pe.is_64,
-            imports,
-            exports,
-            libraries,
+            imports: imports.imports,
+            import_error: imports.error,
+            export_header: exports.header,
+            exports: exports.exports,
+            export_error: exports.error,
+            libraries: imports.libraries,
             data_directories: data_directories.directories,
         })
     }
@@ -1790,27 +1841,6 @@ impl SectionTable {
 }
 
 impl Import {
-    fn from_goblin(goblin_import: &goblin::pe::import::Import) -> Result<Self> {
-        Ok(Self {
-            dll: goblin_import.dll.to_string(),
-            name: if goblin_import.name.is_empty() {
-                None
-            } else {
-                Some(goblin_import.name.to_string())
-            },
-            ordinal: if goblin_import.ordinal != 0 {
-                Some(goblin_import.ordinal)
-            } else {
-                None
-            },
-            rva: u32::try_from(goblin_import.rva)
-                .map_err(|_| pe_invalid("import_rva", "value too large".into()))?,
-            hint: 0, // Not available from goblin
-            ilt_value: u64::try_from(goblin_import.offset)
-                .map_err(|_| pe_invalid("import_offset", "value too large".into()))?,
-        })
-    }
-
     /// Get the function identifier for this import (name or ordinal)
     #[must_use]
     pub fn function_identifier(&self) -> String {
@@ -1821,23 +1851,6 @@ impl Import {
         } else {
             "unknown".to_string()
         }
-    }
-}
-
-impl Export {
-    fn from_goblin(goblin_export: &goblin::pe::export::Export) -> Result<Self> {
-        Ok(Self {
-            name: goblin_export.name.map(ToString::to_string),
-            rva: u32::try_from(goblin_export.rva)
-                .map_err(|_| pe_invalid("export_rva", "value too large".into()))?,
-            offset: goblin_export
-                .offset
-                .map(|o| {
-                    u32::try_from(o)
-                        .map_err(|_| pe_invalid("export_offset", "value too large".into()))
-                })
-                .transpose()?,
-        })
     }
 }
 
@@ -2034,6 +2047,11 @@ impl ResourceDataEntry {
 ///
 /// Only `ResourceDataEntry::offset_to_data` contains an absolute RVA that needs relocation.
 /// All other offsets in the directory are relative to the start of the resource section.
+///
+/// Entries can share a subdirectory or a data entry, or name a directory above them, as the
+/// loader allows: each directory is walked and each data entry relocated once, however many
+/// entries name it. Directories that overlap can name more entries than the section holds,
+/// so the walk reads entries, counted per directory, up to the section's size.
 pub fn relocate_resource_section(data: &mut [u8], old_rva: u32, new_rva: u32) -> Result<()> {
     if old_rva == new_rva || data.is_empty() {
         return Ok(()); // No relocation needed
@@ -2048,75 +2066,178 @@ pub fn relocate_resource_section(data: &mut [u8], old_rva: u32, new_rva: u32) ->
             field: "rva_delta",
             reason: "resource RVA delta overflow".into(),
         })?;
-
-    // Process the root directory at offset 0
-    relocate_resource_directory(data, 0, delta, 0)
-}
-
-/// Deepest resource-directory nesting the relocator will follow.
-const MAX_RESOURCE_DEPTH: usize = 32;
-
-/// Recursively processes a resource directory and its entries, adjusting RVAs as needed.
-fn relocate_resource_directory(
-    data: &mut [u8],
-    offset: usize,
-    delta: i64,
-    depth: usize,
-) -> Result<()> {
-    // Nothing checks that a subdirectory entry points *forward*, so a `.rsrc`
-    // entry naming its own directory recursed forever. Resource trees are three
-    // levels by convention (type/name/language).
-    if depth >= MAX_RESOURCE_DEPTH {
-        return Ok(());
-    }
-    // Read the directory header
-    let dir = ImageResourceDirectory::read_from(data, offset)?;
     let res_invalid = |field: &'static str, reason: String| ParseFailure::InvalidField {
         stage: ParseStage::Resources,
         field,
         reason,
     };
-    let entries_offset = offset
-        .checked_add(IMAGE_RESOURCE_DIRECTORY_SIZE)
-        .ok_or_else(|| res_invalid("entries_offset", "directory entries offset overflow".into()))?;
 
-    // Process each entry
-    for i in 0..dir.entry_count() {
-        let scaled = i
+    // The root directory is at offset 0
+    let mut directories = HashSet::from([0usize]);
+    let mut data_entries = HashSet::new();
+    let mut pending = vec![0usize];
+    let mut budget = data.len();
+    while let Some(offset) = pending.pop() {
+        let dir = ImageResourceDirectory::read_from(data, offset)?;
+        let size = dir
+            .entry_count()
             .checked_mul(RESOURCE_ENTRY_SIZE)
-            .ok_or_else(|| res_invalid("entry_index", "entry index overflow".into()))?;
-        let entry_offset = entries_offset
-            .checked_add(scaled)
-            .ok_or_else(|| res_invalid("entry_offset", "entry offset overflow".into()))?;
-        let entry = ResourceEntry::read_from(data, entry_offset)?;
+            .and_then(|entries| entries.checked_add(IMAGE_RESOURCE_DIRECTORY_SIZE))
+            .ok_or_else(|| res_invalid("entry_count", "directory size overflow".into()))?;
+        budget = budget.checked_sub(size).ok_or_else(|| {
+            res_invalid(
+                "entry_count",
+                format!(
+                    "the directories' entries, counted per directory, are more than the \
+                     section's {} bytes",
+                    data.len()
+                ),
+            )
+        })?;
+        let entries_offset = offset
+            .checked_add(IMAGE_RESOURCE_DIRECTORY_SIZE)
+            .ok_or_else(|| {
+                res_invalid("entries_offset", "directory entries offset overflow".into())
+            })?;
 
-        if entry.is_directory() {
-            // Entry points to another directory - recurse
-            relocate_resource_directory(
-                data,
-                entry.target_offset(),
-                delta,
-                depth.saturating_add(1),
-            )?;
-        } else {
-            // Entry points to a ResourceDataEntry - adjust the RVA in-place.
-            // The RVA is the first 4 bytes of the ResourceDataEntry structure.
-            let data_entry_offset = entry.target_offset();
-            let mut pos = data_entry_offset;
-            let old_data_rva: u32 = read_le_at(data, &mut pos)?;
-            let new_data_rva = u32::try_from(i64::from(old_data_rva).saturating_add(delta))
-                .map_err(|_| {
-                    res_invalid(
-                        "rva",
-                        format!(
-                            "RVA relocation overflow: old_rva={old_data_rva:#x}, delta={delta}",
-                        ),
-                    )
-                })?;
-            let mut pos = data_entry_offset;
-            write_le_at::<u32>(data, &mut pos, new_data_rva)?;
+        for i in 0..dir.entry_count() {
+            let scaled = i
+                .checked_mul(RESOURCE_ENTRY_SIZE)
+                .ok_or_else(|| res_invalid("entry_index", "entry index overflow".into()))?;
+            let entry_offset = entries_offset
+                .checked_add(scaled)
+                .ok_or_else(|| res_invalid("entry_offset", "entry offset overflow".into()))?;
+            let entry = ResourceEntry::read_from(data, entry_offset)?;
+            let target = entry.target_offset();
+
+            if entry.is_directory() {
+                if directories.insert(target) {
+                    pending.push(target);
+                }
+            } else if data_entries.insert(target) {
+                // A ResourceDataEntry: its RVA is its first 4 bytes
+                let mut pos = target;
+                let old_data_rva: u32 = read_le_at(data, &mut pos)?;
+                let new_data_rva = u32::try_from(i64::from(old_data_rva).saturating_add(delta))
+                    .map_err(|_| {
+                        res_invalid(
+                            "rva",
+                            format!(
+                                "RVA relocation overflow: old_rva={old_data_rva:#x}, delta={delta}",
+                            ),
+                        )
+                    })?;
+                let mut pos = target;
+                write_le_at::<u32>(data, &mut pos, new_data_rva)?;
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn get_u32(data: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// A directory at `offset` whose id entries name `targets`, each a subdirectory when
+    /// its flag is set.
+    fn directory(data: &mut [u8], offset: usize, targets: &[(usize, bool)]) {
+        put_u16(data, offset + 14, u16::try_from(targets.len()).unwrap());
+        for (index, &(target, is_directory)) in targets.iter().enumerate() {
+            let entry = offset + 16 + index * 8;
+            put_u32(data, entry, u32::try_from(index).unwrap() + 1);
+            let flag = if is_directory { 0x8000_0000 } else { 0 };
+            put_u32(data, entry + 4, flag | u32::try_from(target).unwrap());
+        }
+    }
+
+    /// Two entries naming one data entry move it once, not by twice the delta.
+    #[test]
+    fn a_shared_data_entry_is_relocated_once() {
+        let mut data = vec![0u8; 0x100];
+        directory(&mut data, 0, &[(0x40, false), (0x40, false)]);
+        put_u32(&mut data, 0x40, 0x2010);
+        relocate_resource_section(&mut data, 0x2000, 0x5000).unwrap();
+        assert_eq!(get_u32(&data, 0x40), 0x5010);
+    }
+
+    /// Two entries naming one subdirectory walk it once: its data entries move once.
+    #[test]
+    fn a_shared_subdirectory_is_walked_once() {
+        let mut data = vec![0u8; 0x100];
+        directory(&mut data, 0, &[(0x40, true), (0x40, true)]);
+        directory(&mut data, 0x40, &[(0x80, false)]);
+        put_u32(&mut data, 0x80, 0x2010);
+        relocate_resource_section(&mut data, 0x2000, 0x5000).unwrap();
+        assert_eq!(get_u32(&data, 0x80), 0x5010);
+    }
+
+    /// An entry naming a directory above it ends the walk there.
+    #[test]
+    fn a_directory_cycle_ends() {
+        let mut data = vec![0u8; 0x100];
+        directory(&mut data, 0, &[(0x40, true)]);
+        directory(&mut data, 0x40, &[(0, true), (0x80, false)]);
+        put_u32(&mut data, 0x80, 0x2010);
+        relocate_resource_section(&mut data, 0x2000, 0x5000).unwrap();
+        assert_eq!(get_u32(&data, 0x80), 0x5010);
+    }
+
+    /// A chain of directories whose two entries both name the next one is 2^depth paths to
+    /// its leaf: walked once per directory, the leaf moves once, deeper than any depth cap.
+    #[test]
+    fn a_doubling_chain_is_walked_once_per_directory() {
+        let depth = 40;
+        let mut data = vec![0u8; 0x20 * (depth + 2)];
+        let leaf = 0x20 * (depth + 1);
+        for level in 0..depth {
+            let next = 0x20 * (level + 1);
+            if level + 1 == depth {
+                directory(&mut data, 0x20 * level, &[(leaf, false), (leaf, false)]);
+            } else {
+                directory(&mut data, 0x20 * level, &[(next, true), (next, true)]);
+            }
+        }
+        put_u32(&mut data, leaf, 0x2010);
+        relocate_resource_section(&mut data, 0x2000, 0x5000).unwrap();
+        assert_eq!(get_u32(&data, leaf), 0x5010);
+    }
+
+    /// Directories that overlap one another name more entries than the section holds: the
+    /// walk stops at the section's size and says so, rather than reading each in full.
+    #[test]
+    fn overlapping_directories_are_bounded_by_the_section() {
+        let count = 1000;
+        let start = 0x3000;
+        // From `start`, every 8 bytes read as a directory header of 0x2000 named entries,
+        // each a data entry at 0x2000
+        let len = start + 8 * count + 16 + 8 * 0x2000;
+        let mut data = vec![0u8; len];
+        let mut offset = start;
+        while offset + 8 <= len {
+            put_u32(&mut data, offset + 4, 0x2000);
+            offset += 8;
+        }
+        let targets: Vec<_> = (0..count).map(|j| (start + 8 * j, true)).collect();
+        directory(&mut data, 0, &targets);
+
+        let error = relocate_resource_section(&mut data, 0x2000, 0x5000).unwrap_err();
+        assert!(
+            error.to_string().contains("more than the section's"),
+            "{error}"
+        );
+    }
 }

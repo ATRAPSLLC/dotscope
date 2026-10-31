@@ -19,7 +19,7 @@ pub(super) fn format_security(
 ) -> io::Result<()> {
     // Permission class comments (before the directive)
     for perm in security.permission_set.permissions() {
-        writeln!(w, "{indent}// [{}]{}", perm.assembly_name, perm.class_name)?;
+        writeln!(w, "{indent}// {}", perm.class_name)?;
     }
 
     let raw = security.permission_set.raw_data();

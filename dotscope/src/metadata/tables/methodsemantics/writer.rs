@@ -29,14 +29,7 @@ use crate::{
 
 impl RowWritable for MethodSemanticsRaw {
     fn sort_key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
-        Ok(Some((
-            sizes.encode_coded_index(
-                self.association.tag,
-                self.association.row,
-                self.association.ci_type,
-            )?,
-            0,
-        )))
+        Ok(Some((self.association.encode(sizes)?, 0)))
     }
 
     /// Serialize a MethodSemantics table row to binary format
@@ -79,11 +72,7 @@ impl RowWritable for MethodSemanticsRaw {
         )?;
 
         // Write HasSemantics coded index for association
-        let association_value = sizes.encode_coded_index(
-            self.association.tag,
-            self.association.row,
-            CodedIndexType::HasSemantics,
-        )?;
+        let association_value = self.association.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

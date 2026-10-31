@@ -9,7 +9,8 @@
 //!
 //! - **PE signature corruption** (BitDotNet): `0x00014550` → `0x00004550`
 //! - **CLR header zeroing** (BitDotNet/BitDecompiler): cb, runtime version, metadata size zeroed
-//! - **Data directory inflation** (BitMono packer): `NumberOfRvaAndSizes` set to `0x13` instead of `0x10`
+//! - **Data directory inflation** (BitMono packer and others): `NumberOfRvaAndSizes` above `0x10`
+//!   (BitMono writes `0x13`); the loader reads only the first 16 directories
 //! - **CLR directory size zeroing** (BitMono packer): .NET directory size set to 0
 //!
 //! # Usage
@@ -33,12 +34,15 @@ use cowfile::CowFile;
 use log::debug;
 
 use crate::{
-    file::pe::{
-        constants::{
-            CLR_DIRECTORY_INDEX, CLR_MAJOR_RUNTIME_VERSION, COR20_HEADER_SIZE, PE32PLUS_MAGIC,
-            PE32_MAGIC, PE_SIGNATURE, STANDARD_DATA_DIRECTORY_COUNT,
+    file::{
+        pe::{
+            constants::{
+                CLR_DIRECTORY_INDEX, CLR_MAJOR_RUNTIME_VERSION, COR20_HEADER_SIZE, PE32PLUS_MAGIC,
+                PE32_MAGIC, PE_SIGNATURE, STANDARD_DATA_DIRECTORY_COUNT,
+            },
+            SectionTable,
         },
-        SectionTable,
+        sectionmap::{RvaMapping, SectionMap},
     },
     metadata::root::CIL_HEADER_MAGIC,
     utils::{read_le_at, write_le_at},
@@ -82,7 +86,8 @@ pub enum RepairAction {
         /// Restored metadata size.
         restored_size: u32,
     },
-    /// `NumberOfRvaAndSizes` corrected (BitMono packer: `0x13` → `0x10`).
+    /// `NumberOfRvaAndSizes` above 16 corrected to 16, the directories the loader reads
+    /// (BitMono packer: `0x13` → `0x10`).
     DataDirectoryCount {
         /// Original (corrupted) data directory count.
         original: u32,
@@ -100,9 +105,6 @@ pub enum RepairAction {
 
 /// BitDotNet's corrupted PE signature (byte at offset +2 changed from 0x00 to 0x01).
 const BITDOTNET_PE_SIGNATURE: u32 = 0x0001_4550;
-
-/// BitMono packer's inflated data directory count.
-const BITMONO_INFLATED_DATA_DIRECTORY_COUNT: u32 = 0x13;
 
 /// Attempt all known PE repairs on raw bytes, in place.
 ///
@@ -258,7 +260,8 @@ fn repair_pe_optional_header(bytes: &mut impl PeBytes, pe_off: usize, result: &m
     };
 
     if let Some(num_rva_sizes) = bytes.read_u32(num_rva_sizes_offset) {
-        if num_rva_sizes == BITMONO_INFLATED_DATA_DIRECTORY_COUNT {
+        // The loader reads the first 16 directories whatever the count says past them
+        if num_rva_sizes > STANDARD_DATA_DIRECTORY_COUNT {
             debug!(
                 "Data directory count repair: 0x{:X} → 0x{:X}",
                 num_rva_sizes, STANDARD_DATA_DIRECTORY_COUNT
@@ -271,13 +274,7 @@ fn repair_pe_optional_header(bytes: &mut impl PeBytes, pe_off: usize, result: &m
         }
     }
 
-    let Some(data_dir_start) = num_rva_sizes_offset.checked_add(4) else {
-        return;
-    };
-    let Some(clr_offset_in_table) = CLR_DIRECTORY_INDEX.checked_mul(8) else {
-        return;
-    };
-    let Some(clr_dir_offset) = data_dir_start.checked_add(clr_offset_in_table) else {
+    let Some(clr_dir_offset) = clr_directory_offset(bytes, pe_off, num_rva_sizes_offset) else {
         return;
     };
     let Some(clr_size_offset) = clr_dir_offset.checked_add(4) else {
@@ -298,6 +295,27 @@ fn repair_pe_optional_header(bytes: &mut impl PeBytes, pe_off: usize, result: &m
     }
 }
 
+/// The file offset of the CLR data directory entry, when the image has one: its directory
+/// count reaches it and the optional header holds it. A count of 14 or fewer declares no CLR
+/// directory, and the bytes where it would be belong to whatever follows the directories.
+fn clr_directory_offset(
+    bytes: &impl PeBytes,
+    pe_off: usize,
+    num_rva_sizes_offset: usize,
+) -> Option<usize> {
+    if usize::try_from(bytes.read_u32(num_rva_sizes_offset)?).ok()? <= CLR_DIRECTORY_INDEX {
+        return None;
+    }
+    let optional_header_size = bytes.read_u16(pe_off.checked_add(20)?)?;
+    let optional_header_end = pe_off
+        .checked_add(24)?
+        .checked_add(usize::from(optional_header_size))?;
+    let entry = num_rva_sizes_offset
+        .checked_add(4)?
+        .checked_add(CLR_DIRECTORY_INDEX.checked_mul(8)?)?;
+    (entry.checked_add(8)? <= optional_header_end).then_some(entry)
+}
+
 fn repair_clr_header(bytes: &mut impl PeBytes, pe_off: usize, result: &mut RepairResult) {
     let Some(optional_header_offset) = pe_off.checked_add(24) else {
         return;
@@ -313,13 +331,7 @@ fn repair_clr_header(bytes: &mut impl PeBytes, pe_off: usize, result: &mut Repai
     let Some(num_rva_sizes_offset) = num_rva_sizes_offset else {
         return;
     };
-    let Some(data_dir_start) = num_rva_sizes_offset.checked_add(4) else {
-        return;
-    };
-    let Some(clr_offset_in_table) = CLR_DIRECTORY_INDEX.checked_mul(8) else {
-        return;
-    };
-    let Some(clr_dir_offset) = data_dir_start.checked_add(clr_offset_in_table) else {
+    let Some(clr_dir_offset) = clr_directory_offset(bytes, pe_off, num_rva_sizes_offset) else {
         return;
     };
     let Some(clr_rva) = bytes.read_u32(clr_dir_offset) else {
@@ -395,38 +407,19 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     read_le_at::<u32>(bytes, &mut off).ok()
 }
 
-/// Converts an RVA to a file offset using the section table.
+/// Where the runtime finds `rva` in the file, by the section table (see [`SectionMap`]).
 fn rva_to_file_offset(bytes: &[u8], pe_off: usize, rva: u32) -> Option<u32> {
     let sections = parse_section_table(bytes, pe_off)?;
-
-    for section in &sections {
-        let section_end = section.virtual_address.checked_add(section.virtual_size)?;
-        if rva >= section.virtual_address && rva < section_end {
-            let offset_within_section = rva.checked_sub(section.virtual_address)?;
-            return section
-                .pointer_to_raw_data
-                .checked_add(offset_within_section);
-        }
+    match SectionMap::new(&sections, bytes.len()).map(rva) {
+        RvaMapping::File(offset) => u32::try_from(offset).ok(),
+        RvaMapping::ZeroFill | RvaMapping::Unmapped => None,
     }
-
-    None
 }
 
-/// Converts a file offset to an RVA using the section table.
+/// The RVA the file byte at `offset` is loaded at, by the section table (see [`SectionMap`]).
 fn file_offset_to_rva(bytes: &[u8], pe_off: usize, offset: u32) -> Option<u32> {
     let sections = parse_section_table(bytes, pe_off)?;
-
-    for section in &sections {
-        let section_end = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)?;
-        if offset >= section.pointer_to_raw_data && offset < section_end {
-            let offset_within_section = offset.checked_sub(section.pointer_to_raw_data)?;
-            return section.virtual_address.checked_add(offset_within_section);
-        }
-    }
-
-    None
+    SectionMap::new(&sections, bytes.len()).offset_to_rva(offset as usize)
 }
 
 /// Parses the section table from raw PE bytes into [`SectionTable`] entries.
@@ -621,13 +614,13 @@ mod tests {
                 CLR_MAJOR_RUNTIME_VERSION, COR20_HEADER_SIZE, PE_SIGNATURE,
                 STANDARD_DATA_DIRECTORY_COUNT,
             },
-            repair::{
-                repair_pe, repair_pe_cow, RepairAction, BITDOTNET_PE_SIGNATURE,
-                BITMONO_INFLATED_DATA_DIRECTORY_COUNT,
-            },
+            repair::{repair_pe, repair_pe_cow, RepairAction, BITDOTNET_PE_SIGNATURE},
         },
         testkit::fixture,
     };
+
+    /// BitMono packer's inflated data directory count.
+    const BITMONO_INFLATED_DATA_DIRECTORY_COUNT: u32 = 0x13;
 
     /// Helper to build a minimal valid PE32 with known layout.
     ///
@@ -804,6 +797,72 @@ mod tests {
         if let RepairAction::DataDirectoryCount { original, restored } = &count_repairs[0] {
             assert_eq!(*original, BITMONO_INFLATED_DATA_DIRECTORY_COUNT);
             assert_eq!(*restored, STANDARD_DATA_DIRECTORY_COUNT);
+        }
+    }
+
+    /// A count of 14 or fewer declares no CLR directory: the CLR-slot repairs leave the bytes
+    /// where it would be, which belong to what follows the directories, as they are.
+    #[test]
+    fn no_clr_directory_is_repaired_where_none_is_declared() {
+        for count in [0u32, 10, 14] {
+            let mut pe = build_minimal_pe();
+            pe[0xF4..0xF8].copy_from_slice(&count.to_le_bytes());
+            // The CLR slot (directory 14) with an RVA and a zero size
+            pe[0x168..0x16C].copy_from_slice(&0x2008u32.to_le_bytes());
+            pe[0x16C..0x170].copy_from_slice(&0u32.to_le_bytes());
+            let before = pe.clone();
+            let result = repair_pe(&mut pe);
+            assert_eq!(pe, before, "count {count}");
+            assert!(
+                result.repairs.is_empty(),
+                "count {count}: {:?}",
+                result.repairs
+            );
+        }
+    }
+
+    /// A CLR slot past the optional header's declared size is not the optional header's.
+    #[test]
+    fn no_clr_directory_is_repaired_past_the_optional_header() {
+        let mut pe = build_minimal_pe();
+        pe[0x16C..0x170].copy_from_slice(&0u32.to_le_bytes());
+        // SizeOfOptionalHeader ends before directory 14's entry
+        pe[0x94..0x96].copy_from_slice(&0x00D0u16.to_le_bytes());
+        let before = pe.clone();
+        repair_pe(&mut pe);
+        assert_eq!(pe[0x168..0x170], before[0x168..0x170]);
+    }
+
+    /// Any count past 16 is repaired, not only BitMono's 0x13; 16 and below are left as
+    /// they are.
+    #[test]
+    fn every_data_directory_count_past_16_is_repaired() {
+        for count in [0x11, 0x14, 0x20, 0xFFFF, u32::MAX] {
+            let mut pe = build_minimal_pe();
+            pe[0xF4..0xF8].copy_from_slice(&count.to_le_bytes());
+            let result = repair_pe(&mut pe);
+            assert_eq!(
+                u32::from_le_bytes(pe[0xF4..0xF8].try_into().unwrap()),
+                STANDARD_DATA_DIRECTORY_COUNT,
+                "count {count:#x}"
+            );
+            assert!(result.repairs.iter().any(|repair| matches!(
+                repair,
+                RepairAction::DataDirectoryCount { original, .. } if *original == count
+            )));
+        }
+        for count in [0x0F, STANDARD_DATA_DIRECTORY_COUNT] {
+            let mut pe = build_minimal_pe();
+            pe[0xF4..0xF8].copy_from_slice(&count.to_le_bytes());
+            let result = repair_pe(&mut pe);
+            assert_eq!(
+                u32::from_le_bytes(pe[0xF4..0xF8].try_into().unwrap()),
+                count
+            );
+            assert!(!result
+                .repairs
+                .iter()
+                .any(|repair| matches!(repair, RepairAction::DataDirectoryCount { .. })));
         }
     }
 

@@ -7,17 +7,13 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::{
-    cilassembly::CilAssembly,
+    cilassembly::{changes::METHOD_BODY_PLACEHOLDER_BASE, CilAssembly},
     metadata::{
         method::MethodBody,
         tables::{MethodDefRaw, TableId},
         token::Token,
     },
 };
-
-/// Placeholder RVA threshold — RVAs at or above this value are placeholder RVAs
-/// that point to regenerated method bodies stored in `AssemblyChanges`.
-pub(crate) const PLACEHOLDER_RVA_THRESHOLD: u32 = 0xF000_0000;
 
 /// Computes the RID range `[start..end)` for a metadata list owned by a parent row.
 ///
@@ -80,17 +76,16 @@ pub(crate) fn with_method_body(
     effective_rva: u32,
     callback: &mut impl FnMut(&[u8], usize),
 ) {
-    if effective_rva >= PLACEHOLDER_RVA_THRESHOLD {
+    if effective_rva >= METHOD_BODY_PLACEHOLDER_BASE {
         if let Some(body_bytes) = assembly.changes().get_method_body(effective_rva) {
             callback(body_bytes, 0);
         }
     } else {
-        let file = assembly.view().file();
-        let original_data = file.data();
-        let Ok(offset) = file.rva_to_offset(effective_rva as usize) else {
-            return;
-        };
-        if let Some(slice) = original_data.get(offset..) {
+        if let Ok(slice) = assembly
+            .view()
+            .file()
+            .section_bounded(effective_rva as usize)
+        {
             callback(slice, effective_rva as usize);
         }
     }

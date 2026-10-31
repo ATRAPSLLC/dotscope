@@ -138,3 +138,52 @@ fn propagate_local_types(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        analysis::DefSite,
+        metadata::signatures::{SignatureLocalVariable, TypeSignature},
+        testkit::helpers::test_assembly_arc,
+    };
+
+    /// A value a local is copied from takes the local's declared type when it has none: an
+    /// `int64` local types the phi it was copied from, so the phi is stored as an `int64`
+    /// once the copy is gone. An `int32` local, the stack's default, and a source already
+    /// typed are left as they are.
+    #[test]
+    fn a_copied_value_takes_its_locals_declared_type() {
+        let assembly = test_assembly_arc();
+        let mut ssa = SsaFunction::new(0, 3);
+        let mut variable =
+            |origin, version, ty| ssa.create_variable(origin, version, DefSite::entry(), ty);
+        let wide_source = variable(VariableOrigin::Phi, 0, SsaType::Unknown);
+        let wide = variable(VariableOrigin::Local(0), 1, SsaType::I64);
+        let narrow_source = variable(VariableOrigin::Phi, 0, SsaType::Unknown);
+        let narrow = variable(VariableOrigin::Local(1), 1, SsaType::I32);
+        let typed_source = variable(VariableOrigin::Phi, 0, SsaType::F64);
+        let typed = variable(VariableOrigin::Local(2), 1, SsaType::I64);
+        let local = |base| SignatureLocalVariable {
+            base,
+            ..SignatureLocalVariable::default()
+        };
+        ssa.set_original_local_types(vec![
+            local(TypeSignature::I8),
+            local(TypeSignature::I4),
+            local(TypeSignature::I8),
+        ]);
+        let resolved = BTreeMap::from([
+            (wide, wide_source),
+            (narrow, narrow_source),
+            (typed, typed_source),
+        ]);
+
+        propagate_local_types(&mut ssa, &resolved, &assembly);
+
+        let type_of = |var| ssa.variable(var).unwrap().var_type().clone();
+        assert_eq!(type_of(wide_source), SsaType::I64);
+        assert_eq!(type_of(narrow_source), SsaType::Unknown);
+        assert_eq!(type_of(typed_source), SsaType::F64);
+    }
+}

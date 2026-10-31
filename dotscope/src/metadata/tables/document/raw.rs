@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
+        pdb::document_name,
         streams::{Blob, Guid, Strings},
         tables::{Document, DocumentRc, TableInfoRef, TableRow},
         token::Token,
@@ -143,10 +144,14 @@ impl DocumentRaw {
     /// # Errors
     /// Returns an error if heap lookups fail or if the data is malformed.
     pub fn to_owned(&self, _strings: &Strings, blobs: &Blob, guids: &Guid) -> Result<DocumentRc> {
-        let name_blob = blobs.get(self.name as usize)?;
-        let name = String::from_utf8_lossy(name_blob).to_string();
+        let name = document_name(blobs.get(self.name as usize)?, blobs)?;
 
-        let hash_algorithm_guid = guids.get(self.hash_algorithm as usize)?;
+        // A document may have no hash algorithm: a nil index
+        let hash_algorithm_guid = if self.hash_algorithm == 0 {
+            None
+        } else {
+            Some(guids.get(self.hash_algorithm as usize)?)
+        };
 
         let hash_bytes = if self.hash == 0 {
             Vec::new()

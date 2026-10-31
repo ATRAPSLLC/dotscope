@@ -4,9 +4,7 @@
 //! `NativeType` representations into binary marshalling descriptors as defined in ECMA-335 II.23.2.9.
 
 use crate::{
-    metadata::marshalling::types::{
-        MarshallingInfo, NativeType, MAX_RECURSION_DEPTH, NATIVE_TYPE, VARIANT_TYPE,
-    },
+    metadata::marshalling::types::{MarshallingInfo, NativeType, MAX_RECURSION_DEPTH, NATIVE_TYPE},
     utils::write_compressed_uint,
     Error::RecursionLimit,
     Result,
@@ -45,7 +43,6 @@ use crate::{
 /// // Encode a simple boolean type
 /// let info = MarshallingInfo {
 ///     primary_type: NativeType::Boolean,
-///     additional_types: vec![],
 /// };
 /// let bytes = encode_marshalling_descriptor(&info)?;
 /// assert_eq!(bytes, vec![NATIVE_TYPE::BOOLEAN]);
@@ -59,7 +56,6 @@ use crate::{
 /// // Encode LPSTR with size parameter index 5
 /// let info = MarshallingInfo {
 ///     primary_type: NativeType::LPStr { size_param_index: Some(5) },
-///     additional_types: vec![],
 /// };
 /// let bytes = encode_marshalling_descriptor(&info)?;
 /// assert_eq!(bytes, vec![NATIVE_TYPE::LPSTR, 0x05]);
@@ -73,11 +69,11 @@ use crate::{
 /// // Encode array of I4 with parameter and size info
 /// let info = MarshallingInfo {
 ///     primary_type: NativeType::Array {
-///         element_type: Box::new(NativeType::I4),
+///         element_type: NATIVE_TYPE::I4,
 ///         num_param: Some(3),
 ///         num_element: Some(10),
+///         flags: None,
 ///     },
-///     additional_types: vec![],
 /// };
 /// let bytes = encode_marshalling_descriptor(&info)?;
 /// // Result will be [NATIVE_TYPE::ARRAY, NATIVE_TYPE::I4, 0x03, 0x0A]
@@ -110,7 +106,6 @@ pub fn encode_marshalling_descriptor(info: &MarshallingInfo) -> Result<Vec<u8>> 
 ///
 /// let info = MarshallingInfo {
 ///     primary_type: NativeType::LPStr { size_param_index: Some(5) },
-///     additional_types: vec![],
 /// };
 ///
 /// let mut encoder = MarshallingEncoder::new();
@@ -161,10 +156,21 @@ impl MarshallingEncoder {
     ///
     /// This helper method reduces code duplication for writing optional
     /// size parameters, indices, and counts.
-    fn write_optional_compressed_uint(&mut self, value: Option<u32>) {
+    /// Writes a length-prefixed UTF-8 string.
+    fn write_string(&mut self, text: &str) -> Result<()> {
+        let length = u32::try_from(text.len()).map_err(|_| {
+            malformed_error!("Marshalling string of {} bytes is too long", text.len())
+        })?;
+        write_compressed_uint(length, &mut self.buffer)?;
+        self.buffer.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+
+    fn write_optional_compressed_uint(&mut self, value: Option<u32>) -> Result<()> {
         if let Some(v) = value {
-            write_compressed_uint(v, &mut self.buffer);
+            write_compressed_uint(v, &mut self.buffer)?;
         }
+        Ok(())
     }
 
     /// Encodes a single native type to the internal buffer.
@@ -190,6 +196,7 @@ impl MarshallingEncoder {
 
         match native_type {
             NativeType::End => self.buffer.push(NATIVE_TYPE::END),
+            NativeType::Unspecified => self.buffer.push(NATIVE_TYPE::MAX),
             NativeType::Void => self.buffer.push(NATIVE_TYPE::VOID),
             NativeType::Boolean => self.buffer.push(NATIVE_TYPE::BOOLEAN),
             NativeType::I1 => self.buffer.push(NATIVE_TYPE::I1),
@@ -213,23 +220,23 @@ impl MarshallingEncoder {
             NativeType::BStr => self.buffer.push(NATIVE_TYPE::BSTR),
             NativeType::LPStr { size_param_index } => {
                 self.buffer.push(NATIVE_TYPE::LPSTR);
-                self.write_optional_compressed_uint(*size_param_index);
+                self.write_optional_compressed_uint(*size_param_index)?;
             }
             NativeType::LPWStr { size_param_index } => {
                 self.buffer.push(NATIVE_TYPE::LPWSTR);
-                self.write_optional_compressed_uint(*size_param_index);
+                self.write_optional_compressed_uint(*size_param_index)?;
             }
             NativeType::LPTStr { size_param_index } => {
                 self.buffer.push(NATIVE_TYPE::LPTSTR);
-                self.write_optional_compressed_uint(*size_param_index);
+                self.write_optional_compressed_uint(*size_param_index)?;
             }
             NativeType::LPUtf8Str { size_param_index } => {
                 self.buffer.push(NATIVE_TYPE::LPUTF8STR);
-                self.write_optional_compressed_uint(*size_param_index);
+                self.write_optional_compressed_uint(*size_param_index)?;
             }
             NativeType::FixedSysString { size } => {
                 self.buffer.push(NATIVE_TYPE::FIXEDSYSSTRING);
-                write_compressed_uint(*size, &mut self.buffer);
+                write_compressed_uint(*size, &mut self.buffer)?;
             }
             NativeType::ObjectRef => self.buffer.push(NATIVE_TYPE::OBJECTREF),
             NativeType::IUnknown => self.buffer.push(NATIVE_TYPE::IUNKNOWN),
@@ -243,54 +250,47 @@ impl MarshallingEncoder {
                 if let Some(packing) = packing_size {
                     self.buffer.push(*packing);
                 }
-                self.write_optional_compressed_uint(*class_size);
+                self.write_optional_compressed_uint(*class_size)?;
             }
             NativeType::Interface { iid_param_index } => {
                 self.buffer.push(NATIVE_TYPE::INTERFACE);
-                self.write_optional_compressed_uint(*iid_param_index);
+                self.write_optional_compressed_uint(*iid_param_index)?;
             }
             NativeType::SafeArray {
                 variant_type,
                 user_defined_name,
             } => {
                 self.buffer.push(NATIVE_TYPE::SAFEARRAY);
-
-                // Always encode variant type if we have a user-defined name, even if EMPTY
-                // This helps with parsing disambiguation
-                if user_defined_name.is_some() || *variant_type != VARIANT_TYPE::EMPTY {
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        self.buffer
-                            .push((*variant_type & VARIANT_TYPE::TYPEMASK) as u8);
-                    }
+                if let Some(variant_type) = variant_type {
+                    write_compressed_uint(u32::from(*variant_type), &mut self.buffer)?;
                 }
-
                 if let Some(user_defined_name) = user_defined_name {
-                    self.buffer.extend_from_slice(user_defined_name.as_bytes());
-                    self.buffer.push(0);
+                    self.write_string(user_defined_name)?;
                 }
             }
             NativeType::FixedArray { size, element_type } => {
                 self.buffer.push(NATIVE_TYPE::FIXEDARRAY);
-                write_compressed_uint(*size, &mut self.buffer);
-                if let Some(elem_type) = element_type {
-                    self.encode_native_type(elem_type)?;
+                write_compressed_uint(*size, &mut self.buffer)?;
+                if let Some(element_type) = element_type {
+                    self.buffer.push(*element_type);
                 }
             }
             NativeType::Array {
                 element_type,
                 num_param,
                 num_element,
+                flags,
             } => {
                 self.buffer.push(NATIVE_TYPE::ARRAY);
-                self.encode_native_type(element_type)?;
-                self.write_optional_compressed_uint(*num_param);
-                self.write_optional_compressed_uint(*num_element);
+                self.buffer.push(*element_type);
+                self.write_optional_compressed_uint(*num_param)?;
+                self.write_optional_compressed_uint(*num_element)?;
+                self.write_optional_compressed_uint(*flags)?;
             }
             NativeType::NestedStruct => self.buffer.push(NATIVE_TYPE::NESTEDSTRUCT),
             NativeType::ByValStr { size } => {
                 self.buffer.push(NATIVE_TYPE::BYVALSTR);
-                write_compressed_uint(*size, &mut self.buffer);
+                write_compressed_uint(*size, &mut self.buffer)?;
             }
             NativeType::AnsiBStr => self.buffer.push(NATIVE_TYPE::ANSIBSTR),
             NativeType::TBStr => self.buffer.push(NATIVE_TYPE::TBSTR),
@@ -305,21 +305,16 @@ impl MarshallingEncoder {
                 type_reference,
             } => {
                 self.buffer.push(NATIVE_TYPE::CUSTOMMARSHALER);
-                // Encode the four strings as null-terminated UTF-8
-                self.buffer.extend_from_slice(guid.as_bytes());
-                self.buffer.push(0);
-                self.buffer.extend_from_slice(native_type_name.as_bytes());
-                self.buffer.push(0);
-                self.buffer.extend_from_slice(cookie.as_bytes());
-                self.buffer.push(0);
-                self.buffer.extend_from_slice(type_reference.as_bytes());
-                self.buffer.push(0);
+                // Four length-prefixed strings, in the order ECMA-335 II.23.4 gives them
+                for text in [guid, native_type_name, type_reference, cookie] {
+                    self.write_string(text)?;
+                }
             }
             NativeType::HString => self.buffer.push(NATIVE_TYPE::HSTRING),
             NativeType::Ptr { ref_type } => {
                 self.buffer.push(NATIVE_TYPE::PTR);
                 if let Some(ref_type) = ref_type {
-                    self.encode_native_type(ref_type)?;
+                    self.buffer.push(*ref_type);
                 }
             }
         }
@@ -357,14 +352,6 @@ impl MarshallingEncoder {
 
         self.encode_native_type(&info.primary_type)?;
 
-        for additional_type in &info.additional_types {
-            self.encode_native_type(additional_type)?;
-        }
-
-        if !info.additional_types.is_empty() {
-            self.buffer.push(NATIVE_TYPE::END);
-        }
-
         Ok(self.buffer.clone())
     }
 
@@ -393,7 +380,6 @@ impl MarshallingEncoder {
     ///
     /// let info = MarshallingInfo {
     ///     primary_type: NativeType::I4,
-    ///     additional_types: vec![],
     /// };
     ///
     /// encoder.encode_descriptor_into(&info, &mut buffer)?;
@@ -412,14 +398,6 @@ impl MarshallingEncoder {
 
         self.encode_native_type(&info.primary_type)?;
 
-        for additional_type in &info.additional_types {
-            self.encode_native_type(additional_type)?;
-        }
-
-        if !info.additional_types.is_empty() {
-            self.buffer.push(NATIVE_TYPE::END);
-        }
-
         output.extend_from_slice(&self.buffer);
         Ok(())
     }
@@ -433,8 +411,13 @@ impl Default for MarshallingEncoder {
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prop_assert_eq, test_runner::TestCaseError};
+
     use super::*;
-    use crate::metadata::marshalling::parse_marshalling_descriptor;
+    use crate::{
+        metadata::marshalling::{parse_marshalling_descriptor, VARIANT_TYPE},
+        testkit::{arb, arb::check},
+    };
 
     #[test]
     fn test_roundtrip_simple_types() {
@@ -477,7 +460,6 @@ mod tests {
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -488,7 +470,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -524,7 +505,6 @@ mod tests {
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -535,7 +515,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -551,7 +530,6 @@ mod tests {
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -562,7 +540,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -590,7 +567,6 @@ mod tests {
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -601,7 +577,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -622,7 +597,6 @@ mod tests {
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -633,7 +607,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -641,13 +614,12 @@ mod tests {
     fn test_safe_array_encoding_debug() {
         // Test parsing a simple case first
         let simple_case = NativeType::SafeArray {
-            variant_type: VARIANT_TYPE::I4,
+            variant_type: Some(VARIANT_TYPE::I4),
             user_defined_name: None,
         };
 
         let info = MarshallingInfo {
             primary_type: simple_case.clone(),
-            additional_types: vec![],
         };
 
         let encoded = encode_marshalling_descriptor(&info).unwrap();
@@ -656,13 +628,12 @@ mod tests {
 
         // Now test the complex case with user-defined name
         let complex_case = NativeType::SafeArray {
-            variant_type: VARIANT_TYPE::EMPTY,
+            variant_type: Some(VARIANT_TYPE::EMPTY),
             user_defined_name: Some("CustomStruct".to_string()),
         };
 
         let info = MarshallingInfo {
             primary_type: complex_case.clone(),
-            additional_types: vec![],
         };
 
         let encoded = encode_marshalling_descriptor(&info).unwrap();
@@ -675,30 +646,30 @@ mod tests {
         let test_cases = vec![
             // SafeArray with no variant type and no user-defined name
             NativeType::SafeArray {
-                variant_type: VARIANT_TYPE::EMPTY,
+                variant_type: None,
                 user_defined_name: None,
             },
             // SafeArray with variant type but no user-defined name
             NativeType::SafeArray {
-                variant_type: VARIANT_TYPE::I4,
+                variant_type: Some(VARIANT_TYPE::I4),
                 user_defined_name: None,
             },
             NativeType::SafeArray {
-                variant_type: VARIANT_TYPE::BSTR,
+                variant_type: Some(VARIANT_TYPE::BSTR),
                 user_defined_name: None,
             },
             // SafeArray with both variant type and user-defined name
             NativeType::SafeArray {
-                variant_type: VARIANT_TYPE::I4,
+                variant_type: Some(VARIANT_TYPE::I4),
                 user_defined_name: Some("MyCustomType".to_string()),
             },
             NativeType::SafeArray {
-                variant_type: VARIANT_TYPE::BSTR,
+                variant_type: Some(VARIANT_TYPE::BSTR),
                 user_defined_name: Some("System.String".to_string()),
             },
             // SafeArray with only user-defined name (no variant type)
             NativeType::SafeArray {
-                variant_type: VARIANT_TYPE::EMPTY,
+                variant_type: Some(VARIANT_TYPE::EMPTY),
                 user_defined_name: Some("CustomStruct".to_string()),
             },
         ];
@@ -706,7 +677,6 @@ mod tests {
         for (i, original_type) in test_cases.into_iter().enumerate() {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -717,7 +687,6 @@ mod tests {
 
             // Verify - Now we can do full verification
             assert_eq!(parsed.primary_type, original_type, "Test case {i} failed");
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -730,18 +699,17 @@ mod tests {
             },
             NativeType::FixedArray {
                 size: 32,
-                element_type: Some(Box::new(NativeType::I4)),
+                element_type: Some(NATIVE_TYPE::I4),
             },
             NativeType::FixedArray {
                 size: 64,
-                element_type: Some(Box::new(NativeType::Boolean)),
+                element_type: Some(NATIVE_TYPE::BOOLEAN),
             },
         ];
 
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -752,7 +720,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -760,31 +727,34 @@ mod tests {
     fn test_roundtrip_variable_array_types() {
         let test_cases = vec![
             NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_param: None,
                 num_element: None,
+                flags: None,
             },
             NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_param: Some(3),
                 num_element: None,
+                flags: None,
             },
             NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_param: Some(3),
                 num_element: Some(10),
+                flags: None,
             },
             NativeType::Array {
-                element_type: Box::new(NativeType::Boolean),
+                element_type: NATIVE_TYPE::BOOLEAN,
                 num_param: Some(5),
                 num_element: None,
+                flags: None,
             },
         ];
 
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -795,7 +765,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -804,17 +773,16 @@ mod tests {
         let test_cases = vec![
             NativeType::Ptr { ref_type: None },
             NativeType::Ptr {
-                ref_type: Some(Box::new(NativeType::I4)),
+                ref_type: Some(NATIVE_TYPE::I4),
             },
             NativeType::Ptr {
-                ref_type: Some(Box::new(NativeType::Void)),
+                ref_type: Some(NATIVE_TYPE::VOID),
             },
         ];
 
         for original_type in test_cases {
             let info = MarshallingInfo {
                 primary_type: original_type.clone(),
-                additional_types: vec![],
             };
 
             // Encode
@@ -825,7 +793,6 @@ mod tests {
 
             // Verify
             assert_eq!(parsed.primary_type, original_type);
-            assert_eq!(parsed.additional_types.len(), 0);
         }
     }
 
@@ -840,7 +807,6 @@ mod tests {
 
         let info = MarshallingInfo {
             primary_type: original_type.clone(),
-            additional_types: vec![],
         };
 
         // Encode
@@ -851,58 +817,40 @@ mod tests {
 
         // Verify
         assert_eq!(parsed.primary_type, original_type);
-        assert_eq!(parsed.additional_types.len(), 0);
     }
 
+    /// An array's element is its type's tag alone (ECMA-335 II.23.4, and as CoreCLR reads it):
+    /// `[MarshalAs(LPArray, ArraySubType = LPWStr, SizeParamIndex = 5)]` is followed by the
+    /// array's parameter index, not a size parameter of the strings'.
     #[test]
-    fn test_roundtrip_complex_nested_types() {
-        // Test nested pointer to array
-        let complex_type = NativeType::Ptr {
-            ref_type: Some(Box::new(NativeType::Array {
-                element_type: Box::new(NativeType::LPWStr {
-                    size_param_index: Some(5),
-                }),
-                num_param: Some(2),
+    fn an_array_element_is_a_tag_and_the_fields_after_it_are_the_arrays() {
+        let bytes = [NATIVE_TYPE::ARRAY, NATIVE_TYPE::LPWSTR, 0x05, 0x0A];
+        let parsed = parse_marshalling_descriptor(&bytes).unwrap();
+        assert_eq!(
+            parsed.primary_type,
+            NativeType::Array {
+                element_type: NATIVE_TYPE::LPWSTR,
+                num_param: Some(5),
                 num_element: Some(10),
-            })),
-        };
+                flags: None,
+            }
+        );
+        assert_eq!(encode_marshalling_descriptor(&parsed).unwrap(), bytes);
+        assert_eq!(
+            NativeType::from_tag(NATIVE_TYPE::LPWSTR),
+            Some(NativeType::LPWStr {
+                size_param_index: None
+            })
+        );
 
-        let info = MarshallingInfo {
-            primary_type: complex_type.clone(),
-            additional_types: vec![],
-        };
-
-        // Encode
-        let encoded = encode_marshalling_descriptor(&info).unwrap();
-
-        // Parse back
-        let parsed = parse_marshalling_descriptor(&encoded).unwrap();
-
-        // Verify
-        assert_eq!(parsed.primary_type, complex_type);
-        assert_eq!(parsed.additional_types.len(), 0);
-    }
-
-    #[test]
-    fn test_roundtrip_descriptors_with_additional_types() {
-        let info = MarshallingInfo {
-            primary_type: NativeType::LPStr {
-                size_param_index: Some(1),
-            },
-            additional_types: vec![NativeType::Boolean, NativeType::I4],
-        };
-
-        // Encode
-        let encoded = encode_marshalling_descriptor(&info).unwrap();
-
-        // Parse back
-        let parsed = parse_marshalling_descriptor(&encoded).unwrap();
-
-        // Verify
-        assert_eq!(parsed.primary_type, info.primary_type);
-        assert_eq!(parsed.additional_types.len(), 2);
-        assert_eq!(parsed.additional_types[0], NativeType::Boolean);
-        assert_eq!(parsed.additional_types[1], NativeType::I4);
+        // A pointer to a struct, and a ByValArray of bytes
+        for bytes in [
+            vec![NATIVE_TYPE::PTR, NATIVE_TYPE::STRUCT],
+            vec![NATIVE_TYPE::FIXEDARRAY, 0x20, NATIVE_TYPE::I1],
+        ] {
+            let parsed = parse_marshalling_descriptor(&bytes).unwrap();
+            assert_eq!(encode_marshalling_descriptor(&parsed).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -912,24 +860,18 @@ mod tests {
             // Win32 API: BOOL CreateDirectory(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes)
             MarshallingInfo {
                 primary_type: NativeType::I4, // BOOL return
-                additional_types: vec![],
             },
             // Parameter 1: LPCWSTR
             MarshallingInfo {
                 primary_type: NativeType::LPWStr {
                     size_param_index: None,
                 },
-                additional_types: vec![],
             },
             // Parameter 2: LPSECURITY_ATTRIBUTES
             MarshallingInfo {
                 primary_type: NativeType::Ptr {
-                    ref_type: Some(Box::new(NativeType::Struct {
-                        packing_size: None,
-                        class_size: None,
-                    })),
+                    ref_type: Some(NATIVE_TYPE::STRUCT),
                 },
-                additional_types: vec![],
             },
         ];
 
@@ -941,14 +883,7 @@ mod tests {
             let parsed = parse_marshalling_descriptor(&encoded).unwrap();
 
             // Verify
-            assert_eq!(parsed.primary_type, scenario.primary_type);
-            assert_eq!(
-                parsed.additional_types.len(),
-                scenario.additional_types.len()
-            );
-            for (i, expected) in scenario.additional_types.iter().enumerate() {
-                assert_eq!(parsed.additional_types[i], *expected);
-            }
+            assert_eq!(parsed, scenario);
         }
     }
 
@@ -960,7 +895,6 @@ mod tests {
                 packing_size: None,
                 class_size: Some(128),
             },
-            additional_types: vec![],
         };
 
         let result = encode_marshalling_descriptor(&invalid);
@@ -972,32 +906,36 @@ mod tests {
         // Invalid: num_element without num_param
         let invalid = MarshallingInfo {
             primary_type: NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_param: None,
                 num_element: Some(10),
+                flags: None,
             },
-            additional_types: vec![],
         };
 
         let result = encode_marshalling_descriptor(&invalid);
         assert!(result.is_err());
     }
 
+    /// An optional field is present when bytes remain, so one cannot be given without those
+    /// before it: the encoder refuses what it would write as something else.
     #[test]
-    fn test_validation_nested_invalid() {
-        // Invalid nested type: Ptr to invalid Struct
-        let invalid = MarshallingInfo {
-            primary_type: NativeType::Ptr {
-                ref_type: Some(Box::new(NativeType::Struct {
-                    packing_size: None,
-                    class_size: Some(64),
-                })),
+    fn optional_fields_out_of_order_are_refused() {
+        for primary_type in [
+            NativeType::Array {
+                element_type: NATIVE_TYPE::I4,
+                num_param: Some(1),
+                num_element: None,
+                flags: Some(1),
             },
-            additional_types: vec![],
-        };
-
-        let result = encode_marshalling_descriptor(&invalid);
-        assert!(result.is_err());
+            NativeType::SafeArray {
+                variant_type: None,
+                user_defined_name: Some("Name".to_string()),
+            },
+        ] {
+            let info = MarshallingInfo { primary_type };
+            assert!(encode_marshalling_descriptor(&info).is_err(), "{info:?}");
+        }
     }
 
     #[test]
@@ -1007,7 +945,6 @@ mod tests {
 
         let info = MarshallingInfo {
             primary_type: NativeType::I4,
-            additional_types: vec![],
         };
 
         encoder.encode_descriptor_into(&info, &mut buffer).unwrap();
@@ -1016,10 +953,53 @@ mod tests {
         // Encode another one into the same buffer
         let info2 = MarshallingInfo {
             primary_type: NativeType::Boolean,
-            additional_types: vec![],
         };
 
         encoder.encode_descriptor_into(&info2, &mut buffer).unwrap();
         assert_eq!(buffer, vec![NATIVE_TYPE::I4, NATIVE_TYPE::BOOLEAN]);
+    }
+
+    /// Descriptors as compilers write them encode back to their own bytes: an array with no
+    /// element type given (`NATIVE_TYPE_MAX`), a parameter index of 0 and the flags after it, a custom marshaler's
+    /// four length-prefixed strings, and a safe array whose element type is `VT_EMPTY`.
+    #[test]
+    fn descriptors_round_trip_to_their_bytes() {
+        let mut custom = vec![NATIVE_TYPE::CUSTOMMARSHALER, 0x00, 0x00, 0x05];
+        custom.extend_from_slice(b"M.Rsh");
+        custom.push(0x00);
+        for bytes in [
+            vec![NATIVE_TYPE::ARRAY, NATIVE_TYPE::MAX],
+            vec![NATIVE_TYPE::ARRAY, NATIVE_TYPE::MAX, 0x00],
+            vec![NATIVE_TYPE::ARRAY, NATIVE_TYPE::MAX, 0x01, 0x00],
+            // parameter index 0, one element, and the flag that the index was given
+            vec![NATIVE_TYPE::ARRAY, NATIVE_TYPE::MAX, 0x00, 0x01, 0x00],
+            vec![NATIVE_TYPE::LPSTR, 0x00],
+            vec![NATIVE_TYPE::SAFEARRAY, 0x00],
+            custom,
+        ] {
+            let parsed = parse_marshalling_descriptor(&bytes).unwrap();
+            assert_eq!(
+                encode_marshalling_descriptor(&parsed).unwrap(),
+                bytes,
+                "{parsed:?}"
+            );
+        }
+    }
+
+    /// Every descriptor the encoder accepts decodes back to itself: one it would write as
+    /// something else must be refused.
+    #[test]
+    fn every_descriptor_the_encoder_accepts_decodes_to_itself() {
+        check(arb::native_type(), |primary_type| {
+            let info = MarshallingInfo { primary_type };
+            let Ok(bytes) = encode_marshalling_descriptor(&info) else {
+                return Ok(());
+            };
+            let decoded = parse_marshalling_descriptor(&bytes).map_err(|error| {
+                TestCaseError::fail(format!("{bytes:02x?} does not decode: {error}"))
+            })?;
+            prop_assert_eq!(&decoded, &info, "encoded as {:02x?}", bytes);
+            Ok(())
+        });
     }
 }

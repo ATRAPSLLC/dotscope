@@ -29,7 +29,7 @@
 //! use dotscope::io::compressed_uint_size;
 //!
 //! let mut buffer = Vec::new();
-//! write_compressed_uint(300, &mut buffer);
+//! write_compressed_uint(300, &mut buffer)?;
 //! assert_eq!(compressed_uint_size(300), buffer.len() as u64);
 //! ```
 //!
@@ -69,11 +69,9 @@ pub(crate) use crypto::derive_key_iv;
 pub(crate) use crypto::derive_pbkdf1_key;
 #[cfg(feature = "deobfuscation")]
 pub(crate) use crypto::CryptoParameters;
-#[cfg(feature = "deobfuscation")]
-pub(crate) use crypto::MAX_PBKDF2_ITERATIONS;
 #[cfg(feature = "emulation")]
 pub(crate) use crypto::{
-    apply_crypto_transform, derive_pbkdf2_key, verify_rsa_pkcs1v15, MAX_DERIVED_KEY_LEN,
+    apply_crypto_transform, derive_pbkdf2_key, pbkdf2_work, rsa_verify_work, verify_rsa_pkcs1v15,
 };
 #[cfg(feature = "emulation")]
 pub(crate) use crypto::{compute_hmac_sha256, compute_hmac_sha512};

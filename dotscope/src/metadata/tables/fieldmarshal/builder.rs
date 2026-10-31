@@ -74,9 +74,9 @@ use crate::{
 /// // Marshal a field as a fixed-size ANSI character array
 /// let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal); // Character array field
 /// let fixed_array_descriptor = vec![
-///     NATIVE_TYPE::ARRAY,
-///     0x04, // Array element type (I1 - signed byte)
-///     0x20, 0x00, 0x00, 0x00, // Array size (32 elements, little-endian)
+///     NATIVE_TYPE::FIXEDARRAY,
+///     0x20,           // 32 elements (a compressed integer)
+///     NATIVE_TYPE::I1, // of signed bytes
 /// ];
 ///
 /// let array_marshal = FieldMarshalBuilder::new()
@@ -237,26 +237,16 @@ impl FieldMarshalBuilder {
         self.simple_native_type(NATIVE_TYPE::LPSTR)
     }
 
-    /// Sets fixed-size array marshaling.
-    ///
-    /// This convenience method configures marshaling for fixed-size arrays with
-    /// specified element type and count. The array is marshaled in-place within
-    /// the containing structure.
-    ///
-    /// # Arguments
-    ///
-    /// * `element_type` - The native type of array elements
-    /// * `size` - The number of elements in the array
+    /// Sets fixed-size array marshaling (`ByValArray`): `size` elements of the native type
+    /// `element_type` (a [`NATIVE_TYPE`] byte), marshaled in place within the containing
+    /// structure.
     ///
     /// # Returns
     ///
     /// Self for method chaining.
     #[must_use]
-    pub fn fixed_array(mut self, element_type: u8, size: u32) -> Self {
-        let mut descriptor = vec![NATIVE_TYPE::ARRAY, element_type];
-        descriptor.extend_from_slice(&size.to_le_bytes());
-        self.native_type = Some(descriptor);
-        self
+    pub fn fixed_array(self, element_type: u8, size: u32) -> Self {
+        self.fixed_array_typed(Some(element_type), size)
     }
 
     /// Sets COM interface marshaling.
@@ -309,6 +299,7 @@ impl FieldMarshalBuilder {
     ///         element_type: Box::new(NativeType::I4),
     ///         num_param: Some(1),
     ///         num_element: Some(10),
+    ///         flags: None,
     ///     })
     ///     .build(&mut assembly)?;
     /// # Ok::<(), dotscope::Error>(())
@@ -317,7 +308,6 @@ impl FieldMarshalBuilder {
     pub fn native_type_spec(mut self, native_type: NativeType) -> Self {
         let info = MarshallingInfo {
             primary_type: native_type,
-            additional_types: vec![],
         };
 
         match encode_marshalling_descriptor(&info) {
@@ -359,7 +349,6 @@ impl FieldMarshalBuilder {
     ///         cookie: "size=dynamic".to_string(),
     ///         type_reference: "MyAssembly.ArrayMarshaler".to_string(),
     ///     },
-    ///     additional_types: vec![NativeType::I4], // Element type hint
     /// };
     ///
     /// let marshal = FieldMarshalBuilder::new()
@@ -385,17 +374,15 @@ impl FieldMarshalBuilder {
     ///
     /// # Arguments
     ///
-    /// * `ref_type` - Optional type that the pointer references
+    /// * `ref_type` - The native type the pointer references, when given: a [`NATIVE_TYPE`]
+    ///   byte
     ///
     /// # Returns
     ///
     /// Self for method chaining.
     #[must_use]
-    pub fn pointer(self, ref_type: Option<NativeType>) -> Self {
-        let ptr_type = NativeType::Ptr {
-            ref_type: ref_type.map(Box::new),
-        };
-        self.native_type_spec(ptr_type)
+    pub fn pointer(self, ref_type: Option<u8>) -> Self {
+        self.native_type_spec(NativeType::Ptr { ref_type })
     }
 
     /// Sets marshaling for a variable-length array.
@@ -405,7 +392,7 @@ impl FieldMarshalBuilder {
     ///
     /// # Arguments
     ///
-    /// * `element_type` - The type of array elements
+    /// * `element_type` - The native type of the elements: a [`NATIVE_TYPE`] byte
     /// * `size_param` - Optional parameter index for array size
     /// * `element_count` - Optional fixed element count
     ///
@@ -415,14 +402,15 @@ impl FieldMarshalBuilder {
     #[must_use]
     pub fn variable_array(
         self,
-        element_type: NativeType,
+        element_type: u8,
         size_param: Option<u32>,
         element_count: Option<u32>,
     ) -> Self {
         let array_type = NativeType::Array {
-            element_type: Box::new(element_type),
+            element_type,
             num_param: size_param,
             num_element: element_count,
+            flags: None,
         };
         self.native_type_spec(array_type)
     }
@@ -434,19 +422,15 @@ impl FieldMarshalBuilder {
     ///
     /// # Arguments
     ///
-    /// * `element_type` - Optional type of array elements
+    /// * `element_type` - The native type of the elements, when given: a [`NATIVE_TYPE`] byte
     /// * `size` - Number of elements in the array
     ///
     /// # Returns
     ///
     /// Self for method chaining.
     #[must_use]
-    pub fn fixed_array_typed(self, element_type: Option<NativeType>, size: u32) -> Self {
-        let array_type = NativeType::FixedArray {
-            element_type: element_type.map(Box::new),
-            size,
-        };
-        self.native_type_spec(array_type)
+    pub fn fixed_array_typed(self, element_type: Option<u8>, size: u32) -> Self {
+        self.native_type_spec(NativeType::FixedArray { size, element_type })
     }
 
     /// Sets marshaling for a native structure.
@@ -487,7 +471,7 @@ impl FieldMarshalBuilder {
     #[must_use]
     pub fn safe_array(self, variant_type: u16, user_defined_name: Option<String>) -> Self {
         let array_type = NativeType::SafeArray {
-            variant_type,
+            variant_type: Some(variant_type),
             user_defined_name,
         };
         self.native_type_spec(array_type)
@@ -1097,7 +1081,7 @@ mod tests {
         // Test variable array marshaling
         let marshal_ref = FieldMarshalBuilder::new()
             .parent(field_ref)
-            .variable_array(NativeType::I4, Some(1), Some(10))
+            .variable_array(NATIVE_TYPE::I4, Some(1), Some(10))
             .build(&mut assembly)
             .unwrap();
 
@@ -1119,7 +1103,7 @@ mod tests {
         // Test fixed array marshaling with type specification
         let marshal_ref = FieldMarshalBuilder::new()
             .parent(field_ref)
-            .fixed_array_typed(Some(NativeType::Boolean), 64)
+            .fixed_array_typed(Some(NATIVE_TYPE::BOOLEAN), 64)
             .build(&mut assembly)
             .unwrap();
 
@@ -1163,7 +1147,7 @@ mod tests {
         // Test pointer marshaling
         let marshal_ref = FieldMarshalBuilder::new()
             .parent(param_ref)
-            .pointer(Some(NativeType::I4))
+            .pointer(Some(NATIVE_TYPE::I4))
             .build(&mut assembly)
             .unwrap();
 
@@ -1236,7 +1220,6 @@ mod tests {
             primary_type: NativeType::LPStr {
                 size_param_index: Some(1),
             },
-            additional_types: vec![NativeType::Boolean],
         };
 
         let marshal_ref = FieldMarshalBuilder::new()

@@ -103,8 +103,9 @@ pub fn apply_all_fixups(ctx: &mut WriteContext) -> Result<()> {
     fixup_cor20_header(ctx)?;
     fixup_data_directories(ctx)?;
 
-    // Zero stripped data regions for better compression
-    zero_stripped_data_regions(ctx)?;
+    // Nothing of the input's debug data or certificate needs scrubbing: `.text` is rebuilt,
+    // so neither is copied unless `write_debug_data` keeps the debug data of a write that
+    // changes nothing, and their directory entries are zeroed or re-pointed above.
 
     // Fix COFF characteristics if relocations were stripped
     fixup_coff_characteristics(ctx)?;
@@ -476,6 +477,13 @@ pub fn fixup_data_directories(ctx: &mut WriteContext) -> Result<()> {
         ctx.write_u32_at(clr_size_off, COR20_HEADER_SIZE)?;
     }
 
+    // Debug (index 6), when a write that changes nothing kept it
+    if let Some((rva, size)) = ctx.debug_dir {
+        let (debug_rva_off, debug_size_off) = dd_entry(6)?;
+        ctx.write_u32_at(debug_rva_off, rva)?;
+        ctx.write_u32_at(debug_size_off, size)?;
+    }
+
     // Import Table (index 1)
     let (imp_rva_off, imp_size_off) = dd_entry(1)?;
     if let (Some(rva), Some(size)) = (ctx.import_data_rva, ctx.import_data_size) {
@@ -639,66 +647,6 @@ pub fn fixup_metadata_stream_headers(
             .and_then(|v| offset.checked_add(v))
             .ok_or_else(|| Error::LayoutFailed("Stream header offset overflow".to_string()))?;
     }
-
-    Ok(())
-}
-
-/// Handles stripped data regions (debug, certificates) after assembly modification.
-///
-/// When modifying a .NET assembly, certain data becomes invalid:
-/// - **Debug data**: IL offsets change, PDB correlation breaks
-/// - **Certificate data**: Digital signatures are invalidated
-///
-/// # Debug Data
-///
-/// Debug data is NOT explicitly zeroed because:
-/// 1. The `.text` section is completely rebuilt with a new layout, so original
-///    debug data (which was in the old `.text`) simply isn't included
-/// 2. The debug directory entry is already zeroed, so loaders won't look for it
-/// 3. Using the original debug RVA would corrupt our new data since the layout changed
-///
-/// # Certificate Data
-///
-/// Certificates use a file offset (not RVA) and are typically appended after all
-/// sections. They are usually excluded by file truncation to `bytes_written`.
-/// If certificate data falls within written bounds, it's zeroed.
-///
-/// # Arguments
-///
-/// * `ctx` - The write context with original directory locations
-pub fn zero_stripped_data_regions(ctx: &mut WriteContext) -> Result<()> {
-    // Debug data handling:
-    //
-    // We do NOT attempt to zero the original debug data region because:
-    //
-    // 1. The .text section is completely rebuilt with a new layout. The original
-    //    debug RVA pointed to data in the OLD .text layout, which no longer exists.
-    //    Using that RVA to calculate a file offset in our new file would corrupt
-    //    unrelated data (e.g., blob heap, method bodies).
-    //
-    // 2. The debug directory entry in the data directories is already zeroed
-    //    during generation (see write_data_directories). This tells loaders
-    //    there is no debug info, so they won't look for any debug data.
-    //
-    // 3. Since we rebuild .text from scratch (metadata, method bodies, etc.),
-    //    the original debug data simply isn't included - we never copy it.
-    //
-    // For assemblies where debug data is in a separate section (e.g., .rdata),
-    // we don't copy those sections either - we only preserve .rsrc and .reloc.
-    let _ = ctx.original_debug_dir; // Stored for reference but not used
-
-    // Certificate data is deliberately NOT scrubbed here.
-    //
-    // `original_certificate_dir` is a **file offset into the input**, and this writes into the
-    // *output*, which has an entirely different layout — the offset that held a signature in the
-    // input names unrelated content here, typically live `.text` or metadata. Zeroing it
-    // corrupted the generated file rather than sanitising it, and it ran before
-    // `fixup_checksum`, so the checksum was computed over the damage and the result looked
-    // internally consistent.
-    //
-    // Nothing needs scrubbing: the output is rebuilt from scratch and never copies certificate
-    // bytes, and `write_optional_header` already zeroes the CertificateTable data-directory
-    // entry. This mirrors the reasoning already applied to the debug directory.
 
     Ok(())
 }

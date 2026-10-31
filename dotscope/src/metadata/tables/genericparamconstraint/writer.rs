@@ -71,11 +71,7 @@ impl RowWritable for GenericParamConstraintRaw {
         )?;
 
         // Write TypeDefOrRef coded index for constraint
-        let constraint_value = sizes.encode_coded_index(
-            self.constraint.tag,
-            self.constraint.row,
-            CodedIndexType::TypeDefOrRef,
-        )?;
+        let constraint_value = self.constraint.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

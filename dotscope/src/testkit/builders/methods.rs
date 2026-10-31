@@ -12,11 +12,12 @@ use crate::{
             MethodModifiers, MethodRc, MethodVtableFlags,
         },
         signatures::{SignatureMethod, SignatureParameter, TypeSignature},
+        tables::ParamList,
         token::Token,
         typesystem::{CilFlavor, TypeRegistry},
     },
     testkit::builders::params::ParamBuilder,
-    utils::LazyList,
+    utils::{LazyList, RowList},
 };
 
 /// Builder for creating mock Method instances with complex configurations
@@ -145,14 +146,14 @@ impl MethodBuilder {
         // Build parameters - either from explicit builders or auto-generated from signature
         let params = if !self.param_builders.is_empty() {
             // Use explicitly provided parameter builders
-            let param_vec = Arc::new(boxcar::Vec::new());
+            let param_vec = ParamList::new();
             for param_builder in self.param_builders {
                 param_vec.push(param_builder.build(type_registry));
             }
             param_vec
         } else if self.auto_create_params {
             // Auto-generate parameters from signature
-            let param_vec = Arc::new(boxcar::Vec::new());
+            let param_vec = ParamList::new();
             if let Some(ref signature) = self.signature {
                 for (index, _param_sig) in signature.params.iter().enumerate() {
                     let param = ParamBuilder::input_param(
@@ -166,7 +167,7 @@ impl MethodBuilder {
             param_vec
         } else {
             // No parameters
-            Arc::new(boxcar::Vec::new())
+            ParamList::new()
         };
 
         Arc::new(Method {
@@ -182,7 +183,6 @@ impl MethodBuilder {
             flags_pinvoke: AtomicU32::new(0),
             name: self.name,
             params,
-            varargs: Arc::new(boxcar::Vec::new()),
             generic_params: Default::default(),
             generic_args: LazyList::new(),
             signature: self.signature.unwrap_or_else(|| SignatureMethod {
@@ -207,10 +207,10 @@ impl MethodBuilder {
             }),
             rva: self.rva,
             body: OnceLock::new(),
-            local_vars: Arc::new(boxcar::Vec::new()),
+            local_vars: LazyList::new(),
             overrides: Default::default(),
             interface_impls: Default::default(),
-            security: OnceLock::new(),
+            security: RowList::new(),
             blocks: OnceLock::new(),
             custom_attributes: Default::default(),
             declaring_type: OnceLock::new(),

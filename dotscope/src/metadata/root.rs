@@ -66,7 +66,7 @@ const FLAGS_FIELD_SIZE: usize = 2;
 /// Size of the stream count field.
 const STREAM_COUNT_FIELD_SIZE: usize = 2;
 
-/// Maximum allowed length for the version string.
+/// The most bytes the version string takes with its terminator (ECMA-335 II.24.2.1).
 const MAX_VERSION_STRING_LENGTH: usize = 255;
 
 /// The stream whose presence makes the runtime read the first of repeated heap headers.
@@ -177,8 +177,8 @@ const FIELD_OFFSET_RESERVED: usize = 8;
 ///
 /// The Root structure performs automatic validation during parsing:
 /// - Verifies the magic signature matches `0x424A5342`
-/// - Ensures version string length is within reasonable bounds
-/// - Checks for proper null-termination of the version string
+/// - Reads the version string as UTF-8 up to its null terminator, and refuses one that takes
+///   more than 255 bytes with it
 /// - Refuses the stream directories the runtime refuses: a header reaching past the
 ///   metadata, a name longer than 32 bytes with its terminator, more than one tables
 ///   stream, and `#Schema` before the tables stream
@@ -224,7 +224,8 @@ pub struct Root {
     /// align the following fields to 4-byte boundaries.
     pub length: u32,
 
-    /// Version string identifying the .NET runtime version.
+    /// Version string identifying the .NET runtime version: the field's text up to its null
+    /// terminator, without the padding that follows.
     ///
     /// Common values include:
     /// - `"v2.0.50727"` for .NET Framework 2.0/3.0/3.5
@@ -287,8 +288,8 @@ impl Root {
     /// This method performs extensive validation during parsing:
     /// - Verifies minimum required data length (36 bytes)
     /// - Validates magic signature matches [`CIL_HEADER_MAGIC`] (`0x424A5342`)
-    /// - Checks version string length for overflow and bounds
-    /// - Ensures proper null-termination of version string
+    /// - Reads the version string as UTF-8 up to its null terminator, and refuses one that
+    ///   takes more than 255 bytes with it
     /// - Refuses the stream directories the runtime refuses: a header reaching past the
     ///   metadata, a name longer than 32 bytes with its terminator, more than one tables
     ///   stream, and `#Schema` before the tables stream
@@ -406,50 +407,33 @@ impl Root {
             }
         }
 
-        let mut version_string: String = String::with_capacity(version_string_length as usize);
-        for counter in 0..version_string_length {
-            let mut pos = usize::from(VERSION_STRING_OFFSET)
-                .checked_add(counter as usize)
-                .ok_or_else(|| invalid("version_string_offset", "offset overflow".into()))?;
-            version_string.push(char::from(read_le_at::<u8>(data, &mut pos)?));
-        }
+        // The field holds UTF-8 text up to its null terminator, then padding to four bytes
+        let field_end = usize::from(VERSION_STRING_OFFSET)
+            .checked_add(version_string_length as usize)
+            .ok_or_else(|| invalid("version_string_offset", "offset overflow".into()))?;
+        let field = data
+            .get(usize::from(VERSION_STRING_OFFSET)..field_end)
+            .ok_or_else(oob)?;
+        let text = field.split(|&b| b == 0).next().unwrap_or_default();
+        // Any text is a version: the .NET Framework 4.8, CoreCLR and Mono run an image whose
+        // version is empty, does not start with `v`, or is not ASCII
+        let version_string = String::from_utf8_lossy(text).into_owned();
 
-        // Validate version string format and content
-        if version_string.is_empty() {
-            return Err(invalid(
-                "version_string",
-                "version string cannot be empty [ECMA-335 §II.24.2.1]".into(),
-            )
-            .into());
-        }
-
-        // Check for common malformed version strings
-        if !version_string.starts_with('v') {
-            return Err(invalid(
-                "version_string",
-                format!("'{version_string}' must start with 'v' [ECMA-335 §II.24.2.1]",),
-            )
-            .into());
-        }
-
-        // Validate version string contains reasonable content
-        if version_string.len() > MAX_VERSION_STRING_LENGTH {
+        if text.len() >= MAX_VERSION_STRING_LENGTH {
             return Err(invalid(
                 "version_string",
                 format!(
-                    "length {} exceeds reasonable limit ({}) [ECMA-335 §II.24.2.1]",
-                    version_string.len(),
-                    MAX_VERSION_STRING_LENGTH
+                    "{} bytes with its terminator, where at most {MAX_VERSION_STRING_LENGTH} \
+                     are allowed [ECMA-335 §II.24.2.1]",
+                    text.len().saturating_add(1),
                 ),
             )
             .into());
         }
 
-        // Stream count is located after: version_string + FLAGS_FIELD_SIZE
-        let mut stream_count_offset = version_string
-            .len()
-            .checked_add(usize::from(VERSION_STRING_OFFSET))
-            .and_then(|v| v.checked_add(FLAGS_FIELD_SIZE))
+        // Stream count is located after: the version field + FLAGS_FIELD_SIZE
+        let mut stream_count_offset = field_end
+            .checked_add(FLAGS_FIELD_SIZE)
             .ok_or_else(|| invalid("stream_count_offset", "offset overflow".into()))?;
         let stream_count = read_le_at::<u16>(data, &mut stream_count_offset)?;
 
@@ -470,11 +454,9 @@ impl Root {
         }
 
         let mut streams = Vec::with_capacity(stream_count as usize);
-        // Stream directory starts after: version_string + FLAGS_FIELD_SIZE + STREAM_COUNT_FIELD_SIZE
-        let mut stream_offset = version_string
-            .len()
-            .checked_add(usize::from(VERSION_STRING_OFFSET))
-            .and_then(|v| v.checked_add(FLAGS_FIELD_SIZE))
+        // Stream directory starts after: the version field + FLAGS_FIELD_SIZE + STREAM_COUNT_FIELD_SIZE
+        let mut stream_offset = field_end
+            .checked_add(FLAGS_FIELD_SIZE)
             .and_then(|v| v.checked_add(STREAM_COUNT_FIELD_SIZE))
             .ok_or_else(|| invalid("stream_directory_offset", "offset overflow".into()))?;
 
@@ -561,9 +543,7 @@ impl Root {
             .into());
         }
 
-        let flags_offset = usize::from(VERSION_STRING_OFFSET)
-            .checked_add(version_string.len())
-            .ok_or_else(|| invalid("flags_offset", "offset overflow".into()))?;
+        let flags_offset = field_end;
 
         Ok(Root {
             signature,
@@ -579,12 +559,7 @@ impl Root {
                 data.get(FIELD_OFFSET_RESERVED..)
                     .ok_or_else(|| Error::from(oob()))?,
             )?,
-            length: u32::try_from(version_string.len()).map_err(|_| {
-                invalid(
-                    "version_string_length",
-                    "string length too large [ECMA-335 §II.24.2.1]".into(),
-                )
-            })?,
+            length: version_string_length,
             flags: read_le::<u16>(data.get(flags_offset..).ok_or_else(|| Error::from(oob()))?)?,
             stream_number: u16::try_from(streams.len()).map_err(|_| {
                 invalid(
@@ -827,18 +802,9 @@ impl Root {
         // Reserved (4 bytes)
         writer.write_all(&self.reserved.to_le_bytes())?;
 
-        // Version string length (padded to 4-byte boundary)
+        // Version string length: the string, its terminator and padding to 4 bytes
         let version_bytes = self.version.as_bytes();
-        let padded_len =
-            version_bytes
-                .len()
-                .checked_add(3)
-                .ok_or_else(|| ParseFailure::InvalidField {
-                    stage: ParseStage::MetadataRoot,
-                    field: "version_string_length",
-                    reason: "padded length overflow".into(),
-                })?
-                & !3usize;
+        let padded_len = self.version_field_size();
         let padded_len_u32 = u32::try_from(padded_len).map_err(|_| ParseFailure::InvalidField {
             stage: ParseStage::MetadataRoot,
             field: "version_string_length",
@@ -846,7 +812,7 @@ impl Root {
         })?;
         writer.write_all(&padded_len_u32.to_le_bytes())?;
 
-        // Version string + null padding to 4-byte boundary
+        // Version string, then its terminator and the padding
         writer.write_all(version_bytes)?;
         let padding = padded_len.saturating_sub(version_bytes.len());
         if padding > 0 {
@@ -865,6 +831,13 @@ impl Root {
         }
 
         Ok(())
+    }
+
+    /// The bytes the version field takes when written: the version string, its null
+    /// terminator and padding to a multiple of four (ECMA-335 II.24.2.1).
+    #[must_use]
+    pub fn version_field_size(&self) -> usize {
+        self.version.len().saturating_add(4) & !3usize
     }
 
     /// Returns the total serialized size of this metadata root header in bytes.
@@ -905,8 +878,7 @@ impl Root {
         // Fixed fields: signature(4) + major(2) + minor(2) + reserved(4) + length(4) + flags(2) + stream_number(2)
         let fixed_size = 20usize;
 
-        // Version string padded to 4-byte boundary
-        let version_padded = self.version.len().saturating_add(3) & !3usize;
+        let version_padded = self.version_field_size();
 
         // Stream headers
         let streams_size: usize = self
@@ -957,6 +929,88 @@ mod tests {
         assert_eq!(parsed_header.stream_headers[0].offset, 0x1);
         assert_eq!(parsed_header.stream_headers[0].size, 0x8);
         assert_eq!(parsed_header.stream_headers[0].name, "#~");
+    }
+
+    /// The version is the field's UTF-8 text up to its terminator, and the stream directory
+    /// follows the whole field: "v4.0é" is six bytes, then two of padding.
+    #[test]
+    fn the_version_is_utf8_text_up_to_its_terminator() {
+        #[rustfmt::skip]
+        let header_bytes = [
+            0x42, 0x53, 0x4A, 0x42,
+            0x01, 0x00,
+            0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00,
+            b'v', b'4', b'.', b'0', 0xC3, 0xA9, 0x00, 0x00,
+            0x00, 0x00,
+            0x01, 0x00,
+            0x28, 0x00, 0x00, 0x00, // StreamHeader
+            0x04, 0x00, 0x00, 0x00,
+            0x23, 0x7E, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let root = Root::read(&header_bytes).unwrap();
+
+        assert_eq!(root.version, "v4.0\u{e9}");
+        assert_eq!(root.length, 8);
+        assert_eq!(root.stream_headers[0].name, "#~");
+        assert_eq!(root.stream_headers[0].offset, 0x28);
+    }
+
+    /// The runtimes run an image whose version is empty or does not start with `v` (measured
+    /// on the .NET Framework 4.8, CoreCLR and Mono with TestApp's version field rewritten), so
+    /// it reads.
+    #[test]
+    fn any_version_text_reads() {
+        for version in [
+            &b"\0\0\0\0"[..],
+            b"x4.0\0\0\0\0",
+            b"Standard CLI 2005\0\0\0",
+        ] {
+            let mut header_bytes = vec![0x42, 0x53, 0x4A, 0x42, 0x01, 0x00, 0x01, 0x00];
+            header_bytes.extend_from_slice(&[0; 4]);
+            header_bytes.extend_from_slice(&u32::try_from(version.len()).unwrap().to_le_bytes());
+            header_bytes.extend_from_slice(version);
+            let directory = header_bytes.len() + 4 + 12;
+            header_bytes.extend_from_slice(&[0, 0, 1, 0]);
+            header_bytes.extend_from_slice(&u32::try_from(directory).unwrap().to_le_bytes());
+            header_bytes.extend_from_slice(&[4, 0, 0, 0, 0x23, 0x7E, 0, 0, 0, 0, 0, 0]);
+
+            let root = Root::read(&header_bytes).unwrap();
+
+            let text = version.split(|&b| b == 0).next().unwrap();
+            assert_eq!(root.version.as_bytes(), text);
+            assert_eq!(root.stream_headers[0].name, "#~");
+        }
+    }
+
+    /// A version whose length is a multiple of four is written with its terminator, in a
+    /// field four bytes longer, and reads back as itself.
+    #[test]
+    fn a_written_version_keeps_its_terminator() {
+        let root = Root {
+            signature: CIL_HEADER_MAGIC,
+            major_version: 1,
+            minor_version: 1,
+            reserved: 0,
+            length: 8,
+            version: "v1.2".to_string(),
+            flags: 0,
+            stream_number: 1,
+            stream_headers: vec![StreamHeader {
+                offset: 0x28,
+                size: 4,
+                name: "#~".to_string(),
+            }],
+        };
+        let mut buffer = Vec::new();
+        root.write_to(&mut buffer).unwrap();
+        assert_eq!(&buffer[12..24], b"\x08\0\0\0v1.2\0\0\0\0");
+        assert_eq!(root.serialized_size(), buffer.len());
+        buffer.resize(0x2C, 0);
+        assert_eq!(Root::read(&buffer).unwrap(), root);
     }
 
     /// The runtime refuses a directory with two tables streams (`metadata/streams/tables_*`).

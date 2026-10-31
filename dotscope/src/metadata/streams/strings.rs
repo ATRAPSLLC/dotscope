@@ -991,6 +991,18 @@ impl<'a> Strings<'a> {
         StringsIterator::new(self)
     }
 
+    /// Every entry of the heap after the null string at offset 0, as its bytes without the
+    /// null terminator, with its offset: valid UTF-8 or not, so that nothing that follows an
+    /// entry [`Self::get`] refuses goes missing. A heap that ends without a terminator ends
+    /// with its unterminated bytes as the last entry.
+    #[must_use]
+    pub fn entries(&self) -> StringEntries<'a> {
+        StringEntries {
+            data: self.data,
+            position: 1,
+        }
+    }
+
     /// Returns the raw underlying data of the strings heap.
     ///
     /// This provides access to the complete heap data including the null byte at offset 0
@@ -1272,10 +1284,8 @@ impl<'a> IntoIterator for &'a Strings<'a> {
 /// - [`std::iter::Iterator`]: Standard iterator trait implementation
 /// - [ECMA-335 II.24.2.3](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Strings heap specification
 pub struct StringsIterator<'a> {
-    /// Reference to the strings heap being iterated
-    strings: &'a Strings<'a>,
-    /// Current position within the strings heap
-    position: usize,
+    /// The heap's entries, valid UTF-8 or not
+    entries: StringEntries<'a>,
 }
 
 impl<'a> StringsIterator<'a> {
@@ -1290,8 +1300,7 @@ impl<'a> StringsIterator<'a> {
     /// A new iterator that will yield all strings in the heap in order.
     pub(crate) fn new(strings: &'a Strings<'a>) -> Self {
         Self {
-            strings,
-            position: 1,
+            entries: strings.entries(),
         }
     }
 }
@@ -1299,20 +1308,36 @@ impl<'a> StringsIterator<'a> {
 impl<'a> Iterator for StringsIterator<'a> {
     type Item = (usize, &'a str);
 
+    /// The next entry that is valid UTF-8. One that is not is passed over, not taken for the
+    /// end of the heap: [`Strings::entries`] yields it too.
     fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.strings.data.len() {
-            return None;
-        }
-
-        let start_position = self.position;
-        match self.strings.get(self.position) {
-            Ok(string) => {
-                // Move position past this string and its null terminator
-                self.position = self.position.saturating_add(string.len()).saturating_add(1);
-                Some((start_position, string))
+        loop {
+            let (offset, bytes) = self.entries.next()?;
+            if let Ok(text) = str::from_utf8(bytes) {
+                return Some((offset, text));
             }
-            Err(_) => None,
         }
+    }
+}
+
+/// Every entry of a strings heap as its bytes, from [`Strings::entries`].
+pub struct StringEntries<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Iterator for StringEntries<'a> {
+    type Item = (usize, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = self
+            .data
+            .get(self.position..)
+            .filter(|rest| !rest.is_empty())?;
+        let offset = self.position;
+        let length = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        self.position = self.position.saturating_add(length).saturating_add(1);
+        Some((offset, rest.get(..length).unwrap_or_default()))
     }
 }
 
@@ -1418,17 +1443,28 @@ mod tests {
         ];
 
         let strings = Strings::from(&data).unwrap();
-        let mut iter = strings.iter();
 
-        // First valid string
-        let (offset1, string1) = iter.next().unwrap();
-        assert_eq!(offset1, 1);
-        assert_eq!(string1, "Hello");
+        // The invalid entry is passed over, not taken for the end of the heap
+        let valid: Vec<(usize, &str)> = strings.iter().collect();
+        assert_eq!(valid, [(1, "Hello"), (10, "World")]);
 
-        // Second string is invalid, should return None
-        assert!(iter.next().is_none());
+        // Every entry, the invalid one too, as bytes
+        let entries: Vec<(usize, &[u8])> = strings.entries().collect();
+        assert_eq!(
+            entries,
+            [
+                (1, &b"Hello"[..]),
+                (7, &[0xFF, 0xFF][..]),
+                (10, &b"World"[..])
+            ]
+        );
+    }
 
-        // Third string should not be reached due to invalid UTF-8
-        assert!(iter.next().is_none());
+    #[test]
+    fn an_unterminated_last_entry_is_an_entry() {
+        let data = [0x00, b'A', 0x00, b'B', b'C'];
+        let strings = Strings::from(&data).unwrap();
+        let entries: Vec<(usize, &[u8])> = strings.entries().collect();
+        assert_eq!(entries, [(1, &b"A"[..]), (3, &b"BC"[..])]);
     }
 }

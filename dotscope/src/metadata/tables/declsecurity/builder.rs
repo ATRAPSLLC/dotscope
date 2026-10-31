@@ -8,7 +8,7 @@
 use crate::{
     cilassembly::{ChangeRefRc, CilAssembly},
     metadata::{
-        security::SecurityAction,
+        security::{PermissionSetBuilder, SecurityAction},
         tables::{CodedIndex, CodedIndexType, DeclSecurityRaw, TableDataOwned, TableId},
         token::Token,
     },
@@ -240,27 +240,19 @@ impl DeclSecurityBuilder {
         self
     }
 
-    /// Creates an unrestricted permission set for full trust scenarios.
-    ///
-    /// This convenience method creates a permission set that grants unrestricted
-    /// access to all security permissions. This is typically used for fully
-    /// trusted assemblies and methods that require elevated privileges.
+    /// Sets the unrestricted permission set, which grants every permission: a binary set
+    /// holding a `PermissionSetAttribute` with `Unrestricted = true`, as a compiler writes
+    /// `[PermissionSet(action, Unrestricted = true)]`.
     ///
     /// # Returns
     ///
     /// Self for method chaining.
     #[must_use]
     pub fn unrestricted_permission_set(mut self) -> Self {
-        // Create a minimal unrestricted permission set blob
-        // This is a simplified representation - in practice, you'd want to create
-        // a proper .NET permission set with the SecurityPermission class
-        let unrestricted_blob = vec![
-            0x01, // Permission set version
-            0x01, // Number of permissions
-            0x00, // SecurityPermission type indicator (simplified)
-            0xFF, // Unrestricted flag
-        ];
-        self.permission_set = Some(unrestricted_blob);
+        self.permission_set = PermissionSetBuilder::new()
+            .add_unrestricted_permission_set()
+            .encode()
+            .ok();
         self
     }
 
@@ -349,7 +341,10 @@ mod tests {
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
-        metadata::{cilassemblyview::CilAssemblyView, security::SecurityAction},
+        metadata::{
+            cilassemblyview::CilAssemblyView,
+            security::{PermissionSet, PermissionSetFormat},
+        },
         testkit::fixture,
     };
 
@@ -515,13 +510,16 @@ mod tests {
 
         let parent_ref = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::HasDeclSecurity);
 
-        // Test unrestricted permission set convenience method
-        let security_ref = DeclSecurityBuilder::new()
+        // The convenience method's blob is the unrestricted binary permission set
+        let builder = DeclSecurityBuilder::new()
             .action(SecurityAction::Assert)
             .parent(parent_ref)
-            .unrestricted_permission_set()
-            .build(&mut assembly)
-            .unwrap();
+            .unrestricted_permission_set();
+        let set = PermissionSet::new(builder.permission_set.as_deref().unwrap()).unwrap();
+        assert_eq!(set.format(), &PermissionSetFormat::Binary);
+        assert!(set.is_unrestricted());
+
+        let security_ref = builder.build(&mut assembly).unwrap();
 
         // Should succeed
         assert_eq!(
@@ -648,11 +646,11 @@ mod tests {
         // Test SecurityAction enum conversion methods
         assert_eq!(SecurityAction::Demand, 0x0002.into());
         assert_eq!(SecurityAction::Assert, 0x0003.into());
-        assert_eq!(SecurityAction::Deny, 0x0001.into());
+        assert_eq!(SecurityAction::Deny, 0x0004.into());
 
         assert_eq!(SecurityAction::from(0x0002), SecurityAction::Demand);
         assert_eq!(SecurityAction::from(0x0003), SecurityAction::Assert);
-        assert_eq!(SecurityAction::from(0x0001), SecurityAction::Deny);
+        assert_eq!(SecurityAction::from(0x0004), SecurityAction::Deny);
         assert_eq!(
             SecurityAction::from(0xFFFF),
             SecurityAction::Unknown(0xFFFF)

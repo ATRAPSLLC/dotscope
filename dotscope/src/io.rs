@@ -13,7 +13,7 @@
 //! use dotscope::io::{compressed_uint_size, read_compressed_uint, write_compressed_uint};
 //!
 //! let mut buffer = Vec::new();
-//! write_compressed_uint(300, &mut buffer);
+//! write_compressed_uint(300, &mut buffer)?;
 //! assert_eq!(buffer, [0x81, 0x2C]);
 //! assert_eq!(compressed_uint_size(300), 2);
 //!

@@ -87,17 +87,12 @@ impl Technique for GenericHandlers {
                 continue;
             }
 
-            let Ok(offset) = file.rva_to_offset(row.rva as usize) else {
+            let Ok(body_data) = file.section_bounded(row.rva as usize) else {
                 continue;
             };
-            let available = file.data().len().saturating_sub(offset);
-            if available == 0 {
+            if body_data.is_empty() {
                 continue;
             }
-
-            let Some(body_data) = file.data().get(offset..offset.saturating_add(available)) else {
-                continue;
-            };
 
             if let Ok((_, filtered)) = MethodBody::from_lenient(body_data) {
                 if filtered > 0 {

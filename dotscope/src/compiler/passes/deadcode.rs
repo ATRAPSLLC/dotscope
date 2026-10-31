@@ -136,3 +136,45 @@ impl World<CilTarget> for CtxWorld<'_> {
         self.ctx.mark_dead(method.token());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::analysis::{CallGraph, SsaFunctionBuilder};
+
+    /// A method reached from an entry point through the calls its SSA makes is live; one no
+    /// live method calls is marked dead.
+    #[test]
+    fn a_method_no_live_method_calls_is_dead() {
+        let (entry, called, uncalled) = (
+            Token::new(0x0600_0001),
+            Token::new(0x0600_0002),
+            Token::new(0x0600_0003),
+        );
+        let returns = || {
+            SsaFunctionBuilder::new(0, 0)
+                .build_with(|f| f.block(0, |b| b.ret()))
+                .unwrap()
+        };
+        let calls_called = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    b.call_void(MethodRef::new(called), &[]);
+                    b.ret();
+                });
+            })
+            .unwrap();
+        let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
+        ctx.set_ssa(entry, calls_called);
+        ctx.set_ssa(called, returns());
+        ctx.set_ssa(uncalled, returns());
+        ctx.add_entry_point(entry);
+
+        assert!(DeadMethodEliminationPass::new().run_global(&ctx).unwrap());
+        assert!(!ctx.is_dead(entry));
+        assert!(!ctx.is_dead(called));
+        assert!(ctx.is_dead(uncalled));
+    }
+}

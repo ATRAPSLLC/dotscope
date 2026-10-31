@@ -51,7 +51,7 @@ pub use streaming::{
 use crate::{
     cilassembly::{
         changes::AssemblyChanges,
-        writer::{context::WriteContext, signatures::SignatureRemap},
+        writer::{blobs::BlobRemap, context::WriteContext},
     },
     CilAssemblyView, Result,
 };
@@ -209,18 +209,24 @@ pub fn precompute_heap_offsets(
     let strings_result = compute_strings_heap_offsets(
         strings_data,
         &changes.string_heap_changes,
-        &changes.referenced_string_offsets,
+        &ctx.referenced_string_offsets,
     )?;
     let blob_result = compute_blob_heap_offsets(
         blob_data,
         &changes.blob_heap_changes,
-        &SignatureRemap {
-            blobs: &ctx.signature_blobs,
+        &BlobRemap {
+            blobs: &ctx.typed_blobs,
             tokens: &ctx.tokens,
+            changes,
         },
+        &ctx.referenced_blob_offsets,
     )?;
     let guid_result = compute_guid_heap_offsets(guid_data, &changes.guid_heap_changes)?;
-    let us_result = compute_userstring_heap_offsets(us_data, &changes.userstring_heap_changes)?;
+    let us_result = compute_userstring_heap_offsets(
+        us_data,
+        &changes.userstring_heap_changes,
+        &ctx.referenced_userstring_offsets,
+    )?;
 
     // Record the emitted heap sizes so the tables stream can pick matching index widths.
     // `usize::try_from` cannot fail for a heap that fits in memory; saturating keeps the

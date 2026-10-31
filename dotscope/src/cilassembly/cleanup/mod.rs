@@ -110,7 +110,7 @@ mod utils;
 
 #[cfg(feature = "deobfuscation")]
 pub use analysis::{compute_entry_points, expand_type_tokens, find_unreferenced_types, TypeNames};
-pub(crate) use compaction::mark_unreferenced_heap_entries;
+pub(crate) use compaction::{collect_referenced_heap_entries, mark_unreferenced_heap_entries};
 pub use executor::execute_cleanup;
 pub use request::CleanupRequest;
 pub use stats::CleanupStats;

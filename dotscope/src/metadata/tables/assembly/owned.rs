@@ -4,13 +4,14 @@
 //! with owned data and resolved heap references. This is the primary data structure
 //! for representing assembly identity and versioning information in a usable form.
 
-use std::sync::OnceLock;
-
-use crate::metadata::{
-    customattributes::CustomAttributeValueList,
-    security::Security,
-    tables::{AssemblyFlags, HashAlgorithmId},
-    token::Token,
+use crate::{
+    metadata::{
+        customattributes::CustomAttributeValueList,
+        security::Security,
+        tables::{AssemblyFlags, HashAlgorithmId},
+        token::Token,
+    },
+    utils::RowList,
 };
 
 /// Represents a .NET CIL assembly with fully resolved metadata and owned data
@@ -114,12 +115,9 @@ pub struct Assembly {
     /// Satellite assemblies typically have specific culture values.
     pub culture: Option<String>,
 
-    /// Security information for this assembly
-    ///
-    /// Contains declarative security attributes and permissions associated with
-    /// the assembly. Uses [`OnceLock`] for thread-safe lazy initialization since
-    /// security information is not always needed and can be expensive to load.
-    pub security: OnceLock<Security>,
+    /// The assembly's declarative security, a `DeclSecurity` row each, in table order: an
+    /// assembly may request permissions under several actions (minimum, optional, refused).
+    pub security: RowList<Security>,
 
     /// Custom attributes attached to this assembly
     ///

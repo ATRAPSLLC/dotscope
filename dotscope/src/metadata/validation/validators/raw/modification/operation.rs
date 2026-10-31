@@ -590,7 +590,6 @@ impl Default for RawOperationValidator {
 
 #[cfg(test)]
 mod tests {
-    use rayon::ThreadPoolBuilder;
 
     use super::*;
     use crate::{
@@ -720,14 +719,12 @@ mod tests {
         };
 
         let scanner = ReferenceScanner::from_view(&view)?;
-        let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
 
         let context = RawValidationContext::new_for_modification(
             &view,
             &corrupted_changes,
             &scanner,
             &config,
-            &thread_pool,
         );
 
         validator.validate_raw(&context)

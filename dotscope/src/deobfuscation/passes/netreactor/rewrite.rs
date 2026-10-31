@@ -182,9 +182,8 @@ mod tests {
     use super::*;
     use crate::{
         analysis::{CallGraph, MethodRef, SsaFunctionBuilder, SsaType},
-        compiler::SsaPass,
         deobfuscation::context::AnalysisContext,
-        testkit::helpers::test_assembly_arc,
+        testkit::{helpers::test_assembly_arc, passes::run_verified},
     };
 
     fn make_ctx() -> AnalysisContext {
@@ -211,13 +210,13 @@ mod tests {
 
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl);
         let ctx = make_ctx();
-        let changed = pass
-            .run_on_method(
-                &mut ssa,
-                &MethodRef::from(Token::new(0x06000003)),
-                &ctx.compiler,
-            )
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(Token::new(0x06000003)),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(changed);
         let block = ssa.block(0).unwrap();
         match block.instructions()[0].op() {
@@ -246,16 +245,21 @@ mod tests {
 
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl);
         let ctx = make_ctx();
-        let changed = pass
-            .run_on_method(
-                &mut ssa,
-                &MethodRef::from(Token::new(0x06000003)),
-                &ctx.compiler,
-            )
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(Token::new(0x06000003)),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(changed);
+        // The call is gone: the block is its return
         let block = ssa.block(0).unwrap();
-        assert!(matches!(block.instructions()[0].op(), SsaOp::Nop));
+        assert!(
+            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None })),
+            "{:?}",
+            block.instructions()
+        );
     }
 
     #[test]
@@ -276,9 +280,8 @@ mod tests {
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl);
         let ctx = make_ctx();
         // Running on the lazy_init method itself should NOT touch its body.
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(lazy_init), &ctx.compiler)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut ssa, &MethodRef::from(lazy_init), &ctx.compiler).unwrap();
         assert!(!changed);
     }
 
@@ -300,13 +303,13 @@ mod tests {
 
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl_unset);
         let ctx = make_ctx();
-        let changed = pass
-            .run_on_method(
-                &mut ssa,
-                &MethodRef::from(Token::new(0x06000003)),
-                &ctx.compiler,
-            )
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(Token::new(0x06000003)),
+            &ctx.compiler,
+        )
+        .unwrap();
         // Shim left intact - fallback is to leave the call alone.
         assert!(!changed);
     }

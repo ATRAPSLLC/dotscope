@@ -748,10 +748,13 @@ mod tests {
                     let object = f.var();
                     loaded = Some(object);
                     f.block(0, |b| {
-                        b.op(SsaOp::LoadStaticField {
-                            dest: object,
-                            field,
-                        });
+                        b.op_typed(
+                            SsaOp::LoadStaticField {
+                                dest: object,
+                                field,
+                            },
+                            SsaType::Object,
+                        );
                         // The field load the pass resolved, already a constant.
                         let _ = b.const_i32(1);
                         if still_read {

@@ -278,37 +278,18 @@ pub mod VARIANT_TYPE {
     pub const TYPEMASK: u16 = 0xfff;
 }
 
-/// Represents a complete marshaling descriptor.
+/// A marshalling descriptor (ECMA-335 II.23.4, `MarshalSpec`): the native type a managed
+/// value is marshalled as during P/Invoke, COM interop or other native interop. An array's
+/// element type and a pointer's target are part of that type.
 ///
-/// A marshalling descriptor contains all the information needed to marshal a managed type
-/// to/from a native type during P/Invoke, COM interop, or other native interop scenarios.
-/// The descriptor consists of a primary type and optional additional types for complex
-/// marshalling scenarios.
+/// # Examples
 ///
-/// # Structure
-///
-/// - **Primary Type**: The main [`NativeType`] that represents the target native type
-/// - **Additional Types**: Secondary types used for complex marshalling (e.g., array element types)
-///
-/// # Usage Patterns
-///
-/// Most marshalling descriptors contain only a primary type:
 /// ```rust,no_run
 /// use dotscope::metadata::marshalling::{MarshallingInfo, NativeType};
 ///
 /// // Simple LPSTR marshalling
 /// let descriptor = MarshallingInfo {
 ///     primary_type: NativeType::LPStr { size_param_index: None },
-///     additional_types: vec![],
-/// };
-/// ```
-///
-/// Complex scenarios may include additional type information:
-/// ```no_run
-/// // Array marshalling with element type
-/// let descriptor = MarshallingInfo {
-///     primary_type: NativeType::Array { /* ... */ },
-///     additional_types: vec![NativeType::I4], // Element type
 /// };
 /// ```
 ///
@@ -324,26 +305,13 @@ pub mod VARIANT_TYPE {
 /// ```
 #[derive(Debug, PartialEq, Clone)]
 pub struct MarshallingInfo {
-    /// The primary native type for this marshalling descriptor
+    /// The native type the descriptor states
     pub primary_type: NativeType,
-    /// Additional type information for complex marshalling scenarios
-    pub additional_types: Vec<NativeType>,
 }
 
 impl std::fmt::Display for MarshallingInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.primary_type)?;
-        if !self.additional_types.is_empty() {
-            write!(f, " + [")?;
-            for (i, t) in self.additional_types.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                write!(f, "{t}")?;
-            }
-            write!(f, "]")?;
-        }
-        Ok(())
+        write!(f, "{}", self.primary_type)
     }
 }
 
@@ -379,7 +347,6 @@ impl MarshallingInfo {
     ///         packing_size: Some(4),
     ///         class_size: Some(128),
     ///     },
-    ///     additional_types: vec![],
     /// };
     /// assert!(valid.validate().is_ok());
     ///
@@ -389,16 +356,11 @@ impl MarshallingInfo {
     ///         packing_size: None,
     ///         class_size: Some(128),
     ///     },
-    ///     additional_types: vec![],
     /// };
     /// assert!(invalid.validate().is_err());
     /// ```
     pub fn validate(&self) -> Result<()> {
-        Self::validate_native_type(&self.primary_type)?;
-        for additional in &self.additional_types {
-            Self::validate_native_type(additional)?;
-        }
-        Ok(())
+        Self::validate_native_type(&self.primary_type)
     }
 
     /// Validates a single native type for encoding correctness.
@@ -417,53 +379,40 @@ impl MarshallingInfo {
     /// - `Array` has `num_element` set without `num_param`
     /// - Any nested type (in `FixedArray`, `Array`, or `Ptr`) is invalid
     fn validate_native_type(native_type: &NativeType) -> Result<()> {
-        match native_type {
+        // Optional fields are positional: one is present when bytes remain after the one
+        // before it, so a later one cannot be given without the earlier ones.
+        let out_of_order = match native_type {
             NativeType::Struct {
                 packing_size,
                 class_size,
-            } => {
-                // class_size can only be present if packing_size is also present
-                // due to sequential binary encoding format
-                if packing_size.is_none() && class_size.is_some() {
-                    return Err(Error::MarshallingError(
-                        "Struct: class_size cannot be set without packing_size \
-                         (sequential encoding constraint)"
-                            .to_string(),
-                    ));
-                }
-                Ok(())
-            }
+            } => (packing_size.is_none() && class_size.is_some())
+                .then_some("Struct: class_size cannot be set without packing_size"),
             NativeType::Array {
-                element_type,
                 num_param,
                 num_element,
+                flags,
+                ..
             } => {
-                // num_element can only be present if num_param is also present
-                // due to sequential binary encoding format
                 if num_param.is_none() && num_element.is_some() {
-                    return Err(Error::MarshallingError(
-                        "Array: num_element cannot be set without num_param \
-                         (sequential encoding constraint)"
-                            .to_string(),
-                    ));
+                    Some("Array: num_element cannot be set without num_param")
+                } else if num_element.is_none() && flags.is_some() {
+                    Some("Array: flags cannot be set without num_element")
+                } else {
+                    None
                 }
-                // Recursively validate nested element type
-                Self::validate_native_type(element_type)?;
-                Ok(())
             }
-            NativeType::FixedArray { element_type, .. } => {
-                if let Some(et) = element_type {
-                    Self::validate_native_type(et)?;
-                }
-                Ok(())
-            }
-            NativeType::Ptr { ref_type } => {
-                if let Some(rt) = ref_type {
-                    Self::validate_native_type(rt)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
+            NativeType::SafeArray {
+                variant_type,
+                user_defined_name,
+            } => (variant_type.is_none() && user_defined_name.is_some())
+                .then_some("SafeArray: user_defined_name cannot be set without variant_type"),
+            _ => None,
+        };
+        match out_of_order {
+            Some(message) => Err(Error::MarshallingError(format!(
+                "{message} (sequential encoding constraint)"
+            ))),
+            None => Ok(()),
         }
     }
 }
@@ -531,9 +480,10 @@ impl MarshallingInfo {
 ///
 /// // Array marshalling
 /// let array = NativeType::Array {
-///     element_type: Box::new(NativeType::I4),
+///     element_type: NATIVE_TYPE::I4,
 ///     num_param: Some(1),
 ///     num_element: Some(10),
+///     flags: None,
 /// };
 ///
 /// // COM interface
@@ -634,22 +584,28 @@ pub enum NativeType {
     FixedArray {
         /// Number of elements in the fixed array
         size: u32,
-        /// Optional element type specification
-        element_type: Option<Box<NativeType>>,
+        /// The elements' native type, when the descriptor gives one: a [`NATIVE_TYPE`] byte,
+        /// which [`NativeType::from_tag`] reads (an element is its type's tag alone)
+        element_type: Option<u8>,
     },
     /// Variable array - Runtime-sized array with parameter-based sizing
     Array {
-        /// Type of array elements
-        element_type: Box<NativeType>,
+        /// The elements' native type: a [`NATIVE_TYPE`] byte, which [`NativeType::from_tag`]
+        /// reads (ECMA-335 II.23.4: an element is its type's tag alone, so an array of
+        /// `LPSTR` holds no size parameter of its own)
+        element_type: u8,
         /// Optional parameter index for array size
         num_param: Option<u32>,
         /// Optional fixed number of elements
         num_element: Option<u32>,
+        /// Optional flags after the element count; bit 0 says the parameter index was given
+        /// (`ntaSizeParamIndexSpecified`), which a parameter index of 0 cannot say alone
+        flags: Option<u32>,
     },
     /// Safe array - COM safe array with variant type information
     SafeArray {
-        /// VARIANT type constant for array elements
-        variant_type: u16,
+        /// The VARTYPE of the array's elements, when the descriptor gives one
+        variant_type: Option<u16>,
         /// Optional user-defined type name
         user_defined_name: Option<String>,
     },
@@ -657,8 +613,9 @@ pub enum NativeType {
     // Pointer types
     /// Pointer - Raw pointer with optional target type information
     Ptr {
-        /// Optional type that the pointer references
-        ref_type: Option<Box<NativeType>>,
+        /// The native type the pointer references, when the descriptor gives one: a
+        /// [`NATIVE_TYPE`] byte, which [`NativeType::from_tag`] reads
+        ref_type: Option<u8>,
     },
 
     // Interface types
@@ -713,6 +670,8 @@ pub enum NativeType {
     // End marker
     /// End marker - Indicates the end of a marshalling descriptor
     End,
+    /// `NATIVE_TYPE_MAX` (0x50): no native type given, as an array's element type
+    Unspecified,
 }
 
 impl std::fmt::Display for NativeType {
@@ -774,8 +733,9 @@ impl std::fmt::Display for NativeType {
             NativeType::VariantBool => write!(f, "variant bool"),
             NativeType::FixedArray { size, element_type } => {
                 write!(f, "fixed array[{size}]")?;
-                if let Some(et) = element_type {
-                    write!(f, " of {et}")?;
+                if let Some(tag) = element_type {
+                    write!(f, " of ")?;
+                    write_tag(f, *tag)?;
                 }
                 Ok(())
             }
@@ -783,8 +743,10 @@ impl std::fmt::Display for NativeType {
                 element_type,
                 num_param,
                 num_element,
+                ..
             } => {
-                write!(f, "array of {element_type}")?;
+                write!(f, "array of ")?;
+                write_tag(f, *element_type)?;
                 match (num_param, num_element) {
                     (Some(p), Some(e)) => write!(f, "(param={p}, count={e})"),
                     (Some(p), None) => write!(f, "(param={p})"),
@@ -796,7 +758,10 @@ impl std::fmt::Display for NativeType {
                 variant_type,
                 user_defined_name,
             } => {
-                write!(f, "safearray(vt=0x{variant_type:04X})")?;
+                write!(f, "safearray")?;
+                if let Some(variant_type) = variant_type {
+                    write!(f, "(vt=0x{variant_type:04X})")?;
+                }
                 if let Some(name) = user_defined_name {
                     write!(f, " of {name}")?;
                 }
@@ -804,8 +769,9 @@ impl std::fmt::Display for NativeType {
             }
             NativeType::Ptr { ref_type } => {
                 write!(f, "ptr")?;
-                if let Some(rt) = ref_type {
-                    write!(f, " to {rt}")?;
+                if let Some(tag) = ref_type {
+                    write!(f, " to ")?;
+                    write_tag(f, *tag)?;
                 }
                 Ok(())
             }
@@ -856,11 +822,103 @@ impl std::fmt::Display for NativeType {
             NativeType::AsAny => write!(f, "asany"),
             NativeType::HString => write!(f, "hstring"),
             NativeType::End => write!(f, "end"),
+            NativeType::Unspecified => write!(f, "unspecified"),
         }
     }
 }
 
+/// Writes an element's native type tag: as the type it states, or as its value when it states
+/// none alone.
+fn write_tag(f: &mut std::fmt::Formatter<'_>, tag: u8) -> std::fmt::Result {
+    match NativeType::from_tag(tag) {
+        Some(native_type) => write!(f, "{native_type}"),
+        None => write!(f, "native type 0x{tag:02X}"),
+    }
+}
+
 impl NativeType {
+    /// The native type a [`NATIVE_TYPE`] tag states on its own, as an array's element type or
+    /// a pointer's target does: its optional fields absent. `None` for a tag no native type
+    /// has, and for one whose type has fields it cannot do without (a fixed string or array,
+    /// an array, a custom marshaler).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dotscope::metadata::marshalling::{NativeType, NATIVE_TYPE};
+    ///
+    /// assert_eq!(
+    ///     NativeType::from_tag(NATIVE_TYPE::LPSTR),
+    ///     Some(NativeType::LPStr { size_param_index: None })
+    /// );
+    /// assert_eq!(NativeType::from_tag(NATIVE_TYPE::BYVALSTR), None);
+    /// ```
+    #[must_use]
+    pub fn from_tag(tag: u8) -> Option<NativeType> {
+        Some(match tag {
+            NATIVE_TYPE::END => NativeType::End,
+            NATIVE_TYPE::MAX => NativeType::Unspecified,
+            NATIVE_TYPE::VOID => NativeType::Void,
+            NATIVE_TYPE::BOOLEAN => NativeType::Boolean,
+            NATIVE_TYPE::I1 => NativeType::I1,
+            NATIVE_TYPE::U1 => NativeType::U1,
+            NATIVE_TYPE::I2 => NativeType::I2,
+            NATIVE_TYPE::U2 => NativeType::U2,
+            NATIVE_TYPE::I4 => NativeType::I4,
+            NATIVE_TYPE::U4 => NativeType::U4,
+            NATIVE_TYPE::I8 => NativeType::I8,
+            NATIVE_TYPE::U8 => NativeType::U8,
+            NATIVE_TYPE::R4 => NativeType::R4,
+            NATIVE_TYPE::R8 => NativeType::R8,
+            NATIVE_TYPE::SYSCHAR => NativeType::SysChar,
+            NATIVE_TYPE::VARIANT => NativeType::Variant,
+            NATIVE_TYPE::CURRENCY => NativeType::Currency,
+            NATIVE_TYPE::PTR => NativeType::Ptr { ref_type: None },
+            NATIVE_TYPE::DECIMAL => NativeType::Decimal,
+            NATIVE_TYPE::DATE => NativeType::Date,
+            NATIVE_TYPE::BSTR => NativeType::BStr,
+            NATIVE_TYPE::LPSTR => NativeType::LPStr {
+                size_param_index: None,
+            },
+            NATIVE_TYPE::LPWSTR => NativeType::LPWStr {
+                size_param_index: None,
+            },
+            NATIVE_TYPE::LPTSTR => NativeType::LPTStr {
+                size_param_index: None,
+            },
+            NATIVE_TYPE::OBJECTREF => NativeType::ObjectRef,
+            NATIVE_TYPE::IUNKNOWN => NativeType::IUnknown,
+            NATIVE_TYPE::IDISPATCH => NativeType::IDispatch,
+            NATIVE_TYPE::STRUCT => NativeType::Struct {
+                packing_size: None,
+                class_size: None,
+            },
+            NATIVE_TYPE::INTERFACE => NativeType::Interface {
+                iid_param_index: None,
+            },
+            NATIVE_TYPE::SAFEARRAY => NativeType::SafeArray {
+                variant_type: None,
+                user_defined_name: None,
+            },
+            NATIVE_TYPE::INT => NativeType::Int,
+            NATIVE_TYPE::UINT => NativeType::UInt,
+            NATIVE_TYPE::NESTEDSTRUCT => NativeType::NestedStruct,
+            NATIVE_TYPE::ANSIBSTR => NativeType::AnsiBStr,
+            NATIVE_TYPE::TBSTR => NativeType::TBStr,
+            NATIVE_TYPE::VARIANTBOOL => NativeType::VariantBool,
+            NATIVE_TYPE::FUNC => NativeType::Func,
+            NATIVE_TYPE::ASANY => NativeType::AsAny,
+            NATIVE_TYPE::LPSTRUCT => NativeType::LPStruct,
+            NATIVE_TYPE::ERROR => NativeType::Error,
+            NATIVE_TYPE::IINSPECTABLE => NativeType::IInspectable,
+            NATIVE_TYPE::HSTRING => NativeType::HString,
+            NATIVE_TYPE::LPUTF8STR => NativeType::LPUtf8Str {
+                size_param_index: None,
+            },
+            _ => return None,
+        })
+    }
+
     /// Returns true if this type requires additional parameter data.
     ///
     /// Many native types include runtime parameters such as size information, parameter indices,
@@ -887,9 +945,10 @@ impl NativeType {
     ///
     /// // Array types always have parameters
     /// let array = NativeType::Array {
-    ///     element_type: Box::new(NativeType::I4),
+    ///     element_type: NATIVE_TYPE::I4,
     ///     num_param: None,
     ///     num_element: Some(10),
+    ///     flags: None,
     /// };
     /// assert!(array.has_parameters());
     /// ```
@@ -980,9 +1039,10 @@ mod tests {
             format!(
                 "{}",
                 NativeType::Array {
-                    element_type: Box::new(NativeType::I4),
+                    element_type: NATIVE_TYPE::I4,
                     num_param: Some(3),
                     num_element: Some(10),
+                    flags: None,
                 }
             ),
             "array of i4(param=3, count=10)"
@@ -1007,17 +1067,8 @@ mod tests {
     fn test_marshalling_info_display() {
         let info = MarshallingInfo {
             primary_type: NativeType::I4,
-            additional_types: vec![],
         };
         assert_eq!(format!("{info}"), "i4");
-
-        let info_with_additional = MarshallingInfo {
-            primary_type: NativeType::LPStr {
-                size_param_index: None,
-            },
-            additional_types: vec![NativeType::Boolean, NativeType::I4],
-        };
-        assert_eq!(format!("{info_with_additional}"), "lpstr + [bool, i4]");
     }
 
     #[test]
@@ -1028,7 +1079,6 @@ mod tests {
                 packing_size: Some(4),
                 class_size: Some(128),
             },
-            additional_types: vec![],
         };
         assert!(valid.validate().is_ok());
 
@@ -1038,7 +1088,6 @@ mod tests {
                 packing_size: Some(4),
                 class_size: None,
             },
-            additional_types: vec![],
         };
         assert!(valid2.validate().is_ok());
 
@@ -1048,7 +1097,6 @@ mod tests {
                 packing_size: None,
                 class_size: None,
             },
-            additional_types: vec![],
         };
         assert!(valid3.validate().is_ok());
     }
@@ -1061,7 +1109,6 @@ mod tests {
                 packing_size: None,
                 class_size: Some(128),
             },
-            additional_types: vec![],
         };
         assert!(invalid.validate().is_err());
     }
@@ -1071,11 +1118,11 @@ mod tests {
         // Invalid: num_element without num_param
         let invalid = MarshallingInfo {
             primary_type: NativeType::Array {
-                element_type: Box::new(NativeType::I4),
+                element_type: NATIVE_TYPE::I4,
                 num_param: None,
                 num_element: Some(10),
+                flags: None,
             },
-            additional_types: vec![],
         };
         assert!(invalid.validate().is_err());
     }

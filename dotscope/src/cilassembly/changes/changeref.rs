@@ -57,8 +57,34 @@ use crate::{
     Error, Result,
 };
 
-/// Counter for generating unique IDs
-static NEXT_CHANGE_ID: AtomicU64 = AtomicU64::new(1);
+/// The ids an assembly's changes take, shared by its heaps and tables: unique within the
+/// assembly, which is all a placeholder is looked up in, and counted from 1 for each one, so
+/// they stay small (a row placeholder holds 23 bits of one) and the same from run to run.
+#[derive(Debug, Clone)]
+pub struct ChangeIds(Arc<AtomicU64>);
+
+impl ChangeIds {
+    /// A fresh id source, starting at 1.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(1)))
+    }
+
+    /// The next id.
+    pub fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl Default for ChangeIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The largest id a row placeholder holds (`0x0080_0000 | id`, below the bit marking a heap
+/// placeholder).
+const MAX_ROW_ID: u64 = 0x007F_FFFF;
 
 /// Sentinel value indicating an unresolved offset/token
 const UNRESOLVED: u32 = u32::MAX;
@@ -164,11 +190,12 @@ impl ChangeRef {
     ///
     /// * `kind` - The type of heap this reference points to
     /// * `content_hash` - Hash of the content for deduplication detection
+    /// * `id` - The change id, from the assembly's [`ChangeIds`]
     #[must_use]
-    pub fn new_heap(kind: ChangeRefKind, content_hash: u64) -> Self {
+    pub fn new_heap(kind: ChangeRefKind, content_hash: u64, id: u64) -> Self {
         debug_assert!(kind.is_heap(), "new_heap called with non-heap kind");
         Self {
-            id: NEXT_CHANGE_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             kind,
             content_hash,
             resolved: AtomicBool::new(false),
@@ -177,21 +204,27 @@ impl ChangeRef {
         }
     }
 
-    /// Creates a new unresolved change reference for a table row.
+    /// Creates a new unresolved change reference for a row of `table_id`, with change id `id`
+    /// (from the assembly's [`ChangeIds`]).
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `table_id` - The metadata table this row belongs to
-    #[must_use]
-    pub fn new_table_row(table_id: TableId) -> Self {
-        Self {
-            id: NEXT_CHANGE_ID.fetch_add(1, Ordering::Relaxed),
+    /// When `id` exceeds what a row placeholder holds: the assembly has made more changes than
+    /// its placeholders can tell apart.
+    pub fn new_table_row(table_id: TableId, id: u64) -> Result<Self> {
+        if id > MAX_ROW_ID {
+            return Err(Error::Other(format!(
+                "Change {id} exceeds the {MAX_ROW_ID:#x} a row placeholder holds"
+            )));
+        }
+        Ok(Self {
+            id,
             kind: ChangeRefKind::TableRow(table_id),
             content_hash: 0, // Table rows don't use content hashing
             resolved: AtomicBool::new(false),
             resolved_offset: AtomicU32::new(UNRESOLVED),
             resolved_token: AtomicU32::new(UNRESOLVED),
-        }
+        })
     }
 
     /// Creates a change reference from an existing heap offset.
@@ -204,10 +237,10 @@ impl ChangeRef {
     /// * `kind` - The type of heap
     /// * `offset` - The existing heap offset
     #[must_use]
-    pub fn from_heap_offset(kind: ChangeRefKind, offset: u32) -> Self {
+    pub fn from_heap_offset(kind: ChangeRefKind, offset: u32, id: u64) -> Self {
         debug_assert!(kind.is_heap(), "from_heap_offset called with non-heap kind");
         Self {
-            id: NEXT_CHANGE_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             kind,
             content_hash: 0,
             resolved: AtomicBool::new(true),
@@ -228,7 +261,7 @@ impl ChangeRef {
     /// # Errors
     ///
     /// Returns an error if the token's table type is not recognized.
-    pub fn from_token(token: Token) -> Result<Self> {
+    pub fn from_token(token: Token, id: u64) -> Result<Self> {
         let table_id = TableId::from_token_type(token.table()).ok_or_else(|| {
             Error::Other(format!(
                 "Token has unrecognized table type: 0x{:02X}",
@@ -236,7 +269,7 @@ impl ChangeRef {
             ))
         })?;
         Ok(Self {
-            id: NEXT_CHANGE_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             kind: ChangeRefKind::TableRow(table_id),
             content_hash: 0,
             resolved: AtomicBool::new(true),
@@ -408,6 +441,13 @@ impl ChangeRef {
         value & 0x8000_0000 != 0 || value >= 0x0080_0000
     }
 
+    /// Whether a heap index is a heap placeholder (`0x8000_0000 | id`): bit 31, which no heap
+    /// offset has. A heap offset past `0x0080_0000` is an offset, not a row placeholder.
+    #[must_use]
+    pub fn is_heap_placeholder(value: u32) -> bool {
+        value & 0x8000_0000 != 0
+    }
+
     /// Extracts the ID portion from a placeholder value.
     ///
     /// Handles both placeholder formats:
@@ -495,38 +535,41 @@ impl std::hash::Hash for ChangeRef {
 impl ChangeRef {
     /// Creates a new string heap reference wrapped in Arc.
     #[must_use]
-    pub fn new_string(content_hash: u64) -> ChangeRefRc {
-        Arc::new(Self::new_heap(ChangeRefKind::String, content_hash))
+    pub fn new_string(content_hash: u64, id: u64) -> ChangeRefRc {
+        Arc::new(Self::new_heap(ChangeRefKind::String, content_hash, id))
     }
 
     /// Creates a new blob heap reference wrapped in Arc.
     #[must_use]
-    pub fn new_blob(content_hash: u64) -> ChangeRefRc {
-        Arc::new(Self::new_heap(ChangeRefKind::Blob, content_hash))
+    pub fn new_blob(content_hash: u64, id: u64) -> ChangeRefRc {
+        Arc::new(Self::new_heap(ChangeRefKind::Blob, content_hash, id))
     }
 
     /// Creates a new GUID heap reference wrapped in Arc.
     #[must_use]
-    pub fn new_guid(content_hash: u64) -> ChangeRefRc {
-        Arc::new(Self::new_heap(ChangeRefKind::Guid, content_hash))
+    pub fn new_guid(content_hash: u64, id: u64) -> ChangeRefRc {
+        Arc::new(Self::new_heap(ChangeRefKind::Guid, content_hash, id))
     }
 
     /// Creates a new user string heap reference wrapped in Arc.
     #[must_use]
-    pub fn new_userstring(content_hash: u64) -> ChangeRefRc {
-        Arc::new(Self::new_heap(ChangeRefKind::UserString, content_hash))
+    pub fn new_userstring(content_hash: u64, id: u64) -> ChangeRefRc {
+        Arc::new(Self::new_heap(ChangeRefKind::UserString, content_hash, id))
     }
 
     /// Creates a new table row reference wrapped in Arc.
-    #[must_use]
-    pub fn new_row(table_id: TableId) -> ChangeRefRc {
-        Arc::new(Self::new_table_row(table_id))
+    ///
+    /// # Errors
+    ///
+    /// When `id` exceeds what a row placeholder holds (see [`Self::new_table_row`]).
+    pub fn new_row(table_id: TableId, id: u64) -> Result<ChangeRefRc> {
+        Self::new_table_row(table_id, id).map(Arc::new)
     }
 
     /// Creates a reference from an existing heap offset, wrapped in Arc.
     #[must_use]
-    pub fn existing_heap(kind: ChangeRefKind, offset: u32) -> ChangeRefRc {
-        Arc::new(Self::from_heap_offset(kind, offset))
+    pub fn existing_heap(kind: ChangeRefKind, offset: u32, id: u64) -> ChangeRefRc {
+        Arc::new(Self::from_heap_offset(kind, offset, id))
     }
 
     /// Creates a reference from an existing token, wrapped in Arc.
@@ -534,8 +577,8 @@ impl ChangeRef {
     /// # Errors
     ///
     /// Returns an error if the token's table type is not recognized.
-    pub fn existing_token(token: Token) -> Result<ChangeRefRc> {
-        Ok(Arc::new(Self::from_token(token)?))
+    pub fn existing_token(token: Token, id: u64) -> Result<ChangeRefRc> {
+        Ok(Arc::new(Self::from_token(token, id)?))
     }
 }
 
@@ -547,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_changeref_heap_creation() {
-        let ref1 = ChangeRef::new_string(12345);
+        let ref1 = ChangeRef::new_string(12345, 1);
         assert_eq!(ref1.kind(), ChangeRefKind::String);
         assert!(!ref1.is_resolved());
         assert!(ref1.offset().is_none());
@@ -556,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_changeref_table_creation() {
-        let ref1 = ChangeRef::new_row(TableId::TypeDef);
+        let ref1 = ChangeRef::new_row(TableId::TypeDef, 1).unwrap();
         assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
         assert!(!ref1.is_resolved());
         assert!(ref1.offset().is_none());
@@ -565,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_changeref_from_existing_offset() {
-        let ref1 = ChangeRef::existing_heap(ChangeRefKind::String, 100);
+        let ref1 = ChangeRef::existing_heap(ChangeRefKind::String, 100, 1);
         assert!(ref1.is_resolved());
         assert_eq!(ref1.offset(), Some(100));
     }
@@ -573,14 +616,14 @@ mod tests {
     #[test]
     fn test_changeref_from_existing_token() {
         let token = Token::new(0x0200_0001); // TypeDef row 1
-        let ref1 = ChangeRef::existing_token(token).unwrap();
+        let ref1 = ChangeRef::existing_token(token, 1).unwrap();
         assert!(ref1.is_resolved());
         assert_eq!(ref1.token(), Some(token));
     }
 
     #[test]
     fn test_changeref_resolve_offset() {
-        let ref1 = ChangeRef::new_string(12345);
+        let ref1 = ChangeRef::new_string(12345, 1);
         assert!(!ref1.is_resolved());
 
         ref1.resolve_to_offset(500);
@@ -590,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_changeref_resolve_token() {
-        let ref1 = ChangeRef::new_row(TableId::MethodDef);
+        let ref1 = ChangeRef::new_row(TableId::MethodDef, 1).unwrap();
         assert!(!ref1.is_resolved());
 
         let token = Token::new(0x0600_0042);
@@ -601,25 +644,43 @@ mod tests {
 
     #[test]
     fn test_changeref_unique_ids() {
-        let ref1 = ChangeRef::new_string(100);
-        let ref2 = ChangeRef::new_string(100);
-        let ref3 = ChangeRef::new_blob(200);
+        // An assembly's changes take distinct ids from 1, whatever another assembly has made
+        let ids = ChangeIds::new();
+        let ref1 = ChangeRef::new_string(100, ids.next());
+        let ref2 = ChangeRef::new_string(100, ids.next());
+        let ref3 = ChangeRef::new_blob(200, ids.next());
+        assert_eq!((ref1.id(), ref2.id(), ref3.id()), (1, 2, 3));
+        assert_eq!(ChangeIds::new().next(), 1);
+    }
 
-        // Each ChangeRef should have a unique ID
-        assert_ne!(ref1.id(), ref2.id());
-        assert_ne!(ref2.id(), ref3.id());
+    /// A heap placeholder is bit 31 alone: an offset into a heap larger than 8 MB is an
+    /// offset, where the row placeholders' marker would have taken it for a change.
+    #[test]
+    fn a_large_heap_offset_is_not_a_heap_placeholder() {
+        assert!(!ChangeRef::is_heap_placeholder(0x0090_0000));
+        assert!(ChangeRef::is_heap_placeholder(
+            ChangeRef::new_string(1, 7).placeholder()
+        ));
+    }
+
+    /// A row placeholder holds 23 bits of its id: an id past them is refused, where it would
+    /// name another change.
+    #[test]
+    fn a_row_id_past_its_placeholder_is_refused() {
+        assert!(ChangeRef::new_table_row(TableId::TypeDef, 0x007F_FFFF).is_ok());
+        assert!(ChangeRef::new_table_row(TableId::TypeDef, 0x0080_0000).is_err());
     }
 
     #[test]
     fn test_changeref_equality() {
-        let ref1 = ChangeRef::new_heap(ChangeRefKind::String, 100);
+        let ref1 = ChangeRef::new_heap(ChangeRefKind::String, 100, 1);
         let id1 = ref1.id();
 
         // Same ID means equal
         assert_eq!(ref1, ref1);
 
         // Different ID means not equal, even with same content hash
-        let ref2 = ChangeRef::new_heap(ChangeRefKind::String, 100);
+        let ref2 = ChangeRef::new_heap(ChangeRefKind::String, 100, 2);
         assert_ne!(ref1, ref2);
 
         // ID should be stable
@@ -658,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_changeref_thread_safety() {
-        let ref1 = ChangeRef::new_string(100);
+        let ref1 = ChangeRef::new_string(100, 1);
         let ref1_arc = Arc::new(ref1);
 
         let handles: Vec<_> = (0..10)

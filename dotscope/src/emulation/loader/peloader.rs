@@ -55,6 +55,8 @@
 //! - TLS callbacks are not processed
 //! - Delay-load imports are not handled
 
+use goblin::pe::options::{ParseMode, ParseOptions};
+
 use crate::{
     emulation::memory::{AddressSpace, MemoryProtection, MemoryRegion, SectionInfo},
     Error, Result,
@@ -660,8 +662,14 @@ impl PeLoader {
     ) -> Result<LoadedImage> {
         let name = name.into();
 
-        // Parse PE headers using goblin
-        let pe = goblin::pe::PE::parse(pe_bytes)?;
+        // The headers and sections, from goblin, permissively: the loader reads
+        // nothing else of goblin's walk (relocations are applied from the data
+        // directory below), so a malformed optional part does not refuse the
+        // image a process would still map.
+        let pe = goblin::pe::PE::parse_with_opts(
+            pe_bytes,
+            &ParseOptions::default().with_parse_mode(ParseMode::Permissive),
+        )?;
 
         // Determine base address
         let preferred_base = pe.image_base;
@@ -789,9 +797,18 @@ impl PeLoader {
             let is_initialized_data = characteristics & 0x40 != 0; // IMAGE_SCN_CNT_INITIALIZED_DATA
             let is_uninitialized_data = characteristics & 0x80 != 0; // IMAGE_SCN_CNT_UNINITIALIZED_DATA
 
-            // Copy section data to image
+            // Copy section data to image as the loader does (`file::sectionmap`): the raw data
+            // within the section's VirtualSize (its raw size when that is 0), as much of it as
+            // the file holds, and zeros after. Past VirtualSize the image holds zeros, as
+            // CoreCLR leaves them.
             let dest_offset = virtual_address as usize;
-            let copy_size = raw_size.min(virtual_size) as usize;
+            let extent = if virtual_size == 0 {
+                raw_size
+            } else {
+                virtual_size
+            };
+            let copy_size =
+                (raw_size.min(extent) as usize).min(pe_bytes.len().saturating_sub(raw_offset));
 
             let raw_end = raw_offset
                 .checked_add(copy_size)

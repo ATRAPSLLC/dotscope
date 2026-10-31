@@ -565,8 +565,6 @@ pub struct Method {
     /// The parameters (from `Param` table, enhanced with information from the `SignatureMethod`)
     /// sequence 0, is the return value (if there is a count 0).
     pub params: ParamList,
-    /// The vararg parameters of this method
-    pub varargs: Arc<boxcar::Vec<VarArg>>,
     /// All generic parameters this type has (type information, not the instantiated version)
     pub generic_params: GenericParamList,
     /// `MethodSpec` instances that provide generic instantiations for this method
@@ -577,8 +575,8 @@ pub struct Method {
     pub rva: Option<u32>,
     /// The `MethodBody`
     pub body: OnceLock<MethodBody>,
-    /// The local variables
-    pub local_vars: Arc<boxcar::Vec<LocalVariable>>,
+    /// The local variables, allocated on the first one
+    pub local_vars: LazyList<LocalVariable>,
     /// Overridden method declarations for `.override` directive emission
     /// (from `MethodImpl` table where `MethodBody` points to this method).
     /// A method can implement multiple interface methods via separate MethodImpl rows.
@@ -586,8 +584,10 @@ pub struct Method {
     /// Implemented interface methods
     /// (from `MethodImpl` table entries for this type)
     pub interface_impls: RowList<MethodRef>,
-    /// The .NET CIL Security Information (if present)
-    pub security: OnceLock<Security>,
+    /// The method's declarative security, a `DeclSecurity` row each, in table order: a method
+    /// may demand permissions under several actions (a link demand and an inheritance
+    /// demand, say).
+    pub security: RowList<Security>,
     /// The basic blocks of this method, lazily initialized
     pub blocks: OnceLock<Vec<BasicBlock>>,
     /// Custom attributes attached to this method
@@ -1264,7 +1264,6 @@ impl Method {
         }
 
         self.resolve_parameter_signatures(types)?;
-        self.parse_varargs(types)?;
 
         if has_il_body {
             assembly::decode_method(self, file, bodies)?;
@@ -1291,19 +1290,8 @@ impl Method {
         types: &Arc<TypeRegistry>,
         rva: u32,
     ) -> Result<MethodBody> {
-        let method_offset = file.rva_to_offset(rva as usize)?;
-        if method_offset == 0 || method_offset >= file.data().len() {
-            return Err(malformed_error!(
-                "Method offset is invalid - {}",
-                method_offset
-            ));
-        }
-
-        let mut body = MethodBody::from(
-            file.data()
-                .get(method_offset..)
-                .ok_or(out_of_bounds_error!())?,
-        )?;
+        // The runtimes read a body only within its section's VirtualSize
+        let mut body = MethodBody::from(file.section_bounded(rva as usize)?)?;
         if body.local_var_sig_token != 0 {
             self.parse_local_variables(&body, blobs, sigs, types)?;
         }
@@ -1441,39 +1429,6 @@ impl Method {
                     )?;
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    /// Parses vararg (variable argument) parameters from the method signature.
-    ///
-    /// # Arguments
-    /// * `types` - The type registry
-    ///
-    /// # Errors
-    /// Returns an error if a vararg modifier type cannot be resolved.
-    fn parse_varargs(&self, types: &Arc<TypeRegistry>) -> Result<()> {
-        for vararg in &self.signature.varargs {
-            let modifiers = Arc::new(boxcar::Vec::with_capacity(vararg.modifiers.len()));
-            for modifier in &vararg.modifiers {
-                match types.get(&modifier.modifier_type) {
-                    Some(new_mod) => _ = modifiers.push(new_mod.into()),
-                    None => {
-                        return Err(malformed_error!(
-                            "Failed to resolve vararg modifier type - token 0x{:08X}",
-                            modifier.modifier_type.value()
-                        ))
-                    }
-                }
-            }
-
-            let mut resolver = TypeResolver::new(types.clone());
-            self.varargs.push(VarArg {
-                modifiers,
-                by_ref: vararg.by_ref,
-                base: resolver.resolve(&vararg.base)?.into(),
-            });
         }
 
         Ok(())
@@ -1912,15 +1867,12 @@ impl Method {
             .collect()
     }
 
-    /// Encodes the method body to a byte vector.
-    ///
-    /// This method serializes the complete method body including:
-    /// - Method header (tiny or fat format as appropriate)
-    /// - All CIL instructions from basic blocks
-    /// - Exception handler sections (if any)
-    ///
-    /// The output format is compatible with ECMA-335 II.25.4 and can be
-    /// directly written to a PE file's .text section.
+    /// Encodes the method body to a byte vector (ECMA-335 II.25.4), ready for a PE file's
+    /// `.text` section: the header as it was read (its format, its declared stack depth,
+    /// which the instructions alone cannot recompute since a call's stack effect is its
+    /// signature's), the instructions of every block at their places in the code, and the
+    /// exception section as it was laid out. Bytes no block covers, code no path reaches,
+    /// are written as `nop`s.
     ///
     /// # Returns
     ///
@@ -1962,120 +1914,41 @@ impl Method {
             .get()
             .ok_or_else(|| malformed_error!("Method {} has no decoded blocks", self.name))?;
 
-        // Encode all instructions using InstructionEncoder
-        let mut encoder = InstructionEncoder::new();
-
-        for block in blocks {
-            for instruction in &block.instructions {
-                // Convert Operand to Option<Operand> for the encoder
-                let operand = match &instruction.operand {
-                    crate::assembly::Operand::None => None,
-                    op => Some(op.clone()),
-                };
-                encoder.emit_instruction(instruction.mnemonic, operand)?;
-            }
-        }
-
-        // Finalize to get the IL bytecode and max stack
-        let (il_code, max_stack, _) = encoder.finalize()?;
-
-        // Determine if we have exception handlers
-        let has_exceptions = !body.exception_handlers.is_empty();
-
-        // Calculate IL code size, ensuring it fits in u32
-        let il_code_size = u32::try_from(il_code.len())
-            .map_err(|_| malformed_error!("IL code size {} exceeds u32 range", il_code.len()))?;
-
-        // Encode the method header
-        let header = encode_method_body_header(
-            il_code_size,
-            max_stack,
-            body.local_var_sig_token,
-            has_exceptions,
-            body.is_init_local,
+        // The instructions of every block, each at its place in the code, where the exception
+        // handlers' offsets find them. Bytes no block covers (code no path reaches) are not
+        // kept with the method: they are written as `nop`s.
+        let instructions: Vec<_> = blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter().cloned())
+            .collect();
+        let code_rva = instructions
+            .iter()
+            .map(|instruction| instruction.rva)
+            .min()
+            .unwrap_or_default();
+        let il_code = InstructionEncoder::encode_decoded(
+            &instructions,
+            &vec![0x00; body.size_code],
+            code_rva,
         )?;
 
-        // Build the complete method body
-        let mut result = header;
-        result.extend_from_slice(&il_code);
-
-        // If fat format with exceptions, align to 4 bytes and add exception handlers
-        if has_exceptions {
-            // Align to 4-byte boundary
-            let remainder = result.len() % 4;
-            let padding = if remainder == 0 {
-                0
-            } else {
-                4usize.saturating_sub(remainder)
-            };
-            result.extend(std::iter::repeat_n(0u8, padding));
-
-            // Encode and append exception handlers
-            let exception_data = encode_exception_handlers(&body.exception_handlers)?;
-            result.extend_from_slice(&exception_data);
-        }
-
+        // The body as it was read: its header format, its exception section's layout and its
+        // declared stack depth, which the instructions alone cannot recompute (a call's
+        // effect on the stack is its signature's)
+        let mut result = Vec::new();
+        body.write_to(&mut result, &il_code)?;
         Ok(result)
     }
 
-    /// Returns the total encoded size of this method body in bytes.
-    ///
-    /// This calculates the size without actually encoding, useful for
-    /// layout planning. The size includes header, IL code, alignment
-    /// padding, and exception handler sections.
+    /// The size [`Self::encode_body`] encodes the method body to, in bytes: header, code,
+    /// alignment padding and exception section.
     ///
     /// # Returns
     ///
-    /// Returns `Some(size)` if the method has a body, `None` otherwise.
+    /// `None` when the method has no body or it does not encode.
     #[must_use]
     pub fn encoded_size(&self) -> Option<usize> {
-        let body = self.body.get()?;
-        let blocks = self.blocks.get()?;
-
-        // Calculate IL code size from instructions
-        let mut code_size = 0usize;
-        for block in blocks {
-            for instruction in &block.instructions {
-                // instruction.size is u64, safely convert to usize
-                let size = usize::try_from(instruction.size).ok()?;
-                code_size = code_size.checked_add(size)?;
-            }
-        }
-
-        // Determine header size
-        let has_exceptions = !body.exception_handlers.is_empty();
-        let has_locals = body.local_var_sig_token != 0;
-        let needs_fat = code_size > 63 || body.max_stack > 8 || has_locals || has_exceptions;
-
-        let header_size: usize = if needs_fat { 12 } else { 1 };
-
-        let mut total = header_size.checked_add(code_size)?;
-
-        // Add exception handler section size if needed
-        if has_exceptions {
-            // Align to 4 bytes
-            total = total.checked_add(3)? & !3;
-
-            // Calculate exception section size
-            let handler_count = body.exception_handlers.len();
-            // Check if we need fat format for exception handlers
-            let needs_fat_exceptions = handler_count > 20
-                || body.exception_handlers.iter().any(|h| {
-                    h.try_offset > 0xFFFF
-                        || h.try_length > 0xFF
-                        || h.handler_offset > 0xFFFF
-                        || h.handler_length > 0xFF
-                });
-
-            let per_handler = if needs_fat_exceptions { 24 } else { 12 };
-            // Fat format: 4-byte header + 24 bytes per handler
-            // Small format: 4-byte header + 12 bytes per handler
-            let handlers_size = handler_count.checked_mul(per_handler)?;
-            let section_size = handlers_size.checked_add(4)?;
-            total = total.checked_add(section_size)?;
-        }
-
-        Some(total)
+        self.encode_body().ok().map(|bytes| bytes.len())
     }
 }
 

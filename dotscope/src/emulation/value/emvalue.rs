@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::{
-    analysis::ConstValue,
+    analysis::{ConstValue, FloatFormat},
     emulation::{value::symbolic::SymbolicValue, EmulationError},
     metadata::{
         token::Token,
@@ -511,7 +511,7 @@ impl EmValue {
     /// use dotscope::analysis::ConstValue;
     ///
     /// assert_eq!(EmValue::I32(42).to_const_value(), Some(ConstValue::I32(42)));
-    /// assert_eq!(EmValue::F64(3.14).to_const_value(), Some(ConstValue::F64(3.14)));
+    /// assert_eq!(EmValue::F64(3.14).to_const_value(), Some(ConstValue::from(3.14)));
     /// assert_eq!(EmValue::Null.to_const_value(), Some(ConstValue::Null));
     /// assert_eq!(EmValue::Void.to_const_value(), None);
     /// ```
@@ -521,8 +521,8 @@ impl EmValue {
         match self {
             EmValue::I32(v) => Some(ConstValue::I32(*v)),
             EmValue::I64(v) => Some(ConstValue::I64(*v)),
-            EmValue::F32(v) => Some(ConstValue::F32(*v)),
-            EmValue::F64(v) => Some(ConstValue::F64(*v)),
+            EmValue::F32(v) => Some(ConstValue::from(*v)),
+            EmValue::F64(v) => Some(ConstValue::from(*v)),
             EmValue::Bool(v) => Some(ConstValue::from_bool(*v)),
             EmValue::NativeInt(v) => Some(ConstValue::NativeInt(*v)),
             EmValue::NativeUInt(v) => Some(ConstValue::NativeUInt(*v)),
@@ -758,14 +758,26 @@ impl From<ManagedPointer> for EmValue {
     }
 }
 
-impl From<&ConstValue> for EmValue {
-    /// Converts an SSA constant value to an emulation value.
+impl TryFrom<&ConstValue> for EmValue {
+    type Error = EmulationError;
+
+    /// Converts an SSA constant value to the emulation value the evaluation stack holds,
+    /// following CIL's widening rules (smaller integers are widened to `int32`). A runtime
+    /// handle is its token as a native int, as `ldtoken` pushes it.
     ///
-    /// Maps SSA constant values to emulator values, following CIL stack type
-    /// widening rules (smaller integers are widened to i32).
+    /// # Errors
+    ///
+    /// [`EmulationError::ValueConversion`] for a constant that is an object of the heap
+    /// (a user string, a decrypted string or array), which only a process can allocate, and
+    /// for a SIMD vector or a float format other than binary32 and binary64, which CIL has no
+    /// value for.
     #[allow(clippy::cast_possible_wrap)] // U32->I32 and U64->I64 are intentional bit-preserving casts
-    fn from(value: &ConstValue) -> Self {
-        match value {
+    fn try_from(value: &ConstValue) -> Result<Self, Self::Error> {
+        let refused = |source_type: &'static str| EmulationError::ValueConversion {
+            source_type,
+            target_type: "an evaluation stack value",
+        };
+        Ok(match value {
             // Uninhabited for this target: CIL has no symbol space.
             ConstValue::Symbol(symbol) => match *symbol {},
             // Signed integers - promote small types to I32 using infallible From
@@ -783,25 +795,28 @@ impl From<&ConstValue> for EmValue {
             // Native integers - stored as i64/u64 internally in EmValue
             ConstValue::NativeInt(v) => EmValue::NativeInt(*v),
             ConstValue::NativeUInt(v) => EmValue::NativeUInt(*v),
-            // Floating point
-            ConstValue::F32(v) => EmValue::F32(*v),
-            ConstValue::F64(v) => EmValue::F64(*v),
-            // Boolean and null
-            ConstValue::Null
-            | ConstValue::DecryptedString(_)
-            | ConstValue::DecryptedArray { .. }
-            | ConstValue::Vector(_)
-            | ConstValue::Type(_)
-            | ConstValue::MethodHandle(_)
-            | ConstValue::FieldHandle(_) => EmValue::Null,
+            ConstValue::Null => EmValue::Null,
             ConstValue::True => EmValue::I32(1),
             ConstValue::False => EmValue::I32(0),
-            // String constants are represented by their heap index in SSA
-            // For emulation, we treat the index as an i32 since we can't
-            // resolve it without the string heap
-            #[allow(clippy::cast_possible_wrap)]
-            ConstValue::String(idx) => EmValue::I32(*idx as i32),
-        }
+            ConstValue::Type(type_ref) => EmValue::NativeInt(i64::from(type_ref.token().value())),
+            ConstValue::MethodHandle(method_ref) => {
+                EmValue::NativeInt(i64::from(method_ref.token().value()))
+            }
+            ConstValue::FieldHandle(field_ref) => {
+                EmValue::NativeInt(i64::from(field_ref.token().value()))
+            }
+            ConstValue::String(_) => return Err(refused("a user string")),
+            ConstValue::DecryptedString(_) => return Err(refused("a decrypted string")),
+            ConstValue::DecryptedArray(_) => return Err(refused("a decrypted array")),
+            ConstValue::Vector(_) => return Err(refused("a vector constant")),
+            // binary32 and binary64 are CIL's floats; the other formats have no CIL value
+            ConstValue::Float(bits) => match bits.format() {
+                FloatFormat::Single => f32::try_from(*bits).map(EmValue::F32),
+                FloatFormat::Double => f64::try_from(*bits).map(EmValue::F64),
+                _ => Err(*bits),
+            }
+            .map_err(|_| refused("a float format CIL has no value for"))?,
+        })
     }
 }
 

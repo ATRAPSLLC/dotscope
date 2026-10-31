@@ -188,7 +188,7 @@ fn decompose_standard_instruction(
             def.and_then(|dest| {
                 extract_f32(&instr.operand).map(|v| SsaOp::Const {
                     dest,
-                    value: ConstValue::F32(v),
+                    value: ConstValue::from(v),
                 })
             })
         }
@@ -197,7 +197,7 @@ fn decompose_standard_instruction(
             def.and_then(|dest| {
                 extract_f64(&instr.operand).map(|v| SsaOp::Const {
                     dest,
-                    value: ConstValue::F64(v),
+                    value: ConstValue::from(v),
                 })
             })
         }
@@ -2192,7 +2192,7 @@ mod tests {
         let v0 = SsaVarId::from_index(0);
         let op = decompose_instruction(&instr, &[], Some(v0), &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
-            assert_eq!(value, ConstValue::F32(std::f32::consts::PI));
+            assert_eq!(value, ConstValue::from(std::f32::consts::PI));
         } else {
             panic!("Expected SsaOp::Const");
         }
@@ -2211,7 +2211,7 @@ mod tests {
         let v0 = SsaVarId::from_index(0);
         let op = decompose_instruction(&instr, &[], Some(v0), &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
-            assert_eq!(value, ConstValue::F64(std::f64::consts::E));
+            assert_eq!(value, ConstValue::from(std::f64::consts::E));
         } else {
             panic!("Expected SsaOp::Const");
         }

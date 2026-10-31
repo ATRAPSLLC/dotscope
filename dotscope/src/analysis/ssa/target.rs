@@ -18,7 +18,7 @@ use std::fmt;
 use analyssa::scheduling::DeobfuscationCapability;
 pub use analyssa::target::Target;
 use analyssa::{
-    ir::{value::ConstValue, HandlerKind},
+    ir::{value::ConstValue, FloatFormat, FloatRounding, HandlerKind},
     PointerSize,
 };
 
@@ -194,6 +194,20 @@ impl Target for CilTarget {
         t.size_bytes().map(|b| b.saturating_mul(8))
     }
 
+    fn operand_width(t: &Self::Type) -> Option<u32> {
+        // A value is typed by where it came from, but an instruction reads it
+        // off the evaluation stack, which holds every integer up to 32 bits as
+        // `int32` (ECMA-335 III.1.1): a `byte` local and an `int32` constant
+        // are one width to `xor`. `native int` mixes with `int32`, and a float
+        // computes in the runtime's own `F` (III.1.5), so neither has a width
+        // to agree on; `int32` against `int64` stays unverifiable.
+        match t.arithmetic_class()? {
+            SsaType::I32 => Some(32),
+            SsaType::I64 => Some(64),
+            _ => None,
+        }
+    }
+
     fn instruction_mnemonic(instr: &Self::OriginalInstruction) -> &'static str {
         instr.mnemonic
     }
@@ -246,12 +260,16 @@ impl Target for CilTarget {
             ConstValue::U64(_) => SsaType::U64,
             ConstValue::NativeInt(_) => SsaType::NativeInt,
             ConstValue::NativeUInt(_) => SsaType::NativeUInt,
-            ConstValue::F32(_) => SsaType::F32,
-            ConstValue::F64(_) => SsaType::F64,
             ConstValue::String(_) | ConstValue::DecryptedString(_) => SsaType::String,
             ConstValue::DecryptedArray { .. } => SsaType::Object,
             // SIMD vector constant from the native substrate — no CIL type.
             ConstValue::Vector(_) => return None,
+            // binary32 and binary64 are CIL's floats; the other formats have no CIL type
+            ConstValue::Float(bits) => match bits.format() {
+                FloatFormat::Single => SsaType::F32,
+                FloatFormat::Double => SsaType::F64,
+                _ => return None,
+            },
             ConstValue::Null => SsaType::Null,
             ConstValue::True | ConstValue::False => SsaType::Bool,
             ConstValue::Type(_) | ConstValue::MethodHandle(_) | ConstValue::FieldHandle(_) => {
@@ -300,6 +318,12 @@ impl Target for CilTarget {
 
     fn byref_class_type_from_ref(r: &Self::TypeRef) -> Option<Self::Type> {
         Some(SsaType::ByRef(Box::new(SsaType::Class(*r))))
+    }
+
+    /// The CLI rounds every float result to nearest (ECMA-335 I.12.1.3); a
+    /// program sets no other mode.
+    fn environment_rounding() -> Option<FloatRounding> {
+        Some(FloatRounding::NearestEven)
     }
 
     fn convert_const(
@@ -428,8 +452,8 @@ fn numeric_to_target(
         SsaType::U64 => ConstValue::U64(numeric as u64),
         SsaType::NativeInt => ConstValue::NativeInt(numeric as i64),
         SsaType::NativeUInt => ConstValue::NativeUInt(numeric as u64),
-        SsaType::F32 => ConstValue::F32(numeric as f32),
-        SsaType::F64 => ConstValue::F64(numeric as f64),
+        SsaType::F32 => ConstValue::from(numeric as f32),
+        SsaType::F64 => ConstValue::from(numeric as f64),
         SsaType::Bool => ConstValue::from_bool(numeric != 0),
         _ => return None,
     };
@@ -562,7 +586,7 @@ fn cil_evaluator_apply_conversion(
             } else {
                 value as f32
             };
-            ConstValue::F32(float_val)
+            ConstValue::from(float_val)
         }
         SsaType::F64 => {
             let float_val = if unsigned {
@@ -570,7 +594,7 @@ fn cil_evaluator_apply_conversion(
             } else {
                 value as f64
             };
-            ConstValue::F64(float_val)
+            ConstValue::from(float_val)
         }
         _ => ConstValue::I64(value),
     }
@@ -584,7 +608,7 @@ mod tests {
     use crate::{
         analysis::ssa::{
             value::ConstValue, DefSite, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaVarId,
-            VariableOrigin,
+            SsaVerifier, VariableOrigin, VerifierError, VerifyLevel,
         },
         metadata::token::Token,
     };
@@ -634,6 +658,152 @@ mod tests {
         );
     }
 
+    /// An operation computes over its operands as the evaluation stack holds
+    /// them: a `byte` or `char` against an `int32` is one width, as is `int32`
+    /// against `native int` and `float32` against `float64`; `int32` against
+    /// `int64` is not.
+    #[test]
+    fn operands_compute_at_their_stack_width() {
+        /// Verifies `dest = left xor right` (a comparison when `compare`),
+        /// the operands typed `left` and `right` and `dest` the class they
+        /// compute in.
+        fn mismatched(compare: bool, left: SsaType, right: SsaType) -> bool {
+            let dest_type = if compare {
+                SsaType::Bool
+            } else {
+                SsaType::binary_numeric(&left, &right, false).unwrap_or(SsaType::I64)
+            };
+            let mut ssa: SsaFunction = SsaFunction::new(2, 0);
+            let [left, right] = [(0, left), (1, right)].map(|(index, ty)| {
+                ssa.create_variable(VariableOrigin::Argument(index), 0, DefSite::entry(), ty)
+            });
+            let dest = ssa.create_variable(
+                VariableOrigin::Phi,
+                0,
+                DefSite::instruction(0, 0),
+                dest_type,
+            );
+            let op = if compare {
+                SsaOp::Ceq { dest, left, right }
+            } else {
+                SsaOp::Xor {
+                    dest,
+                    left,
+                    right,
+                    flags: None,
+                }
+            };
+            let mut block = SsaBlock::new(0);
+            block.add_instruction(SsaInstruction::synthetic(op));
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+                value: Some(dest),
+            }));
+            ssa.add_block(block);
+            ssa.recompute_uses();
+            SsaVerifier::new(&ssa)
+                .verify(VerifyLevel::Standard)
+                .iter()
+                .any(|finding| matches!(finding, VerifierError::InvalidOperandWidths { .. }))
+        }
+        assert!(!mismatched(false, SsaType::U8, SsaType::I32));
+        assert!(!mismatched(true, SsaType::Char, SsaType::I32));
+        assert!(!mismatched(true, SsaType::I16, SsaType::U8));
+        assert!(!mismatched(false, SsaType::I32, SsaType::NativeInt));
+        assert!(!mismatched(true, SsaType::F32, SsaType::F64));
+        assert!(mismatched(false, SsaType::I32, SsaType::I64));
+        assert!(mismatched(true, SsaType::U16, SsaType::I64));
+    }
+
+    /// `b ^ b` over a `byte` is the `int32` zero the evaluation stack holds,
+    /// not a byte one.
+    #[test]
+    fn a_byte_cancelled_by_itself_is_an_int32_zero() {
+        let (dest, byte) = (SsaVarId::from_index(1), SsaVarId::from_index(0));
+        let xor: SsaOp = SsaOp::Xor {
+            dest,
+            left: byte,
+            right: byte,
+            flags: None,
+        };
+        assert_eq!(
+            analyssa::analysis::algebraic::simplify_op(
+                &xor,
+                &std::collections::BTreeMap::new(),
+                Some(&SsaType::U8)
+            ),
+            analyssa::analysis::algebraic::SimplifyResult::Constant(ConstValue::I32(0))
+        );
+    }
+
+    /// `(b << 3) | (b >> 5)` over a `byte` computes at 32 bits on the
+    /// evaluation stack: the bits shifted past bit 7 stay, so it is no 8-bit
+    /// rotate.
+    #[test]
+    fn a_byte_shifted_both_ways_is_no_byte_rotate() {
+        let mut ssa: SsaFunction = SsaFunction::new(1, 0);
+        let byte = ssa.create_variable(
+            VariableOrigin::Argument(0),
+            0,
+            DefSite::entry(),
+            SsaType::U8,
+        );
+        let [three, five, left, right, rotated] = [0, 1, 2, 3, 4].map(|index| {
+            ssa.create_variable(
+                VariableOrigin::Phi,
+                0,
+                DefSite::instruction(0, index),
+                SsaType::I32,
+            )
+        });
+        let or = SsaOp::Or {
+            dest: rotated,
+            left,
+            right,
+            flags: None,
+        };
+        let mut block = SsaBlock::new(0);
+        for op in [
+            SsaOp::Const {
+                dest: three,
+                value: ConstValue::I32(3),
+            },
+            SsaOp::Const {
+                dest: five,
+                value: ConstValue::I32(5),
+            },
+            SsaOp::Shl {
+                dest: left,
+                value: byte,
+                amount: three,
+                flags: None,
+            },
+            SsaOp::Shr {
+                dest: right,
+                value: byte,
+                amount: five,
+                unsigned: true,
+                flags: None,
+            },
+            or.clone(),
+            SsaOp::Return {
+                value: Some(rotated),
+            },
+        ] {
+            block.add_instruction(SsaInstruction::synthetic(op));
+        }
+        ssa.add_block(block);
+        ssa.recompute_uses();
+        let constants = [(three, ConstValue::I32(3)), (five, ConstValue::I32(5))]
+            .into_iter()
+            .collect();
+        let folded = analyssa::analysis::rotate::fold(&ssa, &or, &constants, &ssa.count_uses());
+        assert!(
+            folded.is_none(),
+            "a 32-bit shift pair is folded as a byte rotate: {:?}",
+            folded.map(|fold| fold.op)
+        );
+    }
+
     /// Converts `value` as CIL would, unchecked.
     fn conv(value: ConstValue, target: SsaType, unsigned_source: bool) -> Option<ConstValue> {
         cil_convert_const(&value, &target, unsigned_source, PointerSize::Bit64)
@@ -662,7 +832,7 @@ mod tests {
         // conv.r.un reads the bits unsigned rather than declining.
         assert_eq!(
             conv(ConstValue::I32(-1), SsaType::F64, true),
-            Some(ConstValue::F64(4_294_967_295.0))
+            Some(ConstValue::from(4_294_967_295.0_f64))
         );
         // A uint32 on the stack is the same int32 bits: conv.i8 sign-extends it.
         assert_eq!(

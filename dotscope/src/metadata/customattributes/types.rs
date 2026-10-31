@@ -199,56 +199,119 @@ pub struct CustomAttributeValue {
     pub blob_index: usize,
 }
 
-/// Represents a single custom attribute argument value with full .NET type support.
-///
-/// This enum covers all argument types supported by the .NET custom attribute system
-/// according to ECMA-335. Each variant corresponds to a specific [`crate::metadata::typesystem::CilFlavor`]
-/// or [`SERIALIZATION_TYPE`] in the binary format.
-///
-/// # Type Categories
-///
-/// **Primitive Types**: Bool, Char, I1-I8, U1-U8, R4, R8, I, U
-/// **Reference Types**: String, Type, Array
-/// **Complex Types**: Enum (with type name + underlying value)
-/// **Special**: Void (for completeness)
+/// The type of a custom attribute argument, as the blob names it: ECMA-335 II.23.3's
+/// `FieldOrPropType`, which a named argument and a boxed value carry before their value.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
-/// use dotscope::metadata::customattributes::CustomAttributeArgument;
+/// use dotscope::metadata::customattributes::FieldOrPropType;
 ///
-/// // Different argument types
-/// let bool_arg = CustomAttributeArgument::Bool(true);
-/// let string_arg = CustomAttributeArgument::String("Hello".to_string());
-/// let int_arg = CustomAttributeArgument::I4(42);
-/// let array_arg = CustomAttributeArgument::Array(vec![
-///     CustomAttributeArgument::I4(1),
-///     CustomAttributeArgument::I4(2),
-/// ]);
+/// // `int[]`, and an enum named by its type
+/// let numbers = FieldOrPropType::SzArray(Box::new(FieldOrPropType::I4));
+/// let targets = FieldOrPropType::Enum("System.AttributeTargets".to_string());
+/// # let _ = (numbers, targets);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FieldOrPropType {
+    /// `bool`
+    Bool,
+    /// `char`
+    Char,
+    /// `sbyte`
+    I1,
+    /// `byte`
+    U1,
+    /// `short`
+    I2,
+    /// `ushort`
+    U2,
+    /// `int`
+    I4,
+    /// `uint`
+    U4,
+    /// `long`
+    I8,
+    /// `ulong`
+    U8,
+    /// `float`
+    R4,
+    /// `double`
+    R8,
+    /// `string`
+    String,
+    /// `System.Type`, stored as a type name
+    Type,
+    /// `object`: the value names its own type before it ([`CustomAttributeArgument::Boxed`])
+    Boxed,
+    /// An enum, by its type name; its value has the size of the enum's underlying type
+    Enum(String),
+    /// A single-dimensional array of the element type
+    SzArray(Box<FieldOrPropType>),
+}
+
+impl fmt::Display for FieldOrPropType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FieldOrPropType::Bool => write!(f, "bool"),
+            FieldOrPropType::Char => write!(f, "char"),
+            FieldOrPropType::I1 => write!(f, "int8"),
+            FieldOrPropType::U1 => write!(f, "uint8"),
+            FieldOrPropType::I2 => write!(f, "int16"),
+            FieldOrPropType::U2 => write!(f, "uint16"),
+            FieldOrPropType::I4 => write!(f, "int32"),
+            FieldOrPropType::U4 => write!(f, "uint32"),
+            FieldOrPropType::I8 => write!(f, "int64"),
+            FieldOrPropType::U8 => write!(f, "uint64"),
+            FieldOrPropType::R4 => write!(f, "float32"),
+            FieldOrPropType::R8 => write!(f, "float64"),
+            FieldOrPropType::String => write!(f, "string"),
+            FieldOrPropType::Type => write!(f, "type"),
+            FieldOrPropType::Boxed => write!(f, "object"),
+            FieldOrPropType::Enum(name) => write!(f, "enum {name}"),
+            FieldOrPropType::SzArray(element) => write!(f, "{element}[]"),
+        }
+    }
+}
+
+/// A custom attribute argument's value, as ECMA-335 II.23.3 encodes one.
 ///
-/// // Enum with underlying value
-/// let enum_arg = CustomAttributeArgument::Enum(
+/// A fixed argument's type is its constructor parameter's, a named argument's is its
+/// [`CustomAttributeNamedArgument::arg_type`]; the value says the rest: whether a string, a
+/// type or an array is null, an array's element type, and for a boxed (`object`) value the
+/// type it holds.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use dotscope::metadata::customattributes::{CustomAttributeArgument, FieldOrPropType};
+///
+/// let text = CustomAttributeArgument::String(Some("Hello".to_string()));
+/// let nothing = CustomAttributeArgument::String(None);
+/// let numbers = CustomAttributeArgument::Array(
+///     FieldOrPropType::I4,
+///     Some(vec![CustomAttributeArgument::I4(1), CustomAttributeArgument::I4(2)]),
+/// );
+/// let target = CustomAttributeArgument::Enum(
 ///     "System.AttributeTargets".to_string(),
 ///     Box::new(CustomAttributeArgument::I4(1)),
 /// );
-/// # Ok::<(), dotscope::Error>(())
+/// let boxed = CustomAttributeArgument::Boxed(Box::new(CustomAttributeArgument::I4(7)));
+/// # let _ = (text, nothing, numbers, target, boxed);
 /// ```
 ///
 /// # Thread Safety
 ///
 /// [`CustomAttributeArgument`] is [`std::marker::Send`] and [`std::marker::Sync`] as all variants contain only owned data.
-/// Instances can be safely shared across threads and accessed concurrently.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CustomAttributeArgument {
-    /// Void type (for completeness, rarely used in custom attributes)
-    Void,
     /// Boolean value
     Bool(bool),
-    /// Character value (16-bit Unicode)
-    Char(char),
+    /// A UTF-16 code unit, as stored: an unpaired surrogate too
+    Char(u16),
     /// Signed 8-bit integer
     I1(i8),
-    /// Unsigned 8-bit integer  
+    /// Unsigned 8-bit integer
     U1(u8),
     /// Signed 16-bit integer
     I2(i16),
@@ -266,26 +329,52 @@ pub enum CustomAttributeArgument {
     R4(f32),
     /// 64-bit floating point
     R8(f64),
-    /// Native signed integer (platform-dependent size)
-    I(isize),
-    /// Native unsigned integer (platform-dependent size)
-    U(usize),
-    /// UTF-8 string
-    String(String),
-    /// Type reference (as string)
-    Type(String),
-    /// Array of arguments
-    Array(Vec<CustomAttributeArgument>),
-    /// Enum value (base type + value)
+    /// A string; `None` is the null string
+    String(Option<String>),
+    /// A `System.Type`, by its type name; `None` is a null type
+    Type(Option<String>),
+    /// A single-dimensional array of the element type; `None` is the null array
+    Array(FieldOrPropType, Option<Vec<CustomAttributeArgument>>),
+    /// An enum value: the enum's type name and its value in the enum's underlying type
     Enum(String, Box<CustomAttributeArgument>),
+    /// An `object` argument: the value it holds, whose type the blob names before it
+    Boxed(Box<CustomAttributeArgument>),
+}
+
+impl CustomAttributeArgument {
+    /// The type the blob names before this value when it is boxed or a named argument:
+    /// `None` for a boxed value, which cannot itself be boxed.
+    #[must_use]
+    pub fn field_or_prop_type(&self) -> Option<FieldOrPropType> {
+        Some(match self {
+            CustomAttributeArgument::Bool(_) => FieldOrPropType::Bool,
+            CustomAttributeArgument::Char(_) => FieldOrPropType::Char,
+            CustomAttributeArgument::I1(_) => FieldOrPropType::I1,
+            CustomAttributeArgument::U1(_) => FieldOrPropType::U1,
+            CustomAttributeArgument::I2(_) => FieldOrPropType::I2,
+            CustomAttributeArgument::U2(_) => FieldOrPropType::U2,
+            CustomAttributeArgument::I4(_) => FieldOrPropType::I4,
+            CustomAttributeArgument::U4(_) => FieldOrPropType::U4,
+            CustomAttributeArgument::I8(_) => FieldOrPropType::I8,
+            CustomAttributeArgument::U8(_) => FieldOrPropType::U8,
+            CustomAttributeArgument::R4(_) => FieldOrPropType::R4,
+            CustomAttributeArgument::R8(_) => FieldOrPropType::R8,
+            CustomAttributeArgument::String(_) => FieldOrPropType::String,
+            CustomAttributeArgument::Type(_) => FieldOrPropType::Type,
+            CustomAttributeArgument::Array(element, _) => {
+                FieldOrPropType::SzArray(Box::new(element.clone()))
+            }
+            CustomAttributeArgument::Enum(name, _) => FieldOrPropType::Enum(name.clone()),
+            CustomAttributeArgument::Boxed(_) => return None,
+        })
+    }
 }
 
 impl fmt::Display for CustomAttributeArgument {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CustomAttributeArgument::Void => write!(f, "void"),
             CustomAttributeArgument::Bool(v) => write!(f, "bool({v})"),
-            CustomAttributeArgument::Char(v) => write!(f, "char(0x{:04X})", *v as u32),
+            CustomAttributeArgument::Char(v) => write!(f, "char(0x{v:04X})"),
             CustomAttributeArgument::I1(v) => write!(f, "int8({v})"),
             CustomAttributeArgument::U1(v) => write!(f, "uint8({v})"),
             CustomAttributeArgument::I2(v) => write!(f, "int16({v})"),
@@ -296,11 +385,12 @@ impl fmt::Display for CustomAttributeArgument {
             CustomAttributeArgument::U8(v) => write!(f, "uint64({v})"),
             CustomAttributeArgument::R4(v) => write!(f, "float32({v})"),
             CustomAttributeArgument::R8(v) => write!(f, "float64({v})"),
-            CustomAttributeArgument::I(v) => write!(f, "int({v})"),
-            CustomAttributeArgument::U(v) => write!(f, "uint({v})"),
-            CustomAttributeArgument::String(s) => write!(f, "\"{s}\""),
-            CustomAttributeArgument::Type(s) => write!(f, "type({s})"),
-            CustomAttributeArgument::Array(items) => {
+            CustomAttributeArgument::String(Some(s)) => write!(f, "\"{s}\""),
+            CustomAttributeArgument::String(None) => write!(f, "null"),
+            CustomAttributeArgument::Type(Some(s)) => write!(f, "type({s})"),
+            CustomAttributeArgument::Type(None) => write!(f, "type(null)"),
+            CustomAttributeArgument::Array(_, None) => write!(f, "null"),
+            CustomAttributeArgument::Array(_, Some(items)) => {
                 write!(f, "[")?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
@@ -310,63 +400,42 @@ impl fmt::Display for CustomAttributeArgument {
                 }
                 write!(f, "]")
             }
-            CustomAttributeArgument::Enum(name, val) => {
-                write!(f, "enum {name}({val})")
-            }
+            CustomAttributeArgument::Enum(name, val) => write!(f, "enum {name}({val})"),
+            CustomAttributeArgument::Boxed(value) => write!(f, "object({value})"),
         }
     }
 }
 
-/// Represents a named argument (field or property assignment) in a custom attribute.
-///
-/// Named arguments appear after fixed arguments in the custom attribute binary format.
-/// They contain explicit type information via [`SERIALIZATION_TYPE`] tags, allowing
-/// the parser to handle them without external type resolution.
-///
-/// # Format in Binary
-/// 1. Field/Property indicator: 0x53 (FIELD) or 0x54 (PROPERTY)
-/// 2. Type tag: [`SERIALIZATION_TYPE`] enumeration value
-/// 3. Name: Compressed length + UTF-8 string
-/// 4. Value: Type-specific binary data
+/// A named argument (a field or property set) of a custom attribute: ECMA-335 II.23.3's
+/// `NamedArg`, its type as the blob names it, then its value.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
-/// use dotscope::metadata::customattributes::{CustomAttributeNamedArgument, CustomAttributeArgument};
-///
-/// // Property assignment
-/// let named_arg = CustomAttributeNamedArgument {
-///     is_field: false,  // This is a property
-///     name: "Name".to_string(),
-///     arg_type: "String".to_string(),
-///     value: CustomAttributeArgument::String("MyName".to_string()),
+/// use dotscope::metadata::customattributes::{
+///     CustomAttributeArgument, CustomAttributeNamedArgument, FieldOrPropType,
 /// };
 ///
-/// println!("Setting {} property '{}' to {:?}",
-///          if named_arg.is_field { "field" } else { "property" },
-///          named_arg.name, named_arg.value);
-/// # Ok::<(), dotscope::Error>(())
+/// let named_arg = CustomAttributeNamedArgument {
+///     is_field: false,
+///     name: "Name".to_string(),
+///     arg_type: FieldOrPropType::String,
+///     value: CustomAttributeArgument::String(Some("MyName".to_string())),
+/// };
+/// # let _ = named_arg;
 /// ```
 ///
 /// # Thread Safety
 ///
 /// [`CustomAttributeNamedArgument`] is [`std::marker::Send`] and [`std::marker::Sync`] as it contains only owned data.
-/// Instances can be safely shared across threads and accessed concurrently.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CustomAttributeNamedArgument {
     /// Whether this is a field (true) or property (false)
     pub is_field: bool,
     /// Name of the field or property
     pub name: String,
-    /// Type of the argument as a human-readable string.
-    ///
-    /// Common values include: "Boolean", "Char", "I1", "U1", "I2", "U2", "I4", "U4",
-    /// "I8", "U8", "R4", "R8", "String", "Type", or an enum type name.
-    ///
-    /// Note: This is stored as a String rather than an enum for flexibility with
-    /// enum types (which include the full type name) and for human readability
-    /// in debugging and display scenarios.
-    pub arg_type: String,
+    /// The type the blob names for it
+    pub arg_type: FieldOrPropType,
     /// Value of the argument
     pub value: CustomAttributeArgument,
 }

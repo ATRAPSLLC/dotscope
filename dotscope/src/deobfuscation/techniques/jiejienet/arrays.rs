@@ -793,9 +793,7 @@ fn decrypt_field_rva_data_to_bytes(
         return Ok(None);
     }
 
-    let offset = file.rva_to_offset(rva as usize)?;
-    let data = file.data_slice(offset, data_size)?;
-    let mut decrypted = data.to_vec();
+    let mut decrypted = file.rva_slice(rva as usize, data_size)?.into_owned();
 
     xor_decrypt_array_data(&mut decrypted, xor_key);
 

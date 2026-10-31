@@ -307,7 +307,8 @@ mod tests {
                 rid: 1,
                 token: Token::new(0x11000001),
                 offset: 0,
-                signature: 0x12345678,
+                // An index has to fit its column: a two-byte one holds at most 0xFFFF
+                signature: if large_blob { 0x12345678 } else { 0x1234 },
             };
 
             // Verify row size matches expected

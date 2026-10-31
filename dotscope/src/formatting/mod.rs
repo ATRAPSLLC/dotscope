@@ -200,7 +200,7 @@ impl IlFormatter {
             }
 
             if self.opts.show_security {
-                if let Some(sec) = cil_type.security.get() {
+                for (_, sec) in cil_type.security.iter() {
                     security::format_security(w, sec, "  ")?;
                 }
             }
@@ -265,7 +265,7 @@ impl IlFormatter {
             attributes::format_custom_attributes(w, &method.custom_attributes, "    ", asm)?;
         }
         if self.opts.show_security {
-            if let Some(sec) = method.security.get() {
+            for (_, sec) in method.security.iter() {
                 security::format_security(w, sec, "    ")?;
             }
         }
@@ -454,6 +454,22 @@ mod tests {
         assert!(
             output.contains(".class"),
             "Missing .class directive: {output}"
+        );
+    }
+
+    /// A constraint that is a type specification is written from its signature, with its
+    /// arguments: `IEquatable<TKey>` was written `IEquatable`1`, another type.
+    #[test]
+    fn a_type_specification_constraint_keeps_its_arguments() {
+        let asm = load_crafted_2();
+        let output = format_type_by_name(&asm, "ComplexGeneric`3");
+        let header = output
+            .lines()
+            .find(|line| line.starts_with(".class"))
+            .unwrap();
+        assert!(
+            header.contains("(class [mscorlib]'System.IEquatable`1'<!0>) TKey"),
+            "{header}"
         );
     }
 

@@ -43,8 +43,8 @@ use analyssa::analysis::copies::ParallelCopy;
 
 use crate::{
     analysis::{
-        BlockRange, CmpKind, ConstValue, HandlerKind, RuntimeValueKind, SsaBlock, SsaFunction,
-        SsaOp, SsaType, SsaVarId, SsaVerifier, VerifierError, VerifyLevel,
+        BlockRange, CmpKind, ConstValue, FloatFormat, HandlerKind, RuntimeValueKind, SsaBlock,
+        SsaFunction, SsaOp, SsaType, SsaVarId, SsaVerifier, VerifierError, VerifyLevel,
     },
     assembly::{decode_stream, Immediate, InstructionEncoder, Operand},
     cilassembly::CilAssembly,
@@ -1304,38 +1304,17 @@ impl SsaCodeGenerator {
         namespace: &'static str,
         name: &'static str,
     ) -> Result<CodedIndex> {
-        if let Some(found) = assembly.find_corelib_typeref(namespace, name) {
+        if let Some(found) = assembly.find_corelib_type(namespace, name) {
             return Ok(found);
         }
         if let Some(added) = self.corelib_types.get(&(namespace, name)) {
             return Ok(added.clone());
         }
         let Some(scope) = assembly.find_core_library_ref() else {
-            let view = assembly.view();
-            let (Some(tables), Some(strings)) = (view.tables(), view.strings()) else {
-                return Err(Error::CodegenFailed(format!(
-                    "{namespace}.{name} cannot be named: the module has no metadata tables"
-                )));
-            };
-            return tables
-                .table::<TypeDefRaw>()
-                .into_iter()
-                .flat_map(|table| table.iter().filter_map(skip_unreadable))
-                .find(|row| {
-                    strings
-                        .get(row.type_name as usize)
-                        .is_ok_and(|found| found == name)
-                        && strings
-                            .get(row.type_namespace as usize)
-                            .is_ok_and(|found| found == namespace)
-                })
-                .map(|row| CodedIndex::new(TableId::TypeDef, row.rid, CodedIndexType::TypeDefOrRef))
-                .ok_or_else(|| {
-                    Error::CodegenFailed(format!(
-                        "{namespace}.{name} cannot be named: the module references no core \
-                         library and does not define it"
-                    ))
-                });
+            return Err(Error::CodegenFailed(format!(
+                "{namespace}.{name} cannot be named: the module references no core library and \
+                 does not define it"
+            )));
         };
         let added = TypeRefBuilder::new()
             .name(name)
@@ -3359,17 +3338,19 @@ impl SsaCodeGenerator {
                 encoder.emit_instruction("conv.u", None)?;
             }
 
-            // Floating point
-            ConstValue::F32(_) => {
+            // Floating point: CIL loads binary32 and binary64 constants
+            ConstValue::Float(float) => {
+                let opcode = match float.format() {
+                    FloatFormat::Single => "ldc.r4",
+                    FloatFormat::Double => "ldc.r8",
+                    _ => {
+                        return Err(Error::CodegenFailed(format!(
+                            "{float:?} has a float format CIL cannot load"
+                        )));
+                    }
+                };
                 encoder.emit_instruction(
-                    "ldc.r4",
-                    Some(Operand::Immediate(Immediate::try_from(value)?)),
-                )?;
-            }
-
-            ConstValue::F64(_) => {
-                encoder.emit_instruction(
-                    "ldc.r8",
+                    opcode,
                     Some(Operand::Immediate(Immediate::try_from(value)?)),
                 )?;
             }

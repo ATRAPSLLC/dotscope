@@ -58,11 +58,7 @@ impl RowWritable for MethodSpecRaw {
         sizes: &TableInfoRef,
     ) -> Result<()> {
         // Write MethodDefOrRef coded index for method
-        let method_value = sizes.encode_coded_index(
-            self.method.tag,
-            self.method.row,
-            CodedIndexType::MethodDefOrRef,
-        )?;
+        let method_value = self.method.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,
@@ -435,7 +431,8 @@ mod tests {
                 token: Token::new(0x2B000001),
                 offset: 0,
                 method: CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef),
-                instantiation: 0x12345678,
+                // An index has to fit its column: a two-byte one holds at most 0xFFFF
+                instantiation: if large_blob { 0x12345678 } else { 0x1234 },
             };
 
             // Verify row size includes correct blob index size

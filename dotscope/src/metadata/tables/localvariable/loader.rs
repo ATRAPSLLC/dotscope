@@ -10,7 +10,7 @@ use crate::{
     metadata::{
         diagnostics::DiagnosticCategory,
         loader::{LoaderContext, MetadataLoader},
-        tables::TableId,
+        tables::{LocalVariableRaw, TableId},
     },
     utils::TryForEachInOrder,
     Result,
@@ -41,10 +41,13 @@ pub struct LocalVariableLoader;
 
 impl MetadataLoader for LocalVariableLoader {
     fn load(&self, context: &LoaderContext) -> Result<()> {
-        let (Some(header), Some(strings)) = (context.meta, context.strings) else {
+        let Some(pdb) = &context.pdb else {
             return Ok(());
         };
-        let Some(table) = header.table::<crate::metadata::tables::LocalVariableRaw>() else {
+        let (Some(header), Some(strings)) = (pdb.meta, pdb.strings) else {
+            return Ok(());
+        };
+        let Some(table) = header.table::<LocalVariableRaw>() else {
             return Ok(());
         };
 
@@ -52,12 +55,13 @@ impl MetadataLoader for LocalVariableLoader {
             .par_iter()
             .enumerate()
             .try_for_each_in_order(|(index, row)| {
-                let Some(row) = context.handle_row(row, index)? else {
+                let Some(row) = context.handle_row_in(pdb.lenient, row, index)? else {
                     return Ok(());
                 };
                 let token_msg = || format!("local variable 0x{:08x}", row.token.value());
 
-                let Some(local_variable) = context.handle_result(
+                let Some(local_variable) = context.handle_result_in(
+                    pdb.lenient,
                     row.to_owned(strings),
                     DiagnosticCategory::Method,
                     token_msg,
@@ -66,8 +70,8 @@ impl MetadataLoader for LocalVariableLoader {
                     return Ok(());
                 };
 
-                context
-                    .local_variable
+                pdb.target
+                    .local_variables
                     .insert(local_variable.token, local_variable);
                 Ok(())
             })

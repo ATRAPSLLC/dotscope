@@ -25,10 +25,7 @@
 //! `try`/`catch` — which obfuscator runtimes and packers routinely do — then behaves as it
 //! would on a real runtime, instead of the whole emulation being abandoned.
 
-use crate::{
-    emulation::{engine::synthetic_exception, runtime::hook::PreHookResult},
-    utils::MAX_DERIVED_KEY_LEN,
-};
+use crate::emulation::{engine::synthetic_exception, runtime::hook::PreHookResult};
 
 /// Ceiling for a general-purpose buffer materialised inside a single hook.
 ///
@@ -44,32 +41,19 @@ pub(crate) const MAX_HOOK_BUFFER: usize = 16 * 1024 * 1024;
 /// scalars rather than bytes.
 pub(crate) const MAX_HOOK_STRING_CHARS: usize = 4 * 1024 * 1024;
 
-/// Ceiling for key material produced by a key-derivation hook.
-///
-/// Derived keys are small by nature — the largest symmetric key in common use is 32 bytes,
-/// and obfuscator key schedules do not exceed a few hundred.
-///
-/// Defined as the limit [`derive_pbkdf2_key`] actually enforces rather than as its own value.
-/// The two were independent (4096 here, 1024 there), so a `GetBytes(n)` with
-/// `1024 < n <= 4096` passed this check and then hard-failed inside the derivation — an
-/// internal error where the hook should have thrown a managed exception. Whichever bound is
-/// tighter has to be the one the hook applies, or the hook is not the gate it appears to be.
-///
-/// [`derive_pbkdf2_key`]: crate::utils::derive_pbkdf2_key
-pub(crate) const MAX_DERIVED_KEY_BYTES: usize = MAX_DERIVED_KEY_LEN;
-
-/// Ceiling for a key-derivation iteration count.
-///
-/// PBKDF2 work is linear in this value and runs to completion inside one hook call, so a
-/// large count is a wall-clock denial of service even though it allocates nothing. Real
-/// obfuscators use values in the low thousands.
-pub(crate) const MAX_KDF_ITERATIONS: u32 = 100_000;
-
 /// Builds the exception thrown when an emulated count argument is negative.
 pub(crate) fn negative_argument(method: &str, param: &str) -> PreHookResult {
     PreHookResult::Throw {
         exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
         message: format!("{method}: '{param}' must be non-negative"),
+    }
+}
+
+/// Builds the exception thrown when an emulated count argument that must be positive is not.
+pub(crate) fn non_positive_argument(method: &str, param: &str) -> PreHookResult {
+    PreHookResult::Throw {
+        exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+        message: format!("{method}: '{param}' must be positive"),
     }
 }
 

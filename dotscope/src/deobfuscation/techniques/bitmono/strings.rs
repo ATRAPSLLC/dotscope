@@ -67,7 +67,7 @@ use crate::{
         tables::{MemberRefRaw, MetadataTable, RowReadable, TableId, TypeDefRaw, TypeRefRaw},
         token::Token,
     },
-    utils::{CryptoParameters, MAX_DERIVED_KEY_LEN, MAX_PBKDF2_ITERATIONS},
+    utils::CryptoParameters,
     CilObject,
 };
 
@@ -243,16 +243,18 @@ impl Technique for BitMonoStrings {
     #[cfg(feature = "legacy-crypto")]
     fn create_pass(
         &self,
-        _ctx: &AnalysisContext,
+        ctx: &AnalysisContext,
         detection: &Detection,
         _assembly: &Arc<CilObject>,
     ) -> Vec<Box<dyn SsaPass<CilTarget, CompilerContext>>> {
         let Some(findings) = detection.findings::<StringFindings>() else {
             return Vec::new();
         };
+        // The key derivation is held to what emulating the decryptor's own call could spend
         vec![Box::new(StringDecryptionPass::from_findings(
             findings,
             findings.crypto_params.clone(),
+            ctx.emulation_max_instructions(),
         ))]
     }
 
@@ -474,17 +476,6 @@ fn extract_crypto_parameters(ssa: &SsaFunction, assembly: &CilObject) -> CryptoP
     }
     if let Some(&iv_size) = get_bytes_sizes.get(1) {
         params.iv_size = iv_size as usize;
-    }
-
-    // Defence in depth. `derive_pbkdf2_key` enforces these ceilings too and is the guard that
-    // matters, but everything above is lifted verbatim from constants in an attacker-supplied
-    // method body, so an implausible value here means the detection misfired rather than that a
-    // real decryptor wants a 2 GB key. Falling back to the .NET defaults keeps the pass working
-    // on the samples it was written for instead of failing the whole assembly.
-    if params.iterations > MAX_PBKDF2_ITERATIONS
-        || params.key_size.saturating_add(params.iv_size) > MAX_DERIVED_KEY_LEN
-    {
-        return CryptoParameters::default();
     }
 
     params

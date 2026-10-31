@@ -67,8 +67,14 @@ pub fn encode_method_body_header(
     has_exceptions: bool,
     init_locals: bool,
 ) -> Result<Vec<u8>> {
-    // Use tiny format if possible (code size <= 63, max_stack <= 8, no locals, no exceptions)
-    if code_size <= 63 && max_stack <= 8 && local_var_sig_tok == 0 && !has_exceptions {
+    // The tiny format when it can say all of it: at most 63 bytes of code, a stack of 8, no
+    // locals, no exception sections and no InitLocals, which also zeroes `localloc` memory
+    if code_size <= 63
+        && max_stack <= 8
+        && local_var_sig_tok == 0
+        && !has_exceptions
+        && !init_locals
+    {
         // Tiny format: 1 byte header
         let header = u8::try_from((code_size << 2) | 0x02)
             .map_err(|_| malformed_error!("Method body header value exceeds u8 range"))?;
@@ -106,8 +112,10 @@ pub fn encode_method_body_header(
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prelude::*, prop_assert_eq, test_runner::TestCaseError};
+
     use super::*;
-    use crate::metadata::method::body::MethodBody;
+    use crate::{metadata::method::body::MethodBody, testkit::arb::check};
 
     #[test]
     fn test_tiny_format_encoding() -> Result<()> {
@@ -271,5 +279,35 @@ mod tests {
         assert!(!parsed.is_exception_data);
 
         Ok(())
+    }
+
+    /// Every header decodes to what it was encoded from: the code size, the locals, the
+    /// `InitLocals` flag, and the stack depth, which a tiny header states as 8.
+    #[test]
+    fn every_header_decodes_to_what_was_encoded() {
+        let header = (
+            prop_oneof![0u32..64, 64u32..300],
+            prop_oneof![0u16..=8, any::<u16>()],
+            prop_oneof![Just(0u32), Just(0x1100_0001)],
+            any::<bool>(),
+        );
+        check(header, |(code_size, max_stack, locals, init_locals)| {
+            let mut body =
+                encode_method_body_header(code_size, max_stack, locals, false, init_locals)
+                    .map_err(|error| TestCaseError::fail(format!("does not encode: {error}")))?;
+            body.resize(body.len() + code_size as usize, 0x00);
+            let decoded = MethodBody::from(&body)
+                .map_err(|error| TestCaseError::fail(format!("does not decode: {error}")))?;
+            prop_assert_eq!(decoded.size_code, code_size as usize);
+            prop_assert_eq!(decoded.local_var_sig_token, locals);
+            prop_assert_eq!(decoded.is_init_local, init_locals);
+            let stack = if decoded.is_fat {
+                usize::from(max_stack)
+            } else {
+                8
+            };
+            prop_assert_eq!(decoded.max_stack, stack);
+            Ok(())
+        });
     }
 }

@@ -179,7 +179,7 @@ impl CustomDebugInformationRaw {
         let parent_ref = get_ref(&self.parent);
         let kind_guid = guid_heap.get(self.kind as usize)?;
         let value_data = blob_heap.get(self.value as usize)?;
-        let debug_kind = CustomDebugKind::from_guid(kind_guid.to_bytes());
+        let debug_kind = CustomDebugKind::from_guid(kind_guid);
         let parsed_value = parse_custom_debug_blob(value_data, debug_kind)?;
 
         Ok(Arc::new(CustomDebugInformation {
@@ -187,6 +187,7 @@ impl CustomDebugInformationRaw {
             token: self.token,
             offset: self.offset,
             parent: parent_ref,
+            parent_token: self.parent.token,
             kind: kind_guid,
             value: parsed_value,
         }))

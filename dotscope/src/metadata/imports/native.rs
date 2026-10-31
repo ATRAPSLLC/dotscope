@@ -103,7 +103,10 @@
 //! - [`crate::cilassembly::CilAssembly`] - PE writing pipeline for import table generation
 //! - [`goblin`] - PE parsing library for import directory analysis
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     file::pe::Import,
@@ -142,10 +145,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct NativeImports {
     /// Import descriptors indexed by DLL name for fast lookup
-    descriptors: HashMap<String, ImportDescriptor>,
-
-    /// Import Address Table entries indexed by RVA
-    iat_entries: HashMap<u32, ImportAddressEntry>,
+    descriptors: HashMap<String, Dll>,
 
     /// Next available RVA for IAT allocation
     next_iat_rva: u32,
@@ -167,8 +167,8 @@ pub struct NativeImports {
 /// - `dll_name`: Name of the DLL containing the imported functions
 #[derive(Debug, Clone)]
 pub struct ImportDescriptor {
-    /// Name of the DLL (e.g., "kernel32.dll")
-    pub dll_name: String,
+    /// Name of the DLL (e.g., "kernel32.dll"), the string its functions share
+    pub dll_name: Arc<str>,
 
     /// RVA of Import Lookup Table (ILT) - template for IAT
     pub original_first_thunk: u32,
@@ -184,6 +184,43 @@ pub struct ImportDescriptor {
 
     /// Forwarder chain for bound imports (usually 0)
     pub forwarder_chain: u32,
+}
+
+/// A DLL's descriptor, with the names and ordinals it imports: a function imported twice is
+/// found without scanning the descriptor's functions.
+#[derive(Debug, Clone)]
+struct Dll {
+    descriptor: ImportDescriptor,
+    names: HashSet<String>,
+    ordinals: HashSet<u16>,
+}
+
+impl Dll {
+    fn new(dll_name: Arc<str>) -> Self {
+        Dll {
+            descriptor: ImportDescriptor {
+                dll_name,
+                original_first_thunk: 0, // Will be set during table generation
+                first_thunk: 0,          // Will be set during table generation
+                functions: Vec::new(),
+                timestamp: 0,
+                forwarder_chain: 0,
+            },
+            names: HashSet::new(),
+            ordinals: HashSet::new(),
+        }
+    }
+
+    /// Adds `function`, with its name or ordinal, to the descriptor.
+    fn push(&mut self, function: Import) {
+        if let Some(name) = &function.name {
+            self.names.insert(name.clone());
+        }
+        if let Some(ordinal) = function.ordinal {
+            self.ordinals.insert(ordinal);
+        }
+        self.descriptor.functions.push(function);
+    }
 }
 
 /// Entry in the Import Address Table (IAT).
@@ -225,7 +262,6 @@ impl NativeImports {
     pub fn new() -> Self {
         Self {
             descriptors: HashMap::new(),
-            iat_entries: HashMap::new(),
             next_iat_rva: 0x1000, // Default IAT base address
             is_pe32_plus: false,  // Default to PE32 (32-bit)
         }
@@ -296,14 +332,14 @@ impl NativeImports {
     /// use dotscope::metadata::imports::NativeImports;
     /// use dotscope::PeImport;
     ///
-    /// let pe_imports = vec![
-    ///     Import {
-    ///         dll: "kernel32.dll".to_string(),
-    ///         name: "GetCurrentProcessId".to_string(),
-    ///         ordinal: 0,
-    ///         rva: 0x2000,
-    ///     },
-    /// ];
+    /// let pe_imports = vec![PeImport {
+    ///     dll: "kernel32.dll".into(),
+    ///     name: Some("GetCurrentProcessId".to_string()),
+    ///     ordinal: None,
+    ///     rva: 0x2000,
+    ///     hint: 0,
+    ///     ilt_value: 0,
+    /// }];
     ///
     /// // For 32-bit PE files
     /// let native_imports = NativeImports::from_pe_imports(&pe_imports, false)?;
@@ -324,52 +360,18 @@ impl NativeImports {
         }
 
         for (dll_name, dll_imports) in imports_by_dll {
-            let dll_name_owned = dll_name.to_owned();
-
-            let mut descriptor = ImportDescriptor {
-                dll_name: dll_name_owned.clone(),
-                original_first_thunk: 0,
-                first_thunk: 0,
-                functions: Vec::with_capacity(dll_imports.len()),
-                timestamp: 0,
-                forwarder_chain: 0,
-            };
-
+            let mut dll = Dll::new(Arc::from(dll_name));
+            dll.descriptor.functions.reserve(dll_imports.len());
             for pe_import in dll_imports {
-                let function_identifier = Self::build_function_identifier(pe_import);
-
-                native.iat_entries.insert(
-                    pe_import.rva,
-                    ImportAddressEntry {
-                        rva: pe_import.rva,
-                        dll_name: dll_name_owned.clone(),
-                        function_identifier,
-                        original_value: 0,
-                    },
-                );
-
-                descriptor.functions.push(pe_import.clone());
+                dll.push(Import {
+                    dll: Arc::clone(&dll.descriptor.dll_name),
+                    ..pe_import.clone()
+                });
             }
-
-            native.descriptors.insert(dll_name_owned, descriptor);
+            native.descriptors.insert(dll_name.to_owned(), dll);
         }
 
         Ok(native)
-    }
-
-    /// Builds a function identifier string from an import entry.
-    ///
-    /// Returns the function name if available, otherwise formats the ordinal,
-    /// or "unknown" if neither is available.
-    fn build_function_identifier(import: &Import) -> String {
-        if let Some(ref name) = import.name {
-            if !name.is_empty() {
-                return name.clone();
-            }
-        }
-        import
-            .ordinal
-            .map_or_else(|| "unknown".to_string(), |ord| format!("#{ord}"))
     }
 
     /// Add a DLL to the import table.
@@ -403,16 +405,8 @@ impl NativeImports {
         }
 
         if !self.descriptors.contains_key(dll_name) {
-            let descriptor = ImportDescriptor {
-                dll_name: dll_name.to_owned(),
-                original_first_thunk: 0, // Will be set during table generation
-                first_thunk: 0,          // Will be set during table generation
-                functions: Vec::new(),
-                timestamp: 0,
-                forwarder_chain: 0,
-            };
-
-            self.descriptors.insert(dll_name.to_owned(), descriptor);
+            self.descriptors
+                .insert(dll_name.to_owned(), Dll::new(Arc::from(dll_name)));
         }
 
         Ok(())
@@ -458,46 +452,33 @@ impl NativeImports {
             return Err(malformed_error!("Function name cannot be empty"));
         }
 
-        if let Some(descriptor) = self.descriptors.get(dll_name) {
-            if descriptor
-                .functions
-                .iter()
-                .any(|f| f.name.as_deref() == Some(function_name))
-            {
+        match self.descriptors.get(dll_name) {
+            Some(dll) if dll.names.contains(function_name) => {
                 return Err(malformed_error!(
                     "Function '{function_name}' already imported from '{dll_name}'"
                 ));
             }
-        } else {
-            return Err(malformed_error!(
-                "DLL '{dll_name}' not found in import table"
-            ));
+            Some(_) => {}
+            None => {
+                return Err(malformed_error!(
+                    "DLL '{dll_name}' not found in import table"
+                ))
+            }
         }
 
         let iat_rva = self.allocate_iat_rva()?;
-
-        let function = Import {
-            dll: dll_name.to_owned(),
+        let dll = self
+            .descriptors
+            .get_mut(dll_name)
+            .ok_or_else(|| malformed_error!("DLL '{dll_name}' disappeared from import table"))?;
+        dll.push(Import {
+            dll: Arc::clone(&dll.descriptor.dll_name),
             name: Some(function_name.to_owned()),
             ordinal: None,
             rva: iat_rva,
             hint: 0,
             ilt_value: 0,
-        };
-
-        let iat_entry = ImportAddressEntry {
-            rva: iat_rva,
-            dll_name: dll_name.to_owned(),
-            function_identifier: function_name.to_owned(),
-            original_value: 0,
-        };
-
-        let descriptor = self
-            .descriptors
-            .get_mut(dll_name)
-            .ok_or_else(|| malformed_error!("DLL '{dll_name}' disappeared from import table"))?;
-        descriptor.functions.push(function);
-        self.iat_entries.insert(iat_rva, iat_entry);
+        });
 
         Ok(())
     }
@@ -541,46 +522,33 @@ impl NativeImports {
             return Err(malformed_error!("Ordinal cannot be 0"));
         }
 
-        if let Some(descriptor) = self.descriptors.get(dll_name) {
-            if descriptor
-                .functions
-                .iter()
-                .any(|f| f.ordinal == Some(ordinal))
-            {
+        match self.descriptors.get(dll_name) {
+            Some(dll) if dll.ordinals.contains(&ordinal) => {
                 return Err(malformed_error!(
                     "Ordinal {ordinal} already imported from '{dll_name}'"
                 ));
             }
-        } else {
-            return Err(malformed_error!(
-                "DLL '{dll_name}' not found in import table"
-            ));
+            Some(_) => {}
+            None => {
+                return Err(malformed_error!(
+                    "DLL '{dll_name}' not found in import table"
+                ))
+            }
         }
 
         let iat_rva = self.allocate_iat_rva()?;
-        let descriptor = self
+        let dll = self
             .descriptors
             .get_mut(dll_name)
             .ok_or_else(|| malformed_error!("DLL '{dll_name}' disappeared from import table"))?;
-
-        let function = Import {
-            dll: dll_name.to_owned(),
+        dll.push(Import {
+            dll: Arc::clone(&dll.descriptor.dll_name),
             name: None,
             ordinal: Some(ordinal),
             rva: iat_rva,
             hint: 0,
             ilt_value: 0x8000_0000_0000_0000u64 | u64::from(ordinal),
-        };
-
-        let iat_entry = ImportAddressEntry {
-            rva: iat_rva,
-            dll_name: dll_name.to_owned(),
-            function_identifier: format!("#{ordinal}"),
-            original_value: function.ilt_value,
-        };
-
-        descriptor.functions.push(function);
-        self.iat_entries.insert(iat_rva, iat_entry);
+        });
 
         Ok(())
     }
@@ -611,7 +579,7 @@ impl NativeImports {
     /// ```
     #[must_use]
     pub fn get_descriptor(&self, dll_name: &str) -> Option<&ImportDescriptor> {
-        self.descriptors.get(dll_name)
+        self.descriptors.get(dll_name).map(|dll| &dll.descriptor)
     }
 
     /// Get all import descriptors.
@@ -638,7 +606,7 @@ impl NativeImports {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn descriptors(&self) -> impl Iterator<Item = &ImportDescriptor> {
-        self.descriptors.values()
+        self.descriptors.values().map(|dll| &dll.descriptor)
     }
 
     /// Check if a DLL is in the import table.
@@ -696,7 +664,7 @@ impl NativeImports {
     pub fn total_function_count(&self) -> usize {
         self.descriptors
             .values()
-            .map(|descriptor| descriptor.functions.len())
+            .map(|dll| dll.descriptor.functions.len())
             .sum()
     }
 
@@ -770,18 +738,8 @@ impl NativeImports {
     /// Returns an error if the RVA delta would cause integer overflow or
     /// result in invalid RVA values.
     pub fn update_iat_rvas(&mut self, rva_delta: i64) -> Result<()> {
-        let mut updated_entries = HashMap::new();
-
-        for (old_rva, mut entry) in self.iat_entries.drain() {
-            let new_rva = adjust_rva(old_rva, rva_delta)?;
-            entry.rva = new_rva;
-            updated_entries.insert(new_rva, entry);
-        }
-
-        self.iat_entries = updated_entries;
-
-        for descriptor in self.descriptors.values_mut() {
-            for function in &mut descriptor.functions {
+        for dll in self.descriptors.values_mut() {
+            for function in &mut dll.descriptor.functions {
                 function.rva = adjust_rva(function.rva, rva_delta)?;
             }
         }
@@ -825,7 +783,7 @@ impl NativeImports {
         let entry_size: usize = if is_pe32_plus { 8 } else { 4 };
         let mut total_entries: usize = 0;
 
-        for descriptor in self.descriptors.values() {
+        for descriptor in self.descriptors() {
             // Each DLL needs: function entries + 1 null terminator
             let dll_entries = descriptor
                 .functions
@@ -867,7 +825,7 @@ impl NativeImports {
         let mut iat_bytes = Vec::with_capacity(self.iat_byte_size(is_pe32_plus)?);
 
         // Sort descriptors for deterministic ordering (mscoree.dll should be first when building import list)
-        let mut descriptors_sorted: Vec<_> = self.descriptors.values().collect();
+        let mut descriptors_sorted: Vec<_> = self.descriptors().collect();
         descriptors_sorted.sort_by_key(|d| d.dll_name.to_lowercase());
 
         // Calculate where strings will be in the import table
@@ -1008,7 +966,7 @@ impl NativeImports {
         let entry_size: usize = if is_pe32_plus { 8 } else { 4 };
 
         // Sort descriptors for deterministic ordering
-        let mut descriptors_sorted: Vec<_> = self.descriptors.values().collect();
+        let mut descriptors_sorted: Vec<_> = self.descriptors().collect();
         descriptors_sorted.sort_by_key(|d| d.dll_name.to_lowercase());
 
         // Calculate layout sizes
@@ -1285,5 +1243,46 @@ mod tests {
         // Adding same DLL again should not increase count
         imports.add_dll("kernel32.dll").unwrap();
         assert_eq!(imports.dll_count(), 1);
+    }
+
+    /// A function the read table imports is found without scanning: adding it again is
+    /// refused, by name and by ordinal, as for one added through the builder.
+    #[test]
+    fn a_read_import_is_not_imported_twice() {
+        let read = |name: Option<&str>, ordinal: Option<u16>| Import {
+            dll: "kernel32.dll".into(),
+            name: name.map(str::to_string),
+            ordinal,
+            rva: 0x2000,
+            hint: 0,
+            ilt_value: 0,
+        };
+        let mut imports = NativeImports::from_pe_imports(
+            &[read(Some("Sleep"), None), read(None, Some(5))],
+            false,
+        )
+        .unwrap();
+
+        assert!(imports.add_function("kernel32.dll", "Sleep").is_err());
+        assert!(imports.add_function_by_ordinal("kernel32.dll", 5).is_err());
+        imports.add_function("kernel32.dll", "Beep").unwrap();
+        imports.add_function_by_ordinal("kernel32.dll", 6).unwrap();
+        assert!(imports.add_function("kernel32.dll", "Beep").is_err());
+        assert_eq!(imports.total_function_count(), 4);
+    }
+
+    /// A descriptor's functions share its DLL's name rather than a copy each.
+    #[test]
+    fn functions_share_their_dll_name() {
+        let mut imports = NativeImports::new();
+        imports.add_dll("kernel32.dll").unwrap();
+        imports.add_function("kernel32.dll", "Sleep").unwrap();
+        imports.add_function_by_ordinal("kernel32.dll", 5).unwrap();
+
+        let descriptor = imports.get_descriptor("kernel32.dll").unwrap();
+        assert!(descriptor
+            .functions
+            .iter()
+            .all(|function| Arc::ptr_eq(&function.dll, &descriptor.dll_name)));
     }
 }

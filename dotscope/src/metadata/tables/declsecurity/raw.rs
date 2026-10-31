@@ -138,36 +138,36 @@ impl DeclSecurityRaw {
         match parent {
             CilTypeReference::TypeDef(typedef) => {
                 if let Some(strong_ref) = typedef.upgrade() {
-                    strong_ref
-                        .security
-                        .set(Security {
+                    strong_ref.security.push_row(
+                        self.token,
+                        Security {
                             action,
                             permission_set,
-                        })
-                        .ok();
+                        },
+                    );
                 }
                 Ok(())
             }
             CilTypeReference::MethodDef(method) => {
                 if let Some(method) = method.upgrade() {
-                    method
-                        .security
-                        .set(Security {
+                    method.security.push_row(
+                        self.token,
+                        Security {
                             action,
                             permission_set,
-                        })
-                        .ok();
+                        },
+                    );
                 }
                 Ok(())
             }
             CilTypeReference::Assembly(assembly) => {
-                assembly
-                    .security
-                    .set(Security {
+                assembly.security.push_row(
+                    self.token,
+                    Security {
                         action,
                         permission_set,
-                    })
-                    .ok();
+                    },
+                );
                 Ok(())
             }
             _ => Err(malformed_error!(

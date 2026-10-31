@@ -324,29 +324,6 @@ fn print_method_parameters(method: &Method) {
         println!("   Parameter [{i}] from signature:");
         print_signature_parameter(param, "     ");
     }
-
-    // VarArg parameters
-    let vararg_count = method.varargs.count();
-    if vararg_count > 0 {
-        println!("\n   VarArg Parameters:");
-        for (i, vararg) in method.varargs.iter() {
-            println!("   VarArg [{i}]:");
-            println!("     Type: <VarArg Type>"); // CilTypeRef display would need more complex handling
-            println!("     By Reference: {}", vararg.by_ref);
-            if vararg.modifiers.is_empty() {
-                println!("     Custom Modifiers: None");
-            } else {
-                println!(
-                    "     Custom Modifiers: {} modifier(s)",
-                    vararg.modifiers.count()
-                );
-                for (j, modifier) in vararg.modifiers.iter() {
-                    let token_value = modifier.token().map_or(0, |t| t.value());
-                    println!("       [{j}]: Token 0x{token_value:08X}");
-                }
-            }
-        }
-    }
 }
 
 fn print_local_variables(method: &Method) {
@@ -783,10 +760,11 @@ fn print_security_info(method: &Method) {
     println!("\n🔒 SECURITY INFORMATION");
     println!("{}", "-".repeat(50));
 
-    if method.security.get().is_some() {
-        println!("   Security attributes present");
-    } else {
+    if method.security.is_empty() {
         println!("   No security attributes");
+    }
+    for (_, security) in method.security.iter() {
+        println!("   {}: {}", security.action, security.permission_set);
     }
 }
 
@@ -814,7 +792,6 @@ fn print_additional_metadata(method: &Method) {
         "     Parameters List Size: {}",
         method.params.iter().count()
     );
-    println!("     VarArgs Size: {}", method.varargs.iter().count());
     println!(
         "     Local Variables Size: {}",
         method.local_vars.iter().count()

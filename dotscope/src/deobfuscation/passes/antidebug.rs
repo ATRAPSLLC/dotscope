@@ -423,7 +423,7 @@ mod tests {
     use super::*;
     use crate::{
         analysis::{CallGraph, SsaFunctionBuilder, SsaType},
-        testkit::helpers::test_assembly_arc,
+        testkit::{helpers::test_assembly_arc, passes::run_verified},
     };
 
     /// Runs a pass whose only sentinel is the test assembly's first MemberRef.
@@ -441,8 +441,7 @@ mod tests {
         );
         let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
         ctx.set_assembly(assembly);
-        pass.run_on_method(ssa, &MethodRef::new(Token::new(0x0600_0001)), &ctx)
-            .unwrap();
+        run_verified(&pass, ssa, &MethodRef::new(Token::new(0x0600_0001)), &ctx).unwrap();
     }
 
     /// A tainted `ret` stays, so the value it returns keeps its definition.

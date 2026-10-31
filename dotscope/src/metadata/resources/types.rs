@@ -69,7 +69,7 @@
 /// The magic number that identifies a .NET resource file (0xBEEFCACE)
 pub const RESOURCE_MAGIC: u32 = 0xBEEF_CACE;
 
-use crate::{file::parser::Parser, utils::compressed_uint_size, Error::TypeError, Result};
+use crate::{file::parser::Parser, Error::TypeError, Result};
 
 /// Represents all data types that can be stored in .NET resource files.
 ///
@@ -457,10 +457,10 @@ impl ResourceType {
     pub fn data_size(&self) -> Option<u32> {
         match self {
             ResourceType::String(s) => {
-                // UTF-8 byte length (7-bit encoded) + UTF-8 bytes
-                let utf8_byte_count = s.len();
-                let utf8_size = u32::try_from(utf8_byte_count).ok()?;
-                let prefix_size = u32::try_from(compressed_uint_size(utf8_size as usize)).ok()?;
+                // UTF-8 byte length (7-bit encoded: 7 bits a byte) + UTF-8 bytes
+                let utf8_size = u32::try_from(s.len()).ok()?;
+                let bits = u32::BITS.saturating_sub(utf8_size.leading_zeros());
+                let prefix_size = bits.div_ceil(7).max(1);
                 prefix_size.checked_add(utf8_size)
             }
             ResourceType::Boolean(_) | ResourceType::Byte(_) | ResourceType::SByte(_) => Some(1), // Single byte

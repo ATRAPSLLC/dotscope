@@ -259,22 +259,25 @@ impl OwnedAttributeValidator {
             | CustomAttributeArgument::U8(_)
             | CustomAttributeArgument::R4(_)
             | CustomAttributeArgument::R8(_)
-            | CustomAttributeArgument::I(_)
-            | CustomAttributeArgument::U(_)
             | CustomAttributeArgument::Type(_) => true,
 
             // A .NET string may hold any UTF-16 unit, NUL included
             CustomAttributeArgument::String(_) => true,
 
-            CustomAttributeArgument::Array(elements) => elements
+            CustomAttributeArgument::Array(_, elements) => elements
                 .iter()
+                .flatten()
                 .all(|elem| self.is_valid_attribute_argument(elem)),
 
             CustomAttributeArgument::Enum(type_name, underlying_value) => {
                 !type_name.is_empty() && self.is_valid_attribute_argument(underlying_value)
             }
 
-            CustomAttributeArgument::Void => false,
+            // The grammar names a boxed value's type before it, and has no type for a box
+            CustomAttributeArgument::Boxed(value) => {
+                !matches!(**value, CustomAttributeArgument::Boxed(_))
+                    && self.is_valid_attribute_argument(value)
+            }
         }
     }
 }

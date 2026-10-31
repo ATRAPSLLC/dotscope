@@ -32,7 +32,7 @@ use std::{
 
 use crate::{
     cilassembly::changes::{
-        hash_blob, hash_guid, hash_string, ChangeRef, ChangeRefKind, ChangeRefRc,
+        hash_blob, hash_guid, hash_string, ChangeIds, ChangeRef, ChangeRefKind, ChangeRefRc,
     },
     utils::compressed_uint_size,
 };
@@ -81,6 +81,9 @@ pub struct HeapChanges<T> {
 
     /// The kind of heap this tracks changes for
     heap_kind: ChangeRefKind,
+
+    /// The ids the assembly's changes take, shared with its other heaps and its tables
+    ids: ChangeIds,
 }
 
 impl<T> HeapChanges<T> {
@@ -89,13 +92,15 @@ impl<T> HeapChanges<T> {
     /// # Arguments
     ///
     /// * `heap_kind` - The kind of heap this tracks changes for.
-    fn new(heap_kind: ChangeRefKind) -> Self {
+    /// * `ids` - The ids the assembly's changes take.
+    fn new(heap_kind: ChangeRefKind, ids: ChangeIds) -> Self {
         Self {
             appended: Vec::new(),
             modified_items: HashMap::new(),
             removed_indices: HashSet::new(),
             replacement_heap: None,
             heap_kind,
+            ids,
         }
     }
 
@@ -246,13 +251,13 @@ impl<T> HeapChanges<T> {
 
 impl HeapChanges<String> {
     /// Creates a new string heap changes tracker.
-    pub fn new_strings() -> Self {
-        Self::new(ChangeRefKind::String)
+    pub fn new_strings(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::String, ids)
     }
 
     /// Creates a new user string heap changes tracker.
-    pub fn new_userstrings() -> Self {
-        Self::new(ChangeRefKind::UserString)
+    pub fn new_userstrings(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::UserString, ids)
     }
 
     /// Appends a string and returns a ChangeRef for it.
@@ -261,7 +266,11 @@ impl HeapChanges<String> {
     /// the assembly is written.
     pub fn append(&mut self, value: String) -> ChangeRefRc {
         let content_hash = hash_string(&value);
-        let change_ref = Arc::new(ChangeRef::new_heap(self.heap_kind, content_hash));
+        let change_ref = Arc::new(ChangeRef::new_heap(
+            self.heap_kind,
+            content_hash,
+            self.ids.next(),
+        ));
         self.appended.push((value, Arc::clone(&change_ref)));
         change_ref
     }
@@ -296,14 +305,18 @@ impl HeapChanges<String> {
 
 impl HeapChanges<Vec<u8>> {
     /// Creates a new blob heap changes tracker.
-    pub fn new_blobs() -> Self {
-        Self::new(ChangeRefKind::Blob)
+    pub fn new_blobs(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::Blob, ids)
     }
 
     /// Appends a blob and returns a ChangeRef for it.
     pub fn append(&mut self, value: Vec<u8>) -> ChangeRefRc {
         let content_hash = hash_blob(&value);
-        let change_ref = Arc::new(ChangeRef::new_heap(self.heap_kind, content_hash));
+        let change_ref = Arc::new(ChangeRef::new_heap(
+            self.heap_kind,
+            content_hash,
+            self.ids.next(),
+        ));
         self.appended.push((value, Arc::clone(&change_ref)));
         change_ref
     }
@@ -327,14 +340,18 @@ impl HeapChanges<Vec<u8>> {
 
 impl HeapChanges<[u8; 16]> {
     /// Creates a new GUID heap changes tracker.
-    pub fn new_guids() -> Self {
-        Self::new(ChangeRefKind::Guid)
+    pub fn new_guids(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::Guid, ids)
     }
 
     /// Appends a GUID and returns a ChangeRef for it.
     pub fn append(&mut self, value: [u8; 16]) -> ChangeRefRc {
         let content_hash = hash_guid(&value);
-        let change_ref = Arc::new(ChangeRef::new_heap(self.heap_kind, content_hash));
+        let change_ref = Arc::new(ChangeRef::new_heap(
+            self.heap_kind,
+            content_hash,
+            self.ids.next(),
+        ));
         self.appended.push((value, Arc::clone(&change_ref)));
         change_ref
     }
@@ -353,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_string_heap_changes() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         assert!(!changes.has_additions());
         assert!(!changes.has_changes());
 
@@ -373,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_blob_heap_changes() {
-        let mut changes = HeapChanges::<Vec<u8>>::new_blobs();
+        let mut changes = HeapChanges::<Vec<u8>>::new_blobs(ChangeIds::new());
 
         let ref1 = changes.append(vec![1, 2, 3]);
         let ref2 = changes.append(vec![4, 5, 6, 7]);
@@ -387,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_guid_heap_changes() {
-        let mut changes = HeapChanges::<[u8; 16]>::new_guids();
+        let mut changes = HeapChanges::<[u8; 16]>::new_guids(ChangeIds::new());
 
         let guid1 = [0u8; 16];
         let guid2 = [1u8; 16];
@@ -403,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_userstring_heap_changes() {
-        let mut changes = HeapChanges::<String>::new_userstrings();
+        let mut changes = HeapChanges::<String>::new_userstrings(ChangeIds::new());
         assert_eq!(changes.heap_kind(), ChangeRefKind::UserString);
 
         let _ref1 = changes.append("test".to_string());
@@ -416,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_modifications() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         assert!(!changes.has_modifications());
 
         changes.add_modification(50, "modified".to_string());
@@ -429,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_removals() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         assert!(!changes.has_removals());
 
         changes.add_removal(25);
@@ -442,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_replacement_heap() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let _ref1 = changes.append("will be cleared".to_string());
         assert_eq!(changes.additions_count(), 1);
 
@@ -455,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_mark_ref_removed() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let ref1 = changes.append("test".to_string());
 
         assert!(!changes.is_ref_removed(&ref1));
@@ -467,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_appended_iter() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         changes.append("one".to_string());
         changes.append("two".to_string());
 
@@ -487,7 +504,7 @@ mod examples {
     /// when the assembly is written.
     #[test]
     fn module_example() -> Result<()> {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let string_ref = changes.append("MyString".to_string());
 
         assert_eq!(changes.appended_iter().count(), 1);

@@ -103,30 +103,37 @@ use std::collections::BTreeMap;
 
 use crate::{
     metadata::resources::{ResourceType, RESOURCE_MAGIC},
-    utils::{compressed_uint_size, to_u32, write_7bit_encoded_int, write_compressed_uint},
+    utils::{to_u32, write_7bit_encoded_int},
     Error, Result,
 };
 
-/// Computes the hash value for a resource name using the official .NET hash function.
-///
-/// This hash function MUST match the one used by the .NET runtime exactly
-/// (from FastResourceComparer.cs) to ensure proper resource lookup.
-///
-/// # Arguments
-///
-/// * `key` - The resource name to hash
-///
-/// # Returns
-///
-/// Returns the 32-bit hash value used in .NET resource files.
-fn compute_resource_hash(key: &str) -> u32 {
-    // This is the official .NET hash function from FastResourceComparer.cs
-    // It MUST match exactly for compatibility
+/// The `ResourceManager` header version `ResourceWriter` writes.
+const RESOURCE_MANAGER_HEADER_VERSION: u32 = 1;
+
+/// The reader `ResourceWriter` names in the header.
+const READER_TYPE: &str = "System.Resources.ResourceReader, mscorlib, Version=4.0.0.0, \
+                           Culture=neutral, PublicKeyToken=b77a5c561934e089";
+
+/// The resource set `ResourceWriter` names in the header.
+const RESOURCE_SET_TYPE: &str = "System.Resources.RuntimeResourceSet";
+
+/// Writes `value` as `BinaryWriter.Write(string)` does: its UTF-8 length as a 7-bit encoded
+/// int, then its UTF-8 bytes.
+fn write_string(value: &str, buffer: &mut Vec<u8>) -> Result<()> {
+    write_7bit_encoded_int(to_u32(value.len())?, buffer);
+    buffer.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+/// The hash the runtime looks a resource name up by (`FastResourceComparer.HashFunction`):
+/// djb2 over the name's UTF-16 code units, `hash = (hash << 5) + hash ^ unit`, read as a
+/// signed 32-bit value.
+fn compute_resource_hash(key: &str) -> i32 {
     let mut hash = 5381u32;
-    for ch in key.chars() {
-        hash = hash.wrapping_mul(33).wrapping_add(ch as u32);
+    for unit in key.encode_utf16() {
+        hash = (hash << 5).wrapping_add(hash) ^ u32::from(unit);
     }
-    hash
+    hash.cast_signed()
 }
 
 /// Specialized encoder for .NET resource file format.
@@ -843,191 +850,73 @@ impl DotNetResourceEncoder {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn encode_dotnet_format(&self) -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();
-
-        // Reserve space for the size field (will be updated at the end)
-        let size_placeholder_pos = buffer.len();
-        buffer.extend_from_slice(&0u32.to_le_bytes());
-
-        // Resource Manager Header
-        buffer.extend_from_slice(&RESOURCE_MAGIC.to_le_bytes());
-        buffer.extend_from_slice(&self.version.to_le_bytes());
-
-        let header_size_pos = buffer.len();
-        buffer.extend_from_slice(&0u32.to_le_bytes()); // Placeholder for header size
-
-        // Resource reader type name (exact Microsoft constant)
-        let reader_type = "System.Resources.ResourceReader, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
-        write_compressed_uint(to_u32(reader_type.len())?, &mut buffer);
-        buffer.extend_from_slice(reader_type.as_bytes());
-
-        // Resource set type name (exact Microsoft constant)
-        let resource_set_type = "System.Resources.RuntimeResourceSet";
-        write_compressed_uint(to_u32(resource_set_type.len())?, &mut buffer);
-        buffer.extend_from_slice(resource_set_type.as_bytes());
-
-        // Calculate header size and update placeholder
-        let header_size = buffer
-            .len()
-            .checked_sub(header_size_pos)
-            .and_then(|v| v.checked_sub(4))
-            .ok_or_else(|| malformed_error!("Resource header size underflow"))?;
-        let header_size_bytes = to_u32(header_size)?.to_le_bytes();
-        let header_end = header_size_pos
-            .checked_add(4)
-            .ok_or_else(|| malformed_error!("Resource header position overflow"))?;
-        buffer
-            .get_mut(header_size_pos..header_end)
-            .ok_or(out_of_bounds_error!())?
-            .copy_from_slice(&header_size_bytes);
-
-        // Runtime Resource Reader Header
-        buffer.extend_from_slice(&self.version.to_le_bytes()); // RR version
-
-        // Resource count
-        buffer.extend_from_slice(&to_u32(self.resources.len())?.to_le_bytes());
-
-        // Write type table
-        Self::write_type_table(&mut buffer)?;
-
-        // Add padding for 8-byte alignment
-        while buffer.len() % 8 != 0 {
-            buffer.push(b'P'); // Padding byte
+        // The data section first, each resource's offset into it recorded as it is written
+        let mut data = Vec::new();
+        let mut data_offsets = Vec::with_capacity(self.resources.len());
+        for (_, resource_type) in &self.resources {
+            data_offsets.push(to_u32(data.len())?);
+            Self::write_resource_data(resource_type, &mut data)?;
         }
 
-        // Write hash table using official .NET hash function
-        let mut name_hashes: Vec<(u32, usize)> = self
+        // The runtime finds a name by a binary search over the hashes, signed
+        let mut order: Vec<(i32, usize)> = self
             .resources
             .iter()
             .enumerate()
-            .map(|(i, (name, _))| (compute_resource_hash(name), i))
+            .map(|(index, (name, _))| (compute_resource_hash(name), index))
             .collect();
+        order.sort_by_key(|&(hash, _)| hash);
 
-        // Sort by hash value as required by .NET format
-        name_hashes.sort_by_key(|(hash, _)| *hash);
+        // Each name as `BinaryWriter(Encoding.Unicode).Write(string)` writes it, then its
+        // resource's offset into the data section
+        let mut names = Vec::new();
+        let mut name_positions = Vec::with_capacity(order.len());
+        for &(_, index) in &order {
+            let (name, _) = self.resources.get(index).ok_or(out_of_bounds_error!())?;
+            let data_offset = data_offsets.get(index).ok_or(out_of_bounds_error!())?;
+            name_positions.push(to_u32(names.len())?);
+            let utf16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            write_7bit_encoded_int(to_u32(utf16.len())?, &mut names);
+            names.extend_from_slice(&utf16);
+            names.extend_from_slice(&data_offset.to_le_bytes());
+        }
 
-        for (hash, _) in &name_hashes {
+        // ResourceManager header: the reader and set types, after the count of their bytes
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&RESOURCE_MAGIC.to_le_bytes());
+        buffer.extend_from_slice(&RESOURCE_MANAGER_HEADER_VERSION.to_le_bytes());
+        let mut types = Vec::new();
+        write_string(READER_TYPE, &mut types)?;
+        write_string(RESOURCE_SET_TYPE, &mut types)?;
+        buffer.extend_from_slice(&to_u32(types.len())?.to_le_bytes());
+        buffer.extend_from_slice(&types);
+
+        // RuntimeResourceReader header: no type table, every resource has a primitive type code
+        buffer.extend_from_slice(&self.version.to_le_bytes());
+        buffer.extend_from_slice(&to_u32(self.resources.len())?.to_le_bytes());
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+
+        // The hashes are 8-byte aligned from the magic, padded as ResourceWriter pads
+        let misalignment = buffer.len() % 8;
+        if misalignment != 0 {
+            buffer.extend_from_slice(b"PADPADPA".get(misalignment..).unwrap_or_default());
+        }
+        for &(hash, _) in &order {
             buffer.extend_from_slice(&hash.to_le_bytes());
         }
-
-        // Calculate name section layout in sorted hash order
-        let mut name_section_layout = Vec::new();
-        let mut name_offset = 0u32;
-        for (_, resource_index) in &name_hashes {
-            let (name, _) = self
-                .resources
-                .get(*resource_index)
-                .ok_or(out_of_bounds_error!())?;
-            let name_utf16: Vec<u16> = name.encode_utf16().collect();
-            let byte_count = name_utf16
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| malformed_error!("Resource name byte count overflow"))?;
-            #[allow(clippy::cast_possible_truncation)] // compressed_uint_size returns at most 4
-            let len_size = compressed_uint_size(byte_count) as u32;
-            let entry_size = len_size
-                .checked_add(to_u32(byte_count)?)
-                .and_then(|v| v.checked_add(4))
-                .ok_or_else(|| malformed_error!("Resource entry size overflow"))?;
-
-            name_section_layout.push(name_offset);
-            name_offset = name_offset
-                .checked_add(entry_size)
-                .ok_or_else(|| malformed_error!("Resource name offset overflow"))?;
+        for position in &name_positions {
+            buffer.extend_from_slice(&position.to_le_bytes());
         }
 
-        // Write position table (in sorted hash order)
-        for name_position in &name_section_layout {
-            buffer.extend_from_slice(&name_position.to_le_bytes());
-        }
-
-        // Calculate data offsets for sorted resources BEFORE writing name section
-        let mut data_offsets = Vec::new();
-        let mut data_offset = 0u32;
-        for (_, resource_index) in &name_hashes {
-            let (_, resource_type) = self
-                .resources
-                .get(*resource_index)
-                .ok_or(out_of_bounds_error!())?;
-
-            data_offsets.push(data_offset);
-
-            // Calculate the actual size this resource will take in the data section
-            let type_code_size = if let Some(type_code) = resource_type.type_code() {
-                u32::try_from(compressed_uint_size(type_code as usize))
-                    .map_err(|_| Error::NotSupported)?
-            } else {
-                return Err(Error::NotSupported);
-            };
-
-            let data_size = resource_type.data_size().ok_or(Error::NotSupported)?;
-            data_offset = data_offset
-                .checked_add(type_code_size)
-                .and_then(|v| v.checked_add(data_size))
-                .ok_or_else(|| malformed_error!("Resource data offset overflow"))?;
-        }
-
-        // Reserve space for data section offset - we'll update it after writing the name section
-        let data_section_offset_pos = buffer.len();
-        buffer.extend_from_slice(&0u32.to_le_bytes()); // Placeholder
-
-        // Write resource names and data offsets (in sorted hash order)
-        for (i, (_, resource_index)) in name_hashes.iter().enumerate() {
-            let (name, _) = self
-                .resources
-                .get(*resource_index)
-                .ok_or(out_of_bounds_error!())?;
-            let name_utf16: Vec<u16> = name.encode_utf16().collect();
-            let byte_count = name_utf16
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| malformed_error!("Resource name byte count overflow"))?;
-
-            // Write byte count, not character count
-            write_compressed_uint(to_u32(byte_count)?, &mut buffer);
-
-            for utf16_char in name_utf16 {
-                buffer.extend_from_slice(&utf16_char.to_le_bytes());
-            }
-
-            let data_offset_value = data_offsets.get(i).ok_or(out_of_bounds_error!())?;
-            buffer.extend_from_slice(&data_offset_value.to_le_bytes());
-        }
-
-        // Calculate the actual data section offset following Microsoft's ResourceWriter exactly
-        // From ResourceWriter.cs: startOfDataSection += 4; // We're writing an int to store this data
-        // Standard .NET convention: offset is relative to magic number position, requiring +4 adjustment in parser
-        // For embedded resources, we need to be careful about the offset calculation
-        // The offset should point to where the data actually starts in the file
-        let actual_data_section_offset = buffer
+        // The data section's offset from the magic, then the names and the data
+        let data_section = buffer
             .len()
-            .checked_sub(4)
-            .ok_or_else(|| malformed_error!("Resource data section offset underflow"))?; // -4 to account for size prefix
-        let data_section_offset_value = to_u32(actual_data_section_offset)?.to_le_bytes();
-        let data_section_end = data_section_offset_pos
             .checked_add(4)
-            .ok_or_else(|| malformed_error!("Resource data section position overflow"))?;
-        buffer
-            .get_mut(data_section_offset_pos..data_section_end)
-            .ok_or(out_of_bounds_error!())?
-            .copy_from_slice(&data_section_offset_value);
-
-        // Write resource data (in sorted hash order)
-        self.write_resource_data_sorted(&mut buffer, &name_hashes)?;
-
-        // Update the size field at the beginning
-        let total_size = buffer
-            .len()
-            .checked_sub(4)
-            .ok_or_else(|| malformed_error!("Resource total size underflow"))?; // Exclude the size field itself
-        let size_bytes = to_u32(total_size)?.to_le_bytes();
-        let size_end = size_placeholder_pos
-            .checked_add(4)
-            .ok_or_else(|| malformed_error!("Resource size placeholder position overflow"))?;
-        buffer
-            .get_mut(size_placeholder_pos..size_end)
-            .ok_or(out_of_bounds_error!())?
-            .copy_from_slice(&size_bytes);
+            .and_then(|offset| offset.checked_add(names.len()))
+            .ok_or_else(|| malformed_error!("Resource data section offset overflow"))?;
+        buffer.extend_from_slice(&to_u32(data_section)?.to_le_bytes());
+        buffer.extend_from_slice(&names);
+        buffer.extend_from_slice(&data);
 
         Ok(buffer)
     }
@@ -1057,131 +946,103 @@ impl DotNetResourceEncoder {
             .collect()
     }
 
-    /// Writes the type table section of the .NET resource format.
-    /// Following Microsoft's ResourceWriter implementation, we write an empty type table
-    /// for primitive types and use ResourceTypeCode enum values directly.
-    #[allow(clippy::unnecessary_wraps)]
-    fn write_type_table(buffer: &mut Vec<u8>) -> Result<()> {
-        // Microsoft's ResourceWriter.cs line 344: "write 0 for this writer implementation"
-        // For primitive types, Microsoft uses an empty type table and ResourceTypeCode values
-        buffer.extend_from_slice(&0u32.to_le_bytes()); // Type count = 0
+    /// Writes one resource's type code and value as `ResourceWriter` writes them.
+    fn write_resource_data(resource_type: &ResourceType, buffer: &mut Vec<u8>) -> Result<()> {
+        // Use Microsoft's ResourceTypeCode enum values exactly
+        let type_code = match resource_type {
+            ResourceType::Null => 0u32,            // ResourceTypeCode.Null
+            ResourceType::String(_) => 1u32,       // ResourceTypeCode.String
+            ResourceType::Boolean(_) => 2u32,      // ResourceTypeCode.Boolean
+            ResourceType::Char(_) => 3u32,         // ResourceTypeCode.Char
+            ResourceType::Byte(_) => 4u32,         // ResourceTypeCode.Byte
+            ResourceType::SByte(_) => 5u32,        // ResourceTypeCode.SByte
+            ResourceType::Int16(_) => 6u32,        // ResourceTypeCode.Int16
+            ResourceType::UInt16(_) => 7u32,       // ResourceTypeCode.UInt16
+            ResourceType::Int32(_) => 8u32,        // ResourceTypeCode.Int32
+            ResourceType::UInt32(_) => 9u32,       // ResourceTypeCode.UInt32
+            ResourceType::Int64(_) => 10u32,       // ResourceTypeCode.Int64
+            ResourceType::UInt64(_) => 11u32,      // ResourceTypeCode.UInt64
+            ResourceType::Single(_) => 12u32,      // ResourceTypeCode.Single
+            ResourceType::Double(_) => 13u32,      // ResourceTypeCode.Double
+            ResourceType::Decimal { .. } => 14u32, // ResourceTypeCode.Decimal (0x0E)
+            ResourceType::DateTime(_) => 15u32,    // ResourceTypeCode.DateTime (0x0F)
+            ResourceType::TimeSpan(_) => 16u32,    // ResourceTypeCode.TimeSpan (0x10)
+            ResourceType::ByteArray(_) => 32u32,   // ResourceTypeCode.ByteArray (0x20)
+            ResourceType::Stream(_) => 33u32,      // ResourceTypeCode.Stream (0x21)
+            ResourceType::StartOfUserTypes => return Err(Error::NotSupported),
+        };
 
-        Ok(())
-    }
+        // The type code is a 7-bit encoded int (`data.Write7BitEncodedInt`)
+        write_7bit_encoded_int(type_code, buffer);
 
-    /// Writes the resource data section of the .NET resource format in sorted order.
-    fn write_resource_data_sorted(
-        &self,
-        buffer: &mut Vec<u8>,
-        name_hashes: &[(u32, usize)],
-    ) -> Result<()> {
-        for (_, resource_index) in name_hashes {
-            let (_, resource_type) = self
-                .resources
-                .get(*resource_index)
-                .ok_or(out_of_bounds_error!())?;
-
-            // Use Microsoft's ResourceTypeCode enum values exactly
-            let type_code = match resource_type {
-                ResourceType::Null => 0u32,            // ResourceTypeCode.Null
-                ResourceType::String(_) => 1u32,       // ResourceTypeCode.String
-                ResourceType::Boolean(_) => 2u32,      // ResourceTypeCode.Boolean
-                ResourceType::Char(_) => 3u32,         // ResourceTypeCode.Char
-                ResourceType::Byte(_) => 4u32,         // ResourceTypeCode.Byte
-                ResourceType::SByte(_) => 5u32,        // ResourceTypeCode.SByte
-                ResourceType::Int16(_) => 6u32,        // ResourceTypeCode.Int16
-                ResourceType::UInt16(_) => 7u32,       // ResourceTypeCode.UInt16
-                ResourceType::Int32(_) => 8u32,        // ResourceTypeCode.Int32
-                ResourceType::UInt32(_) => 9u32,       // ResourceTypeCode.UInt32
-                ResourceType::Int64(_) => 10u32,       // ResourceTypeCode.Int64
-                ResourceType::UInt64(_) => 11u32,      // ResourceTypeCode.UInt64
-                ResourceType::Single(_) => 12u32,      // ResourceTypeCode.Single
-                ResourceType::Double(_) => 13u32,      // ResourceTypeCode.Double
-                ResourceType::Decimal { .. } => 14u32, // ResourceTypeCode.Decimal (0x0E)
-                ResourceType::DateTime(_) => 15u32,    // ResourceTypeCode.DateTime (0x0F)
-                ResourceType::TimeSpan(_) => 16u32,    // ResourceTypeCode.TimeSpan (0x10)
-                ResourceType::ByteArray(_) => 32u32,   // ResourceTypeCode.ByteArray (0x20)
-                ResourceType::Stream(_) => 33u32,      // ResourceTypeCode.Stream (0x21)
-                ResourceType::StartOfUserTypes => return Err(Error::NotSupported),
-            };
-
-            // Write type code using 7-bit encoding (exactly like Microsoft's data.Write7BitEncodedInt)
-            write_compressed_uint(type_code, buffer);
-
-            // Write value data following Microsoft's WriteValue method exactly
-            match resource_type {
-                ResourceType::Null => {
-                    // No data for null
+        // Write value data following Microsoft's WriteValue method exactly
+        match resource_type {
+            ResourceType::Null => {
+                // No data for null
+            }
+            ResourceType::String(s) => write_string(s, buffer)?,
+            ResourceType::Boolean(b) => {
+                buffer.push(u8::from(*b));
+            }
+            ResourceType::Char(c) => {
+                // Microsoft writes char as ushort (UTF-16)
+                let utf16_char = *c as u16;
+                buffer.extend_from_slice(&utf16_char.to_le_bytes());
+            }
+            ResourceType::Byte(b) => {
+                buffer.push(*b);
+            }
+            ResourceType::SByte(sb) => {
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    buffer.push(*sb as u8);
                 }
-                ResourceType::String(s) => {
-                    // Microsoft uses BinaryWriter.Write(string) which writes UTF-8 with 7-bit encoded length prefix
-                    let utf8_bytes = s.as_bytes();
-                    write_7bit_encoded_int(to_u32(utf8_bytes.len())?, buffer);
-                    buffer.extend_from_slice(utf8_bytes);
-                }
-                ResourceType::Boolean(b) => {
-                    buffer.push(u8::from(*b));
-                }
-                ResourceType::Char(c) => {
-                    // Microsoft writes char as ushort (UTF-16)
-                    let utf16_char = *c as u16;
-                    buffer.extend_from_slice(&utf16_char.to_le_bytes());
-                }
-                ResourceType::Byte(b) => {
-                    buffer.push(*b);
-                }
-                ResourceType::SByte(sb) => {
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        buffer.push(*sb as u8);
-                    }
-                }
-                ResourceType::Int16(i) => {
-                    buffer.extend_from_slice(&i.to_le_bytes());
-                }
-                ResourceType::UInt16(u) => {
-                    buffer.extend_from_slice(&u.to_le_bytes());
-                }
-                ResourceType::Int32(i) => {
-                    buffer.extend_from_slice(&i.to_le_bytes());
-                }
-                ResourceType::UInt32(u) => {
-                    buffer.extend_from_slice(&u.to_le_bytes());
-                }
-                ResourceType::Int64(i) => {
-                    buffer.extend_from_slice(&i.to_le_bytes());
-                }
-                ResourceType::UInt64(u) => {
-                    buffer.extend_from_slice(&u.to_le_bytes());
-                }
-                ResourceType::Single(f) => {
-                    buffer.extend_from_slice(&f.to_le_bytes());
-                }
-                ResourceType::Double(d) => {
-                    buffer.extend_from_slice(&d.to_le_bytes());
-                }
-                ResourceType::Decimal { lo, mid, hi, flags } => {
-                    // Write 4 × i32 in little-endian order: lo, mid, hi, flags
-                    buffer.extend_from_slice(&lo.to_le_bytes());
-                    buffer.extend_from_slice(&mid.to_le_bytes());
-                    buffer.extend_from_slice(&hi.to_le_bytes());
-                    buffer.extend_from_slice(&flags.to_le_bytes());
-                }
-                ResourceType::DateTime(binary_value) => {
-                    // Write i64 binary representation (ticks + kind)
-                    buffer.extend_from_slice(&binary_value.to_le_bytes());
-                }
-                ResourceType::TimeSpan(ticks) => {
-                    // Write i64 ticks
-                    buffer.extend_from_slice(&ticks.to_le_bytes());
-                }
-                ResourceType::ByteArray(data) | ResourceType::Stream(data) => {
-                    buffer.extend_from_slice(&to_u32(data.len())?.to_le_bytes());
-                    buffer.extend_from_slice(data);
-                }
-                ResourceType::StartOfUserTypes => {
-                    return Err(Error::NotSupported);
-                }
+            }
+            ResourceType::Int16(i) => {
+                buffer.extend_from_slice(&i.to_le_bytes());
+            }
+            ResourceType::UInt16(u) => {
+                buffer.extend_from_slice(&u.to_le_bytes());
+            }
+            ResourceType::Int32(i) => {
+                buffer.extend_from_slice(&i.to_le_bytes());
+            }
+            ResourceType::UInt32(u) => {
+                buffer.extend_from_slice(&u.to_le_bytes());
+            }
+            ResourceType::Int64(i) => {
+                buffer.extend_from_slice(&i.to_le_bytes());
+            }
+            ResourceType::UInt64(u) => {
+                buffer.extend_from_slice(&u.to_le_bytes());
+            }
+            ResourceType::Single(f) => {
+                buffer.extend_from_slice(&f.to_le_bytes());
+            }
+            ResourceType::Double(d) => {
+                buffer.extend_from_slice(&d.to_le_bytes());
+            }
+            ResourceType::Decimal { lo, mid, hi, flags } => {
+                // Write 4 × i32 in little-endian order: lo, mid, hi, flags
+                buffer.extend_from_slice(&lo.to_le_bytes());
+                buffer.extend_from_slice(&mid.to_le_bytes());
+                buffer.extend_from_slice(&hi.to_le_bytes());
+                buffer.extend_from_slice(&flags.to_le_bytes());
+            }
+            ResourceType::DateTime(binary_value) => {
+                // Write i64 binary representation (ticks + kind)
+                buffer.extend_from_slice(&binary_value.to_le_bytes());
+            }
+            ResourceType::TimeSpan(ticks) => {
+                // Write i64 ticks
+                buffer.extend_from_slice(&ticks.to_le_bytes());
+            }
+            ResourceType::ByteArray(data) | ResourceType::Stream(data) => {
+                buffer.extend_from_slice(&to_u32(data.len())?.to_le_bytes());
+                buffer.extend_from_slice(data);
+            }
+            ResourceType::StartOfUserTypes => {
+                return Err(Error::NotSupported);
             }
         }
 
@@ -1198,7 +1059,89 @@ impl Default for DotNetResourceEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::resources::parser::parse_dotnet_resource;
+    use crate::metadata::resources::parser::{parse_dotnet_resource, Resource};
+
+    /// Every name in WindowsBase's resources, which the .NET tooling wrote, is stored under
+    /// the hash this computes, and the hashes are in signed order.
+    #[test]
+    fn the_hash_is_the_runtimes() {
+        let data =
+            include_bytes!("../../../tests/samples/WB_FxResources.WindowsBase.SR.resources.bin");
+        let entries = parse_dotnet_resource(data).unwrap();
+        assert!(entries.len() > 500);
+        for entry in entries.values() {
+            assert_eq!(
+                entry.name_hash,
+                compute_resource_hash(&entry.name).cast_unsigned(),
+                "{}",
+                entry.name
+            );
+        }
+        let stored = Resource::parse(data).unwrap().name_hashes;
+        assert!(stored
+            .windows(2)
+            .all(|pair| pair[0].cast_signed() <= pair[1].cast_signed()));
+    }
+
+    /// The names written cover both signs of the hash: they are in signed order, as the
+    /// runtime's binary search reads them, and each one reads back.
+    #[test]
+    fn names_are_in_signed_hash_order() {
+        let mut encoder = DotNetResourceEncoder::new();
+        for index in 0..300 {
+            encoder
+                .add_string(&format!("Name{index}"), &format!("value {index}"))
+                .unwrap();
+        }
+        let encoded = encoder.encode_dotnet_format().unwrap();
+
+        let hashes: Vec<i32> = Resource::parse(&encoded)
+            .unwrap()
+            .name_hashes
+            .iter()
+            .map(|hash| hash.cast_signed())
+            .collect();
+        assert!(hashes.iter().any(|hash| *hash < 0) && hashes.iter().any(|hash| *hash > 0));
+        assert!(hashes.windows(2).all(|pair| pair[0] <= pair[1]));
+        let entries = parse_dotnet_resource(&encoded).unwrap();
+        assert_eq!(entries.len(), 300);
+        assert!(matches!(
+            &entries["Name123"].data,
+            ResourceType::String(value) if value == "value 123"
+        ));
+    }
+
+    /// Embedded in an assembly, a stream sits after its 4-byte length, and reads back the
+    /// same: its padding and data offsets count from its magic. A name past 63 characters
+    /// and a string past 16 KiB take longer 7-bit lengths.
+    #[test]
+    fn an_embedded_stream_reads_back() {
+        let long_name = "N".repeat(100);
+        let long_value = "x\u{e9}\u{1F600}\t".repeat(5000);
+        let mut encoder = DotNetResourceEncoder::new();
+        encoder.add_string(&long_name, &long_value).unwrap();
+        encoder.add_int32("Emoji\u{1F600}", 42).unwrap();
+        encoder.add_byte_array("Bytes", &[1, 2, 255]).unwrap();
+        let stream = encoder.encode_dotnet_format().unwrap();
+
+        for data in [stream.clone(), {
+            let mut embedded = u32::try_from(stream.len()).unwrap().to_le_bytes().to_vec();
+            embedded.extend_from_slice(&stream);
+            embedded
+        }] {
+            let entries = parse_dotnet_resource(&data).unwrap();
+            assert!(
+                matches!(&entries[&long_name].data, ResourceType::String(value) if *value == long_value)
+            );
+            assert!(matches!(
+                entries["Emoji\u{1F600}"].data,
+                ResourceType::Int32(42)
+            ));
+            assert!(
+                matches!(&entries["Bytes"].data, ResourceType::ByteArray(bytes) if bytes == &[1, 2, 255])
+            );
+        }
+    }
 
     #[test]
     fn test_dotnet_resource_encoder_basic() {
@@ -1228,10 +1171,8 @@ mod tests {
             .expect("Should encode .NET format");
         assert!(!encoded.is_empty());
 
-        // Should start with size field, then magic number
-        assert!(encoded.len() >= 8);
-        let _size = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
-        let magic = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
+        // A .resources stream starts with its magic: embedding adds the length before it
+        let magic = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
         assert_eq!(magic, RESOURCE_MAGIC);
 
         // Verify encoding works and produces reasonable output
@@ -1275,10 +1216,10 @@ mod tests {
 
         // Verify magic number is correct
         let magic = u32::from_le_bytes([
-            encoded_data[4],
-            encoded_data[5],
-            encoded_data[6],
-            encoded_data[7],
+            encoded_data[0],
+            encoded_data[1],
+            encoded_data[2],
+            encoded_data[3],
         ]);
         assert_eq!(magic, RESOURCE_MAGIC);
 

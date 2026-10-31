@@ -5,13 +5,16 @@
 //! It integrates the existing [`crate::assembly::InstructionAssembler`] with ECMA-335
 //! method body format encoding.
 
+use std::collections::HashMap;
+
 use crate::{
-    assembly::InstructionAssembler,
+    assembly::{decode_stream, InstructionAssembler},
     cilassembly::CilAssembly,
+    file::parser::Parser,
     metadata::{
         method::{
-            encode_exception_handlers, encode_method_body_header, ExceptionHandler,
-            ExceptionHandlerFlags,
+            encode_exception_handlers, encode_method_body_header, order_nested_first,
+            ExceptionHandler, ExceptionHandlerFlags,
         },
         signatures::{
             encode_local_var_signature, SignatureLocalVariable, SignatureLocalVariables,
@@ -48,13 +51,14 @@ type ImplementationFn = Box<dyn FnOnce(&mut InstructionAssembler) -> Result<()>>
 
 /// Resolve a labeled exception handler to a regular exception handler with calculated byte offsets.
 ///
-/// This function takes an assembler (after implementation but before finalization) and a labeled
-/// exception handler, and converts it to a regular exception handler by looking up the label
-/// positions and calculating the byte offsets and lengths.
+/// This function takes the final label offsets of an assembled body and a labeled exception
+/// handler, and converts it to a regular exception handler by looking up the label positions
+/// and calculating the byte offsets and lengths. The offsets are the finalized ones: finalizing
+/// shortens branches, which moves the code after them.
 ///
 /// # Parameters
 ///
-/// * `assembler` - The instruction assembler with defined labels
+/// * `labels` - Every label's final offset, from [`InstructionAssembler::finish_with_labels`]
 /// * `labeled_handler` - The labeled exception handler to resolve
 ///
 /// # Returns
@@ -65,24 +69,21 @@ type ImplementationFn = Box<dyn FnOnce(&mut InstructionAssembler) -> Result<()>>
 ///
 /// Returns an error if any of the referenced labels are not defined in the assembler.
 fn resolve_labeled_exception_handler(
-    assembler: &InstructionAssembler,
+    labels: &HashMap<String, u32>,
     labeled_handler: &LabeledExceptionHandler,
 ) -> Result<ExceptionHandler> {
+    let position = |label: &str| labels.get(label).copied();
     // Look up all label positions
-    let try_start_offset = assembler
-        .get_label_position(&labeled_handler.try_start_label)
+    let try_start_offset = position(&labeled_handler.try_start_label)
         .ok_or_else(|| Error::UndefinedLabel(labeled_handler.try_start_label.clone()))?;
 
-    let try_end_offset = assembler
-        .get_label_position(&labeled_handler.try_end_label)
+    let try_end_offset = position(&labeled_handler.try_end_label)
         .ok_or_else(|| Error::UndefinedLabel(labeled_handler.try_end_label.clone()))?;
 
-    let handler_start_offset = assembler
-        .get_label_position(&labeled_handler.handler_start_label)
+    let handler_start_offset = position(&labeled_handler.handler_start_label)
         .ok_or_else(|| Error::UndefinedLabel(labeled_handler.handler_start_label.clone()))?;
 
-    let handler_end_offset = assembler
-        .get_label_position(&labeled_handler.handler_end_label)
+    let handler_end_offset = position(&labeled_handler.handler_end_label)
         .ok_or_else(|| Error::UndefinedLabel(labeled_handler.handler_end_label.clone()))?;
 
     // Calculate lengths
@@ -115,9 +116,7 @@ fn resolve_labeled_exception_handler(
 
     // Resolve filter offset for FILTER handlers
     let filter_offset = if let Some(filter_label) = &labeled_handler.filter_start_label {
-        assembler
-            .get_label_position(filter_label)
-            .ok_or_else(|| Error::UndefinedLabel(filter_label.clone()))?
+        position(filter_label).ok_or_else(|| Error::UndefinedLabel(filter_label.clone()))?
     } else {
         0
     };
@@ -493,13 +492,9 @@ impl MethodBodyBuilder {
         exception_type: Option<CilTypeRc>,
     ) -> Self {
         let handler = ExceptionHandler {
-            // Use FAULT for catch-all handlers (when exception_type is None)
-            // Use EXCEPTION for typed handlers (when exception_type is Some)
-            flags: if exception_type.is_some() {
-                ExceptionHandlerFlags::EXCEPTION
-            } else {
-                ExceptionHandlerFlags::FAULT
-            },
+            // A catch-all is a catch of System.Object, resolved when the body is built: a fault
+            // handler would let the exception go on
+            flags: ExceptionHandlerFlags::EXCEPTION,
             try_offset,
             try_length,
             handler_offset,
@@ -626,11 +621,8 @@ impl MethodBodyBuilder {
         exception_type: Option<CilTypeRc>,
     ) -> Self {
         let handler = LabeledExceptionHandler {
-            flags: if exception_type.is_some() {
-                ExceptionHandlerFlags::EXCEPTION
-            } else {
-                ExceptionHandlerFlags::FAULT
-            },
+            // A catch-all is a catch of System.Object, resolved when the body is built
+            flags: ExceptionHandlerFlags::EXCEPTION,
             try_start_label: try_start_label.to_string(),
             try_end_label: try_end_label.to_string(),
             handler_start_label: handler_start_label.to_string(),
@@ -809,18 +801,43 @@ impl MethodBodyBuilder {
                 let mut assembler = InstructionAssembler::new();
                 implementation(&mut assembler)?;
 
-                // Resolve labeled exception handlers to regular exception handlers
+                // The clauses the assembler built, and the labeled handlers resolved at the
+                // offsets the finished code has
+                let (code_bytes, calculated_max_stack, assembled, labels) =
+                    assembler.finish_with_labels()?;
                 let mut all_exception_handlers = exception_handlers;
                 for labeled_handler in labeled_exception_handlers {
-                    let resolved_handler =
-                        resolve_labeled_exception_handler(&assembler, &labeled_handler)?;
-                    all_exception_handlers.push(resolved_handler);
+                    all_exception_handlers.push(resolve_labeled_exception_handler(
+                        &labels,
+                        &labeled_handler,
+                    )?);
                 }
-
-                let (code_bytes, calculated_max_stack, _) = assembler.finish()?;
+                all_exception_handlers.extend(assembled);
                 let max_stack = max_stack.unwrap_or(calculated_max_stack);
                 (code_bytes, all_exception_handlers, max_stack)
             };
+
+        // A catch-all catches System.Object (ECMA-335 II.19); a clause with no class names
+        // the core library's, which the assembly has to reference
+        let mut all_exception_handlers = all_exception_handlers;
+        for clause in &mut all_exception_handlers {
+            if clause.flags == ExceptionHandlerFlags::EXCEPTION
+                && clause.handler.is_none()
+                && clause.filter_offset == 0
+            {
+                let object = assembly
+                    .find_corelib_type("System", "Object")
+                    .ok_or_else(|| {
+                        Error::ModificationInvalid(
+                            "a catch-all handler catches System.Object, which the assembly \
+                             neither references nor defines"
+                                .to_string(),
+                        )
+                    })?;
+                clause.filter_offset = object.token.value();
+            }
+        }
+        let all_exception_handlers = order_nested_first(all_exception_handlers);
 
         // Generate local variable signature token
         let local_var_sig_token_value = if let Some(local_sig) = prebuilt_local_sig {
@@ -863,6 +880,13 @@ impl MethodBodyBuilder {
         // Generate method body header
         let code_size = u32::try_from(code_bytes.len())
             .map_err(|_| malformed_error!("Method body size exceeds u32 range"))?;
+        // InitLocals zeroes the locals and `localloc` memory: a body with neither has nothing
+        // for it to do, and leaving it off lets a small body take the tiny header
+        let init_locals = init_locals
+            && (local_var_sig_token_value != 0
+                || decode_stream(&mut Parser::new(&code_bytes), 0)?
+                    .iter()
+                    .any(|instruction| instruction.mnemonic == "localloc"));
         let header = encode_method_body_header(
             code_size,
             max_stack,
@@ -886,7 +910,7 @@ impl MethodBodyBuilder {
             }
 
             // Exception handlers are encoded after the method body according to ECMA-335
-            let eh_section = encode_exception_handlers(&all_exception_handlers)?;
+            let eh_section = encode_exception_handlers(&all_exception_handlers, None)?;
             body.extend_from_slice(&eh_section);
         }
 
@@ -905,13 +929,114 @@ mod tests {
 
     use super::*;
     use crate::{
-        cilassembly::CilAssembly, metadata::cilassemblyview::CilAssemblyView, testkit::fixture,
+        cilassembly::CilAssembly,
+        metadata::{cilassemblyview::CilAssemblyView, method::MethodBody},
+        testkit::fixture,
     };
 
     fn get_test_assembly() -> Result<CilAssembly> {
         let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path)?;
         Ok(CilAssembly::new(view))
+    }
+
+    /// The exception clauses of a built body, as the body is read back.
+    fn clauses(body: &[u8]) -> Vec<ExceptionHandler> {
+        MethodBody::from(body).unwrap().exception_handlers
+    }
+
+    /// The clauses the assembler builds from `try_start`/`catch_start` are part of the body:
+    /// they were dropped.
+    #[test]
+    fn the_assembler_s_own_clauses_are_kept() -> Result<()> {
+        let mut assembly = get_test_assembly()?;
+        let exception = assembly
+            .find_corelib_typeref("System", "Exception")
+            .expect("WindowsBase references System.Exception")
+            .token;
+        let (body, _) = MethodBodyBuilder::new()
+            .implementation(move |asm| {
+                asm.try_start("t")?
+                    .nop()?
+                    .leave_s("end")?
+                    .try_end("t")?
+                    .catch_start("t", exception)?
+                    .pop()?
+                    .leave_s("end")?
+                    .catch_end("t")?
+                    .label("end")?
+                    .ret()?;
+                Ok(())
+            })
+            .build(&mut assembly)?;
+        let clauses = clauses(&body);
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].flags, ExceptionHandlerFlags::EXCEPTION);
+        assert_eq!(clauses[0].filter_offset, exception.value());
+        Ok(())
+    }
+
+    /// A catch-all is a catch of System.Object (ECMA-335 II.19): it was a fault handler, which
+    /// lets the exception go on.
+    #[test]
+    fn a_catch_all_catches_system_object() -> Result<()> {
+        let mut assembly = get_test_assembly()?;
+        let object = assembly
+            .find_corelib_typeref("System", "Object")
+            .expect("WindowsBase references System.Object")
+            .token;
+        let (body, _) = MethodBodyBuilder::new()
+            .catch_handler_with_labels("try", "try_end", "handler", "handler_end", None)
+            .implementation(|asm| {
+                asm.label("try")?
+                    .nop()?
+                    .leave_s("end")?
+                    .label("try_end")?
+                    .label("handler")?
+                    .leave_s("end")?
+                    .label("handler_end")?
+                    .label("end")?
+                    .ret()?;
+                Ok(())
+            })
+            .build(&mut assembly)?;
+        let clauses = clauses(&body);
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].flags, ExceptionHandlerFlags::EXCEPTION);
+        assert_eq!(clauses[0].filter_offset, object.value());
+        Ok(())
+    }
+
+    /// A labeled handler sits where its labels are in the finished code: finishing shortens
+    /// branches, and the labels after one moved, which the handler was resolved before.
+    #[test]
+    fn a_labeled_handler_is_resolved_after_branches_shorten() -> Result<()> {
+        let mut assembly = get_test_assembly()?;
+        let (body, _) = MethodBodyBuilder::new()
+            .finally_handler_with_labels("try", "try_end", "handler", "handler_end")
+            .implementation(|asm| {
+                asm.br("try")?
+                    .label("try")?
+                    .nop()?
+                    .leave_s("end")?
+                    .label("try_end")?
+                    .label("handler")?
+                    .endfinally()?
+                    .label("handler_end")?
+                    .label("end")?
+                    .ret()?;
+                Ok(())
+            })
+            .build(&mut assembly)?;
+        let parsed = MethodBody::from(&body).unwrap();
+        let code = &body[parsed.size_header..parsed.size_header + parsed.size_code];
+        // The leading branch comes out short (br.s, two bytes): the try region starts after it
+        assert_eq!(code[0], 0x2B, "the branch is shortened");
+        let clauses = parsed.exception_handlers;
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].try_offset, 2);
+        assert_eq!(code[clauses[0].handler_offset as usize], 0xDC, "endfinally");
+        Ok(())
     }
 
     #[test]
@@ -1126,6 +1251,32 @@ mod tests {
         // Code size is 5 bytes: ldc.i4.1(1) + ldc.i4.2(1) + add(1) + dup(1) + ret(1)
         assert_eq!(body_bytes[0], (5 << 2) | 0x02); // 0x16 = tiny format with 5-byte code
 
+        Ok(())
+    }
+
+    /// InitLocals also zeroes `localloc` memory: a body that allocates keeps it without locals,
+    /// and one with neither takes the tiny header, which cannot say it.
+    #[test]
+    fn init_locals_is_kept_where_it_zeroes_something() -> Result<()> {
+        let mut assembly = get_test_assembly()?;
+        let (allocating, _) = MethodBodyBuilder::new()
+            .implementation(|asm| {
+                // localloc
+                asm.ldc_i4_s(16)?.emit_opcode(0xFE0F, None)?.pop()?.ret()?;
+                Ok(())
+            })
+            .build(&mut assembly)?;
+        let body = MethodBody::from(&allocating)?;
+        assert!(body.is_fat);
+        assert!(body.is_init_local);
+
+        let (plain, _) = MethodBodyBuilder::new()
+            .implementation(|asm| {
+                asm.ret()?;
+                Ok(())
+            })
+            .build(&mut assembly)?;
+        assert!(!MethodBody::from(&plain)?.is_fat);
         Ok(())
     }
 }

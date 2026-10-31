@@ -662,7 +662,8 @@ impl<'a> TokenResolver<'a> {
     ///
     /// The instantiated type, resolved like any declaring type, or `None` when
     /// the TypeSpec is not a generic instantiation of a named type.
-    fn generic_definition(&self, token: Token) -> Option<CilTypeRc> {
+    #[must_use]
+    pub fn generic_definition(&self, token: Token) -> Option<CilTypeRc> {
         let tables = self.assembly.tables()?;
         let blob = self.assembly.blob()?;
         let table = <_ as TableAccess<TypeSpecRaw>>::table(tables)?;

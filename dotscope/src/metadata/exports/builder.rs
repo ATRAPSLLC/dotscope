@@ -313,6 +313,7 @@ impl NativeExportsBuilder {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The DLL name is empty or holds a null byte
     /// - Function names are invalid or empty
     /// - Ordinal values are invalid (0)
     /// - Duplicate ordinals are specified
@@ -334,6 +335,8 @@ impl NativeExportsBuilder {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<()> {
+        assembly.set_native_export_dll_name(&self.dll_name)?;
+
         // Add all named functions
         for (name, ordinal, address) in &self.functions {
             assembly.add_native_export_function(name, *ordinal, *address)?;

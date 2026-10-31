@@ -14,6 +14,9 @@
 //! - [`verification`]: SSA-based semantic comparison of original and deobfuscated assemblies.
 //! - [`compatibility`]: load and compare whole runtime corpora (Mono, .NET).
 //! - [`corpus`]: checks swept over every assembly the fixture manifest lists.
+//! - [`dump`]: an assembly's canonical dump, for comparing what two assemblies hold.
+//! - [`equivalence`]: whether generated code computes what the SSA it came from computes.
+//! - [`passes`]: running a pass in a test the way the scheduler does, verified.
 //! - [`analysis`], [`mono`]: analysis and runtime harnesses.
 //! - [`tools`]: which external tools a test may go without, and running them with a timeout.
 //! - [`TestTypeProvider`] with [`build_cfg`], [`build_ssa`] and [`build_ssa_with_handlers`]:
@@ -30,18 +33,27 @@
 )]
 
 pub mod analysis;
+pub mod arb;
 pub mod builders;
 pub mod compatibility;
 pub mod corpus;
 mod crafted2;
+pub mod dump;
 #[cfg(feature = "emulation")]
 pub mod emulation;
+#[cfg(feature = "compiler")]
+pub mod equivalence;
 pub mod factories;
 pub mod fixtures;
 #[cfg(feature = "deobfuscation")]
 pub mod framework;
+#[cfg(feature = "deobfuscation")]
+pub mod fuzz;
 pub mod helpers;
 pub mod mono;
+pub mod oracle;
+#[cfg(feature = "compiler")]
+pub mod passes;
 pub mod tools;
 mod validator;
 pub mod verification;

@@ -5,11 +5,14 @@
 
 use std::sync::{Arc, OnceLock};
 
-use crate::metadata::{
-    signatures::{SignatureProperty, TypeSignature},
-    tables::{Property, PropertyAttributes, PropertyRc},
-    token::Token,
-    typesystem::CilPrimitive,
+use crate::{
+    metadata::{
+        signatures::{SignatureProperty, TypeSignature},
+        tables::{Property, PropertyAttributes, PropertyRc},
+        token::Token,
+        typesystem::CilPrimitive,
+    },
+    utils::RowList,
 };
 
 /// Property constant value types for default values
@@ -88,7 +91,7 @@ impl PropertyBuilder {
             default: OnceLock::new(),
             fn_setter: OnceLock::new(),
             fn_getter: OnceLock::new(),
-            fn_other: OnceLock::new(),
+            fn_other: RowList::new(),
             custom_attributes: Default::default(),
         };
 

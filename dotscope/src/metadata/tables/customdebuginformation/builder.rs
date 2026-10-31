@@ -24,6 +24,7 @@
 use crate::{
     cilassembly::{ChangeRefRc, CilAssembly},
     metadata::{
+        customdebuginformation::{encode_custom_debug_blob, CustomDebugInfo},
         tables::{CodedIndex, CodedIndexType, CustomDebugInformationRaw, TableDataOwned, TableId},
         token::Token,
     },
@@ -85,6 +86,8 @@ pub struct CustomDebugInformationBuilder {
     kind: Option<u32>,
     /// Raw debug information blob data
     value: Option<Vec<u8>>,
+    /// The value, decoded: encoded when the entry is built
+    parsed: Option<CustomDebugInfo>,
 }
 
 impl CustomDebugInformationBuilder {
@@ -109,6 +112,7 @@ impl CustomDebugInformationBuilder {
             parent: None,
             kind: None,
             value: None,
+            parsed: None,
         }
     }
 
@@ -208,6 +212,39 @@ impl CustomDebugInformationBuilder {
     #[must_use]
     pub fn value(mut self, value: &[u8]) -> Self {
         self.value = Some(value.to_vec());
+        self.parsed = None;
+        self
+    }
+
+    /// Sets the custom debug information, decoded: its blob is encoded now, and its kind's
+    /// GUID is added to the `#GUID` heap when [`build`](Self::build) runs, unless
+    /// [`kind`](Self::kind) set one.
+    ///
+    /// The rows the value names (a type's documents, the method of an async method's awaits)
+    /// are rows of the input, or rows a change adds, named by their placeholders; the writer
+    /// renumbers them as it renumbers the rows.
+    ///
+    /// # Arguments
+    ///
+    /// * `info` - The value
+    ///
+    /// # Errors
+    ///
+    /// [`build`](Self::build) fails when the value cannot be encoded
+    /// ([`encode_custom_debug_blob`]).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::{metadata::customdebuginformation::CustomDebugInfo, prelude::*};
+    ///
+    /// let builder = CustomDebugInformationBuilder::new()
+    ///     .value_parsed(CustomDebugInfo::DefaultNamespace("Root".to_string()));
+    /// ```
+    #[must_use]
+    pub fn value_parsed(mut self, info: CustomDebugInfo) -> Self {
+        self.parsed = Some(info);
+        self.value = None;
         self
     }
 
@@ -252,17 +289,27 @@ impl CustomDebugInformationBuilder {
             )
         })?;
 
-        let kind = self.kind.ok_or_else(|| {
-            Error::ModificationInvalid(
-                "Kind GUID index is required for CustomDebugInformation".to_string(),
-            )
-        })?;
+        let kind = match (self.kind, &self.parsed) {
+            (Some(kind), _) => kind,
+            (None, Some(info)) => assembly
+                .guid_add(&info.kind().guid().to_bytes())?
+                .placeholder(),
+            (None, None) => {
+                return Err(Error::ModificationInvalid(
+                    "Kind GUID index is required for CustomDebugInformation".to_string(),
+                ))
+            }
+        };
 
-        let value = self.value.ok_or_else(|| {
-            Error::ModificationInvalid(
-                "Value blob data is required for CustomDebugInformation".to_string(),
-            )
-        })?;
+        let value = match (self.value, &self.parsed) {
+            (Some(value), _) => value,
+            (None, Some(info)) => encode_custom_debug_blob(info)?,
+            (None, None) => {
+                return Err(Error::ModificationInvalid(
+                    "Value blob data is required for CustomDebugInformation".to_string(),
+                ))
+            }
+        };
 
         // Validate that the parent uses a valid coded index type
         let valid_tables = CodedIndexType::HasCustomDebugInformation.tables();

@@ -221,6 +221,9 @@ pub struct InstructionEncoder {
     /// When unreachable, the current_stack_depth is meaningless since there's no execution path.
     /// Defining a label resets this to false (the label makes code reachable again).
     unreachable: bool,
+    /// Whether the stack depth is tracked and checked. Decoded instructions do not state a
+    /// call's stack effect (its signature does), so re-encoding them leaves it off.
+    tracks_stack: bool,
 }
 
 /// Maps long-form branch mnemonics to their short-form equivalents.
@@ -271,6 +274,7 @@ impl InstructionEncoder {
             label_stack_depths: HashMap::new(),
             unreachable: false,
             instruction_count: 0,
+            tracks_stack: true,
         }
     }
 
@@ -342,11 +346,10 @@ impl InstructionEncoder {
         Ok(())
     }
 
-    /// Emit an instruction from a previously decoded [`Instruction`].
-    ///
-    /// This method re-encodes a decoded instruction, preserving its mnemonic and operand.
-    /// It's useful for transforming IL bytecode by decoding, modifying operands
-    /// (e.g., remapping tokens), and re-encoding.
+    /// Emit an instruction from a previously decoded [`Instruction`], preserving its mnemonic
+    /// and operand: useful for transforming IL by decoding, modifying operands (remapping
+    /// tokens, say), and re-encoding. A branch or switch names its targets by RVA, which only
+    /// a whole body gives positions: [`Self::encode_decoded`] encodes those.
     ///
     /// # Arguments
     ///
@@ -354,8 +357,8 @@ impl InstructionEncoder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the instruction's mnemonic is not recognized or if
-    /// the operand doesn't match the expected type for that instruction.
+    /// Returns an error if the instruction's mnemonic is not recognized, if the operand
+    /// doesn't match the expected type for that instruction, or if it is a branch or switch.
     ///
     /// # Examples
     ///
@@ -378,6 +381,12 @@ impl InstructionEncoder {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn emit_instruction_decoded(&mut self, instruction: &Instruction) -> Result<()> {
+        if matches!(instruction.operand, Operand::Target(_) | Operand::Switch(_)) {
+            return Err(Error::InvalidBranch(format!(
+                "'{}' names its targets by RVA; encode the body with encode_decoded",
+                instruction.mnemonic
+            )));
+        }
         let operand = if matches!(instruction.operand, Operand::None) {
             None
         } else {
@@ -416,6 +425,12 @@ impl InstructionEncoder {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn emit_branch(&mut self, mnemonic: &str, label: &str) -> Result<()> {
+        self.emit_branch_form(mnemonic, label, true)
+    }
+
+    /// Emits a branch to `label`, which [`Self::finalize`] may shorten to its short form when
+    /// `shrinkable` and the displacement fits.
+    fn emit_branch_form(&mut self, mnemonic: &str, label: &str, shrinkable: bool) -> Result<()> {
         let (opcode, prefix, metadata) = get_mnemonic_lookup()
             .get(mnemonic)
             .ok_or_else(|| Error::InvalidMnemonic(mnemonic.to_string()))?;
@@ -455,7 +470,7 @@ impl InstructionEncoder {
 
         // Record fixup for later resolution
         // For long-form branches, record the short form for potential optimization
-        let short_form_mnemonic = if offset_size == 4 {
+        let short_form_mnemonic = if offset_size == 4 && shrinkable {
             get_short_form_mnemonic(mnemonic)
         } else {
             None
@@ -495,6 +510,106 @@ impl InstructionEncoder {
         }
 
         Ok(())
+    }
+
+    /// Encodes a decoded method body over its code: each instruction at its own position in
+    /// `code` (which starts at `code_rva`) and the bytes no instruction covers as they are,
+    /// since code no path reaches may hold anything (obfuscators fill it with junk). Every
+    /// instruction is labelled by its RVA, so branches and switches reach the same
+    /// instructions in the form they were written (a long branch stays long), and the body's
+    /// exception handlers, whose offsets are positions in `code`, stay valid. Decoded
+    /// instructions encoded this way give back `code`; ones with a remapped operand of the
+    /// same size give it back with that operand changed.
+    ///
+    /// The stack is not tracked: a call's effect on it is its signature's, which the
+    /// instructions do not state, so the body's declared stack depth is the caller's to keep.
+    ///
+    /// # Errors
+    ///
+    /// When an instruction does not encode, lies outside `code` or overlaps the one before it
+    /// (as one that changed size does), or a branch or switch reaches no instruction.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dotscope::{assembly::{decode_stream, InstructionEncoder}, Parser};
+    ///
+    /// // br.s +1, then a junk byte no path reaches, then ret
+    /// let code = [0x2B, 0x01, 0xFF, 0x2A];
+    /// let instructions: Vec<_> = decode_stream(&mut Parser::new(&code[..2]), 0x1000)?
+    ///     .into_iter()
+    ///     .chain(decode_stream(&mut Parser::new(&code[3..]), 0x1003)?)
+    ///     .collect();
+    /// assert_eq!(InstructionEncoder::encode_decoded(&instructions, &code, 0x1000)?, code);
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    pub fn encode_decoded(
+        instructions: &[Instruction],
+        code: &[u8],
+        code_rva: u64,
+    ) -> Result<Vec<u8>> {
+        let mut ordered: Vec<&Instruction> = instructions.iter().collect();
+        ordered.sort_by_key(|instruction| instruction.rva);
+        let label = |rva: u64| format!("IL_{rva:x}");
+
+        let mut encoder = InstructionEncoder {
+            tracks_stack: false,
+            ..InstructionEncoder::new()
+        };
+        // The RVA up to which `code` has been written
+        let mut written = code_rva;
+        let uncovered = |encoder: &mut InstructionEncoder, from: u64, until: u64| -> Result<()> {
+            if until < from {
+                return Err(malformed_error!(
+                    "Instruction at 0x{:x} overlaps the one before it",
+                    until
+                ));
+            }
+            let start = usize::try_from(from.saturating_sub(code_rva))
+                .map_err(|_| malformed_error!("Code offset exceeds usize"))?;
+            let end = usize::try_from(until.saturating_sub(code_rva))
+                .map_err(|_| malformed_error!("Code offset exceeds usize"))?;
+            let gap = code.get(start..end).ok_or_else(|| {
+                malformed_error!("Instruction at 0x{:x} lies outside its code", until)
+            })?;
+            encoder.emit_raw(gap);
+            Ok(())
+        };
+
+        for instruction in &ordered {
+            uncovered(&mut encoder, written, instruction.rva)?;
+            encoder.define_label(&label(instruction.rva))?;
+            match &instruction.operand {
+                Operand::Target(target) => {
+                    encoder.emit_branch_form(instruction.mnemonic, &label(*target), false)?;
+                }
+                Operand::Switch(offsets) => {
+                    let end = instruction.rva.saturating_add(instruction.size);
+                    let targets: Vec<String> = offsets
+                        .iter()
+                        .map(|offset| label(end.saturating_add_signed(i64::from(*offset))))
+                        .collect();
+                    let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+                    encoder.emit_switch(&targets)?;
+                }
+                _ => encoder.emit_instruction_decoded(instruction)?,
+            }
+            written = instruction.rva.saturating_add(instruction.size);
+        }
+        uncovered(
+            &mut encoder,
+            written,
+            code_rva.saturating_add(code.len() as u64),
+        )?;
+
+        let (code, _, _) = encoder.finalize_as_written()?;
+        Ok(code)
+    }
+
+    /// Emits `bytes` as they are: code no instruction is decoded from, kept in place. They
+    /// have no effect on the stack and hold no label.
+    pub fn emit_raw(&mut self, bytes: &[u8]) {
+        self.bytecode.extend_from_slice(bytes);
     }
 
     /// Emit a switch instruction with multiple target labels.
@@ -1128,6 +1243,12 @@ impl InstructionEncoder {
         // Optimize branches iteratively until no more improvements
         self.optimize_branch_forms()?;
 
+        self.finalize_as_written()
+    }
+
+    /// Resolves the branch and switch fixups over the bytes as they were emitted, adding and
+    /// shortening nothing: the finalization of re-encoded code, which ends as it was read.
+    fn finalize_as_written(mut self) -> Result<(Vec<u8>, u16, HashMap<String, u32>)> {
         // Resolve all branch fixups
         let fixups = std::mem::take(&mut self.fixups);
         for fixup in &fixups {
@@ -1625,6 +1746,9 @@ impl InstructionEncoder {
     ///
     /// Returns an error if stack underflow would occur (negative stack depth).
     fn update_stack_depth(&mut self, pops: u16, pushes: u8) -> Result<()> {
+        if !self.tracks_stack {
+            return Ok(());
+        }
         // A call pops up to u16::MAX arguments, so the arithmetic is in i32.
         let depth = i32::from(self.current_stack_depth)
             .saturating_add(i32::from(pushes))
@@ -1715,6 +1839,9 @@ impl InstructionEncoder {
     /// Returns an error if the label was previously recorded with a different depth,
     /// indicating inconsistent stack depths across control flow paths.
     fn record_label_stack_depth(&mut self, label: &str) -> Result<()> {
+        if !self.tracks_stack {
+            return Ok(());
+        }
         // In unreachable code, don't record or validate stack depths.
         // The current_stack_depth is meaningless since there's no execution path.
         // The first reachable branch to this label will set the correct depth.
@@ -1778,7 +1905,10 @@ impl Default for InstructionEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembly::{Immediate, Operand};
+    use crate::{
+        assembly::{decode_stream, Immediate, Operand},
+        file::parser::Parser,
+    };
 
     #[test]
     fn test_encoder_creation() {
@@ -1890,5 +2020,52 @@ mod tests {
 
         // Verify the lookup table has exactly the expected number of entries
         assert_eq!(get_mnemonic_lookup().len(), instruction_count);
+    }
+
+    /// Decoded code encoded in place is the code: a long branch stays long though its target
+    /// is near, a switch keeps its targets, and bytes between the instructions (code no path
+    /// reaches, here an invalid opcode) are kept.
+    #[test]
+    fn decoded_code_encodes_back_to_itself() {
+        let code = [
+            0x38, 0x09, 0x00, 0x00, 0x00, // br +9 (long form, to ldc.i4.1)
+            0x45, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // switch (1) +0, unreachable
+            0x17, // ldc.i4.1
+            0x2A, // ret
+        ];
+        // Only what control reaches decodes: the switch is dead, so the decoded body is the
+        // branch, ldc.i4.1 and ret, with the switch's bytes uncovered
+        let mut instructions = decode_stream(&mut Parser::new(&code[..5]), 0x2000).unwrap();
+        instructions.extend(decode_stream(&mut Parser::new(&code[14..]), 0x200E).unwrap());
+        assert_eq!(
+            InstructionEncoder::encode_decoded(&instructions, &code, 0x2000).unwrap(),
+            code
+        );
+
+        let switch = [
+            0x45, 0x02, 0, 0, 0, 0x01, 0, 0, 0, 0x00, 0, 0, 0, 0x00, 0x2A,
+        ];
+        let instructions = decode_stream(&mut Parser::new(&switch), 0x3000).unwrap();
+        assert_eq!(
+            InstructionEncoder::encode_decoded(&instructions, &switch, 0x3000).unwrap(),
+            switch
+        );
+    }
+
+    /// A decoded instruction that changed size no longer fits its place: refused, where
+    /// writing it would move every instruction and handler after it.
+    #[test]
+    fn decoded_code_that_no_longer_fits_is_refused() {
+        let code = [0x00, 0x00, 0x2A]; // nop, nop, ret
+        let mut instructions = decode_stream(&mut Parser::new(&code), 0x10).unwrap();
+        instructions[0].rva = 0x11;
+        assert!(InstructionEncoder::encode_decoded(&instructions, &code, 0x10).is_err());
+
+        // A branch on its own names its target by RVA, which only a body places
+        let branch = decode_stream(&mut Parser::new(&[0x2B, 0x00, 0x2A]), 0).unwrap();
+        assert!(InstructionEncoder::new()
+            .emit_instruction_decoded(&branch[0])
+            .is_err());
     }
 }

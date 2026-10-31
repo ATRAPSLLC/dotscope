@@ -29,6 +29,7 @@ use crate::{
         token::Token,
         typesystem::TypeRegistry,
     },
+    utils::RowList,
     Result,
 };
 
@@ -125,7 +126,7 @@ impl EventRaw {
                 }
             },
             fn_on_add: OnceLock::new(),
-            fn_on_other: OnceLock::new(),
+            fn_on_other: RowList::new(),
             fn_on_raise: OnceLock::new(),
             fn_on_remove: OnceLock::new(),
             custom_attributes: Default::default(),

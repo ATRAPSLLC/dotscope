@@ -164,16 +164,18 @@
 //! - **Missing References**: Unresolvable type or assembly references
 //! - **Truncated Data**: Incomplete import declaration data
 //!
-//! Note: Invalid UTF-8 sequences in namespace or type names are handled using lossy
-//! conversion (replacement with U+FFFD) rather than returning errors. This matches
-//! the behavior of other parsers in the codebase.
+//! Note: Invalid UTF-8 sequences in aliases and namespaces are handled using lossy
+//! conversion (replacement with U+FFFD) rather than returning errors, as
+//! System.Reflection.Metadata reads them (the oracle tier compares the two).
 //!
 //! # Performance Considerations
 //!
-//! - **Lazy Parsing**: Import declarations are parsed on-demand during debugging sessions
-//! - **Efficient Storage**: Compact representation minimizes memory overhead
-//! - **Reference Caching**: Type and assembly references are cached for repeated access
-//! - **Incremental Loading**: Large import scopes can be processed incrementally
+//! - **Parsed when loaded**: an ImportScope row's imports are decoded when the assembly's
+//!   Portable PDB is read ([`crate::CilObject::pdb`]), once per row
+//! - **Bounded work**: each declaration reads a fixed number of compressed integers and blob
+//!   lookups, so decoding is linear in the blob's size
+//! - **Owned strings**: aliases and namespaces are copied out of the `#Blob` heap, one string
+//!   each
 //!
 //! # Thread Safety
 //!
@@ -201,5 +203,5 @@
 mod parser;
 mod types;
 
-pub use parser::parse_imports_blob;
+pub use parser::{encode_import_records, parse_import_records, parse_imports_blob, ImportRecord};
 pub use types::{ImportDeclaration, ImportKind, ImportsInfo};

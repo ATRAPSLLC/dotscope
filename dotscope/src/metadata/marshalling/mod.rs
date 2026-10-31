@@ -89,7 +89,7 @@
 //! let native_type = parser.parse_native_type()?;
 //!
 //! match native_type {
-//!     NativeType::Array { element_type, num_param, num_element } => {
+//!     NativeType::Array { element_type, num_param, num_element, .. } => {
 //!         println!("Array of {:?}, param: {:?}, size: {:?}",
 //!                  element_type, num_param, num_element);
 //!     }
@@ -124,7 +124,6 @@
 //! // Create a marshalling descriptor
 //! let info = MarshallingInfo {
 //!     primary_type: NativeType::LPStr { size_param_index: Some(5) },
-//!     additional_types: vec![],
 //! };
 //!
 //! // Encode to binary format

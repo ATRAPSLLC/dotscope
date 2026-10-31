@@ -1168,19 +1168,19 @@ pub(super) fn remove_unreferenced_typespecs(
 mod tests {
     use super::*;
     use crate::{
-        cilassembly::cleanup::utils::PLACEHOLDER_RVA_THRESHOLD,
+        cilassembly::changes::METHOD_BODY_PLACEHOLDER_BASE,
         metadata::{tables::TableId, token::Token},
     };
 
     #[test]
     fn test_placeholder_rva_detection() {
         // Placeholder RVAs start at 0xF000_0000
-        const { assert!(0xF000_0000 >= PLACEHOLDER_RVA_THRESHOLD) };
-        const { assert!(0xF000_0001 >= PLACEHOLDER_RVA_THRESHOLD) };
+        const { assert!(0xF000_0000 >= METHOD_BODY_PLACEHOLDER_BASE) };
+        const { assert!(0xF000_0001 >= METHOD_BODY_PLACEHOLDER_BASE) };
 
         // Normal RVAs are below the threshold
-        const { assert!(0x2000 < PLACEHOLDER_RVA_THRESHOLD) };
-        const { assert!(0x0000_FFFF < PLACEHOLDER_RVA_THRESHOLD) };
+        const { assert!(0x2000 < METHOD_BODY_PLACEHOLDER_BASE) };
+        const { assert!(0x0000_FFFF < METHOD_BODY_PLACEHOLDER_BASE) };
     }
 
     #[test]

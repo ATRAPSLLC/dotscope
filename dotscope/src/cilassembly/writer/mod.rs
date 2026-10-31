@@ -46,6 +46,7 @@
 //! - [ECMA-335 Common Language Infrastructure (CLI)](https://www.ecma-international.org/publications/standards/Ecma-335.htm)
 //! - [PE Format Specification](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format)
 
+mod blobs;
 mod context;
 mod fields;
 mod fixups;
@@ -55,13 +56,16 @@ mod methods;
 mod output;
 mod relocations;
 mod remapper;
-mod signatures;
 mod sizes;
 mod tables;
 
 // Re-export for use by other crate modules
 // Public re-exports
 // Internal use by CilAssembly
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) use blobs::{debug_blobs, signature_blobs, BlobKind};
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) use fields::calculate_field_size;
 pub(super) use generator::PeGenerator;
 pub use generator::{DanglingPolicy, GeneratorConfig};
 pub(crate) use tables::ResolvePlaceholders;

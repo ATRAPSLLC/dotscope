@@ -7,9 +7,12 @@
 
 use std::sync::OnceLock;
 
-use crate::metadata::{
-    customattributes::CustomAttributeValueList, method::MethodRef, tables::EventAttributes,
-    token::Token, typesystem::CilTypeRef,
+use crate::{
+    metadata::{
+        customattributes::CustomAttributeValueList, method::MethodRef, tables::EventAttributes,
+        token::Token, typesystem::CilTypeRef,
+    },
+    utils::RowList,
 };
 
 /// Represents a .NET CIL event with fully resolved metadata and owned data
@@ -99,12 +102,9 @@ pub struct Event {
     /// follows patterns like `raise_EventName`, `fire_EventName`, or `on_EventName`.
     pub fn_on_raise: OnceLock<MethodRef>,
 
-    /// Other accessor method reference (optional)
-    ///
-    /// References any additional custom accessor method that doesn't fit the standard
-    /// add/remove/raise pattern. This is rarely used but allows for custom event
-    /// semantics when needed.
-    pub fn_on_other: OnceLock<MethodRef>,
+    /// The event's other methods, beyond add, remove and raise, in `MethodSemantics` table
+    /// order. ECMA-335 II.22.28 allows any number of them.
+    pub fn_on_other: RowList<MethodRef>,
 
     /// Custom attributes attached to this event
     ///

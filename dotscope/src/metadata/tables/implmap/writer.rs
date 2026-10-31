@@ -31,14 +31,7 @@ use crate::{
 
 impl RowWritable for ImplMapRaw {
     fn sort_key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
-        Ok(Some((
-            sizes.encode_coded_index(
-                self.member_forwarded.tag,
-                self.member_forwarded.row,
-                self.member_forwarded.ci_type,
-            )?,
-            0,
-        )))
+        Ok(Some((self.member_forwarded.encode(sizes)?, 0)))
     }
 
     /// Serialize an ImplMap table row to binary format
@@ -74,11 +67,7 @@ impl RowWritable for ImplMapRaw {
         )?;
 
         // Write MemberForwarded coded index
-        let member_forwarded_value = sizes.encode_coded_index(
-            self.member_forwarded.tag,
-            self.member_forwarded.row,
-            CodedIndexType::MemberForwarded,
-        )?;
+        let member_forwarded_value = self.member_forwarded.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

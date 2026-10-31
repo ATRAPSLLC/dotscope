@@ -275,7 +275,7 @@ mod tests {
             .map(|(_, attribute)| attribute.fixed_args.clone())
             .expect("the ConfusedByAttribute is loaded");
         assert!(
-            matches!(watermark.as_slice(), [CustomAttributeArgument::String(s)] if s == "Confuser.Core 1.6.0+447341964f"),
+            matches!(watermark.as_slice(), [CustomAttributeArgument::String(Some(s))] if s == "Confuser.Core 1.6.0+447341964f"),
             "{watermark:?}"
         );
     }

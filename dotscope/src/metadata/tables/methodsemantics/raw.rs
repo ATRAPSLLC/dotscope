@@ -251,8 +251,7 @@ impl MethodSemanticsRaw {
                     MethodSemanticsAttributes::OTHER => {
                         property
                             .fn_other
-                            .set(method.value().clone().into())
-                            .map_err(|_| malformed_error!("Property `other` method already set"))?;
+                            .push_row(self.token, method.value().clone().into());
                         Ok(())
                     }
                     _ => Err(malformed_error!("Invalid property semantics")),
@@ -284,8 +283,7 @@ impl MethodSemanticsRaw {
                     MethodSemanticsAttributes::OTHER => {
                         event
                             .fn_on_other
-                            .set(method.value().clone().into())
-                            .map_err(|_| malformed_error!("Event `other` method already set"))?;
+                            .push_row(self.token, method.value().clone().into());
                         Ok(())
                     }
                     _ => Err(malformed_error!("Invalid event semantics")),

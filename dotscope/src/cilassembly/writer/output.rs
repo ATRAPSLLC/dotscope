@@ -54,7 +54,10 @@
 //! - [`crate::cilassembly::writer::executor`] - Execution engine that uses output files
 //! - [`crate::cilassembly::writer`] - Main write pipeline coordination
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 use memmap2::{MmapMut, MmapOptions};
 
@@ -70,6 +73,8 @@ enum OutputBacking {
     /// Writes go to a temporary file alongside the target; [`Output::finalize`] renames it into
     /// place. The destination is not touched until generation has fully succeeded.
     File {
+        /// The temporary file, kept to grow it
+        file: File,
         /// The memory mapping of the temporary file
         mmap: MmapMut,
         /// Where the finished file will be renamed to
@@ -131,6 +136,29 @@ pub struct Output {
     finalized: bool,
 }
 
+/// Maps `file`, an output's own temporary file, for writing: when it is created and each time
+/// it grows.
+///
+/// # Errors
+///
+/// When the mapping cannot be created.
+fn map_file(file: &File) -> Result<MmapMut> {
+    // SAFETY: `map_mut` is unsafe because the mapping aliases the file's contents, and Rust
+    // cannot rule out another process mutating or truncating the file underneath us: doing so
+    // would let safe code observe a torn value or take SIGBUS. The file is one `Output::create`
+    // just created beside `target_path` and sized with `set_len`; it is not handed to anything
+    // else, and the mapping is owned by the `Output` that owns the `File`, so it cannot outlive
+    // it. Concurrent external modification of a caller-chosen output path is outside the threat
+    // model this crate defends against: an attacker who can write that path can simply replace
+    // the artefact.
+    #[allow(unsafe_code)]
+    unsafe {
+        MmapOptions::new()
+            .map_mut(file)
+            .map_err(|e| Error::MmapFailed(format!("Failed to create memory mapping: {e}")))
+    }
+}
+
 impl Output {
     /// Creates a new file-backed memory-mapped output.
     ///
@@ -142,7 +170,7 @@ impl Output {
     /// # Arguments
     ///
     /// * `target_path` - The path where the file should be created
-    /// * `size` - The total size of the file to create
+    /// * `size` - The size to create the file with: a write past it grows the file
     ///
     /// # Returns
     ///
@@ -187,26 +215,11 @@ impl Output {
         file.set_len(size)
             .map_err(|e| Error::MmapFailed(format!("Failed to set file size: {e}")))?;
 
-        // Create memory mapping.
-        //
-        // SAFETY: `map_mut` is unsafe because the mapping aliases the file's contents, and Rust
-        // cannot rule out another process mutating or truncating the file underneath us — doing
-        // so would let safe code observe a torn value or take SIGBUS. The file here is one this
-        // function just created via `OpenOptions::create` at `target_path` and sized with
-        // `set_len` above; it is not handed to anything else before the mapping is established,
-        // and the `Mmap` is owned by the returned `Output`, so its lifetime cannot outlive the
-        // `File` it borrows. Concurrent external modification of a caller-chosen output path is
-        // outside the threat model this crate defends against — an attacker who can write that
-        // path can simply replace the artefact.
-        #[allow(unsafe_code)]
-        let mmap = unsafe {
-            MmapOptions::new()
-                .map_mut(&file)
-                .map_err(|e| Error::MmapFailed(format!("Failed to create memory mapping: {e}")))?
-        };
+        let mmap = map_file(&file)?;
 
         Ok(Self {
             backing: OutputBacking::File {
+                file,
                 mmap,
                 target_path,
                 temp_path,
@@ -289,6 +302,31 @@ impl Output {
         }
     }
 
+    /// Grows the output to hold `end` bytes when it holds fewer: the size it was created with
+    /// is an estimate, and the bytes past it are zeros until written. It at least doubles, so a
+    /// run of writes past the end grows it a few times, not once per write.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be extended or mapped again.
+    fn grow_to(&mut self, end: usize) -> Result<()> {
+        let len = self.size();
+        if end <= len {
+            return Ok(());
+        }
+        let target = end.max(len.saturating_mul(2));
+        match &mut self.backing {
+            OutputBacking::Memory { data } => data.resize(target, 0),
+            OutputBacking::File { file, mmap, .. } => {
+                file.set_len(target as u64)
+                    .map_err(|e| Error::MmapFailed(format!("Failed to grow the file: {e}")))?;
+                // The new mapping replaces the old one, which no reference outlives (`&mut self`)
+                *mmap = map_file(file)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Gets a mutable slice to a specific range of the buffer.
     ///
     /// Provides bounds-checked access to a specific range within the buffer.
@@ -298,21 +336,17 @@ impl Output {
     /// * `end` - Ending byte offset (exclusive)
     ///
     /// # Errors
-    /// Returns [`crate::Error::MmapFailed`] if the range is invalid or exceeds buffer bounds.
+    /// Returns [`crate::Error::MmapFailed`] if the range is invalid, or if the output cannot grow
+    /// to hold it (a range past the end grows it).
     pub fn get_mut_range(&mut self, start: usize, end: usize) -> Result<&mut [u8]> {
-        let len = self.size();
-        if end > len {
-            return Err(Error::MmapFailed(format!(
-                "Range end {end} exceeds buffer size {len}"
-            )));
-        }
-
         if start > end {
             return Err(Error::MmapFailed(format!(
                 "Range start {start} is greater than end {end}"
             )));
         }
 
+        self.grow_to(end)?;
+        let len = self.size();
         self.as_mut_slice().get_mut(start..end).ok_or_else(|| {
             Error::LayoutFailed(format!("Range {start}..{end} exceeds buffer of size {len}"))
         })
@@ -327,19 +361,14 @@ impl Output {
     /// * `size` - Number of bytes to include in the slice
     ///
     /// # Errors
-    /// Returns [`crate::Error::MmapFailed`] if the range is invalid or exceeds buffer bounds.
+    /// Returns [`crate::Error::MmapFailed`] if the range is invalid, or if the output cannot grow
+    /// to hold it (a range past the end grows it).
     pub fn get_mut_slice(&mut self, start: usize, size: usize) -> Result<&mut [u8]> {
         let end = start.checked_add(size).ok_or_else(|| {
             Error::LayoutFailed(format!(
                 "Slice end overflows usize: start={start}, size={size}"
             ))
         })?;
-        let len = self.size();
-        if end > len {
-            return Err(Error::MmapFailed(format!(
-                "Write would exceed buffer size: start={start}, size={size}, end={end}, buffer_size={len}"
-            )));
-        }
         self.get_mut_range(start, end)
     }
 
@@ -352,7 +381,8 @@ impl Output {
     /// * `data` - Byte slice to write
     ///
     /// # Errors
-    /// Returns [`crate::Error::MmapFailed`] if the write would exceed buffer bounds.
+    /// Returns [`crate::Error::MmapFailed`] if the output cannot grow to hold the write (a write
+    /// past the end grows it).
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
         let start = usize::try_from(offset).map_err(|_| {
             Error::MmapFailed(format!("Offset {offset} too large for target architecture"))
@@ -364,17 +394,8 @@ impl Output {
                 data.len()
             ))
         })?;
+        self.grow_to(end)?;
         let len = self.size();
-
-        if end > len {
-            return Err(Error::MmapFailed(format!(
-                "Write would exceed buffer size: offset={}, len={}, buffer_size={}",
-                offset,
-                data.len(),
-                len
-            )));
-        }
-
         let dest = self.as_mut_slice().get_mut(start..end).ok_or_else(|| {
             Error::LayoutFailed(format!(
                 "Slice {start}..{end} out of bounds for buffer size {len}"
@@ -438,7 +459,8 @@ impl Output {
     /// * `size` - Number of bytes to copy
     ///
     /// # Errors
-    /// Returns [`crate::Error::MmapFailed`] if either range exceeds buffer bounds
+    /// Returns [`crate::Error::MmapFailed`] if the source range is past the end, or if the
+    /// output cannot grow to hold the target range
     /// or if the ranges overlap in a way that would cause data corruption.
     pub fn copy_range(&mut self, source_offset: u64, target_offset: u64, size: u64) -> Result<()> {
         let source_start = usize::try_from(source_offset).map_err(|_| {
@@ -474,11 +496,7 @@ impl Output {
             )));
         }
 
-        if target_end > len {
-            return Err(Error::MmapFailed(format!(
-                "Target range would exceed buffer size: {target_start}..{target_end} (buffer size: {len})"
-            )));
-        }
+        self.grow_to(target_end)?;
 
         // For safety, use copy_within which handles overlapping ranges correctly
         self.as_mut_slice()
@@ -496,7 +514,7 @@ impl Output {
     /// * `size` - Number of bytes to zero
     ///
     /// # Errors
-    /// Returns [`crate::Error::MmapFailed`] if the region would exceed file bounds.
+    /// Returns [`crate::Error::MmapFailed`] if the output cannot grow to hold the region.
     pub fn zero_range(&mut self, offset: u64, size: u64) -> Result<()> {
         let start = usize::try_from(offset).map_err(|_| {
             Error::MmapFailed(format!("Offset {offset} too large for target architecture"))
@@ -519,19 +537,15 @@ impl Output {
     /// * `byte` - Byte value to write
     ///
     /// # Errors
-    /// Returns [`crate::Error::MmapFailed`] if the offset exceeds buffer bounds.
+    /// Returns [`crate::Error::MmapFailed`] if the output cannot grow to hold the byte.
     pub fn write_byte_at(&mut self, offset: u64, byte: u8) -> Result<()> {
         let index = usize::try_from(offset).map_err(|_| {
             Error::MmapFailed(format!("Offset {offset} too large for target architecture"))
         })?;
+        self.grow_to(index.checked_add(1).ok_or_else(|| {
+            Error::LayoutFailed(format!("Byte offset {offset} overflows usize"))
+        })?)?;
         let len = self.size();
-
-        if index >= len {
-            return Err(Error::MmapFailed(format!(
-                "Byte write would exceed buffer size: offset={offset}, buffer_size={len}"
-            )));
-        }
-
         let cell = self.as_mut_slice().get_mut(index).ok_or_else(|| {
             Error::LayoutFailed(format!("Index {index} out of bounds for buffer size {len}"))
         })?;
@@ -587,10 +601,10 @@ impl Output {
     /// Returns the new offset after writing (offset + bytes_written).
     ///
     /// # Errors
-    /// Returns [`crate::Error::MmapFailed`] if the write would exceed file bounds.
+    /// Returns [`crate::Error::MmapFailed`] if the output cannot grow to hold the write.
     pub fn write_compressed_uint_at(&mut self, offset: u64, value: u32) -> Result<u64> {
         let mut buffer = Vec::new();
-        write_compressed_uint(value, &mut buffer);
+        write_compressed_uint(value, &mut buffer)?;
 
         self.write_at(offset, &buffer)?;
         offset.checked_add(buffer.len() as u64).ok_or_else(|| {
@@ -804,6 +818,7 @@ impl Output {
 
         match backing {
             OutputBacking::File {
+                file,
                 mmap,
                 target_path,
                 temp_path,
@@ -816,6 +831,7 @@ impl Output {
                 // Release the mapping before touching the file through the filesystem: on
                 // Windows a mapped file cannot be renamed.
                 drop(mmap);
+                drop(file);
 
                 // Truncate if requested
                 if let Some(size) = actual_size {
@@ -1201,11 +1217,11 @@ mod tests {
 
         let mut mmap_file = Output::create(&target_path, 10).unwrap();
 
-        // This should fail - trying to write beyond file size
-        assert!(mmap_file.write_at(8, b"too long").is_err());
-
-        // This should also fail - single byte beyond end
-        assert!(mmap_file.write_byte_at(10, 0x42).is_err());
+        // A read past the end fails: nothing was written there
+        let mut buffer = [0u8; 4];
+        assert!(mmap_file.read_at(8, &mut buffer).is_err());
+        // A copy from past the end fails the same way
+        assert!(mmap_file.copy_range(8, 0, 4).is_err());
     }
 
     #[test]
@@ -1307,6 +1323,40 @@ mod tests {
         // Verify file keeps original size
         let metadata = std::fs::metadata(&target_path).unwrap();
         assert_eq!(metadata.len(), initial_size);
+    }
+
+    /// A write past the size the output was created with grows it, keeping what was written,
+    /// in memory and in a file: the size is the writer's estimate, which a change set can
+    /// exceed (a thousand methods added to a small assembly did).
+    #[test]
+    fn a_write_past_the_end_grows_the_output() {
+        let temp_dir = tempdir().unwrap();
+        let target_path = temp_dir.path().join("grown.bin");
+        for mut output in [
+            Output::create_in_memory(8).unwrap(),
+            Output::create(&target_path, 8).unwrap(),
+        ] {
+            output.write_at(0, b"head").unwrap();
+            output.write_at(100, b"tail").unwrap();
+            output.write_byte_at(200, 0x42).unwrap();
+            output.fill_region(300, 4, 0xFF).unwrap();
+            output.copy_range(0, 400, 4).unwrap();
+            assert!(output.size() >= 404);
+            let mut read = [0u8; 4];
+            for (offset, expected) in [(0, b"head"), (100, b"tail"), (400, b"head")] {
+                output.read_at(offset, &mut read).unwrap();
+                assert_eq!(&read, expected);
+            }
+            output.read_at(50, &mut read).unwrap();
+            assert_eq!(read, [0; 4], "the bytes between writes are zeros");
+            if output.is_in_memory() {
+                assert_eq!(output.into_vec(Some(404)).unwrap().len(), 404);
+            } else {
+                output.finalize(Some(404)).unwrap();
+                let written = std::fs::read(&target_path).unwrap();
+                assert_eq!((written.len(), &written[100..104]), (404, &b"tail"[..]));
+            }
+        }
     }
 
     #[test]

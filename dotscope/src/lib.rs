@@ -1040,10 +1040,12 @@ pub use file::{
     parser::Parser,
     pe::{
         CoffHeader, DataDirectories, DataDirectory, DataDirectoryType, DosHeader,
-        Export as PeExport, Import as PeImport, Machine, OptionalHeader, Pe, PeCharacteristics,
-        SectionTable, StandardFields, Subsystem, WindowsFields,
+        Export as PeExport, ExportHeader as PeExportHeader, Import as PeImport, Machine,
+        OptionalHeader, Pe, PeCharacteristics, SectionTable, StandardFields, Subsystem,
+        WindowsFields,
     },
     repair::{repair_pe, RepairAction, RepairResult},
+    sectionmap::{RvaMapping, SectionMap},
     File,
 };
 /// Main entry point for working with .NET assemblies.
@@ -1112,8 +1114,8 @@ pub use metadata::query::{MethodQuery, TypeQuery};
 ///
 /// See the [`crate::metadata::streams`] module for comprehensive examples of all heap types and iterators.
 pub use metadata::streams::{
-    Blob, BlobIterator, Guid, GuidIterator, StreamHeader, Strings, StringsIterator, TablesHeader,
-    UserStrings, UserStringsIterator,
+    Blob, BlobIterator, Guid, GuidIterator, StreamHeader, StringEntries, Strings, StringsIterator,
+    TablesHeader, UserStrings, UserStringsIterator,
 };
 /// Configuration for metadata validation during assembly loading.
 ///

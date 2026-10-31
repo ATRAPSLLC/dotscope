@@ -64,8 +64,10 @@
 
 mod assembly;
 mod changeref;
+mod composite;
 mod heap;
 
 pub use assembly::*;
 pub use changeref::*;
+pub(crate) use composite::{BlobComposite, CompositeImport};
 pub use heap::*;

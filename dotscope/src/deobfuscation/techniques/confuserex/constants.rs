@@ -323,12 +323,12 @@ impl Technique for ConfuserExConstants {
                     if row.rva == 0 {
                         continue;
                     }
-                    if let Ok(offset) = file.rva_to_offset(row.rva as usize) {
-                        let data = file.data();
-                        if data.get(offset).is_some_and(|b| *b == LZMA_MAGIC) {
-                            has_lzma_fieldrva = true;
-                            data_field_tokens.push(Token::from_parts(TableId::Field, row.field));
-                        }
+                    if file
+                        .rva_slice(row.rva as usize, 1)
+                        .is_ok_and(|data| data.first() == Some(&LZMA_MAGIC))
+                    {
+                        has_lzma_fieldrva = true;
+                        data_field_tokens.push(Token::from_parts(TableId::Field, row.field));
                     }
                 }
             }

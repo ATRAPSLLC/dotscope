@@ -125,6 +125,7 @@ impl MetadataLoader for ImplMapLoader {
     /// Array of table identifiers that must be loaded before `ImplMap` processing.
     fn dependencies(&self) -> &'static [TableId] {
         &[
+            TableId::Field,
             TableId::MethodDef,
             TableId::ModuleRef,
             TableId::Module,

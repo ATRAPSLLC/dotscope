@@ -113,10 +113,128 @@ impl MetadataLoader for MethodSemanticsLoader {
     /// Array of required [`crate::metadata::tables::TableId`] dependencies
     fn dependencies(&self) -> &'static [TableId] {
         &[
+            TableId::MethodDef,
             TableId::Event,
             TableId::EventMap,
             TableId::Property,
             TableId::PropertyMap,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        metadata::{
+            method::MethodAccessFlags,
+            tables::{CodedIndex, CodedIndexType, TableDataOwned},
+            token::Token,
+            validation::ValidationConfig,
+        },
+        testkit::helpers::load_sample,
+        CilObject,
+    };
+
+    /// A property or an event may have any number of other methods (ECMA-335 II.22.28): the
+    /// second was refused as "already set", which a strict load turns into a failed load.
+    #[test]
+    fn every_other_method_of_a_property_and_an_event_is_kept() {
+        let sample = load_sample("crafted_2.exe");
+        let first = |table: TableId| -> (Token, usize) {
+            sample
+                .types()
+                .iter()
+                .find_map(|entry| {
+                    let cil_type = entry.value();
+                    match table {
+                        TableId::Property => cil_type
+                            .properties
+                            .iter()
+                            .next()
+                            .map(|(_, p)| (p.token, p.fn_other.len())),
+                        _ => cil_type
+                            .events
+                            .iter()
+                            .next()
+                            .map(|(_, e)| (e.token, e.fn_on_other.len())),
+                    }
+                })
+                .unwrap_or_else(|| panic!("the sample declares a {table:?}"))
+        };
+        let (property, property_before) = first(TableId::Property);
+        let (event, event_before) = first(TableId::Event);
+        let mut others: Vec<Token> = sample
+            .methods()
+            .iter()
+            .filter(|entry| entry.value().flags_access == MethodAccessFlags::PUBLIC)
+            .map(|entry| *entry.key())
+            .take(2)
+            .collect();
+        others.sort();
+        assert_eq!(others.len(), 2);
+
+        let mut assembly = sample.into_assembly();
+        for (table, owner) in [(TableId::Property, property), (TableId::Event, event)] {
+            for method in &others {
+                assembly
+                    .table_row_add(
+                        TableId::MethodSemantics,
+                        TableDataOwned::MethodSemantics(MethodSemanticsRaw {
+                            rid: 0,
+                            token: Token::new(0),
+                            offset: 0,
+                            semantics: 0x0004,
+                            method: method.row(),
+                            association: CodedIndex::new(
+                                table,
+                                owner.row(),
+                                CodedIndexType::HasSemantics,
+                            ),
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        let reloaded = CilObject::from_mem_with_validation(
+            assembly.to_memory().unwrap(),
+            ValidationConfig::production(),
+        )
+        .unwrap();
+
+        let mut property_others = Vec::new();
+        let mut event_others = Vec::new();
+        for entry in reloaded.types().iter() {
+            for (_, p) in entry.value().properties.iter() {
+                if p.token == property {
+                    property_others.extend(
+                        p.fn_other
+                            .iter()
+                            .filter_map(|(_, m)| m.upgrade())
+                            .map(|m| m.token),
+                    );
+                }
+            }
+            for (_, e) in entry.value().events.iter() {
+                if e.token == event {
+                    event_others.extend(
+                        e.fn_on_other
+                            .iter()
+                            .filter_map(|(_, m)| m.upgrade())
+                            .map(|m| m.token),
+                    );
+                }
+            }
+        }
+        for (kept, before) in [
+            (&property_others, property_before),
+            (&event_others, event_before),
+        ] {
+            assert_eq!(kept.len(), before + 2, "{kept:?}");
+            assert!(
+                others.iter().all(|method| kept.contains(method)),
+                "{kept:?}"
+            );
+        }
     }
 }

@@ -7,7 +7,8 @@
 //! `reject`, and [`Loads`] holds it to exactly that error.
 //!
 //! [`CORPUS_FILTER`] narrows a sweep to the fixtures whose path contains one of its
-//! comma-separated parts.
+//! comma-separated parts, and [`CORPUS_REPORT`] names a file a failing sweep writes all its
+//! findings to.
 
 use std::{
     collections::BTreeMap,
@@ -17,13 +18,36 @@ use std::{
 
 use crate::{
     analysis::{SsaVerifier, VerifyLevel},
+    metadata::streams::{Blob, Guid, Strings, TablesHeader, UserStrings},
     testkit::fixtures::{manifest, samples_dir, without_locations, Fixture},
-    CilObject,
+    CilAssemblyView, CilObject,
 };
+
+mod codecs;
+#[cfg(feature = "compiler")]
+mod codegen;
+mod determinism;
+mod identity;
+mod writer;
+
+pub use codecs::{
+    BodyCode, CustomAttributes, ExceptionStructure, Marshalling, MethodBodies, PermissionSets,
+    Signatures,
+};
+#[cfg(feature = "compiler")]
+pub use codegen::CodegenEquivalence;
+pub use determinism::Deterministic;
+pub(crate) use identity::raw_tables;
+pub use identity::{Heaps, TableRows};
+pub use writer::WritesBackUnchanged;
 
 /// The environment variable that narrows a sweep: comma-separated parts, one of which a
 /// fixture's path must contain.
 pub const CORPUS_FILTER: &str = "DOTSCOPE_CORPUS_FILTER";
+
+/// The environment variable naming a file a failing sweep writes every finding to, where its
+/// panic message lists a few per check.
+pub const CORPUS_REPORT: &str = "DOTSCOPE_CORPUS_REPORT";
 
 /// How many assemblies a sweep holds loaded at once: the largest lift to gigabytes of SSA.
 const MAX_THREADS: usize = 8;
@@ -38,6 +62,21 @@ pub struct CorpusItem {
     /// Its manifest entry.
     pub fixture: &'static Fixture,
     object: OnceLock<Result<CilObject, String>>,
+    view: OnceLock<Result<CilAssemblyView, String>>,
+}
+
+/// An assembly's tables and heaps, from whichever of its loads succeeded.
+pub struct Metadata<'a> {
+    /// The tables stream.
+    pub tables: Option<&'a TablesHeader<'a>>,
+    /// The `#Strings` heap.
+    pub strings: Option<&'a Strings<'a>>,
+    /// The `#US` heap.
+    pub userstrings: Option<&'a UserStrings<'a>>,
+    /// The `#Blob` heap.
+    pub blobs: Option<&'a Blob<'a>>,
+    /// The `#GUID` heap.
+    pub guids: Option<&'a Guid<'a>>,
 }
 
 impl CorpusItem {
@@ -48,7 +87,48 @@ impl CorpusItem {
             path,
             fixture,
             object: OnceLock::new(),
+            view: OnceLock::new(),
         }
+    }
+
+    /// The assembly's file bytes.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read.
+    pub fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(samples_dir().join(self.path))
+            .map_err(|error| format!("cannot be read: {error}"))
+    }
+
+    /// The assembly's tables and heaps: the loaded [`CilObject`]'s, or for one that does not
+    /// load (a fixture malformed by design among them), a [`CilAssemblyView`]'s. `None` when
+    /// neither reads the file.
+    pub fn metadata(&self) -> Option<Metadata<'_>> {
+        if let Ok(object) = self.object() {
+            return Some(Metadata {
+                tables: object.tables(),
+                strings: object.strings(),
+                userstrings: object.userstrings(),
+                blobs: object.blob(),
+                guids: object.guids(),
+            });
+        }
+        let view = self
+            .view
+            .get_or_init(|| {
+                CilAssemblyView::from_mem(self.bytes()?)
+                    .map_err(|error| without_locations(&error.to_string()))
+            })
+            .as_ref()
+            .ok()?;
+        Some(Metadata {
+            tables: view.tables(),
+            strings: view.strings(),
+            userstrings: view.userstrings(),
+            blobs: view.blobs(),
+            guids: view.guids(),
+        })
     }
 
     /// The assembly as [`CilObject::from_mem`] loads it, with the validation it applies by
@@ -60,9 +140,8 @@ impl CorpusItem {
     pub fn object(&self) -> Result<&CilObject, &str> {
         self.object
             .get_or_init(|| {
-                let bytes = std::fs::read(samples_dir().join(self.path))
-                    .map_err(|error| format!("cannot be read: {error}"))?;
-                CilObject::from_mem(bytes).map_err(|error| without_locations(&error.to_string()))
+                CilObject::from_mem(self.bytes()?)
+                    .map_err(|error| without_locations(&error.to_string()))
             })
             .as_ref()
             .map_err(String::as_str)
@@ -76,6 +155,14 @@ pub trait CorpusCheck: Sync {
 
     /// What `item` gets wrong, a line per finding: empty when it has the property.
     fn run(&self, item: &CorpusItem) -> Vec<String>;
+
+    /// What the check counted, by kind, over the items it ran on since it was last asked,
+    /// without finding a defect in them: cases it could not decide, say. Asking drains the
+    /// counts, so each sweep reports its own. The sweep reports them with its findings, so
+    /// nothing a check passes over goes unseen.
+    fn take_tallies(&self) -> BTreeMap<String, usize> {
+        BTreeMap::new()
+    }
 }
 
 /// What a sweep found.
@@ -86,22 +173,51 @@ pub struct SweepReport {
     /// Each check's findings, as `path: finding`, in path order. A check that found nothing
     /// has no entry.
     pub findings: BTreeMap<&'static str, Vec<String>>,
+    /// Each check's [tallies](CorpusCheck::take_tallies). A check that counted nothing has no
+    /// entry.
+    pub tallies: BTreeMap<&'static str, BTreeMap<String, usize>>,
 }
 
 impl SweepReport {
+    /// Each check's tallies, a line per kind.
+    #[must_use]
+    pub fn tally_lines(&self) -> String {
+        let mut lines = String::new();
+        for (check, tallies) in &self.tallies {
+            for (kind, count) in tallies {
+                lines.push_str(&format!("{check}: {count:>9}  {kind}\n"));
+            }
+        }
+        lines
+    }
+
     /// Whether no check found anything.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.findings.is_empty()
     }
 
+    /// Prints the tallies, then asserts nothing was found.
+    ///
     /// # Panics
     ///
-    /// When a check found anything: the message lists the findings, check by check.
+    /// When a check found anything: the message lists the findings, check by check, and the
+    /// tallies.
     pub fn assert_clean(&self) {
         assert!(self.assemblies > 0, "the sweep found no assemblies");
+        eprint!("{}", self.tally_lines());
         if self.is_clean() {
             return;
+        }
+        if let Some(path) = std::env::var_os(CORPUS_REPORT) {
+            let all: Vec<String> = self
+                .findings
+                .iter()
+                .flat_map(|(check, findings)| findings.iter().map(move |f| format!("{check}\t{f}")))
+                .collect();
+            if let Err(error) = std::fs::write(&path, all.join("\n")) {
+                eprintln!("{CORPUS_REPORT}: {error}");
+            }
         }
         let mut message = format!("{} assemblies swept:\n", self.assemblies);
         for (check, findings) in &self.findings {
@@ -117,17 +233,23 @@ impl SweepReport {
                 message.push_str(&format!("  ... and {more} more\n"));
             }
         }
+        message.push_str(&self.tally_lines());
         panic!("{message}");
     }
 }
 
-/// The corpus: every `.dll` and `.exe` the manifest lists, narrowed by [`CORPUS_FILTER`].
+/// The corpus: every `.dll`, `.exe` and `.winmd` the manifest lists, narrowed by
+/// [`CORPUS_FILTER`].
 #[must_use]
 pub fn corpus() -> Vec<CorpusItem> {
     let filter = std::env::var(CORPUS_FILTER).ok();
     manifest()
         .iter()
-        .filter(|(path, _)| path.ends_with(".dll") || path.ends_with(".exe"))
+        .filter(|(path, _)| {
+            [".dll", ".exe", ".winmd"]
+                .iter()
+                .any(|kind| path.ends_with(kind))
+        })
         .filter(|(path, _)| {
             filter
                 .as_deref()
@@ -153,7 +275,7 @@ pub fn sweep(checks: &[&dyn CorpusCheck]) -> SweepReport {
 pub fn sweep_items(items: Vec<CorpusItem>, checks: &[&dyn CorpusCheck]) -> SweepReport {
     let report = Mutex::new(SweepReport {
         assemblies: items.len(),
-        findings: BTreeMap::new(),
+        ..SweepReport::default()
     });
     let queue = Mutex::new(items.into_iter());
     let threads = std::thread::available_parallelism()
@@ -198,6 +320,12 @@ pub fn sweep_items(items: Vec<CorpusItem>, checks: &[&dyn CorpusCheck]) -> Sweep
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for findings in report.findings.values_mut() {
         findings.sort();
+    }
+    for check in checks {
+        let tallies = check.take_tallies();
+        if !tallies.is_empty() {
+            report.tallies.insert(check.id(), tallies);
+        }
     }
     report
 }
@@ -293,6 +421,28 @@ mod tests {
     struct Names;
     struct Panics;
 
+    /// A check that finds nothing and counts the items it ran on.
+    #[derive(Default)]
+    struct Counts(Mutex<usize>);
+
+    impl CorpusCheck for Counts {
+        fn id(&self) -> &'static str {
+            "counts"
+        }
+
+        fn run(&self, _item: &CorpusItem) -> Vec<String> {
+            *self.0.lock().unwrap() += 1;
+            Vec::new()
+        }
+
+        fn take_tallies(&self) -> BTreeMap<String, usize> {
+            BTreeMap::from([(
+                "items".to_string(),
+                std::mem::take(&mut *self.0.lock().unwrap()),
+            )])
+        }
+    }
+
     impl CorpusCheck for Names {
         fn id(&self) -> &'static str {
             "names"
@@ -334,6 +484,18 @@ mod tests {
         assert!(!report.is_clean());
     }
 
+    /// What a check counts is reported with the sweep, each sweep its own.
+    #[test]
+    fn a_sweep_reports_each_checks_tallies() {
+        let counts = Counts::default();
+        for _ in 0..2 {
+            let report = sweep_items(vec![crafted(None), crafted(None)], &[&counts]);
+            assert!(report.is_clean());
+            assert_eq!(report.tallies["counts"]["items"], 2);
+            assert!(report.tally_lines().contains("counts:         2  items"));
+        }
+    }
+
     #[test]
     fn a_fixture_is_held_to_the_rejection_its_entry_names() {
         assert!(Loads.run(&crafted(None)).is_empty());
@@ -346,8 +508,10 @@ mod tests {
 
     #[test]
     fn a_corpus_lists_only_assemblies() {
-        assert!(corpus()
+        let corpus = corpus();
+        assert!(corpus.iter().all(|item| [".dll", ".exe", ".winmd"]
             .iter()
-            .all(|item| item.path.ends_with(".dll") || item.path.ends_with(".exe")));
+            .any(|kind| item.path.ends_with(kind))));
+        assert!(corpus.iter().any(|item| item.path.ends_with(".winmd")));
     }
 }

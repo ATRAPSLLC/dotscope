@@ -251,6 +251,33 @@ impl TableInfo {
     ///
     /// * [ECMA-335 Partition II, Section 24.2.6](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - #~ Stream
     pub fn new(data: &[u8], valid_bitvec: u64, wide_columns: bool) -> Result<Self> {
+        Self::read(data, valid_bitvec, wide_columns, None)
+    }
+
+    /// Reads a Portable PDB's tables header: its own tables' row counts from `data`, and the
+    /// row counts of the assembly tables its columns index from `external_rows` (the `#Pdb`
+    /// stream's, by [`TableId`]), so an index into a type-system table the PDB does not hold
+    /// is as wide as that table needs.
+    ///
+    /// # Errors
+    ///
+    /// As [`TableInfo::new`].
+    pub fn with_external_rows(
+        data: &[u8],
+        valid_bitvec: u64,
+        external_rows: &[u32; 64],
+    ) -> Result<Self> {
+        Self::read(data, valid_bitvec, false, Some(external_rows))
+    }
+
+    /// Reads the row counts `data` declares, and takes those of the tables it does not
+    /// declare from `external_rows`.
+    fn read(
+        data: &[u8],
+        valid_bitvec: u64,
+        wide_columns: bool,
+        external_rows: Option<&[u32; 64]>,
+    ) -> Result<Self> {
         // Reject bits that name no table before reading a single row count.
         //
         // `TableId` covers 0x00-0x2C and 0x30-0x37; the gaps at 0x2D-0x2F and 0x38-0x3F have no
@@ -299,6 +326,19 @@ impl TableInfo {
             *slot = TableRowInfo::new(row_count);
         }
 
+        // A Portable PDB's columns index the assembly's tables, which the PDB does not hold
+        if let Some(external_rows) = external_rows {
+            for table_id in TableId::iter() {
+                let rows = external_rows.get(table_id as usize).copied().unwrap_or(0);
+                if rows != 0 && valid_bitvec & (1 << table_id as usize) == 0 {
+                    let slot = table_info
+                        .get_mut(table_id as usize)
+                        .ok_or(out_of_bounds_error!())?;
+                    *slot = TableRowInfo::new(rows);
+                }
+            }
+        }
+
         let heap_size_flags = read_le::<u8>(data.get(6..).ok_or(out_of_bounds_error!())?)?;
         let mut table_info = TableInfo {
             rows: table_info,
@@ -317,7 +357,7 @@ impl TableInfo {
         Ok(table_info)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     /// Special constructor for unit tests with controlled table configuration.
     ///
     /// This method allows precise control over table sizes and heap configurations
@@ -341,7 +381,10 @@ impl TableInfo {
         large_guid: bool,
     ) -> Self {
         let mut table_info = TableInfo {
-            rows: vec![TableRowInfo::default(); TableId::CustomDebugInformation as usize + 1],
+            rows: vec![
+                TableRowInfo::default();
+                (TableId::CustomDebugInformation as usize).saturating_add(1)
+            ],
             declared: 0,
             coded_indexes: vec![0; CodedIndexType::COUNT],
             is_large_index_str: large_str,
@@ -351,7 +394,9 @@ impl TableInfo {
         };
 
         for valid_table in valid_tables {
-            table_info.rows[valid_table.0 as usize] = TableRowInfo::new(valid_table.1);
+            if let Some(row) = table_info.rows.get_mut(valid_table.0 as usize) {
+                *row = TableRowInfo::new(valid_table.1);
+            }
             table_info.declared |= 1u64 << (valid_table.0 as usize);
         }
 
@@ -924,5 +969,27 @@ mod heap_size_tests {
         assert!(narrowed.is_large_str());
         assert!(narrowed.is_large_guid());
         assert!(narrowed.is_large_blob());
+    }
+
+    /// A Portable PDB's columns index the assembly's tables by the `#Pdb` stream's row
+    /// counts: past 65535 MethodDef rows a LocalScope's method index is four bytes, and the
+    /// tables the stream declares keep their own counts.
+    #[test]
+    fn external_rows_size_indexes_into_the_assembly() {
+        // A tables header declaring one LocalScope row
+        let mut header = vec![0u8; 24];
+        let valid = 1u64 << (TableId::LocalScope as u8);
+        header[8..16].copy_from_slice(&valid.to_le_bytes());
+        header.extend_from_slice(&1u32.to_le_bytes());
+
+        let mut external = [0u32; 64];
+        external[TableId::MethodDef as usize] = 70_000;
+        let wide = TableInfo::with_external_rows(&header, valid, &external).unwrap();
+        assert_eq!(wide.table_index_bytes(TableId::MethodDef), 4);
+        assert_eq!(wide.row_count(TableId::LocalScope), 1);
+
+        external[TableId::MethodDef as usize] = 100;
+        let narrow = TableInfo::with_external_rows(&header, valid, &external).unwrap();
+        assert_eq!(narrow.table_index_bytes(TableId::MethodDef), 2);
     }
 }

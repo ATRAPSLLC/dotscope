@@ -600,20 +600,17 @@ impl Interpreter {
 
         match array_ref {
             EmValue::ObjectRef(href) => {
-                let obj = thread.get_heap_object(href)?;
-                let length = match obj {
-                    HeapObject::Array { elements, .. } => elements.len(),
-                    HeapObject::MultiArray { dimensions, .. } => dimensions.iter().product(),
-                    HeapObject::String(s) => s.len(),
-                    _ => {
-                        return Err(EmulationError::TypeMismatch {
-                            operation: "ldlen",
-                            expected: "array",
-                            found: "non-array object",
-                        }
-                        .into())
+                let length = thread.heap().with_object(href, |obj| match obj {
+                    HeapObject::Array { elements, .. } => Ok(elements.len()),
+                    HeapObject::MultiArray { dimensions, .. } => Ok(dimensions.iter().product()),
+                    HeapObject::String(s) => Ok(s.len()),
+                    _ => Err(EmulationError::TypeMismatch {
+                        operation: "ldlen",
+                        expected: "array",
+                        found: "non-array object",
                     }
-                };
+                    .into()),
+                })?;
                 thread.push(EmValue::NativeUInt(length as u64))?;
                 Ok(StepResult::Continue)
             }
@@ -763,8 +760,7 @@ impl Interpreter {
 
         match array_ref {
             EmValue::ObjectRef(href) => {
-                let obj = thread.get_heap_object(href)?;
-                let element = match obj {
+                let element = thread.heap().with_object(href, |obj| match obj {
                     HeapObject::Array {
                         element_type,
                         elements,
@@ -773,7 +769,7 @@ impl Interpreter {
                         // E.g., ldelem.ref (expected=Object) on string[] (element=String)
                         // should succeed since String is assignable to Object.
                         if !element_type.is_compatible_with(expected_type)
-                            && !expected_type.is_compatible_with(&element_type)
+                            && !expected_type.is_compatible_with(element_type)
                         {
                             return Err(EmulationError::TypeMismatch {
                                 operation: "ldelem",
@@ -784,26 +780,24 @@ impl Interpreter {
                         }
 
                         let array_idx = usize::try_from(idx).ok();
-                        match array_idx.and_then(|i| elements.get(i)) {
-                            Some(v) => v.clone(),
-                            None => {
-                                return Err(EmulationError::ArrayIndexOutOfBounds {
+                        array_idx
+                            .and_then(|i| elements.get(i))
+                            .cloned()
+                            .ok_or_else(|| {
+                                EmulationError::ArrayIndexOutOfBounds {
                                     index: idx,
                                     length: elements.len(),
                                 }
-                                .into());
-                            }
-                        }
+                                .into()
+                            })
                     }
-                    _ => {
-                        return Err(EmulationError::TypeMismatch {
-                            operation: "ldelem",
-                            expected: "array",
-                            found: "non-array object",
-                        }
-                        .into())
+                    _ => Err(EmulationError::TypeMismatch {
+                        operation: "ldelem",
+                        expected: "array",
+                        found: "non-array object",
                     }
-                };
+                    .into()),
+                })?;
                 thread.push(element)?;
                 Ok(StepResult::Continue)
             }
@@ -870,20 +864,15 @@ impl Interpreter {
         match array_ref {
             EmValue::ObjectRef(href) => {
                 // Also verify against the array's declared element type
-                let array_element_type = {
-                    let obj = thread.get_heap_object(href)?;
-                    match obj {
-                        HeapObject::Array { element_type, .. } => element_type,
-                        _ => {
-                            return Err(EmulationError::TypeMismatch {
-                                operation: "stelem",
-                                expected: "array",
-                                found: "non-array object",
-                            }
-                            .into())
-                        }
+                let array_element_type = thread.heap().with_object(href, |obj| match obj {
+                    HeapObject::Array { element_type, .. } => Ok(element_type.clone()),
+                    _ => Err(EmulationError::TypeMismatch {
+                        operation: "stelem",
+                        expected: "array",
+                        found: "non-array object",
                     }
-                };
+                    .into()),
+                })?;
 
                 // Check type compatibility
                 // Note: We allow flexible type checking for reference types because:
@@ -1043,12 +1032,9 @@ impl Interpreter {
 
         // Helper to load field from heap reference
         let load_from_href = |thread: &mut EmulationThread, href: HeapRef| -> Result<StepResult> {
-            let obj = thread.get_heap_object(href)?;
-            match obj {
+            let value = thread.heap().with_object(href, |obj| match obj {
                 HeapObject::Object { fields, .. } => {
-                    let value = fields.get(&field_token).cloned().unwrap_or(EmValue::Null);
-                    thread.push(value)?;
-                    Ok(StepResult::Continue)
+                    Ok(fields.get(&field_token).cloned().unwrap_or(EmValue::Null))
                 }
                 _ => Err(EmulationError::TypeMismatch {
                     operation: "ldfld",
@@ -1056,7 +1042,9 @@ impl Interpreter {
                     found: "non-object",
                 }
                 .into()),
-            }
+            })?;
+            thread.push(value)?;
+            Ok(StepResult::Continue)
         };
 
         // Helper to extract a field from a ValueType

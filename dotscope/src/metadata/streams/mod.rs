@@ -257,22 +257,16 @@
 //!
 //! ## Iterator Error Behavior
 //!
-//! Stream iterators have two error handling strategies, chosen based on data characteristics:
+//! An iterator stops only where the heap's own structure ends, never at an entry it cannot
+//! decode, so nothing after a malformed entry goes unseen:
 //!
-//! | Iterator | Strategy | Rationale |
-//! |----------|----------|-----------|
-//! | `StringsIterator` | Fail-fast | Null-terminated strings have clear boundaries |
-//! | `BlobIterator` | Fail-fast | Length prefixes define exact extents |
-//! | `GuidIterator` | Fail-fast | Fixed 16-byte entries have rigid structure |
-//! | `UserStringsIterator` | Best-effort recovery | Complex format may have recoverable corruption |
-//!
-//! **Fail-fast iterators** return `None` immediately on encountering malformed data,
-//! terminating iteration. This is appropriate when data corruption affects parsing
-//! of subsequent entries.
-//!
-//! **Best-effort iterators** attempt to skip over corrupted entries (with bounded
-//! retry limits) to continue yielding valid data. This is useful for forensic
-//! analysis of partially corrupted assemblies.
+//! | Iterator | Entries | Ends |
+//! |----------|---------|------|
+//! | `StringEntries` | every entry, as bytes | at the end of the heap |
+//! | `StringsIterator` | the entries that are valid UTF-8 | at the end of the heap |
+//! | `UserStringsIterator` | the entries that hold a string | where a length is unreadable or overruns the heap |
+//! | `BlobIterator` | every entry | where a length is unreadable or overruns the heap |
+//! | `GuidIterator` | every 16-byte entry | at the last whole entry |
 //!
 //! ## Common Error Scenarios
 //! - Corrupted or truncated stream data
@@ -336,7 +330,7 @@ pub use streamheader::StreamHeader;
 /// Provides [`crate::metadata::streams::strings::Strings`] and [`crate::metadata::streams::strings::StringsIterator`] for accessing null-terminated
 /// UTF-8 strings used for type names, member names, and other identifiers.
 mod strings;
-pub use strings::{Strings, StringsIterator};
+pub use strings::{StringEntries, Strings, StringsIterator};
 
 /// UTF-16 user string heap (`#US`) implementation.
 ///
@@ -365,3 +359,8 @@ pub use guid::{Guid, GuidIterator};
 /// binary data including signatures, custom attributes, and constants.
 mod blob;
 pub use blob::{Blob, BlobIterator};
+
+/// The Portable PDB `#Pdb` stream: the PDB's identity, entry point, and the row counts of the
+/// assembly tables its tables reference.
+mod pdb;
+pub use pdb::PdbStream;

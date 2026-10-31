@@ -243,6 +243,63 @@ impl DecryptionPass {
         (result, failure)
     }
 
+    /// The value a decryptor receives for the constant `value`, allocated in `process` where
+    /// it is an object: a user string read from the assembly's `#US` heap, a string or an
+    /// array an earlier decryption produced.
+    ///
+    /// # Errors
+    ///
+    /// Why `process` cannot build the value: a user string the heap does not hold, an array
+    /// whose element type or data does not resolve, a constant with no CIL value.
+    fn argument(
+        process: &EmulationProcess,
+        value: &ConstValue,
+    ) -> std::result::Result<EmValue, String> {
+        let heap = process.address_space();
+        match value {
+            ConstValue::String(offset) => {
+                let text = process
+                    .assembly()
+                    .and_then(|assembly| assembly.userstrings())
+                    .and_then(|strings| strings.get(*offset as usize).ok())
+                    .ok_or_else(|| format!("no user string at 0x{offset:X}"))?
+                    .to_string_lossy();
+                heap.alloc_string(&text)
+                    .map(EmValue::ObjectRef)
+                    .map_err(|e| e.to_string())
+            }
+            ConstValue::DecryptedString(text) => heap
+                .alloc_string(text)
+                .map(EmValue::ObjectRef)
+                .map_err(|e| e.to_string()),
+            ConstValue::DecryptedArray(array) => {
+                let token = array.element_type_ref.token();
+                let flavor = process
+                    .assembly()
+                    .and_then(|assembly| assembly.types().get(&token))
+                    .map(|element| element.flavor().clone())
+                    .ok_or_else(|| format!("array element type {token} does not resolve"))?;
+                let size = array.element_size;
+                if array.data.len().checked_rem(size) != Some(0) {
+                    return Err(format!(
+                        "{} bytes of array data are no whole number of {size}-byte elements",
+                        array.data.len()
+                    ));
+                }
+                let elements = array
+                    .data
+                    .chunks_exact(size)
+                    .map(|bytes| EmValue::from_le_bytes(bytes, &flavor, PointerSize::Bit32))
+                    .collect();
+                heap.managed_heap()
+                    .alloc_array_with_values(flavor, elements)
+                    .map(EmValue::ObjectRef)
+                    .map_err(|e| e.to_string())
+            }
+            other => EmValue::try_from(other).map_err(|e| e.to_string()),
+        }
+    }
+
     /// Emulates a call to get the decrypted constant.
     ///
     /// Uses Copy-on-Write fork semantics for efficient emulation. A template
@@ -279,26 +336,23 @@ impl DecryptionPass {
             }
         };
 
-        // Convert ConstValue arguments to EmValue.
-        // ConstValue::String holds a #US heap offset - resolve it to an actual
-        // string from the assembly's UserStrings heap and allocate on the
-        // emulation heap so the decryptor receives a proper ObjectRef.
-        let em_args: Vec<EmValue> = args
-            .iter()
-            .map(|cv| match cv {
-                ConstValue::String(us_offset) => {
-                    let resolved = process.assembly().and_then(|asm| {
-                        let us = asm.userstrings()?;
-                        let u16str = us.get(*us_offset as usize).ok()?;
-                        let s = u16str.to_string_lossy();
-                        let href = process.address_space().alloc_string(&s).ok()?;
-                        Some(EmValue::ObjectRef(href))
-                    });
-                    resolved.unwrap_or_else(|| EmValue::from(cv))
+        // A decryptor receives each argument as the value the evaluation stack holds,
+        // objects allocated in the process; one the process cannot build fails the site
+        // rather than reaching the decryptor as something else.
+        let mut em_args = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            match Self::argument(&process, arg) {
+                Ok(value) => em_args.push(value),
+                Err(reason) => {
+                    return (
+                        None,
+                        Some(FailureReason::EmulationFailed(format!(
+                            "argument {index}: {reason}"
+                        ))),
+                    );
                 }
-                _ => EmValue::from(cv),
-            })
-            .collect();
+            }
+        }
 
         // Use thread-safe container to capture the return value
         let captured_value: Arc<Mutex<Option<ConstValue>>> = Arc::new(Mutex::new(None));
@@ -779,6 +833,44 @@ impl DecryptionPass {
                 &mut changed,
             );
 
+            // The padding updates whose result nothing but a `pop` reads (ConfuserEx discards
+            // it) advance a state nothing observes any more, and keep the context type alive:
+            // they go with their pops, before the initialization, which a `newobj` context
+            // they read keeps
+            let padding: Vec<&StateUpdateCall> = state_updates
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !feeding_indices.contains(i))
+                .map(|(_, update)| update)
+                .collect();
+            let padding_results: HashSet<SsaVarId> =
+                padding.iter().map(|update| update.dest).collect();
+            let mut sites: Vec<(usize, usize)> = padding
+                .iter()
+                .map(|update| (update.block_idx, update.instr_idx))
+                .collect();
+            for (block_idx, block) in ssa.iter_blocks() {
+                for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                    if let SsaOp::Pop { value } = instr.op() {
+                        if padding_results.contains(value) {
+                            sites.push((block_idx, instr_idx));
+                        }
+                    }
+                }
+            }
+            for (block_idx, instr_idx, op) in ssa.remove_unread_instructions(sites) {
+                changed = true;
+                if !matches!(op, SsaOp::Pop { .. }) {
+                    changes
+                        .record(EventKind::InstructionRemoved)
+                        .at(
+                            method_token,
+                            block_idx.saturating_mul(1000).saturating_add(instr_idx),
+                        )
+                        .message("removed state machine update call nothing reads");
+                }
+            }
+
             // Remove state machine initialization calls (constructor)
             Self::cleanup_state_initialization(
                 ssa,
@@ -1146,6 +1238,7 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
     use crate::{
         analysis::{
             CallGraph, ConstValue, DefSite, MethodRef, SsaFunction, SsaFunctionBuilder, SsaOp,
@@ -1156,8 +1249,75 @@ mod tests {
             context::AnalysisContext, passes::DecryptionPass, DeobfuscationEngine, EngineConfig,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        testkit::{fixture, helpers::test_assembly_arc},
+        testkit::{
+            emulation::process_builder, fixture, helpers::test_assembly_arc, passes::run_verified,
+        },
     };
+
+    /// A decryptor receives each constant as the value the stack holds: strings and arrays as
+    /// objects of the process, handles as `ldtoken` pushes them. Each went in as null, and a
+    /// user string the heap does not hold as its offset.
+    #[test]
+    fn a_decryptor_receives_its_arguments_as_the_stack_holds_them() {
+        let assembly = test_assembly_arc();
+        let process = process_builder()
+            .assembly_arc(Arc::clone(&assembly))
+            .build()
+            .unwrap();
+        let heap = process.address_space().managed_heap();
+        let object = |value: &ConstValue| match DecryptionPass::argument(&process, value) {
+            Ok(EmValue::ObjectRef(object)) => object,
+            other => panic!("{value:?} became {other:?}"),
+        };
+
+        let decrypted = object(&ConstValue::DecryptedString("decrypted".into()));
+        assert_eq!(&*heap.get_string(decrypted).unwrap(), "decrypted");
+
+        let (offset, text) = assembly
+            .userstrings()
+            .and_then(|strings| strings.iter().find(|(offset, _)| *offset != 0))
+            .expect("the sample has a user string");
+        let user = object(&ConstValue::String(u32::try_from(offset).unwrap()));
+        assert_eq!(*heap.get_string(user).unwrap(), *text.to_string_lossy());
+        assert!(
+            DecryptionPass::argument(&process, &ConstValue::String(u32::MAX)).is_err(),
+            "a user string the heap does not hold is no argument"
+        );
+
+        let int32 = assembly
+            .types()
+            .iter()
+            .find(|entry| *entry.value().flavor() == CilFlavor::I4)
+            .map(|entry| *entry.key())
+            .expect("the sample names System.Int32");
+        let array = |data: Vec<u8>| {
+            ConstValue::DecryptedArray(Box::new(DecryptedArrayData {
+                data,
+                element_type_ref: TypeRef::new(int32),
+                element_size: 4,
+            }))
+        };
+        let elements = object(&array(
+            [1_i32, -2].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        ));
+        assert_eq!(
+            heap.get_array_element(elements, 0).unwrap(),
+            EmValue::I32(1)
+        );
+        assert_eq!(
+            heap.get_array_element(elements, 1).unwrap(),
+            EmValue::I32(-2)
+        );
+        assert!(
+            DecryptionPass::argument(&process, &array(vec![0; 5])).is_err(),
+            "five bytes are no whole number of int32s"
+        );
+
+        assert_eq!(
+            DecryptionPass::argument(&process, &ConstValue::Type(TypeRef::new(int32))).unwrap(),
+            EmValue::NativeInt(i64::from(int32.value()))
+        );
+    }
 
     /// Helper to create a minimal analysis context for testing.
     fn create_test_context() -> AnalysisContext {
@@ -1238,9 +1398,13 @@ mod tests {
             .unwrap();
 
         // No decryptors registered, should return false (no changes)
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1265,9 +1429,13 @@ mod tests {
             .unwrap();
 
         // Has decryptors but no calls to them
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1293,9 +1461,13 @@ mod tests {
             .unwrap();
 
         // Call without destination, can't replace
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1322,9 +1494,13 @@ mod tests {
             .unwrap();
 
         // Argument is not in known_values, should fail
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
 
         // Should have recorded a failure
@@ -1353,9 +1529,13 @@ mod tests {
             })
             .unwrap();
 
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1390,7 +1570,12 @@ mod tests {
 
         // This will try to decrypt but fail (no assembly for emulation)
         // The point is that it recognized the MethodSpec as a decryptor call
-        let _ = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler);
+        let _ = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        );
 
         // Verify the MethodSpec was resolved to the decryptor and a failure was recorded
         // (failure because there's no assembly to emulate against)

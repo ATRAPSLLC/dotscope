@@ -474,8 +474,7 @@ impl<'a> SsaFacts<'a> {
 fn is_zero_bits(value: &ConstValue) -> bool {
     value.is_zero()
         || value.is_null()
-        || matches!(value, ConstValue::F32(f) if f.to_bits() == 0)
-        || matches!(value, ConstValue::F64(f) if f.to_bits() == 0)
+        || matches!(value, ConstValue::Float(bits) if bits.bits() == 0)
 }
 
 /// A store width narrower than the four-byte evaluation stack entry.

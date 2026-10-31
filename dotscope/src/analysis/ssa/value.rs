@@ -11,7 +11,7 @@
 //! - Adds `TryFrom<&ConstValue<CilTarget>> for Immediate` for instruction
 //!   encoding (orphan-rule allowed: `Immediate` is local).
 
-use analyssa::ir::value::ConstValue as AnalyssaConstValue;
+use analyssa::ir::{value::ConstValue as AnalyssaConstValue, FloatFormat};
 
 use crate::{
     analysis::ssa::{target::CilTarget, types::SsaType},
@@ -57,8 +57,6 @@ impl ConstValueCilExt for AnalyssaConstValue<CilTarget> {
             AnalyssaConstValue::U16(_) => SsaType::U16,
             AnalyssaConstValue::U32(_) => SsaType::U32,
             AnalyssaConstValue::U64(_) => SsaType::U64,
-            AnalyssaConstValue::F32(_) => SsaType::F32,
-            AnalyssaConstValue::F64(_) => SsaType::F64,
             AnalyssaConstValue::NativeInt(_)
             | AnalyssaConstValue::Type(_)
             | AnalyssaConstValue::MethodHandle(_)
@@ -68,8 +66,15 @@ impl ConstValueCilExt for AnalyssaConstValue<CilTarget> {
             AnalyssaConstValue::Null
             | AnalyssaConstValue::String(_)
             | AnalyssaConstValue::DecryptedString(_)
-            | AnalyssaConstValue::Vector(_)
             | AnalyssaConstValue::DecryptedArray { .. } => SsaType::Object,
+            // Constants of the native substrate CIL has no type for: SIMD vectors, and float
+            // formats other than binary32 and binary64.
+            AnalyssaConstValue::Float(bits) => match bits.format() {
+                FloatFormat::Single => SsaType::F32,
+                FloatFormat::Double => SsaType::F64,
+                _ => SsaType::Unknown,
+            },
+            AnalyssaConstValue::Vector(_) => SsaType::Unknown,
             // Uninhabited for this target: CIL has no symbol space.
             AnalyssaConstValue::Symbol(symbol) => match *symbol {},
         }
@@ -113,8 +118,14 @@ impl TryFrom<&AnalyssaConstValue<CilTarget>> for Immediate {
                 Ok(Immediate::Int64(*v as i64))
             }
 
-            AnalyssaConstValue::F32(v) => Ok(Immediate::Float32(*v)),
-            AnalyssaConstValue::F64(v) => Ok(Immediate::Float64(*v)),
+            AnalyssaConstValue::Float(bits) => match bits.format() {
+                FloatFormat::Single => f32::try_from(*bits).map(Immediate::Float32),
+                FloatFormat::Double => f64::try_from(*bits).map(Immediate::Float64),
+                _ => Err(*bits),
+            }
+            .map_err(|bits| {
+                Error::SsaError(format!("{bits:?} has a float format CIL cannot load"))
+            }),
 
             AnalyssaConstValue::True => Ok(Immediate::Int32(1)),
             AnalyssaConstValue::False => Ok(Immediate::Int32(0)),
@@ -350,21 +361,21 @@ mod tests {
         let v = ConstValue::I32(42);
         assert_eq!(
             v.convert_to(&SsaType::F32, false, 8),
-            Some(ConstValue::F32(42.0))
+            Some(ConstValue::from(42.0_f32))
         );
 
         // i32 -> f64
         let v = ConstValue::I32(42);
         assert_eq!(
             v.convert_to(&SsaType::F64, false, 8),
-            Some(ConstValue::F64(42.0))
+            Some(ConstValue::from(42.0_f64))
         );
 
         // Unsigned source to float
         let v = ConstValue::U32(42);
         assert_eq!(
             v.convert_to(&SsaType::F32, true, 8),
-            Some(ConstValue::F32(42.0))
+            Some(ConstValue::from(42.0_f32))
         );
     }
 
@@ -590,21 +601,33 @@ mod tests {
 
     #[test]
     fn test_const_float_arithmetic() {
-        let a = ConstValue::F32(10.5);
-        let b = ConstValue::F32(2.5);
-        assert_eq!(a.add(&b, PointerSize::Bit64), Some(ConstValue::F32(13.0)));
-        assert_eq!(a.sub(&b, PointerSize::Bit64), Some(ConstValue::F32(8.0)));
-        assert_eq!(a.mul(&b, PointerSize::Bit64), Some(ConstValue::F32(26.25)));
+        let a = ConstValue::from(10.5_f32);
+        let b = ConstValue::from(2.5_f32);
+        assert_eq!(
+            a.add(&b, PointerSize::Bit64),
+            Some(ConstValue::from(13.0_f32))
+        );
+        assert_eq!(
+            a.sub(&b, PointerSize::Bit64),
+            Some(ConstValue::from(8.0_f32))
+        );
+        assert_eq!(
+            a.mul(&b, PointerSize::Bit64),
+            Some(ConstValue::from(26.25_f32))
+        );
 
-        let a = ConstValue::F64(100.0);
-        let b = ConstValue::F64(4.0);
-        assert_eq!(a.div(&b, PointerSize::Bit64), Some(ConstValue::F64(25.0)));
+        let a = ConstValue::from(100.0_f64);
+        let b = ConstValue::from(4.0_f64);
+        assert_eq!(
+            a.div(&b, PointerSize::Bit64),
+            Some(ConstValue::from(25.0_f64))
+        );
     }
 
     #[test]
     fn test_const_float_comparison() {
-        let a = ConstValue::F64(std::f64::consts::PI);
-        let b = ConstValue::F64(std::f64::consts::E);
+        let a = ConstValue::from(std::f64::consts::PI);
+        let b = ConstValue::from(std::f64::consts::E);
         assert_eq!(a.cgt(&b, PointerSize::Bit64), Some(ConstValue::True));
         assert_eq!(a.clt(&b, PointerSize::Bit64), Some(ConstValue::False));
         assert_eq!(a.ceq(&a), Some(ConstValue::True));
@@ -612,12 +635,12 @@ mod tests {
 
     #[test]
     fn test_const_float_div_by_zero() {
-        let a = ConstValue::F64(1.0);
-        let b = ConstValue::F64(0.0);
+        let a = ConstValue::from(1.0_f64);
+        let b = ConstValue::from(0.0_f64);
         // Float div by zero returns inf, not None
         let result = a.div(&b, PointerSize::Bit64);
         assert!(result.is_some());
-        if let Some(ConstValue::F64(v)) = result {
+        if let Some(v) = result.as_ref().and_then(ConstValue::as_f64) {
             assert!(v.is_infinite());
         }
     }
@@ -698,12 +721,12 @@ mod tests {
 
         // Floating point types
         assert_eq!(
-            ConstValue::F32(std::f32::consts::PI).zero_of_same_type(),
-            ConstValue::F32(0.0)
+            ConstValue::from(std::f32::consts::PI).zero_of_same_type(),
+            ConstValue::from(0.0_f32)
         );
         assert_eq!(
-            ConstValue::F64(std::f64::consts::PI).zero_of_same_type(),
-            ConstValue::F64(0.0)
+            ConstValue::from(std::f64::consts::PI).zero_of_same_type(),
+            ConstValue::from(0.0_f64)
         );
 
         // Non-numeric types default to I32
@@ -821,7 +844,7 @@ mod tests {
         // A width mismatch is what makes a fold impossible: an integer and a
         // float have no common representation to add in.
         let i32_val = ConstValue::I32(10);
-        let f32_val = ConstValue::F32(std::f32::consts::PI);
+        let f32_val = ConstValue::from(std::f32::consts::PI);
         assert!(i32_val.add(&f32_val, PointerSize::Bit64).is_none());
 
         // Signedness is not such a mismatch. CIL has one 64-bit integer stack

@@ -366,8 +366,6 @@ macro_rules! owned_validators {
 #[cfg(test)]
 mod tests {
 
-    use rayon::ThreadPoolBuilder;
-
     use super::*;
     use crate::{
         metadata::{
@@ -421,8 +419,7 @@ mod tests {
         let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
         let scanner = ReferenceScanner::from_view(&view).unwrap();
         let config = ValidationConfig::minimal();
-        let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
-        let context = factory::raw_loading_context(&view, &scanner, &config, &thread_pool);
+        let context = factory::raw_loading_context(&view, &scanner, &config);
 
         let validator = TestRawValidator {
             name: "TestValidator",

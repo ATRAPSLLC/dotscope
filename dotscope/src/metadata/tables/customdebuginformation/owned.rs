@@ -21,81 +21,103 @@ use crate::metadata::{
     customdebuginformation::CustomDebugInfo, token::Token, typesystem::CilTypeReference,
 };
 
-/// Owned representation of a `CustomDebugInformation` table entry
+/// Owned representation of a `CustomDebugInformation` table entry (table `0x37`)
 ///
-/// This structure contains the processed `CustomDebugInformation` data with all heap indices
-/// resolved to their actual data. Custom debug information provides extensibility for
-/// debugging scenarios beyond the standard Portable PDB tables, allowing compilers
-/// and tools to store implementation-specific debugging metadata.
+/// This structure holds a `CustomDebugInformation` row with its heap indices resolved: the
+/// kind's GUID read from the `#GUID` heap, and the value's blob decoded by that kind.
+/// Custom debug information carries debugging data beyond the standard Portable PDB tables,
+/// recorded by compilers and tools under a GUID of their choosing.
 ///
-/// # Custom Debug Information Types
+/// # Custom Debug Information Kinds
 ///
-/// The Kind field contains a GUID that identifies the specific type of custom debug
-/// information. Microsoft compilers define several well-known types:
+/// The Kind column names a GUID that decides how the Value blob is read.
+/// [`CustomDebugKind`](crate::metadata::customdebuginformation::CustomDebugKind) has a variant
+/// for each kind the Portable PDB specification and the C#, Visual Basic and F# compilers
+/// define, and the [module documentation](crate::metadata::customdebuginformation) gives each
+/// blob's layout. They fall into these groups:
+///
+/// ## Source and Build Information
+/// - **`{CC110556-A091-4D38-9FEC-25AB9A351A6A}`**: Source Link (Module)
+///   JSON mapping document paths to the URLs their sources can be fetched from.
+/// - **`{0E8A571B-6926-466E-B4AD-8AB04611F5FE}`**: Embedded Source (Document)
+///   The document's source, stored as it is or deflated.
+/// - **`{B5FEEC05-8CD0-4A83-96DA-466284BB4BD8}`**: Compilation Options (Module)
+///   The compiler's name, version, language version and the options it was run with.
+/// - **`{7E4D4708-096E-4C5C-AEDA-CB10BA6A740D}`**: Compilation Metadata References (Module)
+///   Each assembly the module was compiled against, by name, time stamp, size and MVID.
+/// - **`{58B2EAB6-209F-4E4E-A22C-B2D0F910C782}`**: Default Namespace (Module)
+///   A Visual Basic project's root namespace.
+/// - **`{932E74BC-DBA9-4478-8D46-0F32A7BAB3D3}`**: Type Definition Documents (TypeDef)
+///   The documents of a type that has no method bodies to name them through sequence points.
+///
+/// ## Local Information
+/// - **`{83C563C4-B4F3-47D5-B824-BA5441477EA8}`**: Dynamic Local Variables (LocalVariable,
+///   LocalConstant) Which types in the local's type the source declared `dynamic`.
+/// - **`{ED9FDF71-8879-4747-8ED3-FE5EDE3CE710}`**: Tuple Element Names (LocalVariable,
+///   LocalConstant) The element names of the tuple types in the local's type.
 ///
 /// ## State Machine Information
-/// - **`{6DA9A61E-F8C7-4874-BE62-68BC5630DF71}`**: State Machine Hoisted Local Scopes
-///   Associates variables hoisted to state machine fields with their scope information.
+/// - **`{6DA9A61E-F8C7-4874-BE62-68BC5630DF71}`**: State Machine Hoisted Local Scopes (MethodDef)
+///   The IL scope of each local an async method or iterator hoisted to a field.
+/// - **`{54FD2AC5-E925-401A-9C2A-F94F171072F8}`**: Async Method Stepping Information (MethodDef)
+///   The yield and resume offsets of each `await`, so a debugger can step over it.
 ///
-/// - **`{755F52A8-91C5-45BE-B4B8-209571E552BD}`**: Edit and Continue Local Slot Map
-///   Maps local variables to their syntax positions for edit-and-continue debugging.
+/// ## Edit and Continue Information
+/// - **`{755F52A8-91C5-45BE-B4B8-209571E552BD}`**: Local Slot Map (MethodDef)
+///   The syntax that declared each local slot.
+/// - **`{A643004C-0240-496F-A783-30D64F4979DE}`**: Lambda and Closure Map (MethodDef)
+///   The syntax of each lambda and closure in the method.
+/// - **`{8B78CD68-2EDE-420B-980B-E15884B8AAA3}`**: State Machine State Map (MethodDef)
+///   The syntax each state of a state machine suspends at.
+/// - **`{9D40ACE1-C703-4D0E-BF41-7243060A8FB5}`**: Primary Constructor Information (MethodDef)
+///   Marks a C# primary constructor.
 ///
-/// - **`{A643004C-0240-496F-A783-30D64F4979DE}`**: Edit and Continue Lambda and Closure Map
-///   Maps lambdas and closures to their implementing methods and syntax positions.
-///
-/// ## Dynamic and Source Information
-/// - **`{83C563C4-B4F3-47D5-B824-BA5441477EA8}`**: Dynamic Local Variables (C#)
-///   Tracks which System.Object types were originally declared as `dynamic` in source code.
-///
-/// - **`{58b2eab6-209f-4e4e-a22c-b2d0f910c782}`**: Default Namespace (VB)
-///   Stores the default namespace for VB.NET projects/modules.
-///
-/// - **`{0E8A571B-6926-466E-B4AD-8AB04611F5FE}`**: Embedded Source
-///   Contains source code embedded directly in the PDB file.
-///
-/// - **`{CC110556-A091-4D38-9FEC-25AB9A351A6A}`**: Source Link
-///   JSON configuration for retrieving source files from version control systems.
+/// A GUID none of these name decodes to
+/// [`CustomDebugInfo::Unknown`](crate::metadata::customdebuginformation::CustomDebugInfo::Unknown),
+/// which keeps its blob.
 ///
 /// # Parent Element
 ///
-/// The Parent field identifies which metadata element this custom debug information
-/// is associated with. It can reference methods, types, fields, parameters, and many
-/// other metadata elements through the `HasCustomDebugInformation` coded index.
+/// The Parent column names the entity the information is about through the
+/// `HasCustomDebugInformation` coded index: any of the assembly's tables that
+/// `HasCustomAttribute` names, and the PDB's Document, LocalScope, LocalVariable,
+/// LocalConstant and ImportScope tables. [`parent`](Self::parent) resolves a parent in the
+/// assembly's tables; [`parent_token`](Self::parent_token) names every parent, including one
+/// in the PDB's own tables, and is what
+/// [`PortablePdb::custom_debug_info_of`](crate::metadata::pdb::PortablePdb::custom_debug_info_of)
+/// looks rows up by.
 ///
 /// # Usage Examples
 ///
 /// ```no_run
-/// use dotscope::metadata::tables::CustomDebugInformation;
-/// use dotscope::metadata::customdebuginformation::CustomDebugInfo;
+/// use dotscope::metadata::{customdebuginformation::CustomDebugInfo, tables::CustomDebugInformation};
 ///
-/// # fn process_custom_debug(custom_debug: &CustomDebugInformation) -> crate::Result<()> {
-/// // Example: Processing different types of custom debug information
-/// match &custom_debug.value {
-///     CustomDebugInfo::SourceLink { document } => {
-///         println!("Source Link JSON: {}", document);
-///         // Parse JSON to get source server mappings
-///     }
-///     CustomDebugInfo::EmbeddedSource { filename, content } => {
-///         println!("Embedded source file: {}", filename);
-///         println!("Content: {} characters", content.len());
-///     }
-///     CustomDebugInfo::CompilationMetadata { metadata } => {
-///         println!("Compilation metadata: {}", metadata);
-///     }
-///     CustomDebugInfo::Unknown { kind, data } => {
-///         println!("Unknown debug info type: {:?}", kind);
-///         println!("Raw data: {} bytes", data.len());
-///         // Handle custom or unsupported debug information types
+/// fn describe(row: &CustomDebugInformation) {
+///     match &row.value {
+///         CustomDebugInfo::SourceLink(json) => println!("Source Link JSON: {json}"),
+///         CustomDebugInfo::EmbeddedSource { .. } => match row.value.embedded_source_text() {
+///             Some(Ok(text)) => println!("Embedded source: {} characters", text.len()),
+///             Some(Err(e)) => println!("Embedded source that does not inflate: {e}"),
+///             None => {}
+///         },
+///         CustomDebugInfo::CompilationOptions(options) => {
+///             for (name, value) in options {
+///                 println!("{name}: {value}");
+///             }
+///         }
+///         CustomDebugInfo::Unknown { kind, data } => {
+///             // Custom or newer kinds keep their blob
+///             println!("Unknown debug info {kind}: {} bytes", data.len());
+///         }
+///         other => println!("{:?} on 0x{:08X}", other.kind(), row.parent_token.value()),
 ///     }
 /// }
-/// # Ok(())
-/// # }
 /// ```
 ///
 /// # References
 ///
-/// - [Portable PDB Format - CustomDebugInformation Table](https://github.com/dotnet/corefx/blob/master/src/System.Reflection.Metadata/specs/PortablePdb-Metadata.md#customdebuginformation-table-0x37)
-/// - [Custom Debug Information Records](https://github.com/dotnet/corefx/blob/master/src/System.Reflection.Metadata/specs/PortablePdb-Metadata.md#language-specific-custom-debug-information-records)
+/// - Portable PDB v1.0: CustomDebugInformation Table (0x37)
+/// - Portable PDB v1.0: Language Specific Custom Debug Information Records
 #[derive(Clone)]
 pub struct CustomDebugInformation {
     /// Row identifier (1-based index in the table)
@@ -107,43 +129,35 @@ pub struct CustomDebugInformation {
     /// Byte offset of this row in the original metadata stream
     pub offset: usize,
 
-    /// Reference to the metadata element this custom debug information is associated with
-    ///
-    /// This field contains a resolved reference to the metadata element that this
-    /// custom debug information is associated with. The reference can point to any
-    /// type of metadata element that supports custom debug information.
-    ///
-    /// Common parent types include:
-    /// - `MethodDef`: Method-specific debug information (most common)
-    /// - Document: Document-specific information (embedded source, etc.)
-    /// - Module: Module/assembly-wide information (default namespace, source link)
-    /// - `LocalVariable`/`LocalConstant`: Variable-specific information (dynamic flags)
-    /// - `TypeDef`: Type-specific debug information
+    /// The parent, resolved in the assembly's tables (a method, type, field, the module,
+    /// ...); [`CilTypeReference::None`] for a parent in the PDB's own tables, which
+    /// [`parent_token`](Self::parent_token) names
     pub parent: CilTypeReference,
+
+    /// The parent's token, as the row names it. [`parent`](Self::parent) resolves only the
+    /// assembly's own tables, so a parent in the PDB's tables (a document, local scope,
+    /// local variable or constant, or import scope) is known by this token alone.
+    pub parent_token: Token,
 
     /// GUID identifying the type of custom debug information
     ///
-    /// This GUID determines how to interpret the Value data. Well-known GUIDs
-    /// are defined by Microsoft compilers, but tools can define their own
-    /// custom types by using unique GUIDs.
+    /// This GUID determines how the Value blob was read. Well-known GUIDs are defined by
+    /// the Portable PDB specification and the compilers ([`crate::metadata::pdb::guids`]),
+    /// and tools can define their own by choosing a new GUID.
     ///
-    /// The GUID serves as both a type identifier and a versioning mechanism -
-    /// if a format needs to change, a new GUID should be defined rather than
-    /// modifying an existing format.
+    /// The GUID serves as both a type identifier and a versioning mechanism: when a format
+    /// needs to change, a new GUID is defined rather than the existing format modified.
     pub kind: Guid,
 
     /// Parsed custom debug information data
     ///
-    /// This field contains the structured representation of the custom debug information
-    /// blob, parsed according to the Kind GUID. Instead of raw bytes, this provides
-    /// direct access to the meaningful data structures such as:
-    /// - Source Link JSON documents for source server mappings
-    /// - Embedded source file content with filenames
-    /// - Compilation metadata and options as structured text
-    /// - Unknown formats preserved as raw data for future processing
+    /// The Value blob decoded by [`kind`](Self::kind): the Source Link JSON, an embedded
+    /// source (kept as stored, deflated or not, until its text is asked for), the
+    /// compilation options and references, a method's Edit and Continue maps, a local's
+    /// `dynamic` flags or tuple names, and so on. A kind dotscope does not know keeps its blob
+    /// as [`CustomDebugInfo::Unknown`].
     ///
-    /// The parsing is performed automatically during the conversion from raw to owned
-    /// representation, providing immediate access to the debug information without
-    /// requiring additional parsing steps.
+    /// Decoding happens when the row is loaded; a blob that is not in its kind's format fails
+    /// the row.
     pub value: CustomDebugInfo,
 }

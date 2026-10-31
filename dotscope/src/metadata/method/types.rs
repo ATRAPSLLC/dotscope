@@ -151,7 +151,7 @@
 
 use crate::metadata::{
     signatures::{CustomModifier, SignatureLocalVariable, TypeSignature},
-    typesystem::{CilFlavor, CilModifier, CilTypeRef, CilTypeRefList},
+    typesystem::{CilFlavor, CilModifier, CilTypeRef},
 };
 
 /// Bitmask for extracting code type from [`crate::metadata::method::MethodImplCodeType`] implementation flags.
@@ -1267,6 +1267,10 @@ impl SectionFlags {
     /// type of data section and contains structured exception handling metadata.
     pub const EHTABLE: Self = Self(0x1);
 
+    /// The bits that name a section's kind (`CorILMethod_Sect_KindMask`): a section is an EH
+    /// table when these are [`Self::EHTABLE`] alone.
+    pub const KIND_MASK: Self = Self(0x3F);
+
     /// Reserved section type for optional IL tables.
     ///
     /// This flag is reserved by the ECMA-335 specification and shall be zero
@@ -1481,83 +1485,4 @@ impl LocalVariable {
             | CilFlavor::Unknown => TypeSignature::Object,
         })
     }
-}
-
-/// Variable argument parameter used in method signatures to describe vararg parameters.
-///
-/// `VarArg` represents a single parameter in the variable-length argument list of a
-/// method that uses varargs (...) calling convention. Each vararg parameter has its
-/// own type signature and modifiers, allowing for type-safe variable argument processing.
-///
-/// # Varargs in .NET
-///
-/// Variable arguments in .NET are less common than in C/C++ but are still supported
-/// for scenarios like P/Invoke to C libraries that use varargs, or for implementing
-/// methods like `String.Format` with variable parameter counts.
-///
-/// # Type Resolution
-///
-/// Like `LocalVariable`, `VarArg` contains fully resolved type references rather than
-/// raw signature data, making it efficient for analysis and code generation without
-/// requiring additional type lookups.
-///
-/// # Examples
-///
-/// ```no_run
-/// use dotscope::CilObject;
-/// use std::path::Path;
-///
-/// let assembly = CilObject::from_path(Path::new("tests/samples/WindowsBase.dll"))?;
-///
-/// for entry in assembly.methods().iter() {
-///     let method = entry.value();
-///
-///     if !method.varargs.is_empty() {
-///         println!("Method '{}' has {} vararg parameters:",
-///                  method.name, method.varargs.len());
-///
-///         for (i, vararg) in method.varargs.iter().enumerate() {
-///             let arg_info = format!("  VarArg[{}] Type: {}, ByRef: {}, Modifiers: {}",
-///                                   i,
-///                                   vararg.base.name(),
-///                                   vararg.by_ref,
-///                                   vararg.modifiers.len());
-///             println!("{}", arg_info);
-///         }
-///     }
-/// }
-/// # Ok::<(), dotscope::Error>(())
-/// ```
-///
-/// # Memory Management
-///
-/// - **Type References**: Use `Arc` for efficient sharing and thread safety
-/// - **Modifiers**: Reference-counted vectors for minimal memory overhead  
-/// - **Flags**: Simple boolean values for fast access
-///
-/// # Thread Safety
-///
-/// `VarArg` is thread-safe through its use of `Arc`-based type references.
-/// Multiple threads can safely access vararg parameter information concurrently.
-pub struct VarArg {
-    /// Custom modifiers applied to the parameter type.
-    ///
-    /// These are optional and required modifiers that change the semantic meaning
-    /// of the base parameter type. Common modifiers include `const`, `volatile`,
-    /// or custom attribute-based type modifications.
-    pub modifiers: CilTypeRefList,
-
-    /// Whether the parameter is passed by reference.
-    ///
-    /// When `true`, the parameter is passed by reference rather than by value.
-    /// This allows the called method to modify the original value in the caller's
-    /// context, similar to `ref` or `out` parameters in C#.
-    pub by_ref: bool,
-
-    /// The resolved base type of the parameter.
-    ///
-    /// This is the primary type of the vararg parameter after all type tokens
-    /// have been resolved to concrete type references. The type includes full
-    /// namespace and assembly qualification for unambiguous identification.
-    pub base: CilTypeRef,
 }

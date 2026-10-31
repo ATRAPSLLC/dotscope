@@ -90,6 +90,8 @@ pub struct StringDecryptionPass {
     string_cache: Mutex<HashMap<Token, String>>,
     /// Crypto parameters extracted from the decryptor method's SSA.
     crypto_params: CryptoParameters,
+    /// The most PRF invocations one key derivation may take, 0 for no bound.
+    max_work: u64,
 }
 
 impl StringDecryptionPass {
@@ -99,10 +101,13 @@ impl StringDecryptionPass {
     ///
     /// * `findings` - Detection findings containing decryptor method tokens.
     /// * `crypto_params` - PBKDF2/AES parameters extracted from the decryptor SSA.
+    /// * `max_work` - The most PRF invocations one key derivation may take, 0 for no bound
+    ///   (the parameters are constants of an attacker-supplied method body).
     #[must_use]
     pub fn from_findings(
         findings: &BitMonoStringFindings,
         crypto_params: CryptoParameters,
+        max_work: u64,
     ) -> Self {
         let decryptor_tokens = findings.decryptor_tokens.iter().copied().collect();
         Self {
@@ -111,6 +116,7 @@ impl StringDecryptionPass {
             key_cache: Mutex::new(HashMap::new()),
             string_cache: Mutex::new(HashMap::new()),
             crypto_params,
+            max_work,
         }
     }
 
@@ -136,7 +142,7 @@ impl StringDecryptionPass {
 
         let salt_bytes = get_field_rva_data(assembly, salt_token.row(), field_rva_map)?;
         let key_bytes = get_field_rva_data(assembly, key_token.row(), field_rva_map)?;
-        let derived = derive_key_iv(&key_bytes, &salt_bytes, &self.crypto_params)?;
+        let derived = derive_key_iv(&key_bytes, &salt_bytes, &self.crypto_params, self.max_work)?;
 
         self.key_cache
             .lock()
@@ -462,10 +468,10 @@ fn get_field_rva_data(
         Error::Deobfuscation(format!("No FieldRVA entry for field RID 0x{:X}", field_rid))
     })?;
 
-    let file = assembly.file();
-    let offset = file.rva_to_offset(*rva as usize)?;
-    let data = file.data_slice(offset, *size)?;
-    Ok(data.to_vec())
+    Ok(assembly
+        .file()
+        .rva_slice(*rva as usize, *size)?
+        .into_owned())
 }
 
 /// Decrypts a single encrypted string using AES-256-CBC with PKCS7 padding.
@@ -510,7 +516,7 @@ mod tests {
     use super::*;
     use crate::{
         analysis::{CallGraph, FieldRef, SsaFunctionBuilder, SsaInstruction, SsaType},
-        testkit::helpers::test_assembly_arc,
+        testkit::{helpers::test_assembly_arc, passes::run_verified},
     };
 
     /// A site whose decryption fails keeps the salt and key loads it shares
@@ -524,16 +530,22 @@ mod tests {
                 let loads: Vec<SsaVarId> = (0..4).map(|_| f.var()).collect();
                 f.block(0, |b| {
                     for (row, &dest) in (1..).zip(&loads[..3]) {
-                        b.op(SsaOp::LoadStaticField {
-                            dest,
-                            field: field(row),
-                        });
+                        b.op_typed(
+                            SsaOp::LoadStaticField {
+                                dest,
+                                field: field(row),
+                            },
+                            SsaType::Object,
+                        );
                     }
                     let _ = b.call(MethodRef::new(decryptor), &loads[..3], SsaType::String);
-                    b.op(SsaOp::LoadStaticField {
-                        dest: loads[3],
-                        field: field(4),
-                    });
+                    b.op_typed(
+                        SsaOp::LoadStaticField {
+                            dest: loads[3],
+                            field: field(4),
+                        },
+                        SsaType::Object,
+                    );
                     let _ = b.call(
                         MethodRef::new(decryptor),
                         &[loads[3], loads[1], loads[2]],
@@ -553,12 +565,17 @@ mod tests {
                 "Hello".to_string(),
             )])),
             crypto_params: CryptoParameters::default(),
+            max_work: 0,
         };
         let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
         ctx.set_assembly(test_assembly_arc());
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::new(Token::new(0x0600_0001)), &ctx)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::new(Token::new(0x0600_0001)),
+            &ctx,
+        )
+        .unwrap();
 
         assert!(changed, "the first site decrypts");
         let ops: Vec<&SsaOp> = ssa
@@ -568,26 +585,45 @@ mod tests {
             .iter()
             .map(SsaInstruction::op)
             .collect();
-        assert!(
-            matches!(ops[0], SsaOp::Nop),
-            "the first site's own load goes"
+        let loaded: Vec<FieldRef> = ops
+            .iter()
+            .filter_map(|op| match op {
+                SsaOp::LoadStaticField { field, .. } => Some(*field),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loaded,
+            [field(2), field(3), field(4)],
+            "the first site's own load goes; the salt and key loads the failed site reads stay"
         );
         assert!(
-            matches!(ops[1], SsaOp::LoadStaticField { .. })
-                && matches!(ops[2], SsaOp::LoadStaticField { .. }),
-            "the salt and key loads the failed site reads stay"
+            ops.iter().any(|op| matches!(
+                op,
+                SsaOp::Const {
+                    value: ConstValue::DecryptedString(_),
+                    ..
+                }
+            )),
+            "the first site's call is its string"
         );
-        assert!(matches!(
-            ops[3],
-            SsaOp::Const {
-                value: ConstValue::DecryptedString(_),
-                ..
-            }
-        ));
-        assert!(
-            matches!(ops[5], SsaOp::Call { .. }),
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, SsaOp::Call { .. }))
+                .count(),
+            1,
             "the failed site is untouched"
         );
+    }
+
+    /// A derivation past the budget is refused before any of it is done: its parameters are
+    /// constants of an attacker-supplied body.
+    #[test]
+    fn a_key_derivation_past_the_budget_is_refused() {
+        // SHA-1, 48 bytes: three blocks of 1000 iterations
+        let params = CryptoParameters::default();
+        assert!(derive_key_iv(&[0; 8], &[0; 8], &params, 3000).is_ok());
+        assert!(derive_key_iv(&[0; 8], &[0; 8], &params, 2999).is_err());
     }
 
     #[test]
@@ -597,13 +633,13 @@ mod tests {
         let key = [0u8; 8];
 
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         assert_eq!(aes_key.len(), 32, "AES-256 key should be 32 bytes");
         assert_eq!(aes_iv.len(), 16, "AES IV should be 16 bytes");
 
         // Verify deterministic output with all-zero inputs
-        let (aes_key2, aes_iv2) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key2, aes_iv2) = derive_key_iv(&key, &salt, &params, 0).unwrap();
         assert_eq!(aes_key, aes_key2, "Key derivation should be deterministic");
         assert_eq!(aes_iv, aes_iv2, "IV derivation should be deterministic");
     }
@@ -613,7 +649,7 @@ mod tests {
         let salt = [0u8; 8];
         let key = [0u8; 8];
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         // Encrypt a test string using the shared crypto utility
         let original = "Hello, BitMono!";
@@ -631,7 +667,7 @@ mod tests {
         let salt = [0u8; 8];
         let key = [0u8; 8];
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         let result = decrypt_string(&[], &aes_key, &aes_iv).unwrap();
         assert_eq!(result, "");
@@ -642,7 +678,7 @@ mod tests {
         let salt = [0u8; 8];
         let key = [0u8; 8];
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         // Non-multiple-of-16 data should fail
         let result = decrypt_string(&[1, 2, 3], &aes_key, &aes_iv);

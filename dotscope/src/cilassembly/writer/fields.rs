@@ -73,7 +73,7 @@ fn collect_field_data(
 ///
 /// Uses the signature parser and ClassLayout table to find explicit sizes for value types.
 /// Returns an error if the size cannot be determined.
-fn calculate_field_size(
+pub(crate) fn calculate_field_size(
     view: &CilAssemblyView,
     field_index: u32,
     ptr_size: PointerSize,
@@ -261,15 +261,10 @@ fn collect_original_fieldrva_data(
         #[allow(clippy::cast_possible_truncation)]
         let size = calculate_field_size(view, field_index, ptr_size)? as u32;
 
-        // Read original data
-        let offset = file.rva_to_offset(rva as usize).map_err(|_| {
+        // The data as the loaded image holds it, zeros of a zero-filled part included
+        let data = file.rva_slice(rva as usize, size as usize).map_err(|_| {
             Error::ModificationInvalid(format!(
-                "Cannot convert RVA 0x{rva:08x} to file offset for field {field_index}"
-            ))
-        })?;
-        let data = file.data_slice(offset, size as usize).map_err(|_| {
-            Error::ModificationInvalid(format!(
-                "Cannot read {size} bytes at offset 0x{offset:08x} for field {field_index}"
+                "Cannot read {size} bytes at RVA 0x{rva:08x} for field {field_index}"
             ))
         })?;
 

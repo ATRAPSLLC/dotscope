@@ -367,8 +367,8 @@ pub use crate::emulation::{
 /// These provide direct access to PE file components without borrowing from source data.
 pub use crate::file::pe::{
     CoffHeader, DataDirectories, DataDirectory, DataDirectoryType, DosHeader, Export as PeExport,
-    Import as PeImport, Machine, OptionalHeader, Pe, PeCharacteristics, SectionTable,
-    StandardFields, Subsystem, WindowsFields,
+    ExportHeader as PeExportHeader, Import as PeImport, Machine, OptionalHeader, Pe,
+    PeCharacteristics, SectionTable, StandardFields, Subsystem, WindowsFields,
 };
 // ================================================================================================
 // Formatting and Disassembly Output
@@ -401,7 +401,7 @@ pub use crate::metadata::cilassemblyview::CilAssemblyView;
 /// Provides parsing capabilities for custom debug information blobs in Portable PDB format,
 /// including Source Link, Embedded Source, and Compilation Metadata formats.
 pub use crate::metadata::customdebuginformation::{
-    parse_custom_debug_blob, CustomDebugInfo, CustomDebugKind, CustomDebugParser,
+    encode_custom_debug_blob, parse_custom_debug_blob, CustomDebugInfo, CustomDebugKind,
 };
 /// Diagnostics collection for assembly loading anomalies.
 ///
@@ -484,8 +484,8 @@ pub use crate::metadata::root::CIL_HEADER_MAGIC;
 /// permission sets, and security actions. Essential for analyzing legacy .NET Framework
 /// assemblies that use declarative security attributes and CAS policies.
 pub use crate::metadata::security::{
-    ArgumentType, ArgumentValue, NamedArgument, Permission, PermissionSet, PermissionSetFormat,
-    Security, SecurityAction, SecurityPermissionFlags,
+    Permission, PermissionSet, PermissionSetFormat, Security, SecurityAction,
+    SecurityPermissionFlags,
 };
 /// Signature parsing functions.
 ///
@@ -530,7 +530,7 @@ pub use crate::metadata::streams::{Blob, Guid, Strings, UserStrings};
 /// Performance-optimized iterators for sequential access to heap contents when
 /// processing large amounts of metadata or performing bulk analysis operations.
 pub use crate::metadata::streams::{
-    BlobIterator, GuidIterator, StringsIterator, UserStringsIterator,
+    BlobIterator, GuidIterator, StringEntries, StringsIterator, UserStringsIterator,
 };
 /// Metadata tables and stream headers.
 ///

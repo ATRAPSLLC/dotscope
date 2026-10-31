@@ -182,54 +182,20 @@ pub mod CALLING_CONVENTION {
     pub const EXPLICITTHIS: u8 = 0x40;
 }
 
-/// Maximum nesting depth for signature parsing to prevent stack overflow.
-///
-/// This limit protects against malformed signatures that could cause excessive memory usage
-/// through circular type references or deeply nested generic types. The iterative parser
-/// uses an explicit stack which is tracked against this limit.
-///
-/// 1000 levels accommodates even the most complex real-world .NET assemblies with deep generic
-/// hierarchies while still preventing resource exhaustion.
-///
-/// This bound is **per invocation** of `parse_type_inner`, which is not sufficient on its own -
-/// see [`MAX_SIGNATURE_NODES`].
+/// The deepest a parsed type may nest: the height of the tree it builds, counted across the
+/// function pointers it holds. Each level is a `Box` the consumers (drop, `Display`,
+/// equality, the reference scanners) walk recursively, so the bound keeps them on a worker's
+/// stack. A type's breadth (its generic arguments, a method's parameters) is bounded by the
+/// bytes that state it, not by this.
 const MAX_NESTING_DEPTH: usize = 1000;
-
-/// Maximum number of type nodes a single [`SignatureParser`] will construct, across every
-/// nested invocation.
-///
-/// [`MAX_NESTING_DEPTH`] bounds one invocation's heap work stack, and
-/// [`MAX_NATIVE_RECURSION_DEPTH`] bounds native re-entry - but the two **multiply** rather than
-/// compose. `work_stack` and `result_stack` are allocated fresh per `parse_type_inner` call
-/// while `self.depth` advances by only 1 per native re-entry, so at native depth *d* an
-/// invocation may still build `MAX_NESTING_DEPTH - d` levels. Summing over the permitted native
-/// depths yields roughly 61 000 nested `Box<TypeSignature>` levels in the *returned* value from
-/// a ~60 KB blob of `PTR` runs separated by `FNPTR` headers.
-///
-/// Construction survives that; the consumers do not. Drop glue, `Display` and the reference
-/// scanners all recurse over the finished structure, and signature blobs are parsed on rayon
-/// workers with the default 2 MiB stack. The result is a SIGSEGV while merely opening an
-/// assembly - not a catchable panic, since `deny(panic)` does not apply to drop glue.
-///
-/// This counter is never reset for the lifetime of a parser, so it bounds the total structure
-/// regardless of how native recursion and heap work stacks interleave. It is deliberately
-/// larger than [`MAX_NESTING_DEPTH`] because it counts *breadth* as well as depth: a method
-/// signature with many shallow parameters is legitimate and must not trip it.
-const MAX_SIGNATURE_NODES: usize = 10_000;
 
 /// Maximum depth of **native** (call-stack) recursion in this parser.
 ///
-/// Deliberately far tighter than [`MAX_NESTING_DEPTH`], because the two bound
-/// different resources. That one limits a heap work stack, where 1000 entries
-/// cost a few hundred KB and are harmless. This one limits real stack frames:
-/// `parse_type_simple` recurses natively, and so does the
-/// `parse_type` → `parse_method_signature` → `parse_param` → `parse_type`
-/// cycle. At debug frame sizes 1000 of those exhaust the stack outright, so
-/// reusing the heap number here left the guard nominally present and
-/// practically useless.
-///
-/// Real signatures do not approach this: pointer/generic nesting in shipped
-/// assemblies is single digits.
+/// Tighter than [`MAX_NESTING_DEPTH`], because the two bound different resources: that one
+/// the height of the tree built on the heap, this one real stack frames. A function pointer's
+/// signature is parsed by re-entering the parser (`parse_type` → `parse_method_signature` →
+/// `parse_param` → `parse_type`), and at debug frame sizes a thousand of those cycles exhaust
+/// a worker's stack.
 const MAX_NATIVE_RECURSION_DEPTH: usize = 64;
 
 /// Maximum number of array dimensions allowed in a signature.
@@ -238,30 +204,9 @@ const MAX_NATIVE_RECURSION_DEPTH: usize = 64;
 /// attacks. 32 dimensions is far beyond any practical use case.
 const MAX_ARRAY_DIMENSIONS: u32 = 32;
 
-/// Maximum number of parameters in a method or property signature.
-///
-/// Most methods have fewer than 10 parameters. 1024 accommodates extreme edge cases
-/// while preventing allocation bombs from malformed signatures.
-const MAX_SIGNATURE_PARAMS: u32 = 1024;
-
-/// Maximum number of generic type arguments.
-///
-/// Generic instantiations like List<T> rarely exceed a handful of type arguments.
-/// 256 provides headroom for complex scenarios while preventing abuse.
-const MAX_GENERIC_ARGS: u32 = 256;
-
-/// Maximum number of local variables in a method.
-///
-/// This is an early reject on the *declared* count, before any allocation is made against it,
-/// so a bogus length field costs nothing. It matches the ECMA-335 ceiling.
-///
-/// It is **not** the effective limit on a local-variable signature.
-/// [`MAX_SIGNATURE_NODES`] bounds the total type nodes a parser constructs and is an order of
-/// magnitude smaller, so it fires first for any signature declaring more than ~10 000 locals -
-/// each local contributes at least one node. That is deliberate: the node budget is the bound
-/// that actually protects against the recursive-drop stack overflow, and it counts breadth as
-/// well as depth precisely so a wide signature cannot evade it. A signature declaring 65 536
-/// locals is rejected, just by the other limit and with a different error.
+/// Maximum number of local variables in a method: locals are numbered by an unsigned 16-bit
+/// index (ECMA-335 III.3.43). The declared count is refused past it before anything is
+/// allocated against it.
 const MAX_LOCAL_VARIABLES: u32 = 65536;
 
 /// Binary signature parser for all .NET metadata signature types according to ECMA-335.
@@ -396,26 +341,14 @@ const MAX_LOCAL_VARIABLES: u32 = 65536;
 pub struct SignatureParser<'a> {
     /// Binary data parser for reading signature bytes
     parser: Parser<'a>,
-    /// Current recursion depth, for stack-overflow prevention.
-    ///
-    /// Lives on the parser rather than as a per-call argument so the bound
-    /// survives the wrappers. [`parse_type`] is iterative and bounds itself with
-    /// a heap work stack, but it allocates a *fresh* one per invocation - so a
-    /// signature that re-enters it through `FNPTR` (`parse_type` →
-    /// `parse_method_signature` → `parse_param` → `parse_type`) re-armed the cap
-    /// on every hop and was effectively unbounded. `parse_type_simple`, the
-    /// lookahead helper, recursed natively with no bound at all.
-    ///
-    /// Both are attacker-reachable: signature blobs come straight from the
-    /// metadata heap of the .NET file being analyzed.
+    /// Native recursion depth: [`parse_type`](Self::parse_type) re-enters itself through a
+    /// function pointer's method signature, bounded by [`MAX_NATIVE_RECURSION_DEPTH`].
     depth: usize,
 
-    /// Total type nodes constructed by this parser, across every nested invocation.
-    ///
-    /// Never reset - see [`MAX_SIGNATURE_NODES`] for why a per-invocation bound cannot catch
-    /// the case this exists for. Parsers are single-use by contract, so this is a per-signature
-    /// total.
-    nodes: usize,
+    /// How deep in the tree the type being parsed sits: the levels of the types and function
+    /// pointers around it. A function pointer's signature parses its types from here, so
+    /// [`MAX_NESTING_DEPTH`] bounds the whole tree's height, not each signature's.
+    base_depth: usize,
 }
 
 impl<'a> SignatureParser<'a> {
@@ -452,136 +385,84 @@ impl<'a> SignatureParser<'a> {
         SignatureParser {
             parser: Parser::new(data),
             depth: 0,
-            nodes: 0,
+            base_depth: 0,
         }
     }
 
-    /// Charges one constructed type node against [`MAX_SIGNATURE_NODES`].
+    /// Reads the compressed count of a list that follows. Each element takes at least a byte,
+    /// so a count the bytes that remain cannot hold is refused before anything is allocated
+    /// for it.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::DepthLimitExceeded`] once the parser has built more nodes than
-    /// the budget allows.
-    fn charge_node(&mut self) -> Result<()> {
-        self.nodes = self.nodes.saturating_add(1);
-        if self.nodes > MAX_SIGNATURE_NODES {
-            return Err(DepthLimitExceeded(MAX_SIGNATURE_NODES));
+    /// [`crate::ParseFailure::OutOfBounds`] when the count exceeds the bytes that remain: the
+    /// data ends before the list does.
+    fn element_count(&mut self) -> Result<u32> {
+        let count = self.parser.read_compressed_uint()?;
+        if count as usize > self.parser.len().saturating_sub(self.parser.pos()) {
+            return Err(out_of_bounds_error!());
         }
-        Ok(())
+        Ok(count)
     }
 
-    /// Parse a single type signature from the current position in the signature blob.
-    ///
-    /// This is the core type parsing method that handles all .NET type encodings
-    /// according to ECMA-335. It uses recursive descent to parse complex nested
-    /// types while maintaining protection against infinite recursion.
-    ///
-    /// # Type Categories Supported
-    ///
-    /// ## Primitive Types
-    /// - **Void**: `void` (`ELEMENT_TYPE_VOID`)
-    /// - **Integers**: `bool`, `char`, `sbyte`, `byte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`
-    /// - **Floating Point**: `float`, `double`
-    /// - **Reference Types**: `string`, `object`
-    /// - **Platform Types**: `IntPtr`, `UIntPtr`
-    ///
-    /// ## Complex Types
-    /// - **Arrays**: Single and multi-dimensional arrays with bounds
-    /// - **Pointers**: Unmanaged pointer types (`T*`)
-    /// - **References**: Managed references (`ref T`, `out T`)
-    /// - **Generic Types**: Open and closed generic type instantiations
-    /// - **Function Pointers**: Delegate and function pointer signatures
-    ///
-    /// ## Metadata References
-    /// - **Class Types**: Reference types from TypeDef/TypeRef tables
-    /// - **Value Types**: Value types from TypeDef/TypeRef tables  
-    /// - **Generic Parameters**: Type (`T`) and method (`M`) generic parameters
-    /// - **Custom Modifiers**: Required and optional custom modifiers
-    ///
-    /// # Nesting Depth Protection
-    ///
-    /// The parser uses explicit stack-based processing to prevent call stack overflow from malformed
-    /// signatures. The maximum nesting depth is [`MAX_NESTING_DEPTH`] levels.
-    ///
-    /// # Returns
-    /// A [`crate::metadata::signatures::TypeSignature`] representing the parsed type information.
+    /// Parse a single type signature from the current position in the signature blob, in one
+    /// pass in stream order (ECMA-335 II.23.2.12): an array's shape follows its element, a
+    /// generic instantiation's arguments its base type.
     ///
     /// # Errors
-    /// - [`crate::error::Error::DepthLimitExceeded`]: Maximum nesting depth exceeded
+    /// - [`crate::error::Error::DepthLimitExceeded`]: the type nests deeper than
+    ///   [`MAX_NESTING_DEPTH`], or its function pointers deeper than
+    ///   [`MAX_NATIVE_RECURSION_DEPTH`]
     /// - [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`]: Invalid element type or malformed signature data
     /// - [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`]: Truncated signature data
-    ///
-    /// # Implementation Notes
-    ///
-    /// This method implements the complete ECMA-335 type encoding specification
-    /// using an iterative stack-based approach. Custom modifiers are parsed inline
-    /// and associated with the appropriate type elements.
     fn parse_type(&mut self) -> Result<TypeSignature> {
-        // Accounted on the parser, not just the local work stack: this function
-        // re-enters itself through `FNPTR` (→ `parse_method_signature` →
-        // `parse_param` → here), and each entry allocated a fresh work stack, so
-        // the local bound below re-armed on every hop and never fired. The
-        // running depth makes the cap survive the round trip.
         self.enter()?;
         let result = self.parse_type_inner();
         self.exit();
         result
     }
 
-    /// Inner implementation of [`parse_type`]; depth is handled by the caller.
+    /// Inner implementation of [`parse_type`]; native depth is handled by the caller.
     fn parse_type_inner(&mut self) -> Result<TypeSignature> {
         /// Work items for the iterative parsing stack
         enum WorkItem {
             /// Parse a type signature and push result
             ParseType,
-            /// Seek parser to a specific position
-            Seek(usize),
-            /// Build PTR from modifiers and base type on stack
+            /// Build PTR from modifiers and the type on the stack
             BuildPtr(Vec<CustomModifier>),
-            /// Build BYREF from base type on stack
+            /// Build BYREF from the type on the stack
             BuildByRef,
-            /// Build ARRAY - needs elem_type, rank, dimensions on stack
-            BuildArray {
-                rank: u32,
-                dimensions: Vec<ArrayDimensions>,
-            },
-            /// Build GENERICINST - needs base_type and N type_args on stack
+            /// Read the array shape that follows the element, then build ARRAY from the
+            /// element on the stack
+            BuildArray,
+            /// Build GENERICINST from the base type and `arg_count` arguments on the stack
             BuildGenericInst { arg_count: u32 },
-            /// Build SZARRAY from modifiers and base type on stack
+            /// Build SZARRAY from modifiers and the element on the stack
             BuildSzArray(Vec<CustomModifier>),
-            /// Build PINNED from base type on stack
+            /// Build PINNED from the type on the stack
             BuildPinned,
         }
 
-        let mut work_stack: Vec<WorkItem> = Vec::new();
+        let mut work_stack: Vec<WorkItem> = vec![WorkItem::ParseType];
         let mut result_stack: Vec<TypeSignature> = Vec::new();
-
-        // Start with parsing the root type
-        work_stack.push(WorkItem::ParseType);
+        // The types under construction around the next one parsed: its ancestors in the tree
+        let mut open = 0usize;
 
         while let Some(work) = work_stack.pop() {
-            // Nesting limit, counting both this invocation's pending work and
-            // the depth already accumulated by any enclosing invocations.
-            if self
-                .depth
-                .saturating_add(work_stack.len())
-                .saturating_add(result_stack.len())
-                > MAX_NESTING_DEPTH
-            {
-                return Err(DepthLimitExceeded(MAX_NESTING_DEPTH));
+            if !matches!(work, WorkItem::ParseType) {
+                open = open.saturating_sub(1);
             }
-
-            // Global budget across every nested invocation. The check above is re-armed on each
-            // native re-entry because the work stacks are per-invocation, so it alone permits a
-            // structure tens of thousands of levels deep; this one does not reset.
-            self.charge_node()?;
-
             match work {
-                WorkItem::Seek(pos) => {
-                    self.parser.seek(pos)?;
-                }
                 WorkItem::ParseType => {
+                    if self.base_depth.saturating_add(open) >= MAX_NESTING_DEPTH {
+                        return Err(DepthLimitExceeded(MAX_NESTING_DEPTH));
+                    }
                     let current_byte = self.parser.read_le::<u8>()?;
+                    let mut wrap = |item: WorkItem, work_stack: &mut Vec<WorkItem>| {
+                        work_stack.push(item);
+                        open = open.saturating_add(1);
+                        work_stack.push(WorkItem::ParseType);
+                    };
                     match current_byte {
                         ELEMENT_TYPE::VOID => result_stack.push(TypeSignature::Void),
                         ELEMENT_TYPE::BOOLEAN => result_stack.push(TypeSignature::Boolean),
@@ -613,8 +494,12 @@ impl<'a> SignatureParser<'a> {
                         ELEMENT_TYPE::I => result_stack.push(TypeSignature::I),
                         ELEMENT_TYPE::U => result_stack.push(TypeSignature::U),
                         ELEMENT_TYPE::FNPTR => {
-                            let method_sig = self.parse_method_signature()?;
-                            result_stack.push(TypeSignature::FnPtr(Box::new(method_sig)));
+                            // The signature's types sit below this one in the tree
+                            let enclosing = self.base_depth;
+                            self.base_depth = enclosing.saturating_add(open).saturating_add(1);
+                            let method_sig = self.parse_method_signature();
+                            self.base_depth = enclosing;
+                            result_stack.push(TypeSignature::FnPtr(Box::new(method_sig?)));
                         }
                         ELEMENT_TYPE::OBJECT => result_stack.push(TypeSignature::Object),
                         ELEMENT_TYPE::MVAR => {
@@ -624,139 +509,37 @@ impl<'a> SignatureParser<'a> {
                         ELEMENT_TYPE::INTERNAL => result_stack.push(TypeSignature::Internal),
                         ELEMENT_TYPE::MODIFIER => result_stack.push(TypeSignature::Modifier),
                         ELEMENT_TYPE::SENTINEL => result_stack.push(TypeSignature::Sentinel),
-                        ELEMENT_TYPE::END => {
-                            // END (0x00) marks the end of a list in signatures (ECMA-335 II.23.2).
-                            // We treat it as Void to handle padding/terminator bytes gracefully.
-                            result_stack.push(TypeSignature::Void);
-                        }
                         ELEMENT_TYPE::PTR => {
                             let modifiers = self.parse_custom_mods()?;
-                            work_stack.push(WorkItem::BuildPtr(modifiers));
-                            work_stack.push(WorkItem::ParseType);
+                            wrap(WorkItem::BuildPtr(modifiers), &mut work_stack);
                         }
-                        ELEMENT_TYPE::BYREF => {
-                            work_stack.push(WorkItem::BuildByRef);
-                            work_stack.push(WorkItem::ParseType);
-                        }
-                        ELEMENT_TYPE::ARRAY => {
-                            // Skip element type to read array metadata
-                            let elem_pos = self.parser.pos();
-                            self.parse_type_simple()?; // Skip element type
-
-                            // Read array metadata
-                            //
-                            // `rank` is bounded here and not merely stored: it is the only
-                            // ceiling on `num_lo_bounds` below, so an unbounded rank makes that
-                            // check permissive rather than protective, and the lower-bound
-                            // extension loop then grows `dimensions` to the declared count
-                            // before any read can run out of input.
-                            let rank = self.parser.read_compressed_uint()?;
-                            if rank > MAX_ARRAY_DIMENSIONS {
-                                return Err(malformed_error!(
-                                    "Array signature has too many dimensions: rank {} (max: {})",
-                                    rank,
-                                    MAX_ARRAY_DIMENSIONS
-                                ));
-                            }
-
-                            let num_sizes = self.parser.read_compressed_uint()?;
-                            if num_sizes > MAX_ARRAY_DIMENSIONS {
-                                return Err(malformed_error!(
-                                    "Array signature has too many dimensions: {} (max: {})",
-                                    num_sizes,
-                                    MAX_ARRAY_DIMENSIONS
-                                ));
-                            }
-
-                            let mut dimensions: Vec<ArrayDimensions> =
-                                Vec::with_capacity(num_sizes as usize);
-                            for _ in 0..num_sizes {
-                                dimensions.push(ArrayDimensions {
-                                    size: Some(self.parser.read_compressed_uint()?),
-                                    lower_bound: None,
-                                });
-                            }
-
-                            let num_lo_bounds = self.parser.read_compressed_uint()?;
-
-                            // Validate that lower bound count doesn't exceed dimensions
-                            // ECMA-335 II.23.2.13: NumLoBouns can be greater than NumSizes
-                            // but each lower bound should correspond to a rank dimension
-                            if num_lo_bounds > rank {
-                                return Err(malformed_error!(
-                                    "Array signature has more lower bounds ({}) than dimensions (rank {})",
-                                    num_lo_bounds,
-                                    rank
-                                ));
-                            }
-
-                            // Extend dimensions array if needed for lower bounds
-                            while dimensions.len() < num_lo_bounds as usize {
-                                dimensions.push(ArrayDimensions {
-                                    size: None,
-                                    lower_bound: None,
-                                });
-                            }
-
-                            // Lower bounds are signed (ECMA-335 II.23.2.13).
-                            for i in 0..num_lo_bounds {
-                                if let Some(dimension) = dimensions.get_mut(i as usize) {
-                                    dimension.lower_bound =
-                                        Some(self.parser.read_compressed_int()?);
-                                }
-                            }
-                            let shape_end = self.parser.pos();
-
-                            // Reset position to parse element type properly
-                            self.parser.seek(elem_pos)?;
-
-                            // Schedule: parse the element type, then continue
-                            // after the shape, which the element ends in front of,
-                            // then build the array.
-                            work_stack.push(WorkItem::BuildArray { rank, dimensions });
-                            work_stack.push(WorkItem::Seek(shape_end));
-                            work_stack.push(WorkItem::ParseType);
-                        }
+                        ELEMENT_TYPE::BYREF => wrap(WorkItem::BuildByRef, &mut work_stack),
+                        ELEMENT_TYPE::ARRAY => wrap(WorkItem::BuildArray, &mut work_stack),
                         ELEMENT_TYPE::GENERICINST => {
-                            let peek_byte = self.parser.peek_byte()?;
-                            if peek_byte != 0x12 && peek_byte != 0x11 {
-                                return Err(malformed_error!(
+                            // The base type is a class or value type's token, read inline
+                            let base = match self.parser.read_le::<u8>()? {
+                                ELEMENT_TYPE::CLASS => {
+                                    TypeSignature::Class(self.parser.read_compressed_token()?)
+                                }
+                                ELEMENT_TYPE::VALUETYPE => {
+                                    TypeSignature::ValueType(self.parser.read_compressed_token()?)
+                                }
+                                other => {
+                                    return Err(malformed_error!(
                                     "GENERICINST - Next byte is not TYPE_CLASS or TYPE_VALUE - {}",
-                                    peek_byte
-                                ));
-                            }
-
-                            // Save position, parse base type to skip it, read arg_count
-                            let base_pos = self.parser.pos();
-                            self.parse_type_simple()?;
-                            let arg_count = self.parser.read_compressed_uint()?;
-                            if arg_count > MAX_GENERIC_ARGS {
-                                return Err(malformed_error!(
-                                    "Generic instantiation has too many type arguments: {} (max: {})",
-                                    arg_count,
-                                    MAX_GENERIC_ARGS
-                                ));
-                            }
-
-                            let args_pos = self.parser.pos();
-
-                            // Reset to base to parse it properly
-                            self.parser.seek(base_pos)?;
-
+                                    other
+                                ))
+                                }
+                            };
+                            result_stack.push(base);
+                            let arg_count = self.element_count()?;
                             work_stack.push(WorkItem::BuildGenericInst { arg_count });
-                            // Parse type args in reverse order
-                            for _ in 0..arg_count {
-                                work_stack.push(WorkItem::ParseType);
-                            }
-                            // Seek to args position before parsing type args
-                            work_stack.push(WorkItem::Seek(args_pos));
-                            // Parse base type first
-                            work_stack.push(WorkItem::ParseType);
+                            open = open.saturating_add(1);
+                            work_stack.extend((0..arg_count).map(|_| WorkItem::ParseType));
                         }
                         ELEMENT_TYPE::SZARRAY => {
                             let modifiers = self.parse_custom_mods()?;
-                            work_stack.push(WorkItem::BuildSzArray(modifiers));
-                            work_stack.push(WorkItem::ParseType);
+                            wrap(WorkItem::BuildSzArray(modifiers), &mut work_stack);
                         }
                         ELEMENT_TYPE::CMOD_REQD => {
                             // We consumed the CMOD_REQD byte, go back so parse_custom_mods can handle it
@@ -780,10 +563,7 @@ impl<'a> SignatureParser<'a> {
                             let modifiers = self.parse_custom_mods()?;
                             result_stack.push(TypeSignature::ModifiedOptional(modifiers));
                         }
-                        ELEMENT_TYPE::PINNED => {
-                            work_stack.push(WorkItem::BuildPinned);
-                            work_stack.push(WorkItem::ParseType);
-                        }
+                        ELEMENT_TYPE::PINNED => wrap(WorkItem::BuildPinned, &mut work_stack),
                         _ => {
                             return Err(malformed_error!(
                                 "Unsupported ELEMENT_TYPE - {}",
@@ -807,10 +587,11 @@ impl<'a> SignatureParser<'a> {
                         .ok_or_else(|| malformed_error!("Missing base type for BYREF"))?;
                     result_stack.push(TypeSignature::ByRef(Box::new(base_type)));
                 }
-                WorkItem::BuildArray { rank, dimensions } => {
+                WorkItem::BuildArray => {
                     let elem_type = result_stack
                         .pop()
                         .ok_or_else(|| malformed_error!("Missing element type for ARRAY"))?;
+                    let (rank, dimensions) = self.parse_array_shape()?;
                     result_stack.push(TypeSignature::Array(SignatureArray {
                         base: Box::new(elem_type),
                         rank,
@@ -818,29 +599,18 @@ impl<'a> SignatureParser<'a> {
                     }));
                 }
                 WorkItem::BuildGenericInst { arg_count } => {
-                    // Stack has: base_type, arg1, arg2, ..., argN (top is argN)
-                    // We need to pop argN...arg1 in reverse, then base_type
-                    if result_stack.len() < (arg_count as usize).saturating_add(1) {
-                        return Err(malformed_error!(
-                            "Insufficient types on stack for GENERICINST"
-                        ));
-                    }
-
-                    // Pop type args in reverse order (argN, argN-1, ..., arg1)
-                    let mut type_args = Vec::with_capacity(arg_count as usize);
-                    for _ in 0..arg_count {
-                        type_args.push(
-                            result_stack.pop().ok_or_else(|| {
-                                malformed_error!("Missing type arg for GENERICINST")
-                            })?,
-                        );
-                    }
-                    type_args.reverse(); // Reverse to get correct order (arg1, arg2, ..., argN)
-
+                    // The stack holds the base type, then the arguments, the last on top
+                    let first_argument = result_stack
+                        .len()
+                        .checked_sub(arg_count as usize)
+                        .filter(|start| *start > 0)
+                        .ok_or_else(|| {
+                            malformed_error!("Insufficient types on stack for GENERICINST")
+                        })?;
+                    let type_args = result_stack.split_off(first_argument);
                     let base_type = result_stack
                         .pop()
                         .ok_or_else(|| malformed_error!("Missing base type for GENERICINST"))?;
-
                     result_stack.push(TypeSignature::GenericInst(Box::new(base_type), type_args));
                 }
                 WorkItem::BuildSzArray(modifiers) => {
@@ -873,6 +643,61 @@ impl<'a> SignatureParser<'a> {
             .ok_or_else(|| malformed_error!("internal: result stack empty after validation"))
     }
 
+    /// Reads an array shape (ECMA-335 II.23.2.13): the rank, the sizes of leading dimensions,
+    /// then their lower bounds, which are signed.
+    ///
+    /// # Errors
+    ///
+    /// When the shape is truncated, the rank exceeds [`MAX_ARRAY_DIMENSIONS`] (the runtime's
+    /// largest), or more sizes or lower bounds are given than the rank has dimensions.
+    fn parse_array_shape(&mut self) -> Result<(u32, Vec<ArrayDimensions>)> {
+        // `rank` is bounded here and not merely stored: it bounds the size and lower-bound
+        // counts below, before anything is allocated against them
+        let rank = self.parser.read_compressed_uint()?;
+        if rank > MAX_ARRAY_DIMENSIONS {
+            return Err(malformed_error!(
+                "Array signature has too many dimensions: rank {} (max: {})",
+                rank,
+                MAX_ARRAY_DIMENSIONS
+            ));
+        }
+        let num_sizes = self.parser.read_compressed_uint()?;
+        if num_sizes > MAX_ARRAY_DIMENSIONS {
+            return Err(malformed_error!(
+                "Array signature has too many dimensions: {} (max: {})",
+                num_sizes,
+                MAX_ARRAY_DIMENSIONS
+            ));
+        }
+        let mut dimensions: Vec<ArrayDimensions> = Vec::with_capacity(num_sizes as usize);
+        for _ in 0..num_sizes {
+            dimensions.push(ArrayDimensions {
+                size: Some(self.parser.read_compressed_uint()?),
+                lower_bound: None,
+            });
+        }
+        let num_lo_bounds = self.parser.read_compressed_uint()?;
+        if num_lo_bounds > rank {
+            return Err(malformed_error!(
+                "Array signature has more lower bounds ({}) than dimensions (rank {})",
+                num_lo_bounds,
+                rank
+            ));
+        }
+        while dimensions.len() < num_lo_bounds as usize {
+            dimensions.push(ArrayDimensions {
+                size: None,
+                lower_bound: None,
+            });
+        }
+        for i in 0..num_lo_bounds {
+            if let Some(dimension) = dimensions.get_mut(i as usize) {
+                dimension.lower_bound = Some(self.parser.read_compressed_int()?);
+            }
+        }
+        Ok((rank, dimensions))
+    }
+
     /// Enters one level of native recursion, refusing to go past
     /// [`MAX_NATIVE_RECURSION_DEPTH`].
     ///
@@ -890,100 +715,6 @@ impl<'a> SignatureParser<'a> {
     /// Leaves one level of nesting.
     fn exit(&mut self) {
         self.depth = self.depth.saturating_sub(1);
-    }
-
-    /// Helper method to parse a type signature without building the result (for lookahead).
-    /// This is used to skip over types when we need to read metadata that comes after them.
-    ///
-    /// Depth-bounded: one input byte is one stack frame here, so a run of `PTR`
-    /// bytes in a field signature is a direct stack-exhaustion vector.
-    fn parse_type_simple(&mut self) -> Result<()> {
-        self.enter()?;
-        let result = self.parse_type_simple_inner();
-        self.exit();
-        result
-    }
-
-    /// Inner implementation of [`parse_type_simple`]; depth is handled by the
-    /// caller, matching the `MarshallingParser` idiom in this crate.
-    fn parse_type_simple_inner(&mut self) -> Result<()> {
-        let current_byte = self.parser.read_le::<u8>()?;
-        match current_byte {
-            ELEMENT_TYPE::VOID
-            | ELEMENT_TYPE::BOOLEAN
-            | ELEMENT_TYPE::CHAR
-            | ELEMENT_TYPE::I1
-            | ELEMENT_TYPE::U1
-            | ELEMENT_TYPE::I2
-            | ELEMENT_TYPE::U2
-            | ELEMENT_TYPE::I4
-            | ELEMENT_TYPE::U4
-            | ELEMENT_TYPE::I8
-            | ELEMENT_TYPE::U8
-            | ELEMENT_TYPE::R4
-            | ELEMENT_TYPE::R8
-            | ELEMENT_TYPE::STRING
-            | ELEMENT_TYPE::TYPEDBYREF
-            | ELEMENT_TYPE::I
-            | ELEMENT_TYPE::U
-            | ELEMENT_TYPE::OBJECT
-            | ELEMENT_TYPE::INTERNAL
-            | ELEMENT_TYPE::MODIFIER
-            | ELEMENT_TYPE::SENTINEL
-            | ELEMENT_TYPE::END => Ok(()),
-            ELEMENT_TYPE::VALUETYPE | ELEMENT_TYPE::CLASS => {
-                self.parser.read_compressed_token()?;
-                Ok(())
-            }
-            ELEMENT_TYPE::VAR | ELEMENT_TYPE::MVAR => {
-                self.parser.read_compressed_uint()?;
-                Ok(())
-            }
-            ELEMENT_TYPE::PTR | ELEMENT_TYPE::SZARRAY => {
-                let _ = self.parse_custom_mods()?;
-                self.parse_type_simple()
-            }
-            ELEMENT_TYPE::BYREF | ELEMENT_TYPE::PINNED => self.parse_type_simple(),
-            ELEMENT_TYPE::ARRAY => {
-                self.parse_type_simple()?;
-                let _rank = self.parser.read_compressed_uint()?;
-                let num_sizes = self.parser.read_compressed_uint()?;
-                for _ in 0..num_sizes {
-                    self.parser.read_compressed_uint()?;
-                }
-                let num_lo_bounds = self.parser.read_compressed_uint()?;
-                for _ in 0..num_lo_bounds {
-                    self.parser.read_compressed_int()?;
-                }
-                Ok(())
-            }
-            ELEMENT_TYPE::GENERICINST => {
-                self.parse_type_simple()?;
-                let arg_count = self.parser.read_compressed_uint()?;
-                for _ in 0..arg_count {
-                    self.parse_type_simple()?;
-                }
-                Ok(())
-            }
-            ELEMENT_TYPE::FNPTR => {
-                let _ = self.parse_method_signature()?;
-                Ok(())
-            }
-            ELEMENT_TYPE::CMOD_REQD | ELEMENT_TYPE::CMOD_OPT => {
-                let prev_pos = self
-                    .parser
-                    .pos()
-                    .checked_sub(1)
-                    .ok_or_else(|| malformed_error!("Parser position underflow"))?;
-                self.parser.seek(prev_pos)?;
-                let _ = self.parse_custom_mods()?;
-                Ok(())
-            }
-            _ => Err(malformed_error!(
-                "Unsupported ELEMENT_TYPE in simple parse - {}",
-                current_byte
-            )),
-        }
     }
 
     /// Parse custom modifiers (modreq/modopt) from the current signature position.
@@ -1263,29 +994,11 @@ impl<'a> SignatureParser<'a> {
 
         let mut method = SignatureMethod {
             param_count_generic: if convention_byte & CALLING_CONVENTION::GENERIC != 0 {
-                let gen_count = self.parser.read_compressed_uint()?;
-                if gen_count > MAX_GENERIC_ARGS {
-                    return Err(malformed_error!(
-                        "Method signature has too many generic parameters: {} (max: {})",
-                        gen_count,
-                        MAX_GENERIC_ARGS
-                    ));
-                }
-                gen_count
+                self.parser.read_compressed_uint()?
             } else {
                 0
             },
-            param_count: {
-                let p_count = self.parser.read_compressed_uint()?;
-                if p_count > MAX_SIGNATURE_PARAMS {
-                    return Err(malformed_error!(
-                        "Method signature has too many parameters: {} (max: {})",
-                        p_count,
-                        MAX_SIGNATURE_PARAMS
-                    ));
-                }
-                p_count
-            },
+            param_count: self.element_count()?,
             return_type: self.parse_param()?,
             params: Vec::new(),
             varargs: Vec::new(),
@@ -1300,58 +1013,35 @@ impl<'a> SignatureParser<'a> {
         Ok(method)
     }
 
-    /// Parse method parameters, handling both fixed parameters and optional varargs.
-    ///
-    /// This helper method encapsulates the complex logic of parsing method parameters,
-    /// including detection of the SENTINEL marker that separates fixed parameters from
-    /// variable arguments in vararg methods.
-    ///
-    /// # Parameters
-    /// - `param_count`: The declared number of fixed parameters in the signature
+    /// Parse a method signature's `param_count` parameters: the fixed ones, then, after a
+    /// SENTINEL, the varargs of a call site (ECMA-335 II.23.2.2). `ParamCount` counts both, so
+    /// what the sentinel leaves of it is the vararg count; the sentinel needs at least one.
     ///
     /// # Returns
-    /// A tuple containing:
-    /// - `Vec<SignatureParameter>`: Fixed parameters
-    /// - `Vec<SignatureParameter>`: Variable arguments (empty if not a vararg method)
-    ///
-    /// # ECMA-335 Reference
-    /// According to ECMA-335 II.23.2.1:
-    /// - `param_count` only includes fixed parameters, not varargs
-    /// - SENTINEL (0x41) separates fixed parameters from varargs
-    /// - Varargs continue until END (0x00) or end of data
+    /// The fixed parameters and the varargs (empty without a sentinel).
     fn parse_method_parameters(
         &mut self,
         param_count: u32,
     ) -> Result<(Vec<SignatureParameter>, Vec<SignatureParameter>)> {
         let mut params = Vec::with_capacity(param_count as usize);
         let mut varargs = Vec::new();
-
-        // Parse fixed parameters, watching for SENTINEL marker
-        let mut hit_sentinel = false;
         for _ in 0..param_count {
             if self.parser.peek_byte()? == ELEMENT_TYPE::SENTINEL {
-                // SENTINEL indicates fixed params are over, vararg list follows
                 self.parser.advance()?;
-                hit_sentinel = true;
+                let remaining = (param_count as usize).saturating_sub(params.len());
+                if remaining == 0 {
+                    return Err(malformed_error!(
+                        "A method signature's sentinel is followed by no parameter"
+                    ));
+                }
+                varargs.reserve(remaining);
+                for _ in 0..remaining {
+                    varargs.push(self.parse_param()?);
+                }
                 break;
             }
             params.push(self.parse_param()?);
         }
-
-        // Parse varargs if SENTINEL was encountered
-        if hit_sentinel {
-            while self.parser.has_more_data() && self.parser.peek_byte()? != ELEMENT_TYPE::END {
-                if varargs.len() >= MAX_SIGNATURE_PARAMS as usize {
-                    return Err(malformed_error!(
-                        "Method signature has too many varargs: {} (max: {})",
-                        varargs.len(),
-                        MAX_SIGNATURE_PARAMS
-                    ));
-                }
-                varargs.push(self.parse_param()?);
-            }
-        }
-
         Ok((params, varargs))
     }
 
@@ -1648,14 +1338,7 @@ impl<'a> SignatureParser<'a> {
 
         let has_this = (head_byte & CALLING_CONVENTION::HASTHIS) != 0;
 
-        let param_count = self.parser.read_compressed_uint()?;
-        if param_count > MAX_SIGNATURE_PARAMS {
-            return Err(malformed_error!(
-                "Property signature has too many parameters: {} (max: {})",
-                param_count,
-                MAX_SIGNATURE_PARAMS
-            ));
-        }
+        let param_count = self.element_count()?;
 
         let custom_mods = self.parse_custom_mods()?;
         let type_sig = self.parse_type()?;
@@ -2248,14 +1931,7 @@ impl<'a> SignatureParser<'a> {
             ));
         }
 
-        let arg_count = self.parser.read_compressed_uint()?;
-        if arg_count > MAX_GENERIC_ARGS {
-            return Err(malformed_error!(
-                "Method specification has too many type arguments: {} (max: {})",
-                arg_count,
-                MAX_GENERIC_ARGS
-            ));
-        }
+        let arg_count = self.element_count()?;
 
         let mut generic_args = Vec::with_capacity(arg_count as usize);
         for _ in 0..arg_count {
@@ -2454,14 +2130,93 @@ mod tests {
         // level and consumes no other input, which is what makes this cheap to weaponise: a
         // ~60 KB blob describes a ~61 000-level structure, deep enough that recursive drop
         // glue overflows a 2 MiB rayon worker stack.
-        let mut blob = vec![0x0F_u8; MAX_SIGNATURE_NODES.saturating_mul(2)];
+        let mut blob = vec![0x0F_u8; MAX_NESTING_DEPTH.saturating_mul(2)];
         blob.push(0x08); // I4
 
         let mut parser = SignatureParser::new(&blob);
-        assert!(
-            parser.parse_type().is_err(),
-            "a signature past the node budget must be refused during parsing"
+        assert!(matches!(
+            parser.parse_type(),
+            Err(DepthLimitExceeded(MAX_NESTING_DEPTH))
+        ));
+    }
+
+    /// The tree's height is bounded across function pointers: runs of PTR each short of the
+    /// limit, separated by FNPTR headers, add up to a structure past it.
+    #[test]
+    fn nesting_through_function_pointers_counts_toward_one_height() {
+        let mut blob = Vec::new();
+        for _ in 0..4 {
+            blob.extend(std::iter::repeat_n(0x0F, MAX_NESTING_DEPTH / 2));
+            blob.extend_from_slice(&[0x1B, 0x00, 0x00]); // FNPTR, DEFAULT, no parameters
+        }
+        blob.push(0x08); // I4 return
+        assert!(matches!(
+            SignatureParser::new(&blob).parse_type(),
+            Err(DepthLimitExceeded(MAX_NESTING_DEPTH))
+        ));
+    }
+
+    /// Breadth is bounded by the bytes, not by a budget: thousands of locals, and generic
+    /// arguments, parse.
+    #[test]
+    fn wide_signatures_parse() {
+        // 5000 locals, each GENERICINST CLASS TypeRef[1] <int32>
+        let mut locals = vec![0x07, 0x80 | 0x13, 0x88];
+        for _ in 0..5000 {
+            locals.extend_from_slice(&[0x15, 0x12, 0x05, 0x01, 0x08]);
+        }
+        assert_eq!(
+            SignatureParser::new(&locals)
+                .parse_local_var_signature()
+                .unwrap()
+                .locals
+                .len(),
+            5000
         );
+
+        // A local of a generic instantiation with 2000 arguments
+        let mut arguments = vec![0x07, 0x01, 0x15, 0x12, 0x05, 0x80 | 0x07, 0xD0];
+        arguments.extend(std::iter::repeat_n(0x08, 2000));
+        let local = SignatureParser::new(&arguments)
+            .parse_local_var_signature()
+            .unwrap();
+        let TypeSignature::GenericInst(_, args) = &local.locals[0].base else {
+            panic!("{:?}", local.locals[0].base);
+        };
+        assert_eq!(args.len(), 2000);
+    }
+
+    /// ARRAY and FNPTR alternating parse in one pass: the element is parsed once, before the
+    /// shape that follows it, where a lookahead parsed it twice at every level.
+    #[test]
+    fn alternating_arrays_and_function_pointers_parse_once() {
+        let levels = 30;
+        let mut blob = Vec::new();
+        for _ in 0..levels {
+            blob.extend_from_slice(&[0x14, 0x1B, 0x00, 0x00]); // ARRAY of FNPTR() returning
+        }
+        blob.push(0x08); // int32
+        for _ in 0..levels {
+            blob.extend_from_slice(&[0x01, 0x00, 0x00]); // rank 1, no sizes, no bounds
+        }
+        let parsed = SignatureParser::new(&blob).parse_type().unwrap();
+        let mut node = &parsed;
+        for _ in 0..levels {
+            let TypeSignature::Array(array) = node else {
+                panic!("{node:?}");
+            };
+            let TypeSignature::FnPtr(method) = &*array.base else {
+                panic!("{:?}", array.base);
+            };
+            node = &method.return_type.base;
+        }
+        assert_eq!(node, &TypeSignature::I4);
+    }
+
+    /// An END byte is not a type: it is refused, not read as `void`.
+    #[test]
+    fn an_end_byte_is_not_a_type() {
+        assert!(SignatureParser::new(&[0x00]).parse_type().is_err());
     }
 
     /// Signatures of ordinary depth must still parse - the budget must not be so tight that it
@@ -2693,13 +2448,8 @@ mod tests {
         }
     }
 
-    /// A long run of `PTR` bytes in a field signature is refused, not recursed.
-    ///
-    /// `parse_type_simple` is the lookahead helper; it recursed natively with no
-    /// bound, so one attacker byte bought one stack frame. Measured before the
-    /// fix: a 50 KB blob aborted the process on an 8 MiB stack, ~5 KB on 2 MiB.
-    /// Signature blobs come straight out of the analyzed file's metadata heap,
-    /// so this is reachable by every .NET sample.
+    /// A long run of `PTR` bytes inside an array's element is refused, not recursed: a
+    /// lookahead over the element used to recurse natively, one stack frame per byte.
     #[test]
     fn a_deep_pointer_run_is_refused_rather_than_overflowing() {
         // FIELD, ARRAY, then a long run of PTR, terminated by I4.
@@ -2739,5 +2489,35 @@ mod tests {
             parser.parse_field_signature().is_err(),
             "nesting through FNPTR must count toward the same cap"
         );
+    }
+
+    /// A vararg call site's `ParamCount` counts its varargs: inside a local signature, the
+    /// function pointer's varargs end where that count does, and the next local follows.
+    #[test]
+    fn a_vararg_function_pointer_reads_the_varargs_its_count_states() {
+        let blob = [
+            0x07, 0x02, // LOCAL_SIG, two locals
+            0x1B, 0x05, 0x02, 0x01, // FNPTR, VARARG, ParamCount 2, returns void
+            0x08, 0x41, 0x0A, // int32, SENTINEL, int64
+            0x08, // the second local: int32
+        ];
+        let locals = SignatureParser::new(&blob)
+            .parse_local_var_signature()
+            .unwrap()
+            .locals;
+        assert_eq!(locals.len(), 2);
+        let TypeSignature::FnPtr(method) = &locals[0].base else {
+            panic!("{:?}", locals[0].base);
+        };
+        assert_eq!(method.param_count, 2);
+        assert_eq!(method.params.len(), 1);
+        assert_eq!(method.varargs.len(), 1);
+        assert_eq!(method.varargs[0].base, TypeSignature::I8);
+        assert_eq!(locals[1].base, TypeSignature::I4);
+
+        // A sentinel with no parameter after it
+        assert!(SignatureParser::new(&[0x05, 0x01, 0x01, 0x41])
+            .parse_method_signature()
+            .is_err());
     }
 }

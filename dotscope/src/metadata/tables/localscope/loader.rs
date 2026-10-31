@@ -10,7 +10,7 @@ use crate::{
     metadata::{
         diagnostics::DiagnosticCategory,
         loader::{LoaderContext, MetadataLoader},
-        tables::TableId,
+        tables::{LocalScopeRaw, TableId},
     },
     utils::TryForEachInOrder,
     Result,
@@ -43,10 +43,13 @@ pub struct LocalScopeLoader;
 
 impl MetadataLoader for LocalScopeLoader {
     fn load(&self, context: &LoaderContext) -> Result<()> {
-        let Some(header) = context.meta else {
+        let Some(pdb) = &context.pdb else {
             return Ok(());
         };
-        let Some(table) = header.table::<crate::metadata::tables::LocalScopeRaw>() else {
+        let Some(header) = pdb.meta else {
+            return Ok(());
+        };
+        let Some(table) = header.table::<LocalScopeRaw>() else {
             return Ok(());
         };
 
@@ -54,17 +57,18 @@ impl MetadataLoader for LocalScopeLoader {
             .par_iter()
             .enumerate()
             .try_for_each_in_order(|(index, row)| {
-                let Some(row) = context.handle_row(row, index)? else {
+                let Some(row) = context.handle_row_in(pdb.lenient, row, index)? else {
                     return Ok(());
                 };
                 let token_msg = || format!("local scope 0x{:08x}", row.token.value());
 
-                let Some(local_scope) = context.handle_result(
+                let Some(local_scope) = context.handle_result_in(
+                    pdb.lenient,
                     row.to_owned(
                         context.method_def,
-                        &context.import_scope,
-                        &context.local_variable,
-                        &context.local_constant,
+                        &pdb.target.import_scopes,
+                        &pdb.target.local_variables,
+                        &pdb.target.local_constants,
                         table,
                     ),
                     DiagnosticCategory::Method,
@@ -74,7 +78,9 @@ impl MetadataLoader for LocalScopeLoader {
                     return Ok(());
                 };
 
-                context.local_scope.insert(local_scope.token, local_scope);
+                pdb.target
+                    .local_scopes
+                    .insert(local_scope.token, local_scope);
                 Ok(())
             })
     }

@@ -619,6 +619,9 @@ pub struct EmulationThread {
     /// Total instructions executed by this thread.
     instructions_executed: u64,
 
+    /// Native work hooks do for this thread, against the emulation's instruction budget.
+    work: WorkMeter,
+
     /// Return value when thread completes.
     return_value: Option<EmValue>,
 
@@ -629,6 +632,20 @@ pub struct EmulationThread {
     /// here. After each entry's method returns, the controller checks this state
     /// and dispatches the next entry until all are exhausted.
     multicast_state: Option<MulticastState>,
+}
+
+/// The native work hooks do for a thread (key derivation rounds, modular exponentiation),
+/// measured in the units of the emulation's instruction budget: an expensive call costs
+/// what the IL that computed it would, so it ends the run where a long loop would rather
+/// than under a ceiling of its own.
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkMeter {
+    /// Instructions the run had executed when the current step began
+    executed: u64,
+    /// The run's instruction budget, 0 for none
+    limit: u64,
+    /// Work charged since the step began
+    charged: u64,
 }
 
 /// State for tracking multicast delegate invocation progress.
@@ -703,6 +720,7 @@ impl EmulationThread {
             tls: HashMap::new(),
             context,
             instructions_executed: 0,
+            work: WorkMeter::default(),
             return_value: None,
             multicast_state: None,
         }
@@ -1212,6 +1230,33 @@ impl EmulationThread {
         self.instructions_executed = self.instructions_executed.saturating_add(1);
     }
 
+    /// Charges `units` of native work, in instructions, before a hook does it.
+    ///
+    /// Returns `false` when the run's instruction budget cannot cover it: the work is
+    /// charged all the same, and the hook returns without doing it
+    /// (`PreHookResult::Bypass(None)`). The run then ends at its next limit check, before
+    /// the emulated code goes on, as it would had the IL done the work. Without a budget
+    /// every charge is covered.
+    pub fn charge_work(&mut self, units: u64) -> bool {
+        self.work.charged = self.work.charged.saturating_add(units);
+        let total = self.work.executed.saturating_add(self.work.charged);
+        self.work.limit == 0 || total < self.work.limit
+    }
+
+    /// Starts a step: `executed` instructions of a `limit` budget (0 for none) are spent.
+    pub(crate) fn begin_work(&mut self, executed: u64, limit: u64) {
+        self.work = WorkMeter {
+            executed,
+            limit,
+            charged: 0,
+        };
+    }
+
+    /// The native work charged since the step began, for the run's instruction count.
+    pub(crate) fn take_work(&mut self) -> u64 {
+        std::mem::take(&mut self.work.charged)
+    }
+
     /// Returns the method token of the currently executing method.
     #[must_use]
     pub fn current_method(&self) -> Option<Token> {
@@ -1539,6 +1584,23 @@ impl EmulationThread {
 mod tests {
     use super::*;
     use crate::testkit::emulation::{create_test_context, create_test_thread};
+
+    /// A hook's work is covered while the run's executed instructions and the work charged
+    /// this step stay under the budget; the charge stands either way, for the run's count,
+    /// and without a budget every charge is covered.
+    #[test]
+    fn work_is_charged_against_the_rest_of_the_budget() {
+        let mut thread = create_test_thread();
+        thread.begin_work(900, 1000);
+        assert!(thread.charge_work(50));
+        assert!(thread.charge_work(49));
+        assert!(!thread.charge_work(1));
+        assert_eq!(thread.take_work(), 100);
+        assert_eq!(thread.take_work(), 0);
+
+        thread.begin_work(900, 0);
+        assert!(thread.charge_work(u64::MAX));
+    }
 
     /// The index selects which loaded assembly's metadata a frame executes against, and
     /// emulated code grows that list. Narrowing it binds the frame to a different assembly

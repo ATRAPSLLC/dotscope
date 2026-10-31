@@ -20,7 +20,7 @@
 //! # Reference
 //! - [ECMA-335 II.22.2](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - Assembly table specification
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::{
     metadata::{
@@ -28,6 +28,7 @@ use crate::{
         tables::{Assembly, AssemblyFlags, AssemblyRc, HashAlgorithmId, TableInfoRef, TableRow},
         token::Token,
     },
+    utils::RowList,
     Result,
 };
 
@@ -159,7 +160,7 @@ impl AssemblyRaw {
             } else {
                 Some(strings.get(self.culture as usize)?.to_string())
             },
-            security: OnceLock::new(),
+            security: RowList::new(),
             custom_attributes: Default::default(),
         }))
     }

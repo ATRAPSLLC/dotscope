@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        signatures::{parse_field_signature, SignatureField, TypeSignature},
+        pdb::LocalConstantSig,
         streams::{Blob, Strings},
         tables::{LocalConstant, LocalConstantRc, TableInfoRef, TableRow},
         token::Token,
@@ -99,15 +99,14 @@ impl LocalConstantRaw {
             strings.get(self.name as usize)?.to_string()
         };
 
-        let signature = if self.signature == 0 {
-            SignatureField {
-                modifiers: Vec::new(),
-                base: TypeSignature::Void,
-            }
-        } else {
-            let signature_blob = blobs.get(self.signature as usize)?;
-            parse_field_signature(signature_blob)?
-        };
+        // A constant's signature is its type and value: there is no constant without one
+        if self.signature == 0 {
+            return Err(malformed_error!(
+                "LocalConstant row {} has no signature",
+                self.rid
+            ));
+        }
+        let signature = LocalConstantSig::parse(blobs.get(self.signature as usize)?)?;
 
         let constant = LocalConstant {
             rid: self.rid,

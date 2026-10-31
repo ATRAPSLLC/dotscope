@@ -307,12 +307,12 @@ impl CilProject {
             // Link new assembly -> existing assembly
             assembly_arc
                 .types()
-                .registry_link(existing_identity.clone(), existing_assembly.types());
+                .registry_link(existing_identity.clone(), &existing_assembly.types());
 
             // Link existing assembly -> new assembly
             existing_assembly
                 .types()
-                .registry_link(identity.clone(), assembly_arc.types());
+                .registry_link(identity.clone(), &assembly_arc.types());
         }
 
         self.assemblies

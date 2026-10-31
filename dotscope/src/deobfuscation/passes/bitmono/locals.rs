@@ -663,6 +663,7 @@ mod tests {
     use crate::{
         analysis::{CallGraph, SsaFunctionBuilder},
         metadata::token::Token,
+        testkit::passes::run_verified,
     };
 
     /// A 32-bit key: the xor key, an odd multiplier and its inverse, the addend.
@@ -751,9 +752,13 @@ mod tests {
 
     fn run(ssa: &mut SsaFunction) -> bool {
         let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
-        LocalEncodingReversalPass
-            .run_on_method(ssa, &MethodRef::new(Token::new(0x0600_0001)), &ctx)
-            .expect("runs")
+        run_verified(
+            &LocalEncodingReversalPass,
+            ssa,
+            &MethodRef::new(Token::new(0x0600_0001)),
+            &ctx,
+        )
+        .expect("runs")
     }
 
     #[test]

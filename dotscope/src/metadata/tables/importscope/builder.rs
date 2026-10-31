@@ -22,8 +22,9 @@
 //! ```
 
 use crate::{
-    cilassembly::{ChangeRefRc, CilAssembly},
+    cilassembly::{BlobComposite, ChangeRefRc, CilAssembly, CompositeImport},
     metadata::{
+        importscope::{ImportDeclaration, ImportKind, ImportsInfo},
         tables::{ImportScopeRaw, TableDataOwned, TableId},
         token::Token,
     },
@@ -38,7 +39,9 @@ use crate::{
 ///
 /// # Required Fields
 /// - `parent`: Parent scope index (0 for root scope, must be explicitly set)
-/// - `imports`: Raw import blob data (must be provided)
+/// - the imports: either their declarations ([`declarations`](Self::declarations)), whose
+///   aliases and namespaces the builder adds as blobs, or a raw imports blob
+///   ([`imports`](Self::imports)) naming blobs already in the heap
 ///
 /// # Examples
 ///
@@ -67,6 +70,8 @@ pub struct ImportScopeBuilder {
     parent: Option<u32>,
     /// Raw import blob data
     imports: Option<Vec<u8>>,
+    /// The import declarations, encoded when the assembly is written
+    declarations: Option<ImportsInfo>,
 }
 
 impl ImportScopeBuilder {
@@ -90,6 +95,7 @@ impl ImportScopeBuilder {
         Self {
             parent: None,
             imports: None,
+            declarations: None,
         }
     }
 
@@ -126,7 +132,12 @@ impl ImportScopeBuilder {
     /// Sets the import blob data
     ///
     /// Specifies the raw import blob data for this scope. These bytes
-    /// represent the import information as defined in the Portable PDB format.
+    /// represent the import information as defined in the Portable PDB format: each
+    /// declaration's kind followed by its fields, the aliases and namespaces as `#Blob`
+    /// offsets of the input heap and the assemblies as AssemblyRef rows. The writer renumbers
+    /// those offsets and rows when the heap is rebuilt or rows move. To import text the heap
+    /// does not hold yet, use [`declarations`](Self::declarations). Setting the blob replaces
+    /// any declarations set before.
     ///
     /// # Parameters
     /// - `imports`: The raw import blob data
@@ -139,8 +150,8 @@ impl ImportScopeBuilder {
     /// ```rust,no_run
     /// use dotscope::prelude::*;
     ///
-    /// // Import scope with namespace imports
-    /// let import_data = vec![0x01, 0x10, 0x53, 0x79, 0x73, 0x74, 0x65, 0x6D]; // System namespace
+    /// // ImportNamespace (1) of the namespace at blob offset 0x10 of the input heap
+    /// let import_data = vec![0x01, 0x10];
     /// let builder = ImportScopeBuilder::new()
     ///     .imports(&import_data);
     ///
@@ -151,6 +162,45 @@ impl ImportScopeBuilder {
     #[must_use]
     pub fn imports(mut self, imports: &[u8]) -> Self {
         self.imports = Some(imports.to_vec());
+        self.declarations = None;
+        self
+    }
+
+    /// Sets the import declarations
+    ///
+    /// Each declaration's alias and namespace are added to the `#Blob` heap as UTF-8 text
+    /// (an empty one is blob index 0), and the imports blob is encoded with their offsets
+    /// when the assembly is written. Assemblies are AssemblyRef tokens and types TypeDef,
+    /// TypeRef or TypeSpec tokens, of the input or of rows a change adds. Setting the
+    /// declarations replaces any raw blob set before.
+    ///
+    /// # Parameters
+    /// - `declarations`: The scope's imports, in order
+    ///
+    /// # Returns
+    /// Self for method chaining
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::{metadata::importscope::{ImportDeclaration, ImportsInfo}, prelude::*};
+    ///
+    /// let builder = ImportScopeBuilder::new()
+    ///     .parent(0)
+    ///     .declarations(ImportsInfo::with_declarations(vec![
+    ///         ImportDeclaration::ImportNamespace {
+    ///             namespace: "System.Collections.Generic".to_string(),
+    ///         },
+    ///         ImportDeclaration::DefineNamespaceAlias {
+    ///             alias: "IO".to_string(),
+    ///             namespace: "System.IO".to_string(),
+    ///         },
+    ///     ]));
+    /// ```
+    #[must_use]
+    pub fn declarations(mut self, declarations: ImportsInfo) -> Self {
+        self.declarations = Some(declarations);
+        self.imports = None;
         self
     }
 
@@ -193,14 +243,23 @@ impl ImportScopeBuilder {
             )
         })?;
 
-        let imports = self.imports.ok_or_else(|| {
-            Error::ModificationInvalid("Import blob data is required for ImportScope".to_string())
-        })?;
-
-        let imports_index = if imports.is_empty() {
-            0
-        } else {
-            assembly.blob_add(&imports)?.placeholder()
+        let imports_index = match (self.declarations, self.imports) {
+            (Some(declarations), _) => {
+                let mut imports = Vec::with_capacity(declarations.len());
+                for declaration in declarations.iter() {
+                    imports.push(composite_import(assembly, declaration)?);
+                }
+                assembly
+                    .blob_add_composite(BlobComposite::Imports(imports))
+                    .placeholder()
+            }
+            (None, Some(imports)) if imports.is_empty() => 0,
+            (None, Some(imports)) => assembly.blob_add(&imports)?.placeholder(),
+            (None, None) => {
+                return Err(Error::ModificationInvalid(
+                    "Import blob data is required for ImportScope".to_string(),
+                ))
+            }
         };
 
         let import_scope = ImportScopeRaw {
@@ -216,6 +275,92 @@ impl ImportScopeBuilder {
             TableDataOwned::ImportScope(import_scope),
         )
     }
+}
+
+/// A declaration as the writer encodes it: its text added as blobs (an empty one is index 0),
+/// its assembly as an AssemblyRef row.
+fn composite_import(
+    assembly: &mut CilAssembly,
+    declaration: &ImportDeclaration,
+) -> Result<CompositeImport> {
+    let mut text = |value: &str| -> Result<Option<ChangeRefRc>> {
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            assembly.blob_add(value.as_bytes()).map(Some)
+        }
+    };
+    let assembly_row = |token: Token| -> Result<u32> {
+        if token.table() == TableId::AssemblyRef as u8 {
+            Ok(token.row())
+        } else {
+            Err(Error::ModificationInvalid(format!(
+                "an import names assembly {token}, which is not an AssemblyRef"
+            )))
+        }
+    };
+    let mut import = CompositeImport {
+        kind: ImportKind::ImportNamespace,
+        alias: None,
+        assembly: 0,
+        namespace: None,
+        target: None,
+    };
+    match declaration {
+        ImportDeclaration::ImportNamespace { namespace } => {
+            import.namespace = text(namespace)?;
+        }
+        ImportDeclaration::ImportAssemblyNamespace {
+            assembly_ref,
+            namespace,
+        } => {
+            import.kind = ImportKind::ImportAssemblyNamespace;
+            import.assembly = assembly_row(*assembly_ref)?;
+            import.namespace = text(namespace)?;
+        }
+        ImportDeclaration::ImportType { type_ref } => {
+            import.kind = ImportKind::ImportType;
+            import.target = Some(*type_ref);
+        }
+        ImportDeclaration::ImportXmlNamespace { alias, namespace } => {
+            import.kind = ImportKind::ImportXmlNamespace;
+            import.alias = text(alias)?;
+            import.namespace = text(namespace)?;
+        }
+        ImportDeclaration::ImportAssemblyReferenceAlias { alias } => {
+            import.kind = ImportKind::ImportAssemblyReferenceAlias;
+            import.alias = text(alias)?;
+        }
+        ImportDeclaration::DefineAssemblyAlias {
+            alias,
+            assembly_ref,
+        } => {
+            import.kind = ImportKind::DefineAssemblyAlias;
+            import.alias = text(alias)?;
+            import.assembly = assembly_row(*assembly_ref)?;
+        }
+        ImportDeclaration::DefineNamespaceAlias { alias, namespace } => {
+            import.kind = ImportKind::DefineNamespaceAlias;
+            import.alias = text(alias)?;
+            import.namespace = text(namespace)?;
+        }
+        ImportDeclaration::DefineAssemblyNamespaceAlias {
+            alias,
+            assembly_ref,
+            namespace,
+        } => {
+            import.kind = ImportKind::DefineAssemblyNamespaceAlias;
+            import.alias = text(alias)?;
+            import.assembly = assembly_row(*assembly_ref)?;
+            import.namespace = text(namespace)?;
+        }
+        ImportDeclaration::DefineTypeAlias { alias, type_ref } => {
+            import.kind = ImportKind::DefineTypeAlias;
+            import.alias = text(alias)?;
+            import.target = Some(*type_ref);
+        }
+    }
+    Ok(import)
 }
 
 impl Default for ImportScopeBuilder {

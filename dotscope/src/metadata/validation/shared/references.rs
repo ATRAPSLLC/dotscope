@@ -141,8 +141,10 @@ impl<'a> ReferenceValidator<'a> {
 
     /// Validates reference integrity for a specific token.
     ///
-    /// This method checks that a token's incoming and outgoing references
-    /// are all valid and don't create integrity violations.
+    /// This method checks that the token exists and that every token it references
+    /// exists. Its incoming references need no check: the scanner records them from
+    /// the rows it reads, so each one names a row that exists, and walking them for
+    /// every row that references a popular target was quadratic in its referrers.
     ///
     /// # Arguments
     ///
@@ -171,19 +173,6 @@ impl<'a> ReferenceValidator<'a> {
                         table: TableId::from_token_type(referenced_token.table())
                             .unwrap_or(TableId::Module),
                         rid: referenced_token.row(),
-                    });
-                }
-            }
-        }
-
-        // Validate all incoming references
-        if let Some(incoming_refs) = self.scanner.references_to(token) {
-            for &referencing_token in incoming_refs {
-                if !self.scanner.token_exists(referencing_token) {
-                    return Err(Error::InvalidRid {
-                        table: TableId::from_token_type(referencing_token.table())
-                            .unwrap_or(TableId::Module),
-                        rid: referencing_token.row(),
                     });
                 }
             }

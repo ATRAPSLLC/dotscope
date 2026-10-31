@@ -16,7 +16,7 @@ use crate::{
     metadata::{
         method::Method,
         signatures::{parse_type_spec_signature, SignatureParameter, TypeSignature},
-        tables::TypeSpecRaw,
+        tables::{TableId, TypeSpecRaw},
         token::Token,
         typesystem::{CilPrimitive, CilPrimitiveData, CilType, CilTypeReference},
     },
@@ -347,7 +347,7 @@ pub(super) fn format_method_ref(method: &Method, asm: &CilObject) -> String {
     )
 }
 
-/// Build an assembly-scoped name for a type with TypeSpec fallback resolution.
+/// Build an assembly-scoped name for a type, as an ILAsm `typeSpec` names it.
 ///
 /// For types defined in an external assembly, returns a name like
 /// `[mscorlib]System.Object` with the assembly reference prefix.
@@ -356,44 +356,15 @@ pub(super) fn format_method_ref(method: &Method, asm: &CilObject) -> String {
 /// the assembly reference (nested TypeRefs have their parent TypeRef as
 /// resolution scope, not the assembly ref directly).
 ///
-/// Handles TypeSpec entries that represent generic instances of nested types.
-/// These TypeSpecs lack enclosing type info (they were created during type
-/// resolution before the NestedClass table established nesting relationships).
-/// This function searches for the corresponding TypeDef to get the proper
-/// nested name.
+/// A TypeSpec entry is written from its signature, which states what the type is: a generic
+/// instance as `class Name<args>`, an array or pointer by its element type.
 pub(super) fn assembly_scoped_name(cil_type: &CilType, asm: &CilObject) -> String {
-    // For TypeSpec entries without enclosing type, try to find the TypeDef with proper nesting
-    if cil_type.token.table() == 0x1B && cil_type.enclosing_type().is_none() {
-        // Strip arity suffix (e.g. "`2") for comparison — TypeSpec CilTypes may have
-        // an arity suffix added by the type system that the TypeDef metadata name lacks
-        // (e.g. compiler-generated types like `<GetEnumerator>d__13`).
-        let base_name = strip_arity(&cil_type.name);
-        for entry in asm.types().iter() {
-            let td = entry.value();
-            if td.token.table() == 0x02
-                && strip_arity(&td.name) == base_name
-                && td.namespace == cil_type.namespace
-                && td.enclosing_type().is_some()
-            {
-                return format_assembly_scoped(td);
-            }
+    if cil_type.token.is_table(TableId::TypeSpec) {
+        if let Some(formatted) = format_typespec_from_blob(asm, &cil_type.token) {
+            return formatted;
         }
     }
     format_assembly_scoped(cil_type)
-}
-
-/// Strip a trailing generic arity suffix (`` `N ``) from a type name.
-fn strip_arity(name: &str) -> &str {
-    if let Some(pos) = name.rfind('`') {
-        if let Some(rest) = name.get(pos.saturating_add(1)..) {
-            if rest.chars().all(|c| c.is_ascii_digit()) {
-                if let Some(prefix) = name.get(..pos) {
-                    return prefix;
-                }
-            }
-        }
-    }
-    name
 }
 
 /// Format an assembly-scoped name without TypeSpec resolution (internal helper).

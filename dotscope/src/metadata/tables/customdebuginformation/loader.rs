@@ -123,8 +123,10 @@ impl MetadataLoader for CustomDebugInformationLoader {
     /// This method is thread-safe and uses parallel iteration for performance.
     /// Updates to storage collections are handled through atomic operations.
     fn load(&self, context: &LoaderContext) -> Result<()> {
-        let (Some(header), Some(guids), Some(blobs)) = (context.meta, context.guids, context.blobs)
-        else {
+        let Some(pdb) = &context.pdb else {
+            return Ok(());
+        };
+        let (Some(header), Some(guids), Some(blobs)) = (pdb.meta, pdb.guids, pdb.blobs) else {
             return Ok(());
         };
         let Some(table) = header.table::<CustomDebugInformationRaw>() else {
@@ -135,12 +137,13 @@ impl MetadataLoader for CustomDebugInformationLoader {
             .par_iter()
             .enumerate()
             .try_for_each_in_order(|(index, row)| {
-                let Some(row) = context.handle_row(row, index)? else {
+                let Some(row) = context.handle_row_in(pdb.lenient, row, index)? else {
                     return Ok(());
                 };
                 let token_msg = || format!("custom debug info 0x{:08x}", row.token.value());
 
-                let Some(custom_debug_info) = context.handle_result(
+                let Some(custom_debug_info) = context.handle_result_in(
+                    pdb.lenient,
                     row.to_owned(|coded_index| context.get_ref(coded_index), guids, blobs),
                     DiagnosticCategory::Table,
                     token_msg,
@@ -149,7 +152,7 @@ impl MetadataLoader for CustomDebugInformationLoader {
                     return Ok(());
                 };
 
-                context
+                pdb.target
                     .custom_debug_information
                     .insert(custom_debug_info.token, custom_debug_info);
                 Ok(())

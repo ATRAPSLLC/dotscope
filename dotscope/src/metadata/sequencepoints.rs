@@ -231,9 +231,54 @@ pub struct SequencePoints {
 
 impl SequencePoints {
     /// Returns the sequence point for a given IL offset, if any.
+    ///
+    /// The point must start exactly at `il_offset`; [`SequencePoints::find_containing`] gives
+    /// the point an instruction inside a statement belongs to.
     #[must_use]
     pub fn find_by_il_offset(&self, il_offset: u32) -> Option<&SequencePoint> {
         self.points.iter().find(|sp| sp.il_offset == il_offset)
+    }
+
+    /// Returns the sequence point an IL offset belongs to: the last point at or before it, as
+    /// a debugger maps an instruction to its source.
+    ///
+    /// A point covers the IL from its offset up to the next point's. When the covering point
+    /// is hidden ([`SequencePoint::is_hidden`]), the offset has no source location. The blob
+    /// stores offsets as increasing deltas, so the points are in strictly increasing IL offset
+    /// order and the lookup is a binary search.
+    ///
+    /// # Arguments
+    ///
+    /// * `il_offset` - An offset in the method's IL
+    ///
+    /// # Returns
+    ///
+    /// The covering point, or `None` for an offset before the first point.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dotscope::metadata::sequencepoints::{SequencePoint, SequencePoints};
+    ///
+    /// let points = SequencePoints {
+    ///     local_signature: 0,
+    ///     points: vec![
+    ///         SequencePoint::new(0, 10, 5, 10, 20).unwrap(),
+    ///         SequencePoint::new(6, 11, 5, 11, 30).unwrap(),
+    ///     ],
+    /// };
+    /// assert_eq!(points.find_containing(4).unwrap().start_line, 10);
+    /// assert_eq!(points.find_containing(6).unwrap().start_line, 11);
+    /// assert_eq!(points.find_containing(100).unwrap().start_line, 11);
+    /// ```
+    #[must_use]
+    pub fn find_containing(&self, il_offset: u32) -> Option<&SequencePoint> {
+        let after = self
+            .points
+            .partition_point(|point| point.il_offset <= il_offset);
+        after
+            .checked_sub(1)
+            .and_then(|index| self.points.get(index))
     }
 
     /// Serializes the sequence points to the Portable PDB blob format.
@@ -270,7 +315,7 @@ impl SequencePoints {
     /// compressed signed integer.
     pub fn to_bytes(&self, document: u32) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
-        write_compressed_uint(self.local_signature, &mut buffer);
+        write_compressed_uint(self.local_signature, &mut buffer)?;
 
         let document_of = |point: &SequencePoint| -> Result<u32> {
             match (point.document, document) {
@@ -291,7 +336,7 @@ impl SequencePoints {
         let mut current_document = match self.points.first() {
             Some(first) if document == 0 => {
                 let initial = document_of(first)?;
-                write_compressed_uint(initial, &mut buffer);
+                write_compressed_uint(initial, &mut buffer)?;
                 initial
             }
             _ => document,
@@ -303,8 +348,8 @@ impl SequencePoints {
             let point_document = document_of(point)?;
             if point_document != current_document {
                 // A document record: δILOffset 0, then the row.
-                write_compressed_uint(0, &mut buffer);
-                write_compressed_uint(point_document, &mut buffer);
+                write_compressed_uint(0, &mut buffer)?;
+                write_compressed_uint(point_document, &mut buffer)?;
                 current_document = point_document;
             }
 
@@ -320,12 +365,12 @@ impl SequencePoints {
                     }
                 },
             };
-            write_compressed_uint(offset_delta, &mut buffer);
+            write_compressed_uint(offset_delta, &mut buffer)?;
             previous_offset = Some(point.il_offset);
 
             if point.is_hidden {
-                write_compressed_uint(0, &mut buffer);
-                write_compressed_uint(0, &mut buffer);
+                write_compressed_uint(0, &mut buffer)?;
+                write_compressed_uint(0, &mut buffer)?;
                 continue;
             }
 
@@ -340,7 +385,7 @@ impl SequencePoints {
                         point.start_line
                     )
                 })?;
-            write_compressed_uint(line_delta, &mut buffer);
+            write_compressed_uint(line_delta, &mut buffer)?;
             let column_delta = i32::from(point.end_col).saturating_sub(i32::from(point.start_col));
             if line_delta == 0 {
                 let columns = u32::try_from(column_delta)
@@ -353,15 +398,15 @@ impl SequencePoints {
                             point.start_line
                         )
                     })?;
-                write_compressed_uint(columns, &mut buffer);
+                write_compressed_uint(columns, &mut buffer)?;
             } else {
                 write_compressed_int(column_delta, &mut buffer)?;
             }
 
             match previous_start {
                 None => {
-                    write_compressed_uint(point.start_line, &mut buffer);
-                    write_compressed_uint(u32::from(point.start_col), &mut buffer);
+                    write_compressed_uint(point.start_line, &mut buffer)?;
+                    write_compressed_uint(u32::from(point.start_col), &mut buffer)?;
                 }
                 Some((line, col)) => {
                     let line_step = i64::from(point.start_line).saturating_sub(i64::from(line));
@@ -489,6 +534,26 @@ mod tests {
 
     fn point(il_offset: u32, start: (u32, u16), end: (u32, u16)) -> SequencePoint {
         SequencePoint::new(il_offset, start.0, start.1, end.0, end.1).unwrap()
+    }
+
+    /// An offset belongs to the last point at or before it; a hidden point hides the IL it
+    /// covers, and an offset before the first point has none.
+    #[test]
+    fn an_offset_belongs_to_the_point_covering_it() {
+        let points = SequencePoints {
+            local_signature: 0,
+            points: vec![
+                point(2, (10, 5), (10, 20)),
+                SequencePoint::hidden(8),
+                point(12, (11, 5), (11, 30)),
+            ],
+        };
+        assert!(points.find_containing(1).is_none());
+        assert_eq!(points.find_containing(2).unwrap().start_line, 10);
+        assert_eq!(points.find_containing(7).unwrap().start_line, 10);
+        assert!(points.find_containing(9).unwrap().is_hidden);
+        assert_eq!(points.find_containing(500).unwrap().start_line, 11);
+        assert!(points.find_by_il_offset(7).is_none());
     }
 
     #[test]

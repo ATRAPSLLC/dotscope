@@ -895,7 +895,16 @@ impl RemapReferences for ModuleRaw {
 }
 
 impl RemapReferences for FieldPtrRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Field: direct RID into Field table
+        self.field = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Field",
+            },
+            TableId::Field,
+            self.field,
+        )?;
         Ok(())
     }
 }
@@ -907,13 +916,31 @@ impl RemapReferences for FieldRaw {
 }
 
 impl RemapReferences for MethodPtrRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Method: direct RID into MethodDef table
+        self.method = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Method",
+            },
+            TableId::MethodDef,
+            self.method,
+        )?;
         Ok(())
     }
 }
 
 impl RemapReferences for ParamPtrRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Param: direct RID into Param table
+        self.param = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Param",
+            },
+            TableId::Param,
+            self.param,
+        )?;
         Ok(())
     }
 }
@@ -931,13 +958,31 @@ impl RemapReferences for StandAloneSigRaw {
 }
 
 impl RemapReferences for EventPtrRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Event: direct RID into Event table
+        self.event = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Event",
+            },
+            TableId::Event,
+            self.event,
+        )?;
         Ok(())
     }
 }
 
 impl RemapReferences for PropertyPtrRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Property: direct RID into Property table
+        self.property = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Property",
+            },
+            TableId::Property,
+            self.property,
+        )?;
         Ok(())
     }
 }
@@ -991,13 +1036,31 @@ impl RemapReferences for AssemblyOsRaw {
 }
 
 impl RemapReferences for AssemblyRefProcessorRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // AssemblyRef: direct RID into AssemblyRef table
+        self.assembly_ref = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "AssemblyRef",
+            },
+            TableId::AssemblyRef,
+            self.assembly_ref,
+        )?;
         Ok(())
     }
 }
 
 impl RemapReferences for AssemblyRefOsRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // AssemblyRef: direct RID into AssemblyRef table
+        self.assembly_ref = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "AssemblyRef",
+            },
+            TableId::AssemblyRef,
+            self.assembly_ref,
+        )?;
         Ok(())
     }
 }
@@ -1009,49 +1072,110 @@ impl RemapReferences for FileRaw {
 }
 
 impl RemapReferences for DocumentRaw {
+    // No column names a row: its heap columns are patched with the heaps
     fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
         Ok(())
     }
 }
 
 impl RemapReferences for MethodDebugInformationRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Document: direct RID into Document table
+        self.document = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Document",
+            },
+            TableId::Document,
+            self.document,
+        )?;
         Ok(())
     }
 }
 
 impl RemapReferences for LocalScopeRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Method: direct RID into MethodDef table
+        self.method = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Method",
+            },
+            TableId::MethodDef,
+            self.method,
+        )?;
+        // ImportScope: direct RID into ImportScope table
+        self.import_scope = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "ImportScope",
+            },
+            TableId::ImportScope,
+            self.import_scope,
+        )?;
+        // VariableList and ConstantList: list starts in LocalVariable and LocalConstant
+        self.variable_list = remapper.list_start(TableId::LocalVariable, self.variable_list);
+        self.constant_list = remapper.list_start(TableId::LocalConstant, self.constant_list);
         Ok(())
     }
 }
 
 impl RemapReferences for LocalVariableRaw {
+    // No column names a row: its heap columns are patched with the heaps
     fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
         Ok(())
     }
 }
 
 impl RemapReferences for LocalConstantRaw {
+    // No column names a row: its heap columns are patched with the heaps
     fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
         Ok(())
     }
 }
 
 impl RemapReferences for ImportScopeRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Parent: direct RID into ImportScope table
+        self.parent = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "Parent",
+            },
+            TableId::ImportScope,
+            self.parent,
+        )?;
         Ok(())
     }
 }
 
 impl RemapReferences for StateMachineMethodRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // MoveNextMethod and KickoffMethod: direct RIDs into MethodDef table
+        self.move_next_method = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "MoveNextMethod",
+            },
+            TableId::MethodDef,
+            self.move_next_method,
+        )?;
+        self.kickoff_method = remapper.reference(
+            Referrer::Column {
+                row: self.token,
+                column: "KickoffMethod",
+            },
+            TableId::MethodDef,
+            self.kickoff_method,
+        )?;
         Ok(())
     }
 }
 
 impl RemapReferences for CustomDebugInformationRaw {
-    fn remap_references(&mut self, _remapper: &RidRemapper) -> Result<()> {
+    fn remap_references(&mut self, remapper: &RidRemapper) -> Result<()> {
+        // Parent: HasCustomDebugInformation, any table it names (the PDB's own included)
+        remapper.remap_coded_index(self.token, "Parent", &mut self.parent)?;
         Ok(())
     }
 }
@@ -1136,8 +1260,15 @@ impl RidRemapper {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use strum::IntoEnumIterator;
+
     use super::*;
-    use crate::metadata::tables::CodedIndexType;
+    use crate::{
+        dispatch_table_type,
+        metadata::tables::{CodedIndexType, TableInfo, TableRow},
+    };
 
     /// A remapper for `table` of `count` rows with `deleted` rows deleted.
     fn deleting(
@@ -1390,5 +1521,166 @@ mod tests {
 
         let null = deleting(TableId::MethodDef, &[3], 10, DanglingPolicy::Null).token_remap();
         assert_eq!(null.remap(body, 0x0600_0003).unwrap(), 0x0600_0000);
+    }
+
+    /// A remapper deleting `deleted` rows of each table of `count` rows.
+    fn deleting_in(tables: &[(TableId, &[u32], u32)]) -> RidRemapper {
+        let mut remapper = RidRemapper::empty();
+        for &(table, deleted, count) in tables {
+            let deleted: HashSet<u32> = deleted.iter().copied().collect();
+            let (refs, list_starts) = RidRemapper::calculate_remapping(&deleted, count);
+            remapper.refs.insert(table, refs);
+            remapper.list_starts.insert(table, list_starts);
+            remapper.tables_with_deletions.insert(table);
+            remapper.deleted_rids.insert(table, deleted);
+        }
+        remapper
+    }
+
+    /// The Portable PDB tables' row columns follow the rows they name: a method's document,
+    /// a scope's method, import scope and lists, an import scope's parent, a state machine's
+    /// methods and a custom debug information row's parent; and a deleted document is a
+    /// dangling reference.
+    #[test]
+    fn debug_table_columns_follow_their_rows() {
+        let remapper = deleting_in(&[
+            (TableId::Document, &[1], 5),
+            (TableId::MethodDef, &[1], 6),
+            (TableId::ImportScope, &[1], 4),
+            (TableId::LocalVariable, &[1], 4),
+            (TableId::LocalConstant, &[1], 4),
+        ]);
+
+        let mut info = MethodDebugInformationRaw {
+            rid: 1,
+            token: Token::new(0x3100_0001),
+            offset: 0,
+            document: 3,
+            sequence_points: 0,
+        };
+        info.remap_references(&remapper).unwrap();
+        assert_eq!(info.document, 2);
+
+        let mut scope = LocalScopeRaw {
+            rid: 1,
+            token: Token::new(0x3200_0001),
+            offset: 0,
+            method: 4,
+            import_scope: 3,
+            variable_list: 3,
+            constant_list: 2,
+            start_offset: 0,
+            length: 8,
+        };
+        scope.remap_references(&remapper).unwrap();
+        assert_eq!(
+            (
+                scope.method,
+                scope.import_scope,
+                scope.variable_list,
+                scope.constant_list
+            ),
+            (3, 2, 2, 1)
+        );
+
+        let mut import_scope = ImportScopeRaw {
+            rid: 3,
+            token: Token::new(0x3500_0003),
+            offset: 0,
+            parent: 2,
+            imports: 0,
+        };
+        import_scope.remap_references(&remapper).unwrap();
+        assert_eq!(import_scope.parent, 1);
+
+        let mut state_machine = StateMachineMethodRaw {
+            rid: 1,
+            token: Token::new(0x3600_0001),
+            offset: 0,
+            move_next_method: 5,
+            kickoff_method: 4,
+        };
+        state_machine.remap_references(&remapper).unwrap();
+        assert_eq!(
+            (state_machine.move_next_method, state_machine.kickoff_method),
+            (4, 3)
+        );
+
+        let mut record = CustomDebugInformationRaw {
+            rid: 1,
+            token: Token::new(0x3700_0001),
+            offset: 0,
+            parent: CodedIndex::new(
+                TableId::Document,
+                3,
+                CodedIndexType::HasCustomDebugInformation,
+            ),
+            kind: 1,
+            value: 0,
+        };
+        record.remap_references(&remapper).unwrap();
+        assert_eq!(record.parent.row, 2);
+
+        let mut deleted = MethodDebugInformationRaw {
+            document: 1,
+            ..info
+        };
+        assert!(matches!(
+            deleted.remap_references(&remapper),
+            Err(Error::DanglingReference { target, .. }) if target == Token::new(0x3000_0001)
+        ));
+    }
+
+    /// The pointer tables and the AssemblyRef processor and OS tables follow the rows they
+    /// name.
+    #[test]
+    fn pointer_and_assembly_ref_columns_follow_their_rows() {
+        let remapper = deleting_in(&[(TableId::Field, &[1], 5), (TableId::AssemblyRef, &[1], 3)]);
+        let mut pointer = FieldPtrRaw {
+            rid: 1,
+            token: Token::new(0x0300_0001),
+            offset: 0,
+            field: 3,
+        };
+        pointer.remap_references(&remapper).unwrap();
+        assert_eq!(pointer.field, 2);
+
+        let mut os = AssemblyRefOsRaw {
+            rid: 1,
+            token: Token::new(0x2500_0001),
+            offset: 0,
+            os_platform_id: 2,
+            os_major_version: 6,
+            os_minor_version: 1,
+            assembly_ref: 2,
+        };
+        os.remap_references(&remapper).unwrap();
+        assert_eq!(os.assembly_ref, 1);
+    }
+
+    /// `TableId::references` names every table a row's columns can name, as the row layouts
+    /// say: a column naming a table, directly or through a coded index, widens to four bytes
+    /// when that table outgrows two-byte indexes, so a row is larger against a layout where
+    /// only that table is large. The writer renumbers a table's rows only when a table its
+    /// `references` names loses rows, so a table missing there keeps stale rows.
+    #[test]
+    fn references_name_every_table_a_row_names() {
+        let size = |table: TableId, large: Option<TableId>| -> u32 {
+            let rows: Vec<(TableId, u32)> = large
+                .into_iter()
+                .map(|large| (large, 0x0001_0000))
+                .collect();
+            let info = Arc::new(TableInfo::new_test(&rows, false, false, false));
+            dispatch_table_type!(table, |RawType| RawType::row_size(&info))
+        };
+        for table in TableId::iter() {
+            let base = size(table, None);
+            let named: HashSet<TableId> = TableId::iter()
+                .filter(|&target| size(table, Some(target)) > base)
+                .collect();
+            let listed: HashSet<TableId> = table.references().iter().copied().collect();
+            assert_eq!(listed, named, "{table:?}");
+            assert_eq!(table.has_cross_references(), !named.is_empty(), "{table:?}");
+        }
     }
 }

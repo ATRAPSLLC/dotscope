@@ -1,218 +1,202 @@
-//! Binary parser for import declarations in Portable PDB debugging metadata.
+//! Binary codec for import declarations in Portable PDB debugging metadata.
 //!
-//! This module provides the parsing implementation for the imports blob format.
-//! See the parent module [`crate::metadata::importscope`] for the complete binary
-//! format specification and usage examples.
+//! This module provides the parsing and encoding of the imports blob format. See the parent
+//! module [`crate::metadata::importscope`] for the complete binary format specification and
+//! usage examples.
 //!
 //! # Overview
 //!
-//! The parser reads import declarations sequentially from a binary blob, resolving
-//! string references from the blob heap and constructing typed [`ImportDeclaration`]
-//! values for each entry.
+//! An imports blob is a sequence of declarations, each its kind followed by the fields that
+//! kind has, in this order: an alias (a `#Blob` index of UTF-8 text), an assembly (an
+//! AssemblyRef row), a namespace (a `#Blob` index of UTF-8 text) and a type (a
+//! `TypeDefOrRefOrSpecEncoded` token).
+//!
+//! The codec works at two levels:
+//!
+//! - [`parse_import_records`] and [`encode_import_records`] read and write the declarations as
+//!   the blob stores them ([`ImportRecord`]): blob indices and rows, not the text and tokens
+//!   they name. This is the level a writer works at, renumbering what the blob points at.
+//! - [`parse_imports_blob`] resolves the records against the `#Blob` heap into typed
+//!   [`ImportDeclaration`] values with their text.
 //!
 //! # Error Handling
 //!
-//! The parser returns errors for:
+//! Parsing returns errors for:
 //! - **Invalid Kind Values**: Import kind values outside the valid 1-9 range
 //! - **Truncated Data**: Insufficient data for expected import parameters
 //! - **Blob Resolution Failures**: Invalid blob heap indices
 //! - **Token Encoding Errors**: Malformed compressed token encoding
 //!
-//! Note: Invalid UTF-8 sequences in strings are handled using lossy conversion
-//! (replacement with U+FFFD) rather than returning errors, matching the behavior
-//! of other parsers in the codebase.
-//!
-//! # Thread Safety
-//!
-//! All types in this module are [`Send`] and [`Sync`].
+//! Encoding fails for a type token that is not a TypeDef, TypeRef or TypeSpec, and for an
+//! index past what a compressed integer holds.
 
 use crate::{
     file::parser::Parser,
     metadata::{
         importscope::types::{ImportDeclaration, ImportKind, ImportsInfo},
+        signatures::encode_type_def_or_ref_coded_index,
         streams::Blob,
         tables::TableId,
         token::Token,
     },
+    utils::write_compressed_uint,
     Result,
 };
 
-/// Parser for imports blob binary data implementing the Portable PDB specification.
+/// An import declaration as its blob stores it: its kind, and the blob indices, AssemblyRef
+/// row and type token the kind has.
 ///
-/// This parser follows the same architectural pattern as other parsers in the codebase
-/// (like `SignatureParser` and `MarshallingParser`) with proper error handling and
-/// state management. It provides a structured approach to parsing the complex binary
-/// format of imports blobs.
+/// A field the kind does not have is 0 (`None` for the type). Index 0 of a field the kind has
+/// is the empty blob, which reads as empty text.
 ///
-/// # Thread Safety
+/// # Examples
 ///
-/// The parser is [`std::marker::Send`] and [`std::marker::Sync`] as it contains only borrowed data.
-/// Instances can be safely used across threads and accessed concurrently.
-pub struct ImportsParser<'a> {
-    /// Binary data parser for reading blob data
-    parser: Parser<'a>,
-    /// Reference to the blob heap for resolving blob indices
-    blobs: &'a Blob<'a>,
+/// ```rust
+/// use dotscope::metadata::importscope::{
+///     encode_import_records, parse_import_records, ImportKind, ImportRecord,
+/// };
+///
+/// // `using Alias = <namespace at blob 8>;`
+/// let blob = [0x07, 0x01, 0x08];
+/// let records = parse_import_records(&blob)?;
+/// assert_eq!(
+///     records,
+///     [ImportRecord {
+///         kind: ImportKind::DefineNamespaceAlias,
+///         alias: 1,
+///         assembly: 0,
+///         namespace: 8,
+///         target: None,
+///     }]
+/// );
+/// assert_eq!(encode_import_records(&records)?, blob);
+/// # Ok::<(), dotscope::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportRecord {
+    /// The declaration's kind
+    pub kind: ImportKind,
+    /// The `#Blob` index of the alias, for the kinds that define or name an alias
+    pub alias: u32,
+    /// The AssemblyRef row, for the kinds that name an assembly
+    pub assembly: u32,
+    /// The `#Blob` index of the namespace, for the kinds that name one
+    pub namespace: u32,
+    /// The type (a TypeDef, TypeRef or TypeSpec token), for the kinds that name one
+    pub target: Option<Token>,
 }
 
-impl<'a> ImportsParser<'a> {
-    /// Creates a new parser for the given imports blob data.
-    ///
-    /// # Arguments
-    /// * `data` - The byte slice containing the imports blob to parse
-    /// * `blobs` - Reference to the blob heap for resolving blob indices
-    ///
-    /// # Returns
-    /// A new parser ready to parse the provided data.
-    ///
-    /// # Thread Safety
-    ///
-    /// This method is thread-safe and can be called concurrently from multiple threads.
-    #[must_use]
-    pub fn new(data: &'a [u8], blobs: &'a Blob) -> Self {
-        ImportsParser {
-            parser: Parser::new(data),
-            blobs,
+impl ImportKind {
+    /// The fields a declaration of this kind has after its kind, in blob order: an alias, an
+    /// assembly, a namespace, a type.
+    fn fields(self) -> [bool; 4] {
+        match self {
+            ImportKind::ImportNamespace => [false, false, true, false],
+            ImportKind::ImportAssemblyNamespace => [false, true, true, false],
+            ImportKind::ImportType => [false, false, false, true],
+            ImportKind::ImportXmlNamespace | ImportKind::DefineNamespaceAlias => {
+                [true, false, true, false]
+            }
+            ImportKind::ImportAssemblyReferenceAlias => [true, false, false, false],
+            ImportKind::DefineAssemblyAlias => [true, true, false, false],
+            ImportKind::DefineAssemblyNamespaceAlias => [true, true, true, false],
+            ImportKind::DefineTypeAlias => [true, false, false, true],
         }
     }
+}
 
-    /// Parse the complete imports blob into structured import declarations.
-    ///
-    /// This method reads all import declarations from the blob sequentially until
-    /// the end of data is reached. Each declaration is parsed according to its
-    /// kind and added to the resulting imports information.
-    ///
-    /// # Returns
-    /// * [`Ok`]([`ImportsInfo`]) - Successfully parsed imports information
-    /// * [`Err`]([`crate::Error`]) - Parsing failed due to malformed data or I/O errors
-    ///
-    /// # Errors
-    /// This method returns an error in the following cases:
-    /// - **Invalid Kind**: Unrecognized import kind value (not 1-9)
-    /// - **Truncated Data**: Insufficient data for expected parameters
-    /// - **Invalid Blob**: Blob heap references that cannot be resolved
-    /// - **Malformed Tokens**: Invalid compressed token encoding
-    ///
-    /// # Thread Safety
-    ///
-    /// This method is thread-safe and can be called concurrently from multiple threads.
-    pub fn parse_imports(&mut self) -> Result<ImportsInfo> {
-        let mut declarations = Vec::new();
-
-        while self.parser.has_more_data() {
-            let kind_value = self.parser.read_compressed_uint()?;
-            let kind = ImportKind::from_u32(kind_value)
-                .ok_or_else(|| malformed_error!("Invalid import kind: {}", kind_value))?;
-
-            let declaration = match kind {
-                ImportKind::ImportNamespace => {
-                    let namespace = self.read_blob_string()?;
-                    ImportDeclaration::ImportNamespace { namespace }
-                }
-                ImportKind::ImportAssemblyNamespace => {
-                    let assembly_ref = self.read_assembly_ref_token()?;
-                    let namespace = self.read_blob_string()?;
-                    ImportDeclaration::ImportAssemblyNamespace {
-                        assembly_ref,
-                        namespace,
-                    }
-                }
-                ImportKind::ImportType => {
-                    let type_ref = self.parser.read_compressed_token()?;
-                    ImportDeclaration::ImportType { type_ref }
-                }
-                ImportKind::ImportXmlNamespace => {
-                    let alias = self.read_blob_string()?;
-                    let namespace = self.read_blob_string()?;
-                    ImportDeclaration::ImportXmlNamespace { alias, namespace }
-                }
-                ImportKind::ImportAssemblyReferenceAlias => {
-                    let alias = self.read_blob_string()?;
-                    ImportDeclaration::ImportAssemblyReferenceAlias { alias }
-                }
-                ImportKind::DefineAssemblyAlias => {
-                    let alias = self.read_blob_string()?;
-                    let assembly_ref = self.read_assembly_ref_token()?;
-                    ImportDeclaration::DefineAssemblyAlias {
-                        alias,
-                        assembly_ref,
-                    }
-                }
-                ImportKind::DefineNamespaceAlias => {
-                    let alias = self.read_blob_string()?;
-                    let namespace = self.read_blob_string()?;
-                    ImportDeclaration::DefineNamespaceAlias { alias, namespace }
-                }
-                ImportKind::DefineAssemblyNamespaceAlias => {
-                    let alias = self.read_blob_string()?;
-                    let assembly_ref = self.read_assembly_ref_token()?;
-                    let namespace = self.read_blob_string()?;
-                    ImportDeclaration::DefineAssemblyNamespaceAlias {
-                        alias,
-                        assembly_ref,
-                        namespace,
-                    }
-                }
-                ImportKind::DefineTypeAlias => {
-                    let alias = self.read_blob_string()?;
-                    let type_ref = self.parser.read_compressed_token()?;
-                    ImportDeclaration::DefineTypeAlias { alias, type_ref }
-                }
-            };
-
-            declarations.push(declaration);
+/// Reads an imports blob as its declarations are stored, without resolving their blob
+/// indices.
+///
+/// # Arguments
+///
+/// * `data` - The imports blob an ImportScope row's Imports column names
+///
+/// # Returns
+///
+/// The declarations in blob order; none for an empty blob.
+///
+/// # Errors
+///
+/// Returns an error when a kind is not 1 to 9 or the blob ends inside a declaration.
+pub fn parse_import_records(data: &[u8]) -> Result<Vec<ImportRecord>> {
+    let mut parser = Parser::new(data);
+    let mut records = Vec::new();
+    while parser.has_more_data() {
+        let kind_value = parser.read_compressed_uint()?;
+        let kind = ImportKind::from_u32(kind_value)
+            .ok_or_else(|| malformed_error!("Invalid import kind: {}", kind_value))?;
+        let [alias, assembly, namespace, target] = kind.fields();
+        let mut record = ImportRecord {
+            kind,
+            alias: 0,
+            assembly: 0,
+            namespace: 0,
+            target: None,
+        };
+        if alias {
+            record.alias = parser.read_compressed_uint()?;
         }
-
-        Ok(ImportsInfo::with_declarations(declarations))
+        if assembly {
+            record.assembly = parser.read_compressed_uint()?;
+        }
+        if namespace {
+            record.namespace = parser.read_compressed_uint()?;
+        }
+        if target {
+            record.target = Some(parser.read_compressed_token()?);
+        }
+        records.push(record);
     }
+    Ok(records)
+}
 
-    /// Read a UTF-8 string from the blob heap using a compressed blob index.
-    ///
-    /// # UTF-8 Handling
-    ///
-    /// Invalid UTF-8 sequences are replaced with the Unicode replacement character (U+FFFD)
-    /// using lossy conversion. No error is returned for invalid encoding - this matches
-    /// the behavior of other parsers in the codebase (e.g., `security/permissionset.rs`).
-    ///
-    /// # Empty Strings
-    ///
-    /// Empty strings are permitted and returned as-is. The Portable PDB specification
-    /// does not explicitly prohibit empty namespace or alias strings, and some edge
-    /// cases (like default/global namespaces) may legitimately use empty strings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the blob index is invalid or the blob heap lookup fails.
-    fn read_blob_string(&mut self) -> Result<String> {
-        let blob_index = self.parser.read_compressed_uint()?;
-        let blob_data = self.blobs.get(blob_index as usize)?;
-        Ok(String::from_utf8_lossy(blob_data).into_owned())
+/// Writes declarations as an imports blob: the inverse of [`parse_import_records`].
+///
+/// Each declaration writes the fields its kind has; a field it does not have is not written,
+/// whatever it holds.
+///
+/// # Arguments
+///
+/// * `records` - The declarations, in blob order
+///
+/// # Returns
+///
+/// The imports blob.
+///
+/// # Errors
+///
+/// Returns an error when an index or row is past what a compressed integer holds, or a kind
+/// that names a type has none or one that is not a TypeDef, TypeRef or TypeSpec token.
+pub fn encode_import_records(records: &[ImportRecord]) -> Result<Vec<u8>> {
+    let mut blob = Vec::new();
+    for record in records {
+        let [alias, assembly, namespace, target] = record.kind.fields();
+        write_compressed_uint(record.kind as u32, &mut blob)?;
+        if alias {
+            write_compressed_uint(record.alias, &mut blob)?;
+        }
+        if assembly {
+            write_compressed_uint(record.assembly, &mut blob)?;
+        }
+        if namespace {
+            write_compressed_uint(record.namespace, &mut blob)?;
+        }
+        if target {
+            let token = record
+                .target
+                .ok_or_else(|| malformed_error!("a {:?} import names no type", record.kind))?;
+            write_compressed_uint(encode_type_def_or_ref_coded_index(token)?, &mut blob)?;
+        }
     }
-
-    /// Read an AssemblyRef table token from a compressed unsigned integer row ID.
-    ///
-    /// The row ID is read as a compressed unsigned integer and combined with
-    /// the AssemblyRef table identifier (0x23) to form a complete metadata token.
-    ///
-    /// # Token Format
-    ///
-    /// The returned token has format `(TableId::AssemblyRef << 24) | row_id`, where
-    /// `row_id` is a 1-based index into the AssemblyRef table.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading the compressed integer fails due to truncated data.
-    fn read_assembly_ref_token(&mut self) -> Result<Token> {
-        let row_id = self.parser.read_compressed_uint()?;
-        Ok(Token::new((TableId::AssemblyRef as u32) << 24 | row_id))
-    }
+    Ok(blob)
 }
 
 /// Parse an imports blob into structured import declarations.
 ///
-/// This is a convenience function that creates a parser and parses a complete
-/// imports blob from the provided byte slice. The function handles the full parsing
-/// process including kind identification, parameter extraction, and heap resolution.
+/// Reads the declarations ([`parse_import_records`]) and resolves each alias and namespace
+/// against the `#Blob` heap. Text is read as UTF-8, an invalid sequence as U+FFFD, as
+/// System.Reflection.Metadata reads it.
 ///
 /// # Arguments
 /// * `data` - The byte slice containing the imports blob to parse
@@ -231,11 +215,16 @@ impl<'a> ImportsParser<'a> {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use dotscope::metadata::importscope::parse_imports_blob;
+/// ```rust
+/// use dotscope::metadata::{
+///     importscope::{parse_imports_blob, ImportDeclaration},
+///     streams::Blob,
+/// };
 ///
-/// let blob_data = &[0x01, 0x05, 0x54, 0x65, 0x73, 0x74, 0x73]; // ImportNamespace "Tests"
-/// let imports = parse_imports_blob(blob_data, blobs_heap)?;
+/// // A heap holding "Tests" at index 1
+/// let heap = [0x00, 0x05, b'T', b'e', b's', b't', b's'];
+/// let blobs = Blob::from(&heap)?;
+/// let imports = parse_imports_blob(&[0x01, 0x01], &blobs)?; // ImportNamespace "Tests"
 ///
 /// assert_eq!(imports.declarations.len(), 1);
 /// if let ImportDeclaration::ImportNamespace { namespace } = &imports.declarations[0] {
@@ -248,12 +237,61 @@ impl<'a> ImportsParser<'a> {
 ///
 /// This function is thread-safe and can be called concurrently from multiple threads.
 pub fn parse_imports_blob(data: &[u8], blobs: &Blob) -> Result<ImportsInfo> {
-    if data.is_empty() {
-        return Ok(ImportsInfo::new());
-    }
-
-    let mut parser = ImportsParser::new(data, blobs);
-    parser.parse_imports()
+    let text = |index: u32| -> Result<String> {
+        Ok(String::from_utf8_lossy(blobs.get(index as usize)?).into_owned())
+    };
+    let assembly_ref = |row: u32| Token::new((TableId::AssemblyRef as u32) << 24 | row);
+    let type_of = |record: &ImportRecord| {
+        record
+            .target
+            .ok_or_else(|| malformed_error!("a {:?} import names no type", record.kind))
+    };
+    let declarations = parse_import_records(data)?
+        .iter()
+        .map(|record| {
+            Ok(match record.kind {
+                ImportKind::ImportNamespace => ImportDeclaration::ImportNamespace {
+                    namespace: text(record.namespace)?,
+                },
+                ImportKind::ImportAssemblyNamespace => ImportDeclaration::ImportAssemblyNamespace {
+                    assembly_ref: assembly_ref(record.assembly),
+                    namespace: text(record.namespace)?,
+                },
+                ImportKind::ImportType => ImportDeclaration::ImportType {
+                    type_ref: type_of(record)?,
+                },
+                ImportKind::ImportXmlNamespace => ImportDeclaration::ImportXmlNamespace {
+                    alias: text(record.alias)?,
+                    namespace: text(record.namespace)?,
+                },
+                ImportKind::ImportAssemblyReferenceAlias => {
+                    ImportDeclaration::ImportAssemblyReferenceAlias {
+                        alias: text(record.alias)?,
+                    }
+                }
+                ImportKind::DefineAssemblyAlias => ImportDeclaration::DefineAssemblyAlias {
+                    alias: text(record.alias)?,
+                    assembly_ref: assembly_ref(record.assembly),
+                },
+                ImportKind::DefineNamespaceAlias => ImportDeclaration::DefineNamespaceAlias {
+                    alias: text(record.alias)?,
+                    namespace: text(record.namespace)?,
+                },
+                ImportKind::DefineAssemblyNamespaceAlias => {
+                    ImportDeclaration::DefineAssemblyNamespaceAlias {
+                        alias: text(record.alias)?,
+                        assembly_ref: assembly_ref(record.assembly),
+                        namespace: text(record.namespace)?,
+                    }
+                }
+                ImportKind::DefineTypeAlias => ImportDeclaration::DefineTypeAlias {
+                    alias: text(record.alias)?,
+                    type_ref: type_of(record)?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ImportsInfo::with_declarations(declarations))
 }
 
 #[cfg(test)]
@@ -295,15 +333,6 @@ mod tests {
         let blobs = create_empty_blob_stream();
         let result = parse_imports_blob(&[], &blobs).unwrap();
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_imports_parser_new() {
-        let blobs = create_empty_blob_stream();
-        let data = &[0x01, 0x00];
-        let parser = ImportsParser::new(data, &blobs);
-
-        assert_eq!(parser.parser.len(), 2);
     }
 
     #[test]

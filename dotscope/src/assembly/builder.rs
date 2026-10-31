@@ -87,11 +87,15 @@ use crate::{
         FlowType, Immediate, Operand, OperandType,
     },
     metadata::{
-        method::{ExceptionHandler, ExceptionHandlerFlags},
+        method::{order_nested_first, ExceptionHandler, ExceptionHandlerFlags},
         token::Token,
     },
     Error, Result,
 };
+
+/// What [`InstructionAssembler::finish_with_labels`] returns: the bytecode, its maximum stack
+/// depth, its exception clauses and every label's final offset.
+pub type FinishedWithLabels = (Vec<u8>, u16, Vec<ExceptionHandler>, HashMap<String, u32>);
 
 /// Types of exception handlers that can be attached to a try block.
 #[derive(Debug, Clone)]
@@ -130,6 +134,8 @@ struct TryBlockInfo {
     end_label: Option<String>,
     /// Handlers attached to this try block.
     handlers: Vec<HandlerInfo>,
+    /// The order the try block was started in, which orders clauses of equal nesting.
+    sequence: usize,
 }
 
 /// High-level fluent API for assembling CIL instructions.
@@ -290,12 +296,29 @@ impl InstructionAssembler {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn finish(self) -> Result<(Vec<u8>, u16, Vec<ExceptionHandler>)> {
+        self.finish_with_labels()
+            .map(|(bytecode, max_stack, handlers, _)| (bytecode, max_stack, handlers))
+    }
+
+    /// Finalizes the assembly as [`finish`](Self::finish) does, and also returns every label's
+    /// final offset.
+    ///
+    /// Finalizing can shorten branches, which moves the code after them: an offset read with
+    /// [`get_label_position`](Self::get_label_position) before it can be stale. These are the
+    /// offsets the returned bytecode has.
+    ///
+    /// # Errors
+    ///
+    /// As [`finish`](Self::finish).
+    pub fn finish_with_labels(self) -> Result<FinishedWithLabels> {
         // Finalize encoder and get label positions
         let (bytecode, max_stack, labels) = self.encoder.finalize()?;
 
-        // Build exception handlers from try block info
+        // Build exception handlers from try block info, in the order the try blocks began
+        let mut try_blocks: Vec<&TryBlockInfo> = self.try_blocks.values().collect();
+        try_blocks.sort_by_key(|try_block| try_block.sequence);
         let mut handlers = Vec::new();
-        for try_block in self.try_blocks.values() {
+        for try_block in try_blocks {
             let try_start = labels
                 .get(&try_block.start_label)
                 .ok_or_else(|| Error::UndefinedLabel(try_block.start_label.clone()))?;
@@ -352,7 +375,7 @@ impl InstructionAssembler {
             }
         }
 
-        Ok((bytecode, max_stack, handlers))
+        Ok((bytecode, max_stack, order_nested_first(handlers), labels))
     }
 
     /// Get the current maximum stack depth without finalizing the assembly.
@@ -651,12 +674,14 @@ impl InstructionAssembler {
         let start_label = self.generate_label(&format!("try_{name}_start"));
         self.encoder.define_label(&start_label)?;
 
+        let sequence = self.try_blocks.len();
         self.try_blocks.insert(
             name.to_string(),
             TryBlockInfo {
                 start_label,
                 end_label: None,
                 handlers: Vec::new(),
+                sequence,
             },
         );
 
@@ -3496,6 +3521,76 @@ mod tests {
             assert!(handler.is_catch());
         }
 
+        // ECMA-335 II.19: the nested clause first, though the outer try began first
+        assert_eq!(handlers[0].filter_offset, exception_type2.value());
+        assert_eq!(handlers[1].filter_offset, exception_type1.value());
+
+        Ok(())
+    }
+
+    /// Clauses come in nesting order, the same on every build: they came in a hash map's order,
+    /// which differs per assembler, and an enclosing clause before a nested one is invalid IL.
+    #[test]
+    fn clauses_come_nested_first_on_every_build() -> Result<()> {
+        let outer_type = Token::new(0x01000001);
+        let build = || -> Result<Vec<ExceptionHandler>> {
+            // A short try whose catch holds a long try/finally: the nested clause's protected
+            // region is longer than the enclosing one's, so length alone would order them wrong
+            let mut asm = InstructionAssembler::new();
+            asm.try_start("outer")?
+                .nop()?
+                .leave_s("end")?
+                .try_end("outer")?
+                .catch_start("outer", outer_type)?
+                .pop()?
+                .try_start("inner")?
+                .nop()?
+                .nop()?
+                .nop()?
+                .nop()?
+                .nop()?
+                .nop()?
+                .leave_s("after_inner")?
+                .try_end("inner")?
+                .finally_start("inner")?
+                .endfinally()?
+                .finally_end("inner")?
+                .label("after_inner")?
+                .leave_s("end")?
+                .catch_end("outer")?
+                .label("end")?
+                .ret()?;
+            Ok(asm.finish()?.2)
+        };
+        let shape = |clauses: &[ExceptionHandler]| -> Vec<(u32, u32, u32, u32, u32)> {
+            clauses
+                .iter()
+                .map(|c| {
+                    (
+                        c.try_offset,
+                        c.try_length,
+                        c.handler_offset,
+                        c.handler_length,
+                        c.filter_offset,
+                    )
+                })
+                .collect()
+        };
+        let first = build()?;
+        assert_eq!(first.len(), 2);
+        assert!(
+            first[0].is_finally(),
+            "the clause nested in the handler comes first"
+        );
+        assert_eq!(first[1].filter_offset, outer_type.value());
+        assert!(first[0].try_length > first[1].try_length);
+        for _ in 0..50 {
+            assert_eq!(
+                shape(&build()?),
+                shape(&first),
+                "every build orders the clauses alike"
+            );
+        }
         Ok(())
     }
 
@@ -3533,6 +3628,10 @@ mod tests {
         assert!(handlers[1].is_catch());
         assert_eq!(handlers[0].try_offset, handlers[1].try_offset);
         assert_eq!(handlers[0].try_length, handlers[1].try_length);
+
+        // In the order they were added: the first matching catch runs
+        assert_eq!(handlers[0].filter_offset, exception_type1.value());
+        assert_eq!(handlers[1].filter_offset, exception_type2.value());
 
         Ok(())
     }

@@ -120,7 +120,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    file::pe::Export,
+    file::pe::{Export, ExportHeader},
     utils::{to_u32, write_le_at, write_string_at},
     Result,
 };
@@ -289,64 +289,111 @@ impl NativeExports {
         }
     }
 
-    /// Creates native exports from PE export data
+    /// Creates native exports from an export directory as read: its header, and each export
+    /// with its ordinal, its name and its address or forwarder.
+    ///
+    /// The directory keeps its name, ordinal base, time stamp and version, every ordinal its
+    /// own (base 0 makes ordinal 0 one), and every name of an ordinal with several.
     ///
     /// # Arguments
-    /// * `pe_exports` - Slice of PE export entries to process
-    ///
-    /// # Returns
-    /// Returns a configured NativeExports instance with all export functions,
-    /// forwarders, and internal structures properly initialized.
+    /// * `header` - The export directory's own fields
+    /// * `pe_exports` - Its exports, an entry per name of each ordinal
     ///
     /// # Errors
-    /// Returns error if:
-    /// - Memory allocation fails during structure creation
-    /// - Export data contains invalid or inconsistent information
-    /// - Adding functions or forwarders to the directory fails
+    /// When the ordinal base does not fit 16 bits while there are exports, when a name is
+    /// exported twice, or when one ordinal is both a function and a forwarder.
     ///
     /// # Examples
     /// ```no_run
-    /// use dotscope::metadata::exports::NativeExports;
-    /// use dotscope::PeExport;
+    /// use dotscope::{metadata::exports::NativeExports, PeExport, PeExportHeader};
     ///
-    /// let pe_exports = vec![
-    ///     Export {
-    ///         name: Some("MyFunction".to_string()),
-    ///         rva: 0x1000,
-    ///         offset: Some(1),
-    ///     },
-    /// ];
+    /// let header = PeExportHeader {
+    ///     name: "MyLibrary.dll".to_string(),
+    ///     base: 1,
+    ///     timestamp: 0,
+    ///     major_version: 0,
+    ///     minor_version: 0,
+    /// };
+    /// let pe_exports = vec![PeExport {
+    ///     name: Some("MyFunction".to_string()),
+    ///     ordinal: 1,
+    ///     rva: 0x1000,
+    ///     offset: None,
+    ///     forwarder: None,
+    /// }];
     ///
-    /// let native_exports = NativeExports::from_pe_exports(&pe_exports).unwrap();
-    /// assert!(!native_exports.is_empty());
+    /// let native_exports = NativeExports::from_pe_exports(&header, &pe_exports).unwrap();
+    /// assert_eq!(native_exports.dll_name(), "MyLibrary.dll");
     /// ```
-    pub fn from_pe_exports(pe_exports: &[Export]) -> Result<Self> {
-        let mut exports = Self::new(""); // DLL name will be set from first export
+    pub fn from_pe_exports(header: &ExportHeader, pe_exports: &[Export]) -> Result<Self> {
+        let mut exports = Self::new(&header.name);
+        exports.directory.base_ordinal = match u16::try_from(header.base) {
+            Ok(base) => base,
+            Err(_) if pe_exports.is_empty() => exports.directory.base_ordinal,
+            Err(_) => {
+                return Err(malformed_error!(
+                    "Export ordinal base {} exceeds u16 range",
+                    header.base
+                ))
+            }
+        };
+        exports.directory.timestamp = header.timestamp;
+        exports.directory.major_version = header.major_version;
+        exports.directory.minor_version = header.minor_version;
 
         for export in pe_exports {
-            let ordinal = u16::try_from(export.offset.unwrap_or(0))
-                .map_err(|_| malformed_error!("Export ordinal exceeds u16 range"))?;
-
-            if export.rva == 0 {
-                continue; // Skip invalid exports
+            let ordinal = export.ordinal;
+            if let Some(target) = &export.forwarder {
+                if exports.functions.contains_key(&ordinal) {
+                    return Err(malformed_error!(
+                        "Ordinal {ordinal} is both a function and a forwarder"
+                    ));
+                }
+                exports
+                    .forwarders
+                    .entry(ordinal)
+                    .or_insert_with(|| ExportForwarder {
+                        ordinal,
+                        name: export.name.clone(),
+                        target: target.clone(),
+                    });
+            } else {
+                if exports.forwarders.contains_key(&ordinal) {
+                    return Err(malformed_error!(
+                        "Ordinal {ordinal} is both a function and a forwarder"
+                    ));
+                }
+                exports
+                    .functions
+                    .entry(ordinal)
+                    .or_insert_with(|| ExportFunction {
+                        ordinal,
+                        name: export.name.clone(),
+                        address: export.rva,
+                        is_forwarder: false,
+                    });
             }
-
-            // Set DLL name from first export if available
-            if exports.directory.dll_name.is_empty() {
-                if let Some(ref name) = export.name {
-                    exports.directory.dll_name.clone_from(name);
+            if let Some(name) = &export.name {
+                if exports
+                    .name_to_ordinal
+                    .insert(name.clone(), ordinal)
+                    .is_some()
+                {
+                    return Err(malformed_error!("Function name '{name}' is exported twice"));
                 }
             }
-
-            if let Some(ref name) = export.name {
-                // Named export
-                exports.add_function(name, ordinal, export.rva)?;
-            } else {
-                // Ordinal-only export
-                exports.add_function_by_ordinal(ordinal, export.rva)?;
+            if ordinal >= exports.next_ordinal {
+                exports.next_ordinal = ordinal.saturating_add(1);
             }
         }
 
+        exports.directory.function_count = to_u32(
+            exports
+                .functions
+                .len()
+                .saturating_add(exports.forwarders.len()),
+        )?;
+        exports.directory.name_count = to_u32(exports.name_to_ordinal.len())?;
         Ok(exports)
     }
 
@@ -901,18 +948,15 @@ impl NativeExports {
     ///
     /// # Returns
     ///
-    /// A vector containing the complete export table data in PE format, or an
-    /// empty vector if no exports are present.
+    /// A vector containing the complete export table data in PE format: with no exports,
+    /// the directory and the DLL's name, as an image whose export directory lists none
+    /// holds them.
     ///
     /// # Errors
     ///
     /// Returns an error if the export table data cannot be serialized due to
     /// invalid ordinal ranges or buffer allocation failures.
     pub fn get_export_table_data_with_base_rva(&self, base_rva: u32) -> Result<Vec<u8>> {
-        if self.is_empty() {
-            return Ok(Vec::new());
-        }
-
         // Calculate table sizes and offsets
         let export_dir_size = 40u32; // sizeof(IMAGE_EXPORT_DIRECTORY)
 
@@ -1027,6 +1071,10 @@ impl NativeExports {
             .map(|(name, &ordinal)| (name, ordinal))
             .collect();
         named_exports.sort_by_key(|(name, _)| name.as_str());
+        // Forwarder strings follow the names in ordinal order: the same exports always
+        // write the same bytes
+        let mut forwarders: Vec<&ExportForwarder> = self.forwarders.values().collect();
+        forwarders.sort_by_key(|forwarder| forwarder.ordinal);
 
         // Calculate string offsets for forwarders
         let mut forwarder_string_offsets = HashMap::new();
@@ -1045,7 +1093,7 @@ impl NativeExports {
                 .checked_add(name_size)
                 .ok_or_else(|| malformed_error!("Forwarder offset overflow"))?;
         }
-        for forwarder in self.forwarders.values() {
+        for forwarder in &forwarders {
             forwarder_string_offsets.insert(forwarder.ordinal, current_forwarder_offset);
             let target_size = forwarder
                 .target
@@ -1139,7 +1187,7 @@ impl NativeExports {
         }
 
         // Forwarder strings
-        for forwarder in self.forwarders.values() {
+        for forwarder in &forwarders {
             write_string_at(&mut data, &mut offset, &forwarder.target)?;
         }
 
@@ -1515,5 +1563,34 @@ mod tests {
         exports.add_forwarder("Forward3", 3, "api.Func").unwrap();
 
         assert_eq!(exports.forwarder_count(), 3);
+    }
+
+    /// Forwarder strings are written in ordinal order: the same exports always give the same
+    /// table, where they were written in hash order.
+    #[test]
+    fn forwarder_strings_are_written_in_ordinal_order() {
+        let mut exports = NativeExports::new("a.dll");
+        for ordinal in [5u16, 3, 9, 1, 7, 2, 8, 4, 6] {
+            exports
+                .add_forwarder(
+                    &format!("F{ordinal}"),
+                    ordinal,
+                    &format!("t.Target{ordinal}"),
+                )
+                .unwrap();
+        }
+        let data = exports.get_export_table_data_with_base_rva(0x1000).unwrap();
+
+        let at = |ordinal: u16| {
+            let target = format!("t.Target{ordinal}\0");
+            data.windows(target.len())
+                .position(|window| window == target.as_bytes())
+                .unwrap()
+        };
+        let offsets: Vec<usize> = (1..=9).map(at).collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "{offsets:?}"
+        );
     }
 }

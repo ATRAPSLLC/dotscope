@@ -39,7 +39,7 @@
 //! 2. Ensure substring references get proper remapping when entries shift
 //! 3. Potentially preserve substring relationships in the output heap
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use strum::IntoEnumIterator;
 
@@ -232,7 +232,7 @@ pub(crate) fn mark_unreferenced_heap_entries(
 /// - Replaced tables (all rows from the replacement)
 ///
 /// Returns sets of referenced offsets/indices for each heap type.
-fn collect_referenced_heap_entries(
+pub(crate) fn collect_referenced_heap_entries(
     assembly: &CilAssembly,
 ) -> (HashSet<u32>, HashSet<u32>, HashSet<u32>) {
     let mut ref_strings: HashSet<u32> = HashSet::new();
@@ -248,7 +248,13 @@ fn collect_referenced_heap_entries(
         return (ref_strings, ref_blobs, ref_guids);
     };
 
-    let table_info = &tables.info;
+    // Rows are read back through a layout whose heap indices are all four bytes wide: a new
+    // or updated row may hold a heap placeholder (`0x8000_0000 | id`), which a two-byte
+    // column of the original layout would cut to its id, and the id would pass for an offset
+    let wide = tables
+        .info
+        .with_modified_heap_sizes(usize::MAX, usize::MAX, usize::MAX);
+    let table_info: &TableInfoRef = &Arc::new(wide);
     let changes = assembly.changes();
 
     // Iterate all table types
@@ -460,7 +466,7 @@ fn extract_heap_refs_from_row(
             // Skip zero (null reference) and placeholder values
             // Placeholders reference newly added heap entries that don't exist
             // in the original heap
-            if value == 0 || ChangeRef::is_placeholder(value) {
+            if value == 0 || ChangeRef::is_heap_placeholder(value) {
                 continue;
             }
 
@@ -482,6 +488,13 @@ fn extract_heap_refs_from_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        metadata::{
+            cilassemblyview::CilAssemblyView,
+            tables::{CodedIndex, CodedIndexType, TypeRefBuilder},
+        },
+        testkit::fixture,
+    };
 
     #[test]
     fn test_compaction_stats_default() {
@@ -499,5 +512,40 @@ mod tests {
         };
         assert!(stats.has_removals());
         assert_eq!(stats.total_removed(), 9);
+    }
+
+    /// A new row's string column holds a placeholder (`0x8000_0000 | id`) until the heap is
+    /// written. Read back through a two-byte column, it was cut to its id, which counted as a
+    /// referenced string offset: once the id fell inside another name, the writer kept a tail of
+    /// that name cut mid-character.
+    #[test]
+    fn a_new_rows_placeholder_is_not_taken_for_a_string_offset() {
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe")).unwrap();
+        assert!(!view.tables().unwrap().info.is_large_str());
+        let mut assembly = CilAssembly::new(view);
+        let (before, _, _) = collect_referenced_heap_entries(&assembly);
+
+        // Take ids until the next two (the new row's name and namespace) are offsets no row
+        // references, so a truncated placeholder would show
+        let mut taken = 0u32;
+        while before.contains(&(taken + 1)) || before.contains(&(taken + 2)) || taken < 16 {
+            assembly
+                .string_add(&format!("unreferenced{taken}"))
+                .unwrap();
+            taken += 1;
+        }
+        TypeRefBuilder::new()
+            .name("PlaceholderName")
+            .namespace("PlaceholderNamespace")
+            .resolution_scope(CodedIndex::new(
+                TableId::Module,
+                1,
+                CodedIndexType::ResolutionScope,
+            ))
+            .build(&mut assembly)
+            .unwrap();
+
+        let (after, _, _) = collect_referenced_heap_entries(&assembly);
+        assert_eq!(after, before);
     }
 }

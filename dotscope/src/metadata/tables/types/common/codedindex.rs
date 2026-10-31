@@ -24,7 +24,7 @@ use strum::{EnumCount, EnumIter};
 
 use crate::{
     metadata::{
-        tables::{TableId, TableInfoRef},
+        tables::{TableId, TableInfo, TableInfoRef},
         token::Token,
     },
     utils::read_le_at,
@@ -348,8 +348,9 @@ pub struct CodedIndex {
     /// The stored value, when its tag is one `ci_type` assigns to no table; `None` for an
     /// index that decodes normally.
     ///
-    /// The CLR reads such an index as a null reference, and so does this one: `row` is 0 and
-    /// it writes back as null. The value is kept so that validation can report it.
+    /// The CLR reads such an index as a null reference, and so does this one: `row` is 0.
+    /// The value is kept so that validation can report it, and so that [`Self::encode`]
+    /// writes back what was read; making it null is a change of its own.
     pub unassigned_tag: Option<u32>,
 }
 
@@ -392,9 +393,8 @@ impl CodedIndex {
 
         Ok(match info.decode_coded_index(coded_index, ci_type) {
             Some((tag, row)) => CodedIndex::new(tag, row, ci_type),
-            // A stored 0 is the null reference for every coded index, `CustomAttributeType`
-            // too, although its tag 0 names no table.
-            None if coded_index == 0 => CodedIndex::null(ci_type),
+            // A stored 0 is null for every coded index: for `CustomAttributeType`, whose tag 0
+            // names no table, it is one with an unassigned tag, kept so it writes back as 0
             None => CodedIndex {
                 unassigned_tag: Some(coded_index),
                 ..CodedIndex::null(ci_type)
@@ -432,6 +432,29 @@ impl CodedIndex {
             token: Token::from_parts(tag, row),
             unassigned_tag: None,
         }
+    }
+
+    /// The value this index is stored as in a column `info` sizes: its table's tag and its
+    /// row, or for an index read with an unassigned tag, the value it was read as.
+    ///
+    /// A value with an unassigned tag that does not fit the column (one read from a 4-byte
+    /// column, written to a 2-byte one) keeps its tag with row 0: still a tag that names no
+    /// table, still read as null.
+    ///
+    /// # Errors
+    ///
+    /// When the table is not one this coded index can name, or the row does not fit.
+    pub fn encode(&self, info: &TableInfo) -> Result<u32> {
+        let Some(stored) = self.unassigned_tag else {
+            return info.encode_coded_index(self.tag, self.row, self.ci_type);
+        };
+        if info.coded_index_bits(self.ci_type) > 16 || stored <= u32::from(u16::MAX) {
+            return Ok(stored);
+        }
+        let tag_mask = 1u32
+            .checked_shl(u32::from(self.ci_type.tag_bits()))
+            .map_or(u32::MAX, |bound| bound.saturating_sub(1));
+        Ok(stored & tag_mask)
     }
 
     /// Creates a null (empty) `CodedIndex` for the specified coded index type.
@@ -572,7 +595,8 @@ mod tests {
     }
 
     /// A tag that names no table reads as the null reference, as the CLR reads it, and keeps
-    /// the stored value; a stored 0 is the null reference with nothing to keep.
+    /// the stored value, which it writes back: a stored 0 of `CustomAttributeType`, whose
+    /// tag 0 names no table, too.
     #[test]
     fn a_tag_naming_no_table_reads_as_null_and_keeps_the_stored_value() {
         // ConfuserEx's DeclSecurity parent: HasDeclSecurity has three tables, tag 3 is unused.
@@ -586,7 +610,20 @@ mod tests {
 
         let null = read(0, CodedIndexType::CustomAttributeType);
         assert_eq!(null.row, 0);
-        assert_eq!(null.unassigned_tag, None);
+        assert_eq!(null.unassigned_tag, Some(0));
+
+        let info = TableInfo::new_test(&[], false, false, false);
+        for (stored, ci_type) in [
+            (0x7FFF, CodedIndexType::HasDeclSecurity),
+            (5 << 3 | 4, CodedIndexType::CustomAttributeType),
+            (0, CodedIndexType::CustomAttributeType),
+        ] {
+            assert_eq!(
+                read(stored, ci_type).encode(&info).unwrap(),
+                u32::from(stored),
+                "{ci_type:?}"
+            );
+        }
 
         let named = read(5 << 3 | 2, CodedIndexType::CustomAttributeType);
         assert_eq!((named.tag, named.row), (TableId::MethodDef, 5));

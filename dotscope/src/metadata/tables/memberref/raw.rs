@@ -20,7 +20,7 @@ use crate::{
         streams::{Blob, Strings},
         tables::{
             CodedIndex, CodedIndexType, MemberRef, MemberRefRc, MemberRefSignature, Param,
-            TableInfoRef, TableRow,
+            ParamList, TableInfoRef, TableRow,
         },
         token::Token,
         typesystem::{CilTypeReference, TypeRegistry},
@@ -161,7 +161,7 @@ impl MemberRefRaw {
         let (signature, params) = if *signature_data.first().ok_or(out_of_bounds_error!())? == 0x6 {
             (
                 MemberRefSignature::Field(parse_field_signature(signature_data)?),
-                Arc::new(boxcar::Vec::new()),
+                ParamList::new(),
             )
         } else {
             let method_sig = parse_method_signature(signature_data)?;

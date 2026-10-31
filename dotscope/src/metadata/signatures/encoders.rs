@@ -41,17 +41,21 @@ use crate::{
 ///
 /// # Arguments
 ///
-/// * `modifier_token` - The token referencing the modifier type
-/// * `is_required` - Whether this is a required (modreq) or optional (modopt) modifier
+/// * `modifier` - The modifier: its type token and whether it is required
 /// * `buffer` - The output buffer to write the encoded modifier to
 ///
 /// # TypeDefOrRef Coded Index Encoding
 ///
 /// The modifier token is encoded using the TypeDefOrRef coded index format:
 /// - TypeDef: `(rid << 2) | 0`
-/// - TypeRef: `(rid << 2) | 1`  
+/// - TypeRef: `(rid << 2) | 1`
 /// - TypeSpec: `(rid << 2) | 2`
-fn encode_custom_modifier(modifier: &CustomModifier, buffer: &mut Vec<u8>) -> Result<()> {
+///
+/// # Errors
+///
+/// When the modifier's token is not a TypeDef, TypeRef or TypeSpec token, or its row does
+/// not fit a compressed integer.
+pub fn encode_custom_modifier(modifier: &CustomModifier, buffer: &mut Vec<u8>) -> Result<()> {
     let modifier_type = if modifier.is_required {
         ELEMENT_TYPE::CMOD_REQD
     } else {
@@ -60,7 +64,7 @@ fn encode_custom_modifier(modifier: &CustomModifier, buffer: &mut Vec<u8>) -> Re
     buffer.push(modifier_type);
 
     let coded_index = encode_type_def_or_ref_coded_index(modifier.modifier_type)?;
-    write_compressed_uint(coded_index, buffer);
+    write_compressed_uint(coded_index, buffer)?;
     Ok(())
 }
 
@@ -84,7 +88,7 @@ fn encode_custom_modifier(modifier: &CustomModifier, buffer: &mut Vec<u8>) -> Re
 ///
 /// Returns [`crate::Error::ModificationInvalid`] if the token's table is not
 /// TypeDef (0x02), TypeRef (0x01), or TypeSpec (0x1B).
-fn encode_type_def_or_ref_coded_index(token: Token) -> Result<u32> {
+pub fn encode_type_def_or_ref_coded_index(token: Token) -> Result<u32> {
     let table_id = token.table();
     let rid = token.row();
 
@@ -221,7 +225,7 @@ pub fn encode_property_signature(signature: &SignatureProperty) -> Result<Vec<u8
             signature.params.len()
         ))
     })?;
-    write_compressed_uint(param_count, &mut buffer);
+    write_compressed_uint(param_count, &mut buffer)?;
 
     // Encode custom modifiers before the property type
     // Property signatures can have custom modifiers on the property type itself
@@ -272,7 +276,7 @@ pub fn encode_local_var_signature(signature: &SignatureLocalVariables) -> Result
             )
         })?,
         &mut buffer,
-    );
+    )?;
 
     for local in &signature.locals {
         // CustomMod* Constraint* [BYREF] Type (ECMA-335 II.23.2.6)
@@ -329,7 +333,7 @@ pub fn encode_method_spec_signature(signature: &SignatureMethodSpec) -> Result<V
     let mut buffer = vec![SIGNATURE_HEADER::GENRICINST];
     let count = u32::try_from(signature.generic_args.len())
         .map_err(|_| Error::LayoutFailed("too many generic arguments".to_string()))?;
-    write_compressed_uint(count, &mut buffer);
+    write_compressed_uint(count, &mut buffer)?;
     for argument in &signature.generic_args {
         buffer.extend(TypeSignatureEncoder::encode(argument)?);
     }
@@ -338,17 +342,22 @@ pub fn encode_method_spec_signature(signature: &SignatureMethodSpec) -> Result<V
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prop_assert_eq, test_runner::TestCaseError};
+
     use super::*;
-    use crate::metadata::{
-        signatures::{
-            parse_field_signature, parse_local_var_signature, parse_method_signature,
-            parse_method_spec_signature, parse_property_signature, parse_type_spec_signature,
-            CustomModifier, FieldSignatureBuilder, LocalVariableSignatureBuilder,
-            MethodSignatureBuilder, PropertySignatureBuilder, SignatureSzArray, TypeSignature,
-            TypeSpecSignatureBuilder, SIGNATURE_HEADER,
+    use crate::{
+        metadata::{
+            signatures::{
+                parse_field_signature, parse_local_var_signature, parse_method_signature,
+                parse_method_spec_signature, parse_property_signature, parse_type_spec_signature,
+                CustomModifier, FieldSignatureBuilder, LocalVariableSignatureBuilder,
+                MethodSignatureBuilder, PropertySignatureBuilder, SignatureSzArray, TypeSignature,
+                TypeSpecSignatureBuilder, SIGNATURE_HEADER,
+            },
+            token::Token,
+            typesystem::ELEMENT_TYPE,
         },
-        token::Token,
-        typesystem::ELEMENT_TYPE,
+        testkit::{arb, arb::check},
     };
 
     /// Every shape of method signature encodes back to the bytes it was read from: each
@@ -648,5 +657,58 @@ mod tests {
             (3 << 2) | 2,
             "TypeSpec should encode as (rid << 2) | 2"
         );
+    }
+
+    /// `value` encodes, and its encoding decodes back to it.
+    fn round_trips<T: PartialEq + std::fmt::Debug>(
+        value: &T,
+        encode: fn(&T) -> Result<Vec<u8>>,
+        decode: fn(&[u8]) -> Result<T>,
+    ) -> std::result::Result<(), TestCaseError> {
+        let bytes = encode(value)
+            .map_err(|error| TestCaseError::fail(format!("does not encode: {error}")))?;
+        let decoded = decode(&bytes).map_err(|error| {
+            TestCaseError::fail(format!("{bytes:02x?} does not decode: {error}"))
+        })?;
+        prop_assert_eq!(&decoded, value, "encoded as {:02x?}", bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn every_signature_decodes_to_what_was_encoded() {
+        check(arb::method_signature(), |signature| {
+            round_trips(&signature, encode_method_signature, parse_method_signature)
+        });
+        check(arb::field_signature(), |signature| {
+            round_trips(&signature, encode_field_signature, parse_field_signature)
+        });
+        check(arb::property_signature(), |signature| {
+            round_trips(
+                &signature,
+                encode_property_signature,
+                parse_property_signature,
+            )
+        });
+        check(arb::local_var_signature(), |signature| {
+            round_trips(
+                &signature,
+                encode_local_var_signature,
+                parse_local_var_signature,
+            )
+        });
+        check(arb::type_spec_signature(), |signature| {
+            round_trips(
+                &signature,
+                encode_typespec_signature,
+                parse_type_spec_signature,
+            )
+        });
+        check(arb::method_spec_signature(), |signature| {
+            round_trips(
+                &signature,
+                encode_method_spec_signature,
+                parse_method_spec_signature,
+            )
+        });
     }
 }

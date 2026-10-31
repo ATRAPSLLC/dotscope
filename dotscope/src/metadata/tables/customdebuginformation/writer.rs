@@ -47,10 +47,7 @@ use crate::{
 
 impl RowWritable for CustomDebugInformationRaw {
     fn sort_key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
-        Ok(Some((
-            sizes.encode_coded_index(self.parent.tag, self.parent.row, self.parent.ci_type)?,
-            0,
-        )))
+        Ok(Some((self.parent.encode(sizes)?, 0)))
     }
 
     /// Write a `CustomDebugInformation` table row to binary data
@@ -81,11 +78,7 @@ impl RowWritable for CustomDebugInformationRaw {
         sizes: &TableInfoRef,
     ) -> Result<()> {
         // Write HasCustomDebugInformation coded index
-        let parent_value = sizes.encode_coded_index(
-            self.parent.tag,
-            self.parent.row,
-            CodedIndexType::HasCustomDebugInformation,
-        )?;
+        let parent_value = self.parent.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

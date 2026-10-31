@@ -599,10 +599,8 @@ impl AssemblyIdentity {
                         ));
                     }
 
-                    // Convert 8 bytes to u64 token
-                    let mut token_array = [0u8; 8];
-                    token_array.copy_from_slice(&token_bytes);
-                    let token = u64::from_le_bytes(token_array);
+                    let mut token = [0u8; 8];
+                    token.copy_from_slice(&token_bytes);
                     strong_name = Some(Identity::Token(token));
                 }
             } else if let Some(value) = part.strip_prefix("ProcessorArchitecture=") {
@@ -658,41 +656,17 @@ impl AssemblyIdentity {
         let culture_str = self.culture.as_deref().unwrap_or("neutral");
         let _ = write!(result, ", Culture={culture_str}");
 
-        // For PubKey and EcmaKey variants, compute the token using SHA1 (the .NET standard)
-        // Note: Tokens are stored as u64 little-endian internally, but displayed as hex bytes
-        // in their natural order (first byte of the u64 comes first in the hex string).
-        // This matches the .NET display name format where "b77a5c561934e089" represents
-        // the bytes [0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89].
+        // A key's token is computed with SHA-1, as .NET computes it
         result.push_str(", PublicKeyToken=");
-        match &self.strong_name {
-            Some(Identity::Token(token)) => {
-                let bytes = token.to_le_bytes();
-                let _ = write!(
-                    result,
-                    "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
-                );
-            }
+        let token = match &self.strong_name {
+            Some(Identity::Token(token)) => Some(*token),
             Some(identity @ (Identity::PubKey(_) | Identity::EcmaKey(_))) => {
-                match identity.to_token(AssemblyHashAlgorithm::SHA1) {
-                    Ok(token) => {
-                        let bytes = token.to_le_bytes();
-                        let _ = write!(
-                            result,
-                            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                            bytes[0],
-                            bytes[1],
-                            bytes[2],
-                            bytes[3],
-                            bytes[4],
-                            bytes[5],
-                            bytes[6],
-                            bytes[7]
-                        );
-                    }
-                    Err(_) => result.push_str("null"),
-                }
+                identity.to_token(AssemblyHashAlgorithm::SHA1).ok()
             }
+            None => None,
+        };
+        match token {
+            Some(token) => result.push_str(&hex::encode(token)),
             None => result.push_str("null"),
         }
 
@@ -1231,6 +1205,42 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::{testkit::fixture, CilAssemblyView};
+
+    /// A key's token prints as .NET prints it: the ECMA key as `b77a5c561934e089`, not its
+    /// bytes reversed.
+    #[cfg(feature = "legacy-crypto")]
+    #[test]
+    fn a_key_prints_its_token_in_dotnet_order() {
+        let identity = AssemblyIdentity::new(
+            "mscorlib",
+            AssemblyVersion::new(4, 0, 0, 0),
+            None,
+            Some(Identity::EcmaKey(vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0,
+            ])),
+            None,
+        );
+        assert!(identity
+            .display_name()
+            .ends_with("PublicKeyToken=b77a5c561934e089"));
+    }
+
+    /// WindowsBase is signed with Microsoft's key, whose token is `31bf3856ad364e35`; the
+    /// mscorlib it references carries the ECMA token.
+    #[cfg(feature = "legacy-crypto")]
+    #[test]
+    fn windowsbase_identities_print_their_tokens() {
+        let view = CilAssemblyView::from_path(fixture("WindowsBase.dll")).unwrap();
+        let identity = view.identity().unwrap().unwrap();
+        assert!(
+            identity
+                .display_name()
+                .contains("PublicKeyToken=31bf3856ad364e35"),
+            "{}",
+            identity.display_name()
+        );
+    }
 
     #[test]
     fn test_assembly_version_new() {
@@ -1442,9 +1452,8 @@ mod tests {
         assert!(identity.strong_name.is_some());
 
         if let Some(Identity::Token(token)) = identity.strong_name {
-            // Token is parsed as little-endian bytes
-            let expected = u64::from_le_bytes([0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
-            assert_eq!(token, expected);
+            // The token's bytes in the order the name shows them
+            assert_eq!(token, [0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
         } else {
             panic!("Expected Token identity");
         }
@@ -1674,7 +1683,9 @@ mod tests {
             "StrongAssembly",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::Token(0x1234567890ABCDEF)),
+            Some(Identity::Token([
+                0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF,
+            ])),
             None,
         );
         assert!(strong.is_strong_named());
@@ -1748,7 +1759,9 @@ mod tests {
             "TestAssembly",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::Token(0x1234567890ABCDEF)),
+            Some(Identity::Token([
+                0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF,
+            ])),
             None,
         );
 
@@ -1770,7 +1783,9 @@ mod tests {
             "TestAssembly",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::Token(0x1234567890ABCDEF)),
+            Some(Identity::Token([
+                0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF,
+            ])),
             None,
         );
 
@@ -1828,7 +1843,9 @@ mod tests {
             "StrongLib",
             AssemblyVersion::new(1, 2, 3, 4),
             Some("en-US".to_string()),
-            Some(Identity::Token(0xb77a5c561934e089)),
+            Some(Identity::Token([
+                0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89,
+            ])),
             Some(ProcessorArchitecture::X86),
         );
 
@@ -1870,9 +1887,8 @@ mod tests {
         // Verify the token was parsed
         assert!(identity.strong_name.is_some());
         if let Some(Identity::Token(token)) = identity.strong_name {
-            // The token bytes "b77a5c561934e089" interpreted as little-endian
-            let expected = u64::from_le_bytes([0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
-            assert_eq!(token, expected);
+            // The token's bytes in the order the name shows them
+            assert_eq!(token, [0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
         }
     }
 

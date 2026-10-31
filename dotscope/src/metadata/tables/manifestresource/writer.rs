@@ -73,11 +73,7 @@ impl RowWritable for ManifestResourceRaw {
         write_le_at_dyn(data, offset, self.name, sizes.is_large_str())?;
 
         // Write Implementation coded index for resource location
-        let implementation_value = sizes.encode_coded_index(
-            self.implementation.tag,
-            self.implementation.row,
-            CodedIndexType::Implementation,
-        )?;
+        let implementation_value = self.implementation.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,
@@ -461,7 +457,8 @@ mod tests {
                 offset: 0,
                 offset_field: 0x12345678,
                 flags: 0x87654321,
-                name: 0x12345678,
+                // An index has to fit its column: a two-byte one holds at most 0xFFFF
+                name: if large_str { 0x12345678 } else { 0x1234 },
                 implementation: CodedIndex::new(TableId::File, 1, CodedIndexType::Implementation),
             };
 

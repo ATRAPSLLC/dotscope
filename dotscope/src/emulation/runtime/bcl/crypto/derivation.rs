@@ -30,15 +30,13 @@ use crate::utils::derive_pbkdf1_key;
 use crate::{
     emulation::{
         runtime::{
-            bcl::limits::{
-                negative_argument, oversized_argument, MAX_DERIVED_KEY_BYTES, MAX_KDF_ITERATIONS,
-            },
+            bcl::limits::non_positive_argument,
             hook::{Hook, HookContext, HookManager, PreHookResult},
         },
         thread::EmulationThread,
         EmValue,
     },
-    utils::derive_pbkdf2_key,
+    utils::{derive_pbkdf2_key, pbkdf2_work},
     Result,
 };
 
@@ -166,38 +164,28 @@ fn password_derive_bytes_get_bytes_pre(
     ctx: &HookContext<'_>,
     thread: &mut EmulationThread,
 ) -> PreHookResult {
-    // `cb` is attacker-controlled and sizes both the derivation work and the output buffer.
-    // Derived keys are inherently small, so a tight ceiling costs nothing and stops a single
-    // call from allocating gigabytes inside one hook.
-    let size = match ctx
-        .args
-        .first()
-        .map(usize::try_from)
-        .transpose()
-        .ok()
-        .flatten()
-    {
-        Some(n) if n > MAX_DERIVED_KEY_BYTES => {
-            return oversized_argument("DeriveBytes.GetBytes", "cb", n, MAX_DERIVED_KEY_BYTES)
-        }
-        Some(n) => n,
-        None => 16,
+    // `cb` sizes the derivation's work and its output; .NET refuses a count that is not
+    // positive. The work is charged to the run's budget before it is done.
+    let size = match ctx.args.first().map(i32::try_from) {
+        Some(Ok(n)) if n > 0 => n.unsigned_abs() as usize,
+        Some(Ok(_)) => return non_positive_argument("DeriveBytes.GetBytes", "cb"),
+        _ => 16,
     };
 
-    let heap_ref = if let Some(EmValue::ObjectRef(hr)) = ctx.this {
-        *hr
-    } else {
-        let zeros = vec![0u8; size];
-        match thread.heap().alloc_byte_array(&zeros) {
-            Ok(handle) => return PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))),
-            Err(e) => return PreHookResult::Error(format!("heap allocation failed: {e}")),
-        }
+    // An instance call on null
+    let Some(&EmValue::ObjectRef(heap_ref)) = ctx.this else {
+        return PreHookResult::throw_null_reference();
     };
 
     let params = thread.heap().get_key_derivation_params(heap_ref);
 
     let derived_key = match params {
         Ok(Some((password, salt, iterations, _hash_algorithm))) => {
+            // A hash per iteration for the base value, and one per 20-byte SHA-1 block
+            let blocks = u64::try_from(size.div_ceil(20)).unwrap_or(u64::MAX);
+            if !thread.charge_work(u64::from(iterations).saturating_add(blocks)) {
+                return PreHookResult::Bypass(None);
+            }
             derive_pbkdf1_key(&password, &salt, iterations, size)
         }
         _ => vec![0u8; size],
@@ -256,27 +244,12 @@ fn rfc2898_derive_bytes_ctor_pre(
         _ => Vec::new(),
     };
 
-    // The comment this replaced asserted the iteration count "is always positive in crypto
-    // operations". It is not: the value comes from emulated code, and `as u32` turned a
-    // negative Int32 into roughly 4.3 billion rounds executed inside a single hook call, with
-    // no emulation budget evaluated in between. Reject negatives and clamp the magnitude —
-    // real obfuscator key schedules use values in the low thousands.
-    let iterations: u32 = match ctx.args.get(2) {
-        Some(val) => match i32::try_from(val).ok().and_then(|v| u32::try_from(v).ok()) {
-            Some(n) if n > MAX_KDF_ITERATIONS => {
-                return oversized_argument(
-                    "Rfc2898DeriveBytes..ctor",
-                    "iterations",
-                    n as usize,
-                    MAX_KDF_ITERATIONS as usize,
-                )
-            }
-            Some(n) => n,
-            None => {
-                return negative_argument("Rfc2898DeriveBytes..ctor", "iterations");
-            }
-        },
-        None => 1000,
+    // .NET refuses an iteration count that is not positive. Any other count is accepted:
+    // `GetBytes` charges the derivation's work to the run's budget.
+    let iterations: u32 = match ctx.args.get(2).map(i32::try_from) {
+        Some(Ok(n)) if n > 0 => n.unsigned_abs(),
+        Some(Ok(_)) => return non_positive_argument("Rfc2898DeriveBytes..ctor", "iterations"),
+        _ => 1000,
     };
 
     let hash_algorithm = "SHA1";
@@ -307,32 +280,17 @@ fn rfc2898_derive_bytes_get_bytes_pre(
     ctx: &HookContext<'_>,
     thread: &mut EmulationThread,
 ) -> PreHookResult {
-    // `cb` is attacker-controlled and sizes both the derivation work and the output buffer.
-    // Derived keys are inherently small, so a tight ceiling costs nothing and stops a single
-    // call from allocating gigabytes inside one hook.
-    let size = match ctx
-        .args
-        .first()
-        .map(usize::try_from)
-        .transpose()
-        .ok()
-        .flatten()
-    {
-        Some(n) if n > MAX_DERIVED_KEY_BYTES => {
-            return oversized_argument("DeriveBytes.GetBytes", "cb", n, MAX_DERIVED_KEY_BYTES)
-        }
-        Some(n) => n,
-        None => 16,
+    // `cb` sizes the derivation's work and its output; .NET refuses a count that is not
+    // positive. The work is charged to the run's budget before it is done.
+    let size = match ctx.args.first().map(i32::try_from) {
+        Some(Ok(n)) if n > 0 => n.unsigned_abs() as usize,
+        Some(Ok(_)) => return non_positive_argument("DeriveBytes.GetBytes", "cb"),
+        _ => 16,
     };
 
-    let heap_ref = if let Some(EmValue::ObjectRef(hr)) = ctx.this {
-        *hr
-    } else {
-        let zeros = vec![0u8; size];
-        match thread.heap().alloc_byte_array(&zeros) {
-            Ok(handle) => return PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))),
-            Err(e) => return PreHookResult::Error(format!("heap allocation failed: {e}")),
-        }
+    // An instance call on null
+    let Some(&EmValue::ObjectRef(heap_ref)) = ctx.this else {
+        return PreHookResult::throw_null_reference();
     };
 
     let params = thread.heap().get_key_derivation_params(heap_ref);
@@ -342,6 +300,11 @@ fn rfc2898_derive_bytes_get_bytes_pre(
     // garbage, and the analyst has no way to tell that apart from a real result.
     let derived_key = match params {
         Ok(Some((password, salt, iterations, hash_algorithm))) => {
+            match pbkdf2_work(iterations, size, &hash_algorithm) {
+                Ok(work) if thread.charge_work(work) => {}
+                Ok(_) => return PreHookResult::Bypass(None),
+                Err(e) => return PreHookResult::Error(format!("PBKDF2 derivation failed: {e}")),
+            }
             match derive_pbkdf2_key(&password, &salt, iterations, size, &hash_algorithm) {
                 Ok(key) => key,
                 Err(e) => return PreHookResult::Error(format!("PBKDF2 derivation failed: {e}")),
@@ -366,36 +329,124 @@ fn rfc2898_derive_bytes_get_bytes_pre(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{
-        emulation::{
-            runtime::hook::{HookContext, PreHookResult},
-            EmValue,
-        },
+        emulation::{engine::synthetic_exception, HeapRef},
         metadata::{token::Token, typesystem::PointerSize},
         testkit::emulation::create_test_thread,
+        utils::derive_pbkdf2_key,
     };
 
-    #[test]
-    fn test_rfc2898_derive_bytes_get_bytes_hook() {
-        let mut thread = create_test_thread();
-        let args = [EmValue::I32(24)];
-        let ctx = HookContext::new(
-            Token::new(0x0A000001),
+    fn context<'a>(
+        type_name: &'a str,
+        method: &'a str,
+        this: Option<&'a EmValue>,
+        args: &'a [EmValue],
+    ) -> HookContext<'a> {
+        HookContext::new(
+            Token::new(0x0A00_0001),
             "System.Security.Cryptography",
-            "Rfc2898DeriveBytes",
-            "GetBytes",
+            type_name,
+            method,
             PointerSize::Bit64,
         )
-        .with_args(&args);
+        .with_this(this)
+        .with_args(args)
+    }
 
-        let result = super::rfc2898_derive_bytes_get_bytes_pre(&ctx, &mut thread);
-
-        if let PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) = result {
-            let bytes = thread.heap().get_byte_array(handle).unwrap().unwrap();
-            assert_eq!(bytes.len(), 24);
-        } else {
-            panic!("Expected ObjectRef");
+    fn assert_throws(result: &PreHookResult, expected: Token) {
+        match result {
+            PreHookResult::Throw { exception_type, .. } => assert_eq!(*exception_type, expected),
+            other => panic!("expected a throw, got {other:?}"),
         }
+    }
+
+    /// An `Rfc2898DeriveBytes` constructed over b"password" and b"saltsalt" with
+    /// `iterations`, and what its constructor returned.
+    fn rfc2898(thread: &mut EmulationThread, iterations: i32) -> (HeapRef, PreHookResult) {
+        let object = thread.heap().alloc_object(Token::new(0x0200_0001)).unwrap();
+        let password = thread.heap().alloc_byte_array(b"password").unwrap();
+        let salt = thread.heap().alloc_byte_array(b"saltsalt").unwrap();
+        let this = EmValue::ObjectRef(object);
+        let args = [
+            EmValue::ObjectRef(password),
+            EmValue::ObjectRef(salt),
+            EmValue::I32(iterations),
+        ];
+        let ctx = context("Rfc2898DeriveBytes", ".ctor", Some(&this), &args);
+        (object, rfc2898_derive_bytes_ctor_pre(&ctx, thread))
+    }
+
+    fn get_bytes(thread: &mut EmulationThread, object: HeapRef, cb: i32) -> PreHookResult {
+        let this = EmValue::ObjectRef(object);
+        let args = [EmValue::I32(cb)];
+        let ctx = context("Rfc2898DeriveBytes", "GetBytes", Some(&this), &args);
+        rfc2898_derive_bytes_get_bytes_pre(&ctx, thread)
+    }
+
+    /// .NET refuses an iteration count that is not positive; any other count is accepted,
+    /// however large: its work is charged when the bytes are derived.
+    #[test]
+    fn rfc2898_takes_any_positive_iteration_count() {
+        let mut thread = create_test_thread();
+        for iterations in [0, -1, i32::MIN] {
+            let (_, result) = rfc2898(&mut thread, iterations);
+            assert_throws(&result, synthetic_exception::ARGUMENT_OUT_OF_RANGE);
+        }
+        for iterations in [1, 100_001, i32::MAX] {
+            let (_, result) = rfc2898(&mut thread, iterations);
+            assert!(matches!(result, PreHookResult::Bypass(None)), "{result:?}");
+        }
+    }
+
+    /// `GetBytes` refuses a count that is not positive, and a call on null throws
+    /// NullReferenceException rather than handing back an invented key.
+    #[test]
+    fn get_bytes_refuses_a_count_that_is_not_positive_and_null() {
+        let mut thread = create_test_thread();
+        let (object, _) = rfc2898(&mut thread, 1000);
+        for cb in [0, -1, i32::MIN] {
+            assert_throws(
+                &get_bytes(&mut thread, object, cb),
+                synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+            );
+        }
+        let args = [EmValue::I32(16)];
+        let ctx = context("Rfc2898DeriveBytes", "GetBytes", None, &args);
+        assert_throws(
+            &rfc2898_derive_bytes_get_bytes_pre(&ctx, &mut thread),
+            synthetic_exception::NULL_REFERENCE,
+        );
+    }
+
+    /// The derivation's work, iterations for each 20-byte SHA-1 block, is charged before it
+    /// is done: within the budget the key is derived, past it nothing is, and the charge
+    /// stands for the run's next limit check.
+    #[cfg(feature = "legacy-crypto")]
+    #[test]
+    fn get_bytes_charges_its_work_to_the_budget() {
+        let mut thread = create_test_thread();
+        let (object, _) = rfc2898(&mut thread, 1000);
+
+        thread.begin_work(0, 3001);
+        let PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) =
+            get_bytes(&mut thread, object, 48)
+        else {
+            panic!("the key is derived within the budget");
+        };
+        assert_eq!(thread.take_work(), 3000);
+        let derived = thread.heap().get_byte_array(handle).unwrap().unwrap();
+        assert_eq!(
+            derived,
+            derive_pbkdf2_key(b"password", b"saltsalt", 1000, 48, "SHA1").unwrap()
+        );
+
+        thread.begin_work(0, 3000);
+        assert!(matches!(
+            get_bytes(&mut thread, object, 48),
+            PreHookResult::Bypass(None)
+        ));
+        assert_eq!(thread.take_work(), 3000);
     }
 }
 
@@ -411,26 +462,54 @@ mod legacy_tests {
         testkit::emulation::create_test_thread,
     };
 
+    /// `PasswordDeriveBytes.GetBytes` charges its hashes, one per iteration for the base
+    /// value and one per 20-byte block, before deriving.
     #[test]
-    fn test_password_derive_bytes_get_bytes_hook() {
+    fn password_derive_bytes_charges_its_work() {
         let mut thread = create_test_thread();
+        let object = thread.heap().alloc_object(Token::new(0x0200_0001)).unwrap();
+        let password = thread.heap().alloc_byte_array(b"password").unwrap();
+        let salt = thread.heap().alloc_byte_array(b"saltsalt").unwrap();
+        let this = EmValue::ObjectRef(object);
+        let args = [EmValue::ObjectRef(password), EmValue::ObjectRef(salt)];
+        let ctx = HookContext::new(
+            Token::new(0x0A00_0001),
+            "System.Security.Cryptography",
+            "PasswordDeriveBytes",
+            ".ctor",
+            PointerSize::Bit64,
+        )
+        .with_this(Some(&this))
+        .with_args(&args);
+        super::password_derive_bytes_ctor_pre(&ctx, &mut thread);
+
         let args = [EmValue::I32(32)];
         let ctx = HookContext::new(
-            Token::new(0x0A000001),
+            Token::new(0x0A00_0001),
             "System.Security.Cryptography",
             "PasswordDeriveBytes",
             "GetBytes",
             PointerSize::Bit64,
         )
+        .with_this(Some(&this))
         .with_args(&args);
 
+        thread.begin_work(0, 1000);
         let result = super::password_derive_bytes_get_bytes_pre(&ctx, &mut thread);
+        let PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) = result else {
+            panic!("expected a key, got {result:?}");
+        };
+        assert_eq!(
+            thread.heap().get_byte_array(handle).unwrap().unwrap().len(),
+            32
+        );
+        // 100 iterations and two blocks
+        assert_eq!(thread.take_work(), 102);
 
-        if let PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) = result {
-            let bytes = thread.heap().get_byte_array(handle).unwrap().unwrap();
-            assert_eq!(bytes.len(), 32);
-        } else {
-            panic!("Expected ObjectRef");
-        }
+        thread.begin_work(0, 102);
+        assert!(matches!(
+            super::password_derive_bytes_get_bytes_pre(&ctx, &mut thread),
+            PreHookResult::Bypass(None)
+        ));
     }
 }

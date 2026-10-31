@@ -14,13 +14,14 @@ impl RowReadable for ConstantRaw {
         let offset_org = *offset;
 
         let c_type = read_le_at::<u8>(data, offset)?;
-        *offset = offset.saturating_add(1); // Padding
+        let padding = read_le_at::<u8>(data, offset)?;
 
         Ok(ConstantRaw {
             rid,
             token: Token::new(0x0B00_0000u32.saturating_add(rid)),
             offset: offset_org,
             base: c_type,
+            padding,
             parent: CodedIndex::read(data, offset, sizes, CodedIndexType::HasConstant)?,
             value: read_le_at_dyn(data, offset, sizes.is_large_blob())?,
         })

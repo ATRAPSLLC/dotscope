@@ -2,15 +2,18 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     analysis::{
-        CallGraph, CmpKind, ConstValue, ConstValueCilExt, FieldRef, MethodRef, SsaFunctionBuilder,
-        SsaOp, SsaType, SsaVarId,
+        CallGraph, CmpKind, ConstValue, ConstValueCilExt, FieldRef, MethodRef, SsaFunction,
+        SsaFunctionBuilder, SsaOp, SsaType, SsaVarId, SsaVerifier, VerifierError, VerifyLevel,
     },
     compiler::{
         passes::constants::{AlgebraicResult, ConstantPropagationPass, StringFoldOp},
         CompilerContext, EventLog, SsaPass,
     },
     metadata::{token::Token, typesystem::PointerSize},
-    testkit::helpers::{method_token, mono_mscorlib, test_assembly_arc},
+    testkit::{
+        helpers::{method_token, mono_mscorlib, test_assembly_arc},
+        passes::run_verified,
+    },
 };
 
 /// Creates a test compiler context with the standard test assembly
@@ -88,7 +91,7 @@ fn test_conv_to_f32() {
     let operand: ConstValue = ConstValue::I32(42);
     assert_eq!(
         operand.convert_to(&SsaType::F32, false, 8),
-        Some(ConstValue::F32(42.0))
+        Some(ConstValue::from(42.0_f32))
     );
 }
 
@@ -148,7 +151,7 @@ fn test_conv_f64() {
     let operand: ConstValue = ConstValue::I32(42);
     assert_eq!(
         operand.convert_to(&SsaType::F64, false, 8),
-        Some(ConstValue::F64(42.0))
+        Some(ConstValue::from(42.0_f64))
     );
 }
 
@@ -392,7 +395,7 @@ fn test_pass_empty_function() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
     assert!(!result.unwrap());
 }
@@ -415,7 +418,7 @@ fn test_pass_simple_folding() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that v2 was folded to constant 8
@@ -450,7 +453,7 @@ fn test_pass_branch_simplification() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that branch was simplified to jump
@@ -483,7 +486,7 @@ fn test_pass_switch_simplification() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that switch was simplified to jump to target 2 (index 1)
@@ -515,7 +518,7 @@ fn test_constants_cached_in_context() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // What the pass proved is recorded on the value it proved it about, in the
@@ -693,7 +696,7 @@ fn test_chained_constant_folding() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that v4 was folded to 10, on the value itself.
@@ -722,7 +725,7 @@ fn test_branch_false_condition() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that branch was simplified to jump to false branch (target 2)
@@ -755,7 +758,7 @@ fn test_switch_out_of_range_uses_default() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that switch was simplified to jump to default (target 4)
@@ -1298,47 +1301,51 @@ fn test_fold_string_operations_with_decrypted_concat() {
     );
 }
 
-/// What the pass folds `left rem right` to, or `None` when it leaves the
-/// remainder in place.
-fn folded_rem(left: ConstValue, right: ConstValue, unsigned: bool) -> Option<ConstValue> {
-    let (v0, v1, v2) = (
-        SsaVarId::from_index(0),
-        SsaVarId::from_index(1),
-        SsaVarId::from_index(2),
-    );
-    let mut ssa = SsaFunctionBuilder::new(0, 0)
+/// A function returning `left rem right` (`rem.un` when `unsigned`), and the
+/// remainder it returns.
+fn remainder_function(
+    left: ConstValue,
+    right: ConstValue,
+    unsigned: bool,
+) -> (SsaFunction, SsaVarId) {
+    let mut remainder = None;
+    let ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
             f.block(0, |b| {
-                b.op(SsaOp::Const {
-                    dest: v0,
-                    value: left,
-                });
-                b.op(SsaOp::Const {
-                    dest: v1,
-                    value: right,
-                });
-                b.op(SsaOp::Rem {
-                    dest: v2,
-                    left: v0,
-                    right: v1,
-                    unsigned,
-                    flags: None,
-                });
-                b.op(SsaOp::Return { value: Some(v2) });
+                let (l, r) = (b.const_val(left), b.const_val(right));
+                let v = if unsigned {
+                    b.rem_un(l, r)
+                } else {
+                    b.rem(l, r)
+                };
+                remainder = Some(v);
+                b.ret_val(v);
             });
         })
         .unwrap();
-    ConstantPropagationPass::new(10)
-        .run_on_method(
-            &mut ssa,
-            &MethodRef::from(Token::new(0x0600_0001)),
-            &test_context(),
-        )
-        .unwrap();
-    match ssa.get_definition(v2) {
+    (ssa, remainder.unwrap())
+}
+
+/// The constant `remainder` is defined as, if any.
+fn folded(ssa: &SsaFunction, remainder: SsaVarId) -> Option<ConstValue> {
+    match ssa.get_definition(remainder) {
         Some(SsaOp::Const { value, .. }) => Some(value.clone()),
         _ => None,
     }
+}
+
+/// What the pass folds `left rem right` to, or `None` when it leaves the
+/// remainder in place.
+fn folded_rem(left: ConstValue, right: ConstValue, unsigned: bool) -> Option<ConstValue> {
+    let (mut ssa, remainder) = remainder_function(left, right, unsigned);
+    run_verified(
+        &ConstantPropagationPass::new(10),
+        &mut ssa,
+        &MethodRef::from(Token::new(0x0600_0001)),
+        &test_context(),
+    )
+    .unwrap();
+    folded(&ssa, remainder)
 }
 
 /// `rem.un` reads its operands as unsigned at their own width: `-1 rem.un 7`
@@ -1372,10 +1379,9 @@ fn rem_keeps_the_operand_width() {
     );
 }
 
-/// What the runtime turns into an exception is not folded away, and neither
-/// is a remainder of mixed widths, which is unverifiable IL.
+/// What the runtime turns into an exception is not folded away.
 #[test]
-fn rem_refuses_to_fold_faulting_and_unverifiable_cases() {
+fn rem_refuses_to_fold_faulting_cases() {
     let (one, zero) = (ConstValue::I32(1), ConstValue::I32(0));
     assert_eq!(folded_rem(one.clone(), zero.clone(), false), None);
     assert_eq!(folded_rem(one, zero, true), None);
@@ -1383,10 +1389,29 @@ fn rem_refuses_to_fold_faulting_and_unverifiable_cases() {
         folded_rem(ConstValue::I32(i32::MIN), ConstValue::I32(-1), false),
         None
     );
-    assert_eq!(
-        folded_rem(ConstValue::I32(7), ConstValue::I64(2), false),
-        None
+}
+
+/// A remainder of an `int32` by an `int64` is unverifiable IL: the verifier
+/// rejects it before any pass runs, and the pass handed it regardless leaves
+/// it in place.
+#[test]
+fn rem_of_mixed_widths_is_rejected_and_left_unfolded() {
+    let (mut ssa, remainder) = remainder_function(ConstValue::I32(7), ConstValue::I64(2), false);
+    let findings = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| matches!(finding, VerifierError::InvalidOperandWidths { .. })),
+        "{findings:?}"
     );
+    ConstantPropagationPass::new(10)
+        .run_on_method(
+            &mut ssa,
+            &MethodRef::from(Token::new(0x0600_0001)),
+            &test_context(),
+        )
+        .unwrap();
+    assert_eq!(folded(&ssa, remainder), None);
 }
 
 /// An overflow-checked op must test overflow at the operands' width, signed or unsigned.
@@ -1620,18 +1645,10 @@ fn only_system_string_methods_are_string_operations() {
 #[test]
 fn constant_compares_fold_at_their_own_width_and_kind() {
     let fold = |left: ConstValue, right: ConstValue, unsigned: bool| {
-        let (v0, v1) = (SsaVarId::from_index(0), SsaVarId::from_index(1));
         let mut ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.op(SsaOp::Const {
-                        dest: v0,
-                        value: left,
-                    });
-                    b.op(SsaOp::Const {
-                        dest: v1,
-                        value: right,
-                    });
+                    let (v0, v1) = (b.const_val(left), b.const_val(right));
                     b.op(SsaOp::BranchCmp {
                         left: v0,
                         right: v1,
@@ -1645,13 +1662,13 @@ fn constant_compares_fold_at_their_own_width_and_kind() {
                 f.block(2, |b| b.ret());
             })
             .unwrap();
-        ConstantPropagationPass::new(10)
-            .run_on_method(
-                &mut ssa,
-                &MethodRef::from(Token::new(0x0600_0001)),
-                &test_context(),
-            )
-            .unwrap();
+        run_verified(
+            &ConstantPropagationPass::new(10),
+            &mut ssa,
+            &MethodRef::from(Token::new(0x0600_0001)),
+            &test_context(),
+        )
+        .unwrap();
         match ssa.block(0).unwrap().control_terminator() {
             Some(SsaOp::Jump { target }) => Some(*target),
             _ => None,
@@ -1663,7 +1680,7 @@ fn constant_compares_fold_at_their_own_width_and_kind() {
         Some(1)
     );
     assert_eq!(
-        fold(ConstValue::F64(0.5), ConstValue::F64(0.75), false),
+        fold(ConstValue::from(0.5_f64), ConstValue::from(0.75_f64), false),
         Some(1)
     );
 }

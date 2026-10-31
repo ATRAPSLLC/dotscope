@@ -51,17 +51,18 @@ impl EmValue {
             )));
         }
 
+        let (left, right) = (self.on_stack(), other.on_stack());
         let result = match op {
-            CompareOp::Eq => self.cmp_eq(other)?,
-            CompareOp::Ne => !self.cmp_eq(other)?,
-            CompareOp::Lt => self.cmp_lt(other, false)?,
-            CompareOp::LtUn => self.cmp_lt(other, true)?,
-            CompareOp::Le => self.cmp_le(other, false)?,
-            CompareOp::LeUn => self.cmp_le(other, true)?,
-            CompareOp::Gt => self.cmp_gt(other, false)?,
-            CompareOp::GtUn => self.cmp_gt(other, true)?,
-            CompareOp::Ge => self.cmp_ge(other, false)?,
-            CompareOp::GeUn => self.cmp_ge(other, true)?,
+            CompareOp::Eq => left.cmp_eq(&right)?,
+            CompareOp::Ne => !left.cmp_eq(&right)?,
+            CompareOp::Lt => left.cmp_lt(&right, false)?,
+            CompareOp::LtUn => left.cmp_lt(&right, true)?,
+            CompareOp::Le => left.cmp_le(&right, false)?,
+            CompareOp::LeUn => left.cmp_le(&right, true)?,
+            CompareOp::Gt => left.cmp_gt(&right, false)?,
+            CompareOp::GtUn => left.cmp_gt(&right, true)?,
+            CompareOp::Ge => left.cmp_ge(&right, false)?,
+            CompareOp::GeUn => left.cmp_ge(&right, true)?,
         };
 
         Ok(EmValue::I32(i32::from(result)))
@@ -82,18 +83,6 @@ impl EmValue {
             (EmValue::Null, EmValue::Null) => Ok(true),
             (EmValue::ObjectRef(_), EmValue::Null) | (EmValue::Null, EmValue::ObjectRef(_)) => {
                 Ok(false)
-            }
-            (EmValue::Bool(a), EmValue::Bool(b)) => Ok(a == b),
-            (EmValue::Char(a), EmValue::Char(b)) => Ok(a == b),
-            // Cross-type comparisons for int32 stack types (I32, Bool, Char all use int32 on stack)
-            (EmValue::I32(a), EmValue::Bool(b)) | (EmValue::Bool(b), EmValue::I32(a)) => {
-                Ok(*a == i32::from(*b))
-            }
-            (EmValue::I32(a), EmValue::Char(b)) | (EmValue::Char(b), EmValue::I32(a)) => {
-                Ok(*a == (*b as u32) as i32)
-            }
-            (EmValue::Bool(a), EmValue::Char(b)) | (EmValue::Char(b), EmValue::Bool(a)) => {
-                Ok(i32::from(*a) == (*b as u32) as i32)
             }
             // Pointer comparisons
             (EmValue::NativeInt(a), EmValue::UnmanagedPtr(b))

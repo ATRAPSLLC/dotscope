@@ -134,19 +134,18 @@ impl ManifestResourceRaw {
             // Special case, this is actually 'NULL', means that the resource is embedded in the current assembly
             // The resource format is: [4-byte length prefix][data bytes]
             // offset_field points to the length prefix
-            let section_start = file.rva_to_offset(cor20.resource_rva as usize)?;
-            let length_prefix_offset = section_start
+            let length_prefix_rva = (cor20.resource_rva as usize)
                 .checked_add(self.offset_field as usize)
                 .ok_or_else(|| {
                     malformed_error!(
-                        "ManifestResource length-prefix offset overflow: {} + {}",
-                        section_start,
+                        "ManifestResource length-prefix RVA overflow: {} + {}",
+                        cor20.resource_rva,
                         self.offset_field
                     )
                 })?;
 
             // Read the 4-byte length prefix to get actual data size
-            if let Ok(len_bytes) = file.data_slice(length_prefix_offset, 4) {
+            if let Ok(len_bytes) = file.rva_slice(length_prefix_rva, 4) {
                 let b0 = *len_bytes.first().ok_or(out_of_bounds_error!())?;
                 let b1 = *len_bytes.get(1).ok_or(out_of_bounds_error!())?;
                 let b2 = *len_bytes.get(2).ok_or(out_of_bounds_error!())?;
@@ -185,13 +184,28 @@ impl ManifestResourceRaw {
                 };
             }
 
-            // data_offset points to actual data (after the 4-byte length prefix)
-            data_offset = length_prefix_offset.checked_add(4).ok_or_else(|| {
+            // data_offset is the file offset of the data (after the 4-byte length prefix),
+            // which the file must hold whole within its section
+            let data_rva = length_prefix_rva.checked_add(4).ok_or_else(|| {
                 malformed_error!(
-                    "ManifestResource data offset overflow: {} + 4",
-                    length_prefix_offset
+                    "ManifestResource data RVA overflow: {} + 4",
+                    length_prefix_rva
                 )
             })?;
+            data_offset = match file.rva_to_offset(data_rva) {
+                Ok(offset) => offset,
+                // Empty data has no bytes to locate
+                Err(_) if data_size == 0 => 0,
+                Err(error) => return Err(error),
+            };
+            if data_size > 0 && file.section_bounded(data_rva)?.len() < data_size {
+                return Err(malformed_error!(
+                    "ManifestResource {} data of {} bytes at RVA {:#x} runs past its section's data",
+                    self.rid,
+                    data_size,
+                    data_rva
+                ));
+            }
             None
         } else {
             let implementation = get_ref(&self.implementation);

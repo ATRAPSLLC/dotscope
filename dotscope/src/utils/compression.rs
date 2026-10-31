@@ -23,21 +23,21 @@
 //! let mut buffer = Vec::new();
 //!
 //! // Small value (1 byte)
-//! write_compressed_uint(42, &mut buffer);
+//! write_compressed_uint(42, &mut buffer)?;
 //! assert_eq!(buffer, vec![0x2A]);
 //! assert_eq!(compressed_uint_size(42), 1);
 //!
 //! buffer.clear();
 //!
 //! // Medium value (2 bytes)
-//! write_compressed_uint(300, &mut buffer);
+//! write_compressed_uint(300, &mut buffer)?;
 //! assert_eq!(buffer.len(), 2);
 //! assert_eq!(compressed_uint_size(300), 2);
 //!
 //! buffer.clear();
 //!
 //! // Large value (4 bytes)
-//! write_compressed_uint(70000, &mut buffer);
+//! write_compressed_uint(70000, &mut buffer)?;
 //! assert_eq!(buffer.len(), 4);
 //! assert_eq!(compressed_uint_size(70000), 4);
 //! ```
@@ -92,33 +92,33 @@ mod tests {
     #[test]
     fn test_compressed_uint_single_byte() {
         let mut buffer = Vec::new();
-        write_compressed_uint(0, &mut buffer);
+        write_compressed_uint(0, &mut buffer).unwrap();
         assert_eq!(buffer, vec![0x00]);
 
         buffer.clear();
-        write_compressed_uint(127, &mut buffer);
+        write_compressed_uint(127, &mut buffer).unwrap();
         assert_eq!(buffer, vec![0x7F]);
     }
 
     #[test]
     fn test_compressed_uint_two_bytes() {
         let mut buffer = Vec::new();
-        write_compressed_uint(128, &mut buffer);
+        write_compressed_uint(128, &mut buffer).unwrap();
         assert_eq!(buffer, vec![0x80, 0x80]);
 
         buffer.clear();
-        write_compressed_uint(0x3FFF, &mut buffer);
+        write_compressed_uint(0x3FFF, &mut buffer).unwrap();
         assert_eq!(buffer, vec![0xBF, 0xFF]);
     }
 
     #[test]
     fn test_compressed_uint_four_bytes() {
         let mut buffer = Vec::new();
-        write_compressed_uint(0x4000, &mut buffer);
+        write_compressed_uint(0x4000, &mut buffer).unwrap();
         assert_eq!(buffer, vec![0xC0, 0x00, 0x40, 0x00]);
 
         buffer.clear();
-        write_compressed_uint(0x12345678, &mut buffer);
+        write_compressed_uint(0x12345678, &mut buffer).unwrap();
         assert_eq!(buffer, vec![0xD2, 0x34, 0x56, 0x78]);
     }
 
@@ -141,7 +141,7 @@ mod tests {
             let predicted_size = compressed_uint_size(value as usize);
 
             let mut buffer = Vec::new();
-            write_compressed_uint(value, &mut buffer);
+            write_compressed_uint(value, &mut buffer).unwrap();
             let actual_size = buffer.len() as u64;
 
             assert_eq!(

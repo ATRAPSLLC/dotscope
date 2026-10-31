@@ -43,9 +43,12 @@ use strum::IntoEnumIterator;
 #[cfg(feature = "x86")]
 use crate::analysis::x86_native_body_size;
 use crate::{
+    assembly::{decode_stream, Operand},
     cilassembly::{
-        changes::{AssemblyChanges, ChangeRef},
+        changes::{AssemblyChanges, ChangeRef, METHOD_BODY_PLACEHOLDER_BASE},
+        cleanup::collect_referenced_heap_entries,
         writer::{
+            blobs::{debug_blobs, signature_blobs, BlobRemap},
             context::{SectionWriteInfo, WriteContext, FILE_ALIGNMENT_DEFAULT},
             fields::{resolve_field_data_rva, write_field_data},
             fixups::{apply_all_fixups, fixup_metadata_stream_headers},
@@ -57,19 +60,22 @@ use crate::{
             output::Output,
             relocations::{generate_relocations, RelocationConfig},
             remapper::{RemapReferences, RidRemapper},
-            signatures::{signature_blobs, SignatureRemap},
         },
         CilAssembly, Operation, TableModifications,
     },
     dispatch_table_type,
-    file::pe::{
-        relocate_resource_section, DataDirectoryType, DosHeader, PeCharacteristics, SectionTable,
+    file::{
+        pe::{
+            relocate_resource_section, DataDirectoryType, DosHeader, Import, PeCharacteristics,
+            SectionTable,
+        },
+        File,
     },
     metadata::{
         cor20header::Cor20Flags,
         exports::NativeExports,
         imports::NativeImports,
-        method::MethodImplCodeType,
+        method::{MethodBody, MethodImplCodeType},
         root::Root,
         streams::{Blob, Guid, StreamHeader, Strings, UserStrings},
         tablefields::get_heap_fields,
@@ -80,7 +86,7 @@ use crate::{
         token::Token,
     },
     utils::{align_to, calculate_table_row_size},
-    Error, Result,
+    Error, Parser, Result,
 };
 
 /// Upper bound on how far the native-stub decoder will scan for a function end.
@@ -548,12 +554,24 @@ impl<'a> PeGenerator<'a> {
                 ctx.tokens = remapper.token_remap();
                 // The blobs signature columns reference, whose type tokens follow the rows
                 // the remap renumbers.
-                ctx.signature_blobs = signature_blobs(self.assembly);
+                ctx.typed_blobs = signature_blobs(self.assembly);
             }
+            // The Portable PDB blobs whose content names rows or blobs: the blobs they name
+            // move whenever the heap is rebuilt, with or without row renumbering, and the
+            // rows a change adds are named by placeholder
+            ctx.typed_blobs.extend(debug_blobs(self.assembly));
 
             // Build StandAloneSig deduplication mapping
             self.build_standalonesig_dedup(&mut ctx, changes);
         }
+
+        // Every heap offset the tables and the bodies name, so that a heap rebuilt by
+        // deduplication or edits keeps the ones inside another entry's bytes as well as the
+        // entries
+        let (strings, blobs, _) = collect_referenced_heap_entries(self.assembly);
+        ctx.referenced_string_offsets = strings;
+        ctx.referenced_blob_offsets = blobs;
+        ctx.referenced_userstring_offsets = collect_referenced_userstring_offsets(self.assembly);
 
         // Pre-compute heap offsets - needed for method bodies that reference newly added
         // userstrings (ldstr instructions) and other heap entries. This resolves ChangeRefs to
@@ -595,6 +613,12 @@ impl<'a> PeGenerator<'a> {
         // in .text (no .rsrc section). These must be carried over to the new .text.
         self.write_embedded_pe_resources(&mut ctx)?;
 
+        // Keep the debug directory when the write changes nothing: its data still
+        // describes the code
+        if !changes.has_changes() {
+            self.write_debug_data(&mut ctx)?;
+        }
+
         // Calculate .text section size and update sections vector
         ctx.text_section_size = ctx
             .pos()
@@ -633,8 +657,8 @@ impl<'a> PeGenerator<'a> {
 
     /// Estimates the total file size for initial allocation.
     ///
-    /// This provides a conservative over-estimate. The actual file will be
-    /// truncated to the correct size at the end.
+    /// The output starts at this size, grows when a write runs past it (the estimate leaves
+    /// out table rows and index widening), and is truncated to the actual size at the end.
     ///
     /// # Returns
     ///
@@ -829,7 +853,8 @@ impl<'a> PeGenerator<'a> {
     ///
     /// Clones the original optional header and zeroes invalid data directories:
     /// - CertificateTable: Signature is invalidated by any modification
-    /// - Debug: Debug info becomes stale (IL offsets change, PDB correlation breaks)
+    /// - Debug: Debug info becomes stale (IL offsets change, PDB correlation breaks); a write
+    ///   that changes nothing copies it back in (`write_debug_data`)
     ///
     /// Original directory locations are stored in ctx for zeroing actual data regions.
     ///
@@ -988,8 +1013,8 @@ impl<'a> PeGenerator<'a> {
     ///
     /// The import list is built by merging:
     /// 1. mscoree.dll with _CorExeMain/_CorDllMain (always first)
-    /// 2. Original imports from the source PE (excluding mscoree.dll)
-    /// 3. User-added imports from assembly changes
+    /// 2. Original imports from the source PE, but mscoree.dll's entry point
+    /// 3. User-added imports from assembly changes, but those already imported
     ///
     /// # Arguments
     ///
@@ -998,48 +1023,58 @@ impl<'a> PeGenerator<'a> {
     /// # Returns
     ///
     /// A `NativeImports` containing all imports with mscoree.dll first.
+    ///
+    /// # Errors
+    ///
+    /// When the original import table cannot be read in full, or an import cannot be held
+    /// (an empty name, ordinal 0, the same function imported twice): the table written would
+    /// lack it.
     fn build_import_list(&self, ctx: &WriteContext) -> Result<NativeImports> {
         let view = self.assembly.view();
+        let pe = view.file().pe();
+        if let Some(error) = &pe.import_error {
+            return Err(Error::LayoutFailed(format!(
+                "{error}, so it cannot be written back"
+            )));
+        }
 
-        // Collect non-mscoree imports from original PE
+        let is_entry_point = |dll: &str, function: Option<&str>| {
+            dll.eq_ignore_ascii_case("mscoree.dll")
+                && matches!(function, Some("_CorExeMain" | "_CorDllMain"))
+        };
+        let add = |imports: &mut NativeImports, dll: &str, import: &Import| -> Result<()> {
+            imports.add_dll(dll)?;
+            match (&import.name, import.ordinal) {
+                (Some(name), _) => imports.add_function(dll, name),
+                (None, Some(ordinal)) => imports.add_function_by_ordinal(dll, ordinal),
+                (None, None) => Err(Error::LayoutFailed(format!(
+                    "an import from {dll} has neither a name nor an ordinal"
+                ))),
+            }
+        };
+
+        // Collect the original imports, but mscoree.dll's entry point, which is written first
         let mut other_imports = NativeImports::new();
         other_imports.set_pe_format(ctx.is_pe32_plus);
-
-        if let Some(pe_imports) = view.file().imports() {
-            let original = NativeImports::from_pe_imports(pe_imports, ctx.is_pe32_plus)?;
-            for desc in original.descriptors() {
-                // Skip mscoree.dll - we'll add it correctly as first import
-                if desc.dll_name.eq_ignore_ascii_case("mscoree.dll") {
-                    continue;
-                }
-                if other_imports.add_dll(&desc.dll_name).is_ok() {
-                    for func in &desc.functions {
-                        if let Some(ref name) = func.name {
-                            let _ = other_imports.add_function(&desc.dll_name, name);
-                        } else if let Some(ordinal) = func.ordinal {
-                            let _ = other_imports.add_function_by_ordinal(&desc.dll_name, ordinal);
-                        }
-                    }
-                }
+        for import in &pe.imports {
+            if !is_entry_point(&import.dll, import.name.as_deref()) {
+                add(&mut other_imports, &import.dll, import)?;
             }
         }
 
-        // Add user-specified imports from changes
+        // Add user-specified imports from changes, but what is already imported
         let new_imports = self.assembly.changes().native_imports().native();
         for desc in new_imports.descriptors() {
-            // Skip mscoree.dll - protected
-            if desc.dll_name.eq_ignore_ascii_case("mscoree.dll") {
-                continue;
-            }
-            // Add or merge with existing
-            if !other_imports.has_dll(&desc.dll_name) {
-                let _ = other_imports.add_dll(&desc.dll_name);
-            }
             for func in &desc.functions {
-                if let Some(ref name) = func.name {
-                    let _ = other_imports.add_function(&desc.dll_name, name);
-                } else if let Some(ordinal) = func.ordinal {
-                    let _ = other_imports.add_function_by_ordinal(&desc.dll_name, ordinal);
+                let imported = other_imports.descriptors().any(|existing| {
+                    existing.dll_name == desc.dll_name
+                        && existing.functions.iter().any(|f| {
+                            f.name == func.name
+                                && (func.name.is_some() || f.ordinal == func.ordinal)
+                        })
+                });
+                if !imported && !is_entry_point(&desc.dll_name, func.name.as_deref()) {
+                    add(&mut other_imports, &desc.dll_name, func)?;
                 }
             }
         }
@@ -1062,13 +1097,8 @@ impl<'a> PeGenerator<'a> {
 
         // Add all other imports after mscoree.dll
         for desc in other_imports.descriptors() {
-            final_imports.add_dll(&desc.dll_name)?;
             for func in &desc.functions {
-                if let Some(ref name) = func.name {
-                    let _ = final_imports.add_function(&desc.dll_name, name);
-                } else if let Some(ordinal) = func.ordinal {
-                    let _ = final_imports.add_function_by_ordinal(&desc.dll_name, ordinal);
-                }
+                add(&mut final_imports, &desc.dll_name, func)?;
             }
         }
 
@@ -1105,7 +1135,7 @@ impl<'a> PeGenerator<'a> {
 
     /// Checks if this assembly needs native import table entries.
     ///
-    /// Returns `true` if the original PE had native imports (e.g., mscoree.dll)
+    /// Returns `true` if the original PE had an import table, whatever of it could be read,
     /// or if the user has added new native imports. .NET Core assemblies compiled
     /// for x64 typically have no IAT, no import table, and no native entry point;
     /// adding these unconditionally triggers CoreCLR's `CheckILOnly` validation
@@ -1113,8 +1143,14 @@ impl<'a> PeGenerator<'a> {
     fn needs_native_imports(&self) -> bool {
         let view = self.assembly.view();
 
-        // Check if original PE had any imports
-        if view.file().imports().is_some() {
+        // Check if original PE had an import table: the loader goes by its RVA, whatever its
+        // size says (BitMono writes 0)
+        if view
+            .file()
+            .pe()
+            .get_data_directory(DataDirectoryType::ImportTable)
+            .is_some_and(|directory| directory.virtual_address != 0)
+        {
             return true;
         }
 
@@ -1215,7 +1251,7 @@ impl<'a> PeGenerator<'a> {
                         // changes.method_bodies() and will be written separately below.
                         // This happens when cleanup patches a method body and stores it
                         // with a placeholder RVA.
-                        if ChangeRef::is_placeholder(original_rva) {
+                        if original_rva >= METHOD_BODY_PLACEHOLDER_BASE {
                             continue;
                         }
 
@@ -1235,28 +1271,14 @@ impl<'a> PeGenerator<'a> {
                             // x86 instructions to find the function's RET instruction.
                             #[cfg(feature = "x86")]
                             {
-                                let offset = file.rva_to_offset(original_rva as usize)?;
-
-                                // Clamp the scan window to the PE section containing the stub,
+                                // Clamp the scan window to the section containing the stub,
                                 // and to an absolute ceiling. Handing the decoder "everything
                                 // from here to EOF" let a single native method absorb the rest
                                 // of the input file into the output as one body, and made the
                                 // decode cost proportional to file size rather than to the stub.
-                                let section_end = file
-                                    .sections()
-                                    .iter()
-                                    .find_map(|section| {
-                                        let start = section.pointer_to_raw_data as usize;
-                                        let end =
-                                            start.saturating_add(section.size_of_raw_data as usize);
-                                        (offset >= start && offset < end).then_some(end)
-                                    })
-                                    .unwrap_or_else(|| file.data().len())
-                                    .min(file.data().len());
-                                let available = section_end
-                                    .saturating_sub(offset)
-                                    .min(MAX_NATIVE_BODY_SCAN_BYTES);
-                                let scan_data = file.data_slice(offset, available)?;
+                                let section = file.section_bounded(original_rva as usize)?;
+                                let available = section.len().min(MAX_NATIVE_BODY_SCAN_BYTES);
+                                let scan_data = section.get(..available).unwrap_or(section);
 
                                 let body_size = x86_native_body_size(scan_data, file.pe().is_64bit);
 
@@ -1274,7 +1296,7 @@ impl<'a> PeGenerator<'a> {
                                     )));
                                 }
 
-                                let body_data = file.data_slice(offset, body_size)?;
+                                let body_data = scan_data.get(..body_size).unwrap_or(scan_data);
 
                                 // Native code needs 4-byte alignment for consistency
                                 ctx.align_to_4_with_padding()?;
@@ -1285,14 +1307,7 @@ impl<'a> PeGenerator<'a> {
                             }
                         } else {
                             // CIL method - parse, remap tokens, and rebuild
-                            let offset = file.rva_to_offset(original_rva as usize)?;
-                            let remaining =
-                                file.data().len().checked_sub(offset).ok_or_else(|| {
-                                    Error::LayoutFailed(
-                                        "Method offset exceeds file size".to_string(),
-                                    )
-                                })?;
-                            let available_data = file.data_slice(offset, remaining)?;
+                            let available_data = file.section_bounded(original_rva as usize)?;
 
                             let rebuilt = rebuild_method_body(
                                 available_data,
@@ -1323,7 +1338,7 @@ impl<'a> PeGenerator<'a> {
         let mut owners: HashMap<u32, Token> = HashMap::new();
         let mut own = |rid: u32, row: &TableDataOwned| {
             if let TableDataOwned::MethodDef(method) = row {
-                if ChangeRef::is_placeholder(method.rva) {
+                if method.rva >= METHOD_BODY_PLACEHOLDER_BASE {
                     owners
                         .entry(method.rva)
                         .or_insert_with(|| Token::from_parts(TableId::MethodDef, rid));
@@ -1428,9 +1443,8 @@ impl<'a> PeGenerator<'a> {
         // Each resource in the CLR resource section is: [4-byte LE length][data].
         // ManifestResource.offset_field points to the start of the length prefix.
         if cor20.resource_rva != 0 && cor20.resource_size != 0 {
-            let resource_file_offset = file.rva_to_offset(cor20.resource_rva as usize)?;
             let original_data =
-                file.data_slice(resource_file_offset, cor20.resource_size as usize)?;
+                file.rva_slice(cor20.resource_rva as usize, cor20.resource_size as usize)?;
 
             // Check if any ManifestResource rows have been deleted. If not, fast-path:
             // copy everything as-is.
@@ -1510,7 +1524,7 @@ impl<'a> PeGenerator<'a> {
                 }
             } else {
                 // No deletions — copy all original resources as-is
-                ctx.write(original_data)?;
+                ctx.write(&original_data)?;
             }
         }
 
@@ -1641,12 +1655,7 @@ impl<'a> PeGenerator<'a> {
             })
             .collect();
 
-        let version_padded_len = root
-            .version
-            .len()
-            .checked_add(3)
-            .ok_or_else(|| Error::LayoutFailed("Version length overflow".to_string()))?
-            & !3;
+        let version_padded_len = root.version_field_size();
         let version_len_u32 = u32::try_from(version_padded_len).map_err(|_| {
             Error::LayoutFailed(format!(
                 "Version length {version_padded_len} exceeds u32 range"
@@ -1818,7 +1827,7 @@ impl<'a> PeGenerator<'a> {
                         &strings_remap,
                         &blobs_remap,
                         &guids_remap,
-                    );
+                    )?;
                 }
 
                 ctx.write_at(row_offset, &row_buffer)?;
@@ -1887,7 +1896,7 @@ impl<'a> PeGenerator<'a> {
             };
 
             // Check if it's a placeholder
-            if ChangeRef::is_placeholder(value) {
+            if ChangeRef::is_heap_placeholder(value) {
                 if let Some(change_ref) = changes.lookup_by_placeholder(value) {
                     if let Some(resolved) = change_ref.offset() {
                         // Write the resolved value back
@@ -1938,11 +1947,7 @@ impl<'a> PeGenerator<'a> {
 
         // Base header: signature (4) + major (2) + minor (2) + reserved (4) + version_length (4)
         let base_size: usize = 16;
-        // Version string aligned to 4 bytes
-        let version_len = root.version.len();
-        // Safe cast: version_len is a string length which is always small
-        let aligned_version = usize::try_from(align_to(version_len as u64, 4))
-            .unwrap_or_else(|_| version_len.saturating_add(4));
+        let aligned_version = root.version_field_size();
         // Flags (2) + stream count (2)
         let flags_and_count: usize = 4;
         // Stream headers: each is offset (4) + size (4) + name (variable, 4-byte aligned)
@@ -2018,7 +2023,7 @@ impl<'a> PeGenerator<'a> {
             ctx.strings_heap_offset,
             strings_data,
             &changes.string_heap_changes,
-            &changes.referenced_string_offsets,
+            &ctx.referenced_string_offsets,
         )?;
         ctx.strings_heap_size = strings_result.bytes_written;
         ctx.heap_remapping.strings = strings_result.remapping;
@@ -2032,6 +2037,7 @@ impl<'a> PeGenerator<'a> {
             ctx.us_heap_offset,
             us_data,
             &changes.userstring_heap_changes,
+            &ctx.referenced_userstring_offsets,
         )?;
         ctx.us_heap_size = us_result.bytes_written;
         ctx.heap_remapping.userstrings = us_result.remapping;
@@ -2058,10 +2064,12 @@ impl<'a> PeGenerator<'a> {
             ctx.blob_heap_offset,
             blob_data,
             &changes.blob_heap_changes,
-            &SignatureRemap {
-                blobs: &ctx.signature_blobs,
+            &BlobRemap {
+                blobs: &ctx.typed_blobs,
                 tokens: &ctx.tokens,
+                changes,
             },
+            &ctx.referenced_blob_offsets,
         )?;
         ctx.blob_heap_size = blob_result.bytes_written;
         ctx.heap_remapping.blobs = blob_result.remapping;
@@ -2608,7 +2616,7 @@ impl<'a> PeGenerator<'a> {
         // copied original method bodies
         let new_rva = if let Some(&mapped_rva) = method_body_rva_map.get(&rva) {
             mapped_rva
-        } else if rva < 0xF000_0000 {
+        } else if rva < METHOD_BODY_PLACEHOLDER_BASE {
             // Original RVA not in map - apply delta as fallback
             // (used when method bodies region was copied as a whole).
             // If the delta overflows i32, leave the row unchanged rather than
@@ -2939,64 +2947,42 @@ impl<'a> PeGenerator<'a> {
     fn write_export_data(&self, ctx: &mut WriteContext) -> Result<()> {
         let view = self.assembly.view();
 
-        // Get original exports from the PE file
-        let original_exports = if let Some(pe_exports) = view.file().exports() {
-            NativeExports::from_pe_exports(pe_exports)?
-        } else {
-            NativeExports::new("")
-        };
-
+        let pe = view.file().pe();
+        if let Some(error) = &pe.export_error {
+            return Err(Error::LayoutFailed(format!(
+                "{error}, so it cannot be written back"
+            )));
+        }
         let new_exports = self.assembly.changes().native_exports().native();
 
-        // Skip if no exports at all
-        if original_exports.is_empty() && new_exports.is_empty() {
-            return Ok(());
+        // The original directory, with every ordinal and name it holds
+        let mut merged = match &pe.export_header {
+            Some(header) => NativeExports::from_pe_exports(header, &pe.exports)?,
+            None if new_exports.is_empty() => return Ok(()),
+            None => NativeExports::new(new_exports.dll_name()),
+        };
+        // A name the changes set replaces the original's
+        if !new_exports.dll_name().is_empty() {
+            merged.set_dll_name(new_exports.dll_name())?;
         }
 
-        // Clone original exports and merge in new ones
-        let mut merged = if !original_exports.is_empty() {
-            let mut merged = NativeExports::new(original_exports.dll_name());
-
-            // Copy original functions
-            for func in original_exports.functions() {
-                if let Some(ref name) = func.name {
-                    let _ = merged.add_function(name, func.ordinal, func.address);
-                } else {
-                    let _ = merged.add_function_by_ordinal(func.ordinal, func.address);
-                }
-            }
-
-            // Copy original forwarders
-            for fwd in original_exports.forwarders() {
-                if let Some(ref name) = fwd.name {
-                    let _ = merged.add_forwarder(name, fwd.ordinal, &fwd.target);
-                }
-            }
-            merged
-        } else if !new_exports.is_empty() {
-            NativeExports::new(new_exports.dll_name())
-        } else {
-            return Ok(());
-        };
-
-        // Add new exports from changes
+        // Add new exports from changes, but the names already exported
         for func in new_exports.functions() {
-            if let Some(ref name) = func.name {
-                if !merged.has_function(name) {
-                    let _ = merged.add_function(name, func.ordinal, func.address);
-                }
-            } else {
-                let _ = merged.add_function_by_ordinal(func.ordinal, func.address);
+            match &func.name {
+                Some(name) if merged.has_function(name) => {}
+                Some(name) => merged.add_function(name, func.ordinal, func.address)?,
+                None => merged.add_function_by_ordinal(func.ordinal, func.address)?,
             }
         }
         for fwd in new_exports.forwarders() {
-            if let Some(ref name) = fwd.name {
-                let _ = merged.add_forwarder(name, fwd.ordinal, &fwd.target);
+            match &fwd.name {
+                Some(name) if merged.has_function(name) => {}
+                name => merged.add_forwarder(
+                    name.as_deref().unwrap_or_default(),
+                    fwd.ordinal,
+                    &fwd.target,
+                )?,
             }
-        }
-
-        if merged.is_empty() {
-            return Ok(());
         }
 
         ctx.align_to_4();
@@ -3049,15 +3035,8 @@ impl<'a> PeGenerator<'a> {
         }
 
         // Resources are embedded in .text — read from original file
-        let Ok(offset) = file.rva_to_offset(res_rva as usize) else {
-            return Ok(()); // Can't resolve, skip
-        };
-
-        let Some(end) = offset.checked_add(res_size as usize) else {
-            return Ok(()); // Overflow, skip
-        };
-        let Some(data) = file.data().get(offset..end) else {
-            return Ok(()); // Out of bounds, skip
+        let Ok(data) = file.rva_slice(res_rva as usize, res_size as usize) else {
+            return Ok(()); // Not in the image, skip
         };
 
         // Write at aligned position in new .text
@@ -3067,7 +3046,7 @@ impl<'a> PeGenerator<'a> {
 
         // Clone and relocate the resource directory entries if RVA changed
         if res_rva == new_rva {
-            ctx.write(data)?;
+            ctx.write(&data)?;
         } else {
             let mut rsrc_data = data.to_vec();
             relocate_resource_section(&mut rsrc_data, res_rva, new_rva)?;
@@ -3224,17 +3203,7 @@ impl<'a> PeGenerator<'a> {
     ) -> Result<u32> {
         let view = self.assembly.view();
         let file = view.file();
-
-        let Some(end) = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)
-        else {
-            return Ok(0);
-        };
-        let Some(data) = file
-            .data()
-            .get(section.pointer_to_raw_data as usize..end as usize)
-        else {
+        let Some((data, extent)) = section_contents(file, section) else {
             return Ok(0);
         };
 
@@ -3247,7 +3216,7 @@ impl<'a> PeGenerator<'a> {
             ctx.write(&rsrc_data)?;
         }
 
-        Ok(section.virtual_size)
+        Ok(extent)
     }
 
     /// Writes reloc section data with proper CoreCLR compliance.
@@ -3270,13 +3239,7 @@ impl<'a> PeGenerator<'a> {
         let file = view.file();
 
         // Get original reloc data if present
-        let existing_data = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)
-            .and_then(|end| {
-                file.data()
-                    .get(section.pointer_to_raw_data as usize..end as usize)
-            });
+        let existing_data = section_contents(file, section).map(|(data, _)| data);
 
         // Build relocation configuration
         let config = RelocationConfig {
@@ -3306,9 +3269,68 @@ impl<'a> PeGenerator<'a> {
         Ok(Some(size))
     }
 
-    /// Writes a generic section by copying data as-is.
+    /// Copies the debug directory, and the data each of its entries points at, into `.text`,
+    /// pointing the entries at the copies (the PE format's `IMAGE_DEBUG_DIRECTORY`, 28 bytes
+    /// an entry).
     ///
-    /// Returns the size of data written, or 0 if no data.
+    /// # Errors
+    ///
+    /// When the directory or an entry's data lies outside the input.
+    fn write_debug_data(&self, ctx: &mut WriteContext) -> Result<()> {
+        const ENTRY: usize = 28;
+        let Some((rva, size)) = ctx.original_debug_dir else {
+            return Ok(());
+        };
+        let file = self.assembly.view().file();
+        let directory = file.rva_slice(rva as usize, size as usize)?.into_owned();
+        let mut copied = directory.clone();
+        let field = |entry: &[u8], at: usize| -> u32 {
+            entry
+                .get(at..at.saturating_add(4))
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map_or(0, u32::from_le_bytes)
+        };
+        for (index, entry) in directory.as_chunks::<ENTRY>().0.iter().enumerate() {
+            let (data_size, data_rva, data_pointer) =
+                (field(entry, 16), field(entry, 20), field(entry, 24));
+            if data_size == 0 {
+                continue;
+            }
+            // The file pointer is where the bytes are; an entry whose data is not mapped
+            // has no RVA
+            let data = if data_pointer != 0 {
+                file.data_slice(data_pointer as usize, data_size as usize)?
+                    .to_vec()
+            } else {
+                file.rva_slice(data_rva as usize, data_size as usize)?
+                    .into_owned()
+            };
+            ctx.align_to_4_with_padding()?;
+            let (new_rva, new_pointer) = (ctx.current_rva(), ctx.pos());
+            ctx.write(&data)?;
+            let base = index.saturating_mul(ENTRY);
+            if data_rva != 0 {
+                if let Some(slot) = copied.get_mut(base.saturating_add(20)..base.saturating_add(24))
+                {
+                    slot.copy_from_slice(&new_rva.to_le_bytes());
+                }
+            }
+            if data_pointer != 0 {
+                let pointer = u32::try_from(new_pointer).map_err(|_| {
+                    Error::LayoutFailed("Debug data offset exceeds u32 range".to_string())
+                })?;
+                if let Some(slot) = copied.get_mut(base.saturating_add(24)..base.saturating_add(28))
+                {
+                    slot.copy_from_slice(&pointer.to_le_bytes());
+                }
+            }
+        }
+        ctx.align_to_4_with_padding()?;
+        ctx.debug_dir = Some((ctx.current_rva(), size));
+        ctx.write(&copied)?;
+        Ok(())
+    }
+
     /// Returns how many bytes have been written since `start`.
     ///
     /// Measured from the output position rather than trusted from a return value, so
@@ -3326,32 +3348,75 @@ impl<'a> PeGenerator<'a> {
             .map_err(|_| Error::LayoutFailed("Section written size exceeds u32 range".to_string()))
     }
 
+    /// Writes a generic section by copying its contents as-is.
+    ///
+    /// Returns the section's size in the image, or 0 if it has no data.
     fn write_generic_section(&self, ctx: &mut WriteContext, section: &SectionTable) -> Result<u32> {
         let view = self.assembly.view();
-        let file = view.file();
-
-        // Skip sections with no data
-        if section.size_of_raw_data == 0 {
-            return Ok(0);
-        }
-
-        let Some(end) = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)
-        else {
+        let Some((data, extent)) = section_contents(view.file(), section) else {
             return Ok(0);
         };
-        let Some(data) = file
-            .data()
-            .get(section.pointer_to_raw_data as usize..end as usize)
-        else {
-            return Ok(0);
-        };
-
         ctx.write(data)?;
-
-        Ok(section.virtual_size)
+        Ok(extent)
     }
+}
+
+/// Every `#US` offset an `ldstr` of the assembly's bodies names: the original bodies and the
+/// ones a change stores. A body that does not decode names none it can be held to.
+fn collect_referenced_userstring_offsets(assembly: &CilAssembly) -> HashSet<u32> {
+    let mut offsets = HashSet::new();
+    let mut scan = |body: &[u8]| {
+        let Ok(header) = MethodBody::from(body) else {
+            return;
+        };
+        let Some(code) = header
+            .size_header
+            .checked_add(header.size_code)
+            .and_then(|end| body.get(header.size_header..end))
+        else {
+            return;
+        };
+        let Ok(instructions) = decode_stream(&mut Parser::new(code), 0) else {
+            return;
+        };
+        for instruction in instructions {
+            if let Operand::Token(token) = instruction.operand {
+                if token.table() == 0x70 {
+                    offsets.insert(token.row());
+                }
+            }
+        }
+    };
+    let view = assembly.view();
+    let file = view.file();
+    if let Some(methods) = view.tables().and_then(|t| t.table::<MethodDefRaw>()) {
+        for row in methods.iter().flatten() {
+            let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
+            if row.rva == 0
+                || row.rva >= METHOD_BODY_PLACEHOLDER_BASE
+                || code_type.contains(MethodImplCodeType::NATIVE)
+                || code_type.contains(MethodImplCodeType::RUNTIME)
+            {
+                continue;
+            }
+            if let Ok(body) = file.section_bounded(row.rva as usize) {
+                scan(body);
+            }
+        }
+    }
+    for (_, body) in assembly.changes().method_bodies() {
+        scan(body);
+    }
+    offsets
+}
+
+/// A section's contents as the loader maps them ([`SectionMap::contents`]): the raw data the
+/// file holds within its size in the image, and that size. `None` when it holds no data.
+///
+/// [`SectionMap::contents`]: crate::file::sectionmap::SectionMap::contents
+fn section_contents<'a>(file: &'a File, section: &SectionTable) -> Option<(&'a [u8], u32)> {
+    let (extent, data) = file.section_map().contents(file.data(), section);
+    (!data.is_empty()).then_some((data, extent))
 }
 
 #[cfg(test)]

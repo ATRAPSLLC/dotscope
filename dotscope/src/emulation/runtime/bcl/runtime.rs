@@ -394,16 +394,7 @@ fn runtime_helpers_initialize_array_pre(
         return PreHookResult::Bypass(None);
     };
 
-    // Convert RVA to file offset and read data
     let file = assembly.file();
-    let Ok(file_offset) = file.rva_to_offset(rva as usize) else {
-        return PreHookResult::Bypass(None);
-    };
-
-    let pe_data = file.data();
-    if file_offset >= pe_data.len() {
-        return PreHookResult::Bypass(None);
-    }
 
     // Get the array length and element type
     let array_len = thread.heap().get_array_length(array_ref).unwrap_or(0);
@@ -421,16 +412,8 @@ fn runtime_helpers_initialize_array_pre(
         return PreHookResult::Bypass(None);
     };
 
-    // Calculate total bytes to read (saturating: out-of-range simply truncates the copy)
-    let total_bytes = array_len.saturating_mul(element_size);
-    let remaining = pe_data.len().saturating_sub(file_offset);
-    let bytes_to_read = total_bytes.min(remaining);
-
-    // Read the bytes from the PE file
-    let Some(end) = file_offset.checked_add(bytes_to_read) else {
-        return PreHookResult::Bypass(None);
-    };
-    let Some(data) = pe_data.get(file_offset..end) else {
+    // The array's bytes as the loaded image holds them at the field's RVA
+    let Ok(data) = file.rva_slice(rva as usize, array_len.saturating_mul(element_size)) else {
         return PreHookResult::Bypass(None);
     };
 

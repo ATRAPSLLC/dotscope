@@ -1077,6 +1077,19 @@ fn decode_body(method: &Method, file: &File, rva: usize) -> Result<Vec<BasicBloc
         return Ok(Vec::new());
     }
 
+    // The runtimes refuse a body that runs past its section's data
+    let in_section = file.section_bounded(rva)?.len();
+    if body
+        .size_header
+        .checked_add(body.size_code)
+        .is_none_or(|end| end > in_section)
+    {
+        return Err(malformed_error!(
+            "Method body at RVA {:#x} runs past its section's data",
+            rva
+        ));
+    }
+
     // Bound decoding to this method's declared code window, and track what has
     // been decoded within that window alone.
     let code_end = code_start

@@ -10,7 +10,7 @@ use crate::{
     metadata::{
         diagnostics::DiagnosticCategory,
         loader::{LoaderContext, MetadataLoader},
-        tables::TableId,
+        tables::{LocalConstantRaw, TableId},
     },
     utils::TryForEachInOrder,
     Result,
@@ -41,12 +41,13 @@ pub(crate) struct LocalConstantLoader;
 
 impl MetadataLoader for LocalConstantLoader {
     fn load(&self, context: &LoaderContext) -> Result<()> {
-        let (Some(header), Some(strings), Some(blobs)) =
-            (context.meta, context.strings, context.blobs)
-        else {
+        let Some(pdb) = &context.pdb else {
             return Ok(());
         };
-        let Some(table) = header.table::<crate::metadata::tables::LocalConstantRaw>() else {
+        let (Some(header), Some(strings), Some(blobs)) = (pdb.meta, pdb.strings, pdb.blobs) else {
+            return Ok(());
+        };
+        let Some(table) = header.table::<LocalConstantRaw>() else {
             return Ok(());
         };
 
@@ -54,12 +55,13 @@ impl MetadataLoader for LocalConstantLoader {
             .par_iter()
             .enumerate()
             .try_for_each_in_order(|(index, row)| {
-                let Some(row) = context.handle_row(row, index)? else {
+                let Some(row) = context.handle_row_in(pdb.lenient, row, index)? else {
                     return Ok(());
                 };
                 let token_msg = || format!("local constant 0x{:08x}", row.token.value());
 
-                let Some(local_constant) = context.handle_result(
+                let Some(local_constant) = context.handle_result_in(
+                    pdb.lenient,
                     row.to_owned(strings, blobs),
                     DiagnosticCategory::Method,
                     token_msg,
@@ -68,8 +70,8 @@ impl MetadataLoader for LocalConstantLoader {
                     return Ok(());
                 };
 
-                context
-                    .local_constant
+                pdb.target
+                    .local_constants
                     .insert(local_constant.token, local_constant);
                 Ok(())
             })

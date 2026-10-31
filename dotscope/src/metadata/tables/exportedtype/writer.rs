@@ -89,11 +89,7 @@ impl RowWritable for ExportedTypeRaw {
         write_le_at_dyn(data, offset, self.namespace, sizes.is_large_str())?;
 
         // Write coded index
-        let encoded_index = sizes.encode_coded_index(
-            self.implementation.tag,
-            self.implementation.row,
-            CodedIndexType::Implementation,
-        )?;
+        let encoded_index = self.implementation.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

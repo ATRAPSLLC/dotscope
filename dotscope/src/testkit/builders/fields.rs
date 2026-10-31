@@ -35,6 +35,13 @@ impl FieldBuilder {
         }
     }
 
+    /// The field's attributes (public by default).
+    #[must_use]
+    pub fn flags(mut self, flags: FieldAttributes) -> Self {
+        self.flags = flags;
+        self
+    }
+
     /// Create a simple int32 field
     pub fn simple_i4_field(name: &str) -> Self {
         let i4_type = Arc::new(crate::metadata::typesystem::CilType::new(
@@ -117,38 +124,34 @@ impl FieldBuilder {
 
     pub fn build(self) -> FieldRc {
         // Create field signature based on the field type
-        let signature = if let Some(ref field_type) = self.field_type {
-            match field_type.flavor() {
-                CilFlavor::I4 => SignatureField {
-                    modifiers: Vec::new(),
-                    base: TypeSignature::I4,
-                },
-                CilFlavor::String => SignatureField {
-                    modifiers: Vec::new(),
-                    base: TypeSignature::String,
-                },
-                CilFlavor::Boolean => SignatureField {
-                    modifiers: Vec::new(),
-                    base: TypeSignature::Boolean,
-                },
-                CilFlavor::R4 => SignatureField {
-                    modifiers: Vec::new(),
-                    base: TypeSignature::R4,
-                },
-                CilFlavor::Object => SignatureField {
-                    modifiers: Vec::new(),
-                    base: TypeSignature::Object,
-                },
-                _ => SignatureField {
-                    modifiers: Vec::new(),
-                    base: TypeSignature::I4, // Default fallback
-                },
-            }
-        } else {
-            SignatureField {
-                modifiers: Vec::new(),
-                base: TypeSignature::I4, // Default fallback
-            }
+        // The field's type as a signature: primitives and strings by their element type, any
+        // other type as int32
+        let base = match self
+            .field_type
+            .as_ref()
+            .map(|field_type| field_type.flavor())
+        {
+            Some(CilFlavor::Void) => TypeSignature::Void,
+            Some(CilFlavor::Boolean) => TypeSignature::Boolean,
+            Some(CilFlavor::Char) => TypeSignature::Char,
+            Some(CilFlavor::I1) => TypeSignature::I1,
+            Some(CilFlavor::U1) => TypeSignature::U1,
+            Some(CilFlavor::I2) => TypeSignature::I2,
+            Some(CilFlavor::U2) => TypeSignature::U2,
+            Some(CilFlavor::U4) => TypeSignature::U4,
+            Some(CilFlavor::I8) => TypeSignature::I8,
+            Some(CilFlavor::U8) => TypeSignature::U8,
+            Some(CilFlavor::R4) => TypeSignature::R4,
+            Some(CilFlavor::R8) => TypeSignature::R8,
+            Some(CilFlavor::I) => TypeSignature::I,
+            Some(CilFlavor::U) => TypeSignature::U,
+            Some(CilFlavor::String) => TypeSignature::String,
+            Some(CilFlavor::Object) => TypeSignature::Object,
+            _ => TypeSignature::I4,
+        };
+        let signature = SignatureField {
+            modifiers: Vec::new(),
+            base,
         };
 
         // Create field with OnceLock fields

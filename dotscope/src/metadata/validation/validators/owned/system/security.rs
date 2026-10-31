@@ -72,6 +72,7 @@
 
 use crate::{
     metadata::{
+        security::SecurityAction,
         typesystem::{CilType, CilTypeReference},
         validation::{
             context::{OwnedValidationContext, ValidationContext},
@@ -126,93 +127,27 @@ impl OwnedSecurityValidator {
 }
 
 impl OwnedSecurityValidator {
-    /// Validates security permission declarations and syntax.
+    /// Validates that every security declaration's action is one ECMA-335 II.22.11 defines
+    /// (`System.Security.Permissions.SecurityAction`, 1 to 15). Its permission set is
+    /// decoded when the row loads, which refuses a malformed one.
     ///
-    /// Ensures that security declarations are properly formed according to
-    /// ECMA-335 specifications and .NET security model requirements.
-    /// Currently a placeholder for future implementation when security_declarations API is available.
+    /// # Errors
     ///
-    /// # Arguments
-    ///
-    /// * `_context` - Owned validation context containing resolved security structures via [`crate::metadata::validation::context::OwnedValidationContext`]
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - All security permission declarations are valid (placeholder implementation)
-    /// * `Err(`[`crate::Error::ValidationOwnedFailed`]`)` - Declaration violations found
+    /// Returns [`crate::Error::ValidationOwnedFailed`] for an action outside that set.
     fn validate_security_permission_declarations(
         &self,
         context: &OwnedValidationContext,
     ) -> Result<()> {
-        let security_declarations = context.object().security_declarations();
-
-        for entry in security_declarations {
-            let (_token, decl_security) = (entry.key(), entry.value());
-
-            // Validate security action is within valid range
-            if !Self::is_valid_security_action(decl_security.action.into()) {
+        for entry in context.object().security_declarations().iter() {
+            let decl_security = entry.value();
+            if let SecurityAction::Unknown(action) = decl_security.action {
                 return Err(Error::ValidationOwnedFailed {
                     validator: self.name().to_string(),
-                    message: format!(
-                        "Security declaration has invalid action: {:?}",
-                        decl_security.action
-                    ),
+                    message: format!("Security declaration has invalid action: {action:#06x}"),
                 });
             }
-
-            // Validate permission set format - for XML format, check the XML content
-            let permission_set = &decl_security.permission_set;
-            if let crate::metadata::security::PermissionSetFormat::Xml = permission_set.format() {
-                let xml_content = String::from_utf8_lossy(permission_set.raw_data());
-                self.validate_permission_set_format(&xml_content)?;
-            } else {
-                // For binary format, perform basic validation on the raw data
-                let raw_data = permission_set.raw_data();
-                if raw_data.is_empty() {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: "Security declaration has empty permission set data".to_string(),
-                    });
-                }
-            }
         }
-
         Ok(())
-    }
-
-    /// Validates permission set format according to XML schema.
-    fn validate_permission_set_format(&self, permission_set: &str) -> Result<()> {
-        if permission_set.is_empty() {
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: "Empty permission set in security declaration".to_string(),
-            });
-        }
-
-        // Check for basic XML structure
-        if !permission_set.trim_start().starts_with('<')
-            || !permission_set.trim_end().ends_with('>')
-        {
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: "Permission set is not valid XML".to_string(),
-            });
-        }
-
-        // Check for required elements
-        if !permission_set.contains("PermissionSet") {
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: "Permission set missing PermissionSet element".to_string(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Validates security action values.
-    fn is_valid_security_action(action: u16) -> bool {
-        matches!(action, 1..=14)
     }
 
     /// Validates security-critical and security-transparent code.

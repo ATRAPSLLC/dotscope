@@ -210,7 +210,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::analysis::{CallGraph, SsaFunctionBuilder, SsaType};
+    use crate::{
+        analysis::{CallGraph, SsaFunctionBuilder, SsaType},
+        testkit::passes::run_verified,
+    };
 
     /// The fake native call goes once its string is a constant, and stays
     /// while another instruction still reads the pointer it returned.
@@ -236,19 +239,25 @@ mod tests {
                 native_string_map: HashMap::from([(native, "Hello".to_string())]),
             };
             let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
-            let changed = pass
-                .run_on_method(&mut ssa, &MethodRef::new(Token::new(0x0600_0001)), &ctx)
-                .unwrap();
+            let changed = run_verified(
+                &pass,
+                &mut ssa,
+                &MethodRef::new(Token::new(0x0600_0001)),
+                &ctx,
+            )
+            .unwrap();
             assert!(changed, "the constructor becomes a constant");
             let instructions = ssa.block(0).unwrap().instructions();
-            assert!(matches!(
-                instructions[1].op(),
+            assert!(instructions.iter().any(|instruction| matches!(
+                instruction.op(),
                 SsaOp::Const {
                     value: ConstValue::DecryptedString(_),
                     ..
                 }
-            ));
-            matches!(instructions[0].op(), SsaOp::Call { .. })
+            )));
+            instructions.iter().any(|instruction| {
+                matches!(instruction.op(), SsaOp::Call { method, .. } if *method == MethodRef::new(native))
+            })
         };
         assert!(!native_call_kept(false), "an unread native call is removed");
         assert!(native_call_kept(true), "a native call still read is kept");

@@ -1486,6 +1486,33 @@ impl ManagedHeap {
         )
     }
 
+    /// Reads an object on the heap in place: `f` sees it under the heap's read lock, without
+    /// the copy [`get`](Self::get) makes, which for an array is every element. `f` must not
+    /// touch the heap itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmulationError::InvalidHeapReference`] if the reference is invalid.
+    pub fn with_object<F, R>(&self, heap_ref: HeapRef, f: F) -> Result<R>
+    where
+        F: FnOnce(&HeapObject) -> Result<R>,
+    {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "managed heap",
+            })?;
+        let obj =
+            state
+                .objects
+                .get(&heap_ref.id())
+                .ok_or(EmulationError::InvalidHeapReference {
+                    reference_id: heap_ref.id(),
+                })?;
+        f(obj)
+    }
+
     /// Applies a mutation function to an object on the heap.
     ///
     /// This method provides controlled mutable access while maintaining

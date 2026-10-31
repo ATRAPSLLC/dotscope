@@ -183,7 +183,7 @@ pub fn unflatten_with_dispatchers(
         log::debug!("Promoted {spilled} cross-block value(s) to locals before unflattening");
     }
 
-    let applied = resolve::apply_rewires(&mut patched, &rewires);
+    let applied = resolve::apply_rewires(&mut patched, &rewires, &dispatcher_blocks);
     if applied == 0 {
         return None;
     }
@@ -466,10 +466,11 @@ impl SsaPass<CilTarget, CompilerContext> for CffReconstructionPass {
 mod tests {
     use std::sync::{Arc, LazyLock};
 
+    use super::*;
     use crate::{
         analysis::{
-            PhiNode, PhiOperand, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId,
-            VariableOrigin,
+            CmpKind, ConstValue, DefSite, PhiNode, PhiOperand, SsaBlock, SsaFunction,
+            SsaInstruction, SsaOp, SsaType, SsaVarId, VariableOrigin,
         },
         assembly::InstructionAssembler,
         deobfuscation::{
@@ -477,7 +478,11 @@ mod tests {
             DetectionWeights, EngineConfig,
         },
         metadata::token::Token,
-        testkit::{build_cfg, build_ssa, engine, engine_with, fixture, TestTypeProvider},
+        testkit::{
+            build_cfg, build_ssa, engine, engine_with,
+            equivalence::{compare, Equivalence},
+            fixture, TestTypeProvider,
+        },
         CilObject,
     };
 
@@ -622,6 +627,243 @@ mod tests {
 
         let (_, cfg) = build_cfg(asm)?;
         build_ssa(&cfg, &TestTypeProvider::all_i32(0, 3))
+    }
+
+    /// A flattened loop whose case updates `lower` and branches to pick the next case; the
+    /// branches meet at a merge that decodes the next state and jumps to the dispatcher, and
+    /// the next cases read `lower`. After copy propagation the case writes `lower` nowhere:
+    /// its new value reaches the dispatcher only as the operand `lower`'s phi takes on the
+    /// merge's edge, either computed before the branch (`t = a + 1`) or, when each branch
+    /// computes its own, merged by a phi in the merge itself.
+    ///
+    /// ```text
+    /// B0: lower = 0; s = 0; jump B1
+    /// B1: lower' = phi(lower B0, t B6); s' = phi(s B0, next B6); switch s' [B3, B7, B8] B2
+    /// B3: t = a + 1; branch t > 5 ? B5 : B4
+    /// B4: k = 6; jump B6          B5: k = 5; jump B6
+    /// B6: p = phi(k B4, k B5); next = p ^ 7; jump B1
+    /// B7: ret lower'              B8: ret lower' + 100          B2: ret -1
+    /// ```
+    ///
+    /// With `merged`, B4 and B5 each compute `t` (`a + 2`, `a + 3`) and B6 joins them in a phi.
+    fn skipped_merge_cff(merged: bool) -> (SsaFunction, Dispatcher) {
+        let mut ssa = SsaFunction::new(1, 1);
+        for id in 0..9 {
+            ssa.add_block(SsaBlock::new(id));
+        }
+        let var = |ssa: &mut SsaFunction, origin, site| {
+            ssa.create_variable(origin, 0, site, SsaType::I32)
+        };
+        let argument = var(&mut ssa, VariableOrigin::Argument(0), DefSite::entry());
+        let local = VariableOrigin::Local(0);
+        let temp = VariableOrigin::Phi;
+        let lower = var(&mut ssa, local, DefSite::instruction(0, 0));
+        let state = var(&mut ssa, temp, DefSite::instruction(0, 1));
+        let lower_merged = var(&mut ssa, local, DefSite::phi(1));
+        let state_merged = var(&mut ssa, temp, DefSite::phi(1));
+        let one = var(&mut ssa, temp, DefSite::instruction(3, 0));
+        let computed = var(&mut ssa, temp, DefSite::instruction(3, 1));
+        let five = var(&mut ssa, temp, DefSite::instruction(3, 2));
+        let small = var(&mut ssa, temp, DefSite::instruction(4, 0));
+        let big = var(&mut ssa, temp, DefSite::instruction(5, 0));
+        let encoded = var(&mut ssa, temp, DefSite::phi(6));
+        let key = var(&mut ssa, temp, DefSite::instruction(6, 0));
+        let next = var(&mut ssa, temp, DefSite::instruction(6, 1));
+        let hundred = var(&mut ssa, temp, DefSite::instruction(8, 0));
+        let sum = var(&mut ssa, temp, DefSite::instruction(8, 1));
+        let minus_one = var(&mut ssa, temp, DefSite::instruction(2, 0));
+        ssa.set_rename_group(argument, 0);
+        for local_version in [lower, lower_merged] {
+            ssa.set_rename_group(local_version, 1);
+        }
+
+        let constant = |dest, value| SsaOp::Const {
+            dest,
+            value: ConstValue::I32(value),
+        };
+        let plus = |dest, left, right| SsaOp::Add {
+            dest,
+            left,
+            right,
+            flags: None,
+        };
+        let fill = |ssa: &mut SsaFunction, id: usize, ops: Vec<SsaOp>| {
+            if let Some(block) = ssa.block_mut(id) {
+                for op in ops {
+                    block.add_instruction(SsaInstruction::synthetic(op));
+                }
+            }
+        };
+        let phi = |result, origin, operands: &[(SsaVarId, usize)]| {
+            let mut phi = PhiNode::new(result, origin);
+            for &(value, predecessor) in operands {
+                phi.add_operand(PhiOperand::new(value, predecessor));
+            }
+            phi
+        };
+
+        fill(
+            &mut ssa,
+            0,
+            vec![
+                constant(lower, 0),
+                constant(state, 0),
+                SsaOp::Jump { target: 1 },
+            ],
+        );
+        fill(
+            &mut ssa,
+            1,
+            vec![SsaOp::Switch {
+                value: state_merged,
+                targets: vec![3, 7, 8],
+                default: 2,
+            }],
+        );
+        fill(
+            &mut ssa,
+            2,
+            vec![
+                constant(minus_one, -1),
+                SsaOp::Return {
+                    value: Some(minus_one),
+                },
+            ],
+        );
+        fill(
+            &mut ssa,
+            3,
+            vec![
+                constant(one, 1),
+                plus(computed, argument, one),
+                constant(five, 5),
+                SsaOp::BranchCmp {
+                    left: computed,
+                    right: five,
+                    cmp: CmpKind::Gt,
+                    unsigned: false,
+                    true_target: 5,
+                    false_target: 4,
+                },
+            ],
+        );
+        // What `lower` takes on the merge's edge: the value computed before the branch, or
+        // the phi joining what each branch computed
+        let update = if merged {
+            let joined = var(&mut ssa, temp, DefSite::phi(6));
+            let (two, three) = (
+                var(&mut ssa, temp, DefSite::instruction(4, 1)),
+                var(&mut ssa, temp, DefSite::instruction(5, 1)),
+            );
+            let (in_small, in_big) = (
+                var(&mut ssa, temp, DefSite::instruction(4, 2)),
+                var(&mut ssa, temp, DefSite::instruction(5, 2)),
+            );
+            fill(
+                &mut ssa,
+                4,
+                vec![
+                    constant(small, 1 ^ 7),
+                    constant(two, 2),
+                    plus(in_small, argument, two),
+                    SsaOp::Jump { target: 6 },
+                ],
+            );
+            fill(
+                &mut ssa,
+                5,
+                vec![
+                    constant(big, 2 ^ 7),
+                    constant(three, 3),
+                    plus(in_big, argument, three),
+                    SsaOp::Jump { target: 6 },
+                ],
+            );
+            if let Some(block) = ssa.block_mut(6) {
+                block.add_phi(phi(joined, temp, &[(in_small, 4), (in_big, 5)]));
+            }
+            joined
+        } else {
+            fill(
+                &mut ssa,
+                4,
+                vec![constant(small, 1 ^ 7), SsaOp::Jump { target: 6 }],
+            );
+            fill(
+                &mut ssa,
+                5,
+                vec![constant(big, 2 ^ 7), SsaOp::Jump { target: 6 }],
+            );
+            computed
+        };
+        fill(
+            &mut ssa,
+            6,
+            vec![
+                constant(key, 7),
+                SsaOp::Xor {
+                    dest: next,
+                    left: encoded,
+                    right: key,
+                    flags: None,
+                },
+                SsaOp::Jump { target: 1 },
+            ],
+        );
+        fill(
+            &mut ssa,
+            7,
+            vec![SsaOp::Return {
+                value: Some(lower_merged),
+            }],
+        );
+        fill(
+            &mut ssa,
+            8,
+            vec![
+                constant(hundred, 100),
+                plus(sum, lower_merged, hundred),
+                SsaOp::Return { value: Some(sum) },
+            ],
+        );
+        if let Some(block) = ssa.block_mut(1) {
+            block.add_phi(phi(lower_merged, local, &[(lower, 0), (update, 6)]));
+            block.add_phi(phi(state_merged, temp, &[(state, 0), (next, 6)]));
+        }
+        if let Some(block) = ssa.block_mut(6) {
+            block.add_phi(phi(encoded, temp, &[(small, 4), (big, 5)]));
+        }
+        ssa.recompute_uses();
+        let dispatcher =
+            Dispatcher::new(1, state_merged, vec![3, 7, 8], 2).with_state_phi(state_merged);
+        (ssa, dispatcher)
+    }
+
+    /// Unflattening rewires each branch straight to its next case, skipping the merge, and
+    /// used to skip the update of `lower` with it: the next case read the value `lower` had
+    /// on entry (ConfuserEx's `DemoCharOperations` counted no vowels). Both ways the update
+    /// can cross the merge are carried onto the rewired edges.
+    #[test]
+    fn a_value_updated_on_a_skipped_merge_reaches_the_next_case() {
+        for merged in [false, true] {
+            let (ssa, dispatcher) = skipped_merge_cff(merged);
+            let mut unflattened = unflatten_with_dispatchers(&ssa, vec![dispatcher], None)
+                .expect("the dispatch resolves");
+            unflattened.rebuild_ssa().unwrap();
+
+            assert!(
+                unflattened
+                    .blocks()
+                    .iter()
+                    .all(|block| !matches!(block.last_op(), Some(SsaOp::Switch { .. }))),
+                "the dispatcher is gone:\n{unflattened}"
+            );
+            let verdict = compare(&ssa, &unflattened);
+            assert!(
+                matches!(verdict, Equivalence::Equivalent { conclusive, .. } if conclusive > 0),
+                "merged={merged}: {verdict:?}\n{unflattened}"
+            );
+        }
     }
 
     /// `process_ssa` detects flattening by the engine's configuration: with every detection

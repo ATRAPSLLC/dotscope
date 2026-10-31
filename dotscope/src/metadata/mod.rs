@@ -190,8 +190,13 @@ pub(crate) mod loader;
 pub mod marshalling;
 /// Implementation of the MethodHeader of CIL
 pub mod method;
+
+/// Portable PDB metadata: standalone `.pdb` files and PDBs embedded in images.
+pub mod pdb;
 /// Composable query system for types and methods
 pub mod query;
+/// ReadyToRun images: the header, the methods compiled ahead of time, and the import cells
+pub mod readytorun;
 /// Cross-table token resolver for metadata normalization
 pub mod resolver;
 /// Implementation of the .NET resources

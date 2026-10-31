@@ -10,7 +10,7 @@ use crate::{
     metadata::{
         customattributes::{
             encode_custom_attribute_value, CustomAttributeArgument, CustomAttributeNamedArgument,
-            CustomAttributeValue,
+            CustomAttributeValue, FieldOrPropType,
         },
         tables::{
             CodedIndex, CodedIndexType, CustomAttributeBuilder, MethodDefBuilder, TableId,
@@ -136,8 +136,8 @@ fn property(name: &str, value: &str) -> CustomAttributeNamedArgument {
     CustomAttributeNamedArgument {
         is_field: false,
         name: name.to_string(),
-        arg_type: "String".to_string(),
-        value: CustomAttributeArgument::String(value.to_string()),
+        arg_type: FieldOrPropType::String,
+        value: CustomAttributeArgument::String(Some(value.to_string())),
     }
 }
 
@@ -198,7 +198,9 @@ pub fn create_assembly_with_nul_in_string_argument() -> Result<TestAssembly> {
         apply_test_attribute(
             assembly,
             &[0x0E], // a String parameter
-            vec![CustomAttributeArgument::String("Bad\0String".to_string())],
+            vec![CustomAttributeArgument::String(Some(
+                "Bad\0String".to_string(),
+            ))],
             Vec::new(),
         )
     })
@@ -210,7 +212,7 @@ pub fn create_assembly_with_long_string_argument() -> Result<TestAssembly> {
         apply_test_attribute(
             assembly,
             &[0x0E], // a String parameter
-            vec![CustomAttributeArgument::String("A".repeat(10001))],
+            vec![CustomAttributeArgument::String(Some("A".repeat(10001)))],
             Vec::new(),
         )
     })

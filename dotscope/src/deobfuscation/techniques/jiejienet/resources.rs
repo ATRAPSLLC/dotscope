@@ -808,9 +808,9 @@ fn extract_and_decrypt_resource(
             ))
         })?;
 
-    let file = assembly.file();
-    let offset = file.rva_to_offset(rva_entry.rva as usize)?;
-    let raw_data = file.data_slice(offset, data_size)?;
+    let raw_data = assembly
+        .file()
+        .rva_slice(rva_entry.rva as usize, data_size)?;
 
     if raw_data.len() < 4 {
         return Err(Error::Deobfuscation(format!(

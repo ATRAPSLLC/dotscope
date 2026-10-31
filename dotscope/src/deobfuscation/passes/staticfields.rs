@@ -174,8 +174,8 @@ impl FieldValueExtractor for F64Extractor {
         value: &EmValue,
     ) -> Option<ConstValue> {
         match value {
-            EmValue::F64(val) => Some(ConstValue::F64(*val)),
-            EmValue::F32(val) => Some(ConstValue::F64(f64::from(*val))),
+            EmValue::F64(val) => Some(ConstValue::from(*val)),
+            EmValue::F32(val) => Some(ConstValue::from(f64::from(*val))),
             other => {
                 debug!(
                     "Float64ValueContainer: field 0x{:08X} has unexpected type {:?}",

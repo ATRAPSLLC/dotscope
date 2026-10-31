@@ -82,8 +82,8 @@ pub(super) fn format_properties(
             }
         }
 
-        // .other accessor
-        if let Some(other_ref) = prop.fn_other.get() {
+        // .other accessors
+        for (_, other_ref) in prop.fn_other.iter() {
             if let Some(other) = other_ref.upgrade() {
                 writeln!(w, "    .other {}", format_method_ref(&other, asm))?;
             }

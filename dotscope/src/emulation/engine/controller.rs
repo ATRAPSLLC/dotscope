@@ -583,6 +583,12 @@ impl EmulationController {
         thread.exception_state_mut().clear();
 
         loop {
+            // Native work the last step's hooks did counts as instructions
+            let stats = interpreter.stats_mut();
+            stats.instructions_executed = stats
+                .instructions_executed
+                .saturating_add(thread.take_work());
+
             // Check all limits (instruction count, call depth, timeout)
             if let Some(limit_exceeded) = interpreter
                 .stats()
@@ -593,6 +599,10 @@ impl EmulationController {
                     partial_state: None,
                 });
             }
+            thread.begin_work(
+                interpreter.stats().instructions_executed,
+                self.context.config.limits.max_instructions,
+            );
 
             // Get current method and assembly index from the active frame.
             let (current_method, asm_index) = match thread.current_frame() {
@@ -2904,13 +2914,59 @@ mod tests {
 
     use super::*;
     use crate::{
-        emulation::{engine::typeops, process::UnknownMethodBehavior},
+        emulation::{
+            engine::typeops, process::UnknownMethodBehavior, Hook, LimitExceeded, PreHookResult,
+            ProcessBuilder,
+        },
         testkit::{
             emulation::{create_test_thread, emulation_config},
             fixture,
         },
         CilObject,
     };
+
+    /// Runs crafted_2.exe's entry point under a budget of `limit` instructions, with a hook on
+    /// `Console.WriteLine` that charges `units` of native work.
+    fn run_charging(units: u64, limit: u64) -> EmulationOutcome {
+        let assembly = Arc::new(CilObject::from_path(fixture("crafted_2.exe")).unwrap());
+        let entry = Token::new(assembly.cor20header().entry_point_token);
+        let process = ProcessBuilder::new()
+            .assembly_arc(assembly)
+            .with_max_instructions(limit)
+            .hook(
+                Hook::new("charge")
+                    .match_name("System", "Console", "WriteLine")
+                    .pre(move |_, thread| {
+                        thread.charge_work(units);
+                        PreHookResult::Bypass(None)
+                    }),
+            )
+            .build()
+            .unwrap();
+        process.execute_method(entry, vec![]).unwrap()
+    }
+
+    /// Native work a hook charges counts as instructions: past the budget the run ends at
+    /// its next limit check, as a long IL loop would.
+    #[test]
+    fn hook_work_counts_against_the_instruction_budget() {
+        let free = run_charging(0, 100_000);
+        assert!(
+            !matches!(free, EmulationOutcome::LimitReached { .. }),
+            "{free:?}"
+        );
+        let charged = run_charging(1_000_000, 100_000);
+        assert!(
+            matches!(
+                charged,
+                EmulationOutcome::LimitReached {
+                    limit: LimitExceeded::Instructions { .. },
+                    ..
+                }
+            ),
+            "{charged:?}"
+        );
+    }
 
     /// Helper function to create a controller for testing with default infrastructure.
     fn create_test_controller() -> EmulationController {

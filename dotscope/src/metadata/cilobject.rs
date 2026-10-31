@@ -181,6 +181,7 @@ use crate::{
         imports::UnifiedImportContainer,
         loader::CilObjectData,
         method::{method_name_by_token, MethodMap, MethodRc},
+        pdb::PortablePdb,
         query::{MethodQuery, TypeQuery},
         resolver::TokenResolver,
         resources::Resources,
@@ -188,8 +189,8 @@ use crate::{
         streams::{Blob, Guid, Strings, TablesHeader, UserStrings},
         tables::{
             member_ref_name_by_token, method_spec_name_by_token, AssemblyOsRc, AssemblyProcessorRc,
-            AssemblyRc, AssemblyRefMap, DeclSecurityMap, FieldMap, FileMap, MemberRefMap,
-            MemberRefRc, MethodSpecMap, MethodSpecRc, ModuleRc, ModuleRefMap,
+            AssemblyRc, AssemblyRefMap, CustomAttributeMap, DeclSecurityMap, FieldMap, FileMap,
+            MemberRefMap, MemberRefRc, MethodSpecMap, MethodSpecRc, ModuleRc, ModuleRefMap,
         },
         token::Token,
         typesystem::{CilTypeReference, TypeRegistry},
@@ -259,6 +260,9 @@ pub struct CilObject {
     assembly_view: CilAssemblyView,
     /// Contains resolved metadata structures (types, methods, etc.)
     data: CilObjectData,
+    /// The validation the assembly was loaded with, which a reload with a PDB attached
+    /// ([`CilObject::with_pdb`]) repeats
+    validation_config: ValidationConfig,
 }
 
 impl CilObject {
@@ -353,22 +357,9 @@ impl CilObject {
         validation_config: ValidationConfig,
     ) -> Result<Self> {
         debug!("Loading assembly: {}", path.as_ref().display());
-        let assembly_view = CilAssemblyView::from_path_with_validation(path, validation_config)?;
-        let lenient = validation_config.lenient;
-        let data = CilObjectData::from_assembly_view(&assembly_view, None, lenient)?;
-
-        let object = CilObject {
-            assembly_view,
-            data,
-        };
-
-        object.validate(validation_config)?;
-        debug!(
-            "Assembly loaded: {} types, {} methods",
-            object.types().len(),
-            object.methods().len()
-        );
-        Ok(object)
+        let assembly_view =
+            CilAssemblyView::from_path_with_validation(path, ValidationConfig::disabled())?;
+        Self::load_validated(assembly_view, validation_config, None)
     }
 
     /// Creates a new `CilObject` by parsing a .NET assembly from a memory buffer.
@@ -454,22 +445,9 @@ impl CilObject {
         validation_config: ValidationConfig,
     ) -> Result<Self> {
         debug!("Loading assembly from memory buffer ({} bytes)", data.len());
-        let assembly_view = CilAssemblyView::from_mem_with_validation(data, validation_config)?;
-        let lenient = validation_config.lenient;
-        let object_data = CilObjectData::from_assembly_view(&assembly_view, None, lenient)?;
-
-        let object = CilObject {
-            assembly_view,
-            data: object_data,
-        };
-
-        object.validate(validation_config)?;
-        debug!(
-            "Assembly loaded: {} types, {} methods",
-            object.types().len(),
-            object.methods().len()
-        );
-        Ok(object)
+        let assembly_view =
+            CilAssemblyView::from_mem_with_validation(data, ValidationConfig::disabled())?;
+        Self::load_validated(assembly_view, validation_config, None)
     }
 
     /// Creates a CilObject from a dotscope::file::File.
@@ -535,17 +513,11 @@ impl CilObject {
             return Err(Error::NotSupported);
         }
 
-        let assembly_view =
-            CilAssemblyView::from_dotscope_file_with_validation(file, validation_config)?;
-
-        let lenient = validation_config.lenient;
-        let data = CilObjectData::from_assembly_view(&assembly_view, None, lenient)?;
-        let object = CilObject {
-            assembly_view,
-            data,
-        };
-        object.validate(validation_config)?;
-        Ok(object)
+        let assembly_view = CilAssemblyView::from_dotscope_file_with_validation(
+            file,
+            ValidationConfig::disabled(),
+        )?;
+        Self::load_validated(assembly_view, validation_config, None)
     }
 
     /// Creates a CilObject from an opened std::fs::File.
@@ -734,15 +706,52 @@ impl CilObject {
         assembly_view: CilAssemblyView,
         validation_config: ValidationConfig,
     ) -> Result<Self> {
-        let lenient = validation_config.lenient;
-        let object_data = CilObjectData::from_assembly_view(&assembly_view, None, lenient)?;
+        Self::load_validated(assembly_view, validation_config, None)
+    }
 
+    /// Builds the object for `assembly_view` and validates it with one engine, so one
+    /// reference scan: the raw stage before the owned data is built, so a raw failure ends
+    /// the load before it, and the owned stage after. `standalone_pdb` is a Portable PDB to
+    /// read the debug information from instead of the image's own.
+    fn load_validated(
+        assembly_view: CilAssemblyView,
+        validation_config: ValidationConfig,
+        standalone_pdb: Option<&[u8]>,
+    ) -> Result<Self> {
+        let engine = if validation_config == ValidationConfig::disabled() {
+            None
+        } else {
+            Some(ValidationEngine::new(&assembly_view, validation_config)?)
+        };
+        if let Some(engine) = engine
+            .as_ref()
+            .filter(|_| validation_config.should_validate_raw())
+        {
+            engine
+                .execute_stage1_validation(&assembly_view, None)?
+                .into_result()?;
+        }
+
+        let data = CilObjectData::from_assembly_view(
+            &assembly_view,
+            None,
+            validation_config.lenient,
+            standalone_pdb,
+        )?;
         let object = CilObject {
             assembly_view,
-            data: object_data,
+            data,
+            validation_config,
         };
 
-        object.validate(validation_config)?;
+        if let Some(engine) = engine.filter(|_| validation_config.should_validate_owned()) {
+            engine.execute_stage2_validation(&object)?.into_result()?;
+        }
+        debug!(
+            "Assembly loaded: {} types, {} methods",
+            object.types().len(),
+            object.methods().len()
+        );
         Ok(object)
     }
 
@@ -787,18 +796,30 @@ impl CilObject {
         // The stage 4 barrier inside from_assembly_view ensures all assemblies complete
         // their metadata loaders before any assembly proceeds past this point.
         let lenient = validation_config.lenient;
-        let object_data =
-            CilObjectData::from_assembly_view(&assembly_view, Some(project_context), lenient)?;
+        let object_data = CilObjectData::from_assembly_view(
+            &assembly_view,
+            Some(project_context),
+            lenient,
+            None,
+        )?;
 
         let object = CilObject {
             assembly_view,
             data: object_data,
+            validation_config,
         };
 
         // Phase 2: Validate after all assemblies have completed loading.
         // This ensures cross-assembly nested type references are fully populated
-        // before validation attempts to traverse them.
-        object.validate(validation_config)?;
+        // before validation attempts to traverse them. The raw stage ran when the
+        // project loader read the view, which lets it leave out an assembly that fails it.
+        if validation_config != ValidationConfig::disabled()
+            && validation_config.should_validate_owned()
+        {
+            ValidationEngine::new(&object.assembly_view, validation_config)?
+                .execute_stage2_validation(&object)?
+                .into_result()?;
+        }
         Ok(object)
     }
 
@@ -1506,6 +1527,26 @@ impl CilObject {
         &self.data.fields
     }
 
+    /// Returns every custom attribute, keyed by CustomAttribute token (table 0x0C).
+    ///
+    /// The same attributes are reachable through their owners' attribute lists; this map
+    /// holds them all, with their parent and constructor, without walking every owner.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dotscope::CilObject;
+    ///
+    /// let assembly = CilObject::from_path("tests/samples/mono_4.8/mscorlib.dll")?;
+    /// for entry in assembly.custom_attributes().iter().take(3) {
+    ///     println!("{:?}: {} fixed arguments", entry.key(), entry.value().value.fixed_args.len());
+    /// }
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    pub fn custom_attributes(&self) -> &CustomAttributeMap {
+        &self.data.custom_attributes
+    }
+
     /// Returns the method definition for the given token.
     ///
     /// Convenience accessor over [`methods()`](Self::methods) - looks up a
@@ -1775,6 +1816,98 @@ impl CilObject {
     /// ```
     pub fn resources(&self) -> &Resources {
         &self.data.resources
+    }
+
+    /// Returns the assembly's Portable PDB: its debug information.
+    ///
+    /// Every load reads the PDB the assembly carries: the one the image embeds in its debug
+    /// directory, or else the debug tables in the image's own metadata. A standalone `.pdb`
+    /// file is never looked for on disk; [`CilObject::with_pdb`] attaches one.
+    ///
+    /// The PDB the image carries is read leniently whatever the load's mode, since the runtime
+    /// never reads it to load the assembly: a malformed row, or an embedded PDB that does not
+    /// inflate or was written for another image, is a [diagnostic](Self::diagnostics) rather
+    /// than a failed load.
+    ///
+    /// # Returns
+    ///
+    /// The [`PortablePdb`], with its documents, method debug information (sequence points),
+    /// local scopes, variables and constants, import scopes, state machine methods and custom
+    /// debug information; `None` when the assembly has no debug information.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::CilObject;
+    ///
+    /// let assembly = CilObject::from_path("tests/samples/pdb/embedded/PdbProbe.dll")?;
+    /// if let Some(pdb) = assembly.pdb() {
+    ///     println!("{} PDB with {} documents", pdb.origin(), pdb.documents().len());
+    ///     for entry in pdb.documents().iter() {
+    ///         let document = entry.value();
+    ///         println!("  {} ({})", document.name, document.hash_algorithm_name());
+    ///     }
+    /// }
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    #[must_use]
+    pub fn pdb(&self) -> Option<&PortablePdb> {
+        self.data.pdb.as_ref()
+    }
+
+    /// Reloads the assembly with the standalone Portable PDB at `path` attached.
+    ///
+    /// See [`CilObject::with_pdb_bytes`], which this reads the file for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, and as [`CilObject::with_pdb_bytes`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::CilObject;
+    ///
+    /// let assembly = CilObject::from_path("tests/samples/pdb/portable/PdbProbe.dll")?
+    ///     .with_pdb("tests/samples/pdb/portable/PdbProbe.pdb")?;
+    /// let pdb = assembly.pdb().expect("the PDB is attached");
+    /// println!("entry point: {:?}", pdb.entry_point());
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    pub fn with_pdb(self, path: impl AsRef<Path>) -> Result<Self> {
+        let pdb = std::fs::read(path)?;
+        self.with_pdb_bytes(&pdb)
+    }
+
+    /// Reloads the assembly with the standalone Portable PDB `pdb` attached.
+    ///
+    /// The assembly is loaded again from the same file, with the same validation, and its
+    /// debug information read from `pdb` rather than the PDB the image carries. The result
+    /// is the object a load with that PDB gives: its diagnostics are the new load's.
+    ///
+    /// A standalone PDB is read in the load's mode. In strict mode it fails the reload when
+    /// it does not read, a row of it is malformed, or its `#Pdb` stream records row counts
+    /// other than the image's (it was written for another image, so its columns cannot be
+    /// read against this one); in lenient mode each of these is a diagnostic. A PDB whose id
+    /// is not the one the image's CodeView entry names (another build of the same source)
+    /// is read, with a diagnostic, since its rows are still well-formed.
+    ///
+    /// # Arguments
+    ///
+    /// * `pdb` - The standalone PDB's bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assembly no longer loads or validates, or, in strict mode,
+    /// when `pdb` is malformed or written for another image. The object is consumed either
+    /// way: on an error, load the assembly again to keep working without the PDB.
+    pub fn with_pdb_bytes(self, pdb: &[u8]) -> Result<Self> {
+        let file = self.assembly_view.file().clone();
+        let validation_config = self.validation_config;
+        drop(self);
+        let assembly_view =
+            CilAssemblyView::load_with_validation(file, ValidationConfig::disabled())?;
+        Self::load_validated(assembly_view, validation_config, Some(pdb))
     }
 
     /// Returns the type registry containing all type definitions and references.

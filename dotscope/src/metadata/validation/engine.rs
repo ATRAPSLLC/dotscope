@@ -52,7 +52,7 @@
 use std::{sync::OnceLock, time::Instant};
 
 use log::debug;
-use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
+use rayon::prelude::*;
 
 use crate::{
     cilassembly::AssemblyChanges,
@@ -173,8 +173,6 @@ pub struct ValidationEngine {
     config: ValidationConfig,
     /// Shared reference scanner
     scanner: ReferenceScanner,
-    /// Dedicated thread pool for this validation engine instance
-    thread_pool: ThreadPool,
 }
 
 impl ValidationEngine {
@@ -198,17 +196,6 @@ impl ValidationEngine {
                 message: format!("Failed to initialize reference scanner: {e}"),
             })?;
 
-        let thread_count = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(4);
-        let thread_pool = ThreadPoolBuilder::new()
-            .thread_name(|i| format!("validation-engine-{i}"))
-            .num_threads(thread_count)
-            .build()
-            .map_err(|e| Error::ValidationEngineInitFailed {
-                message: format!("Failed to create thread pool: {e}"),
-            })?;
-
         debug!(
             "Validation starting: {} raw + {} owned validators, lenient={}",
             init_raw_validators().len(),
@@ -216,11 +203,7 @@ impl ValidationEngine {
             config.lenient
         );
 
-        Ok(Self {
-            config,
-            scanner,
-            thread_pool,
-        })
+        Ok(Self { config, scanner })
     }
 
     /// Executes validation in two stages: Raw → Owned.
@@ -345,20 +328,9 @@ impl ValidationEngine {
 
         // Create validation context
         let context = if let Some(changes) = changes {
-            context_factory::raw_modification_context(
-                view,
-                changes,
-                &self.scanner,
-                &self.config,
-                &self.thread_pool,
-            )
+            context_factory::raw_modification_context(view, changes, &self.scanner, &self.config)
         } else {
-            context_factory::raw_loading_context(
-                view,
-                &self.scanner,
-                &self.config,
-                &self.thread_pool,
-            )
+            context_factory::raw_loading_context(view, &self.scanner, &self.config)
         };
 
         let active_validators: Vec<_> = validators
@@ -370,22 +342,20 @@ impl ValidationEngine {
             return Ok(ValidationResult::success());
         }
 
-        // Execute validators in parallel using this instance's dedicated thread pool
-        let results: Vec<(&str, Result<()>)> = self.thread_pool.install(|| {
-            active_validators
-                .par_iter()
-                .map(|validator| {
-                    let validator_result =
-                        validator
-                            .validate_raw(&context)
-                            .map_err(|e| Error::ValidationRawFailed {
-                                validator: validator.name().to_string(),
-                                message: e.to_string(),
-                            });
-                    (validator.name(), validator_result)
-                })
-                .collect()
-        });
+        // Execute validators in parallel on the global pool
+        let results: Vec<(&str, Result<()>)> = active_validators
+            .par_iter()
+            .map(|validator| {
+                let validator_result =
+                    validator
+                        .validate_raw(&context)
+                        .map_err(|e| Error::ValidationRawFailed {
+                            validator: validator.name().to_string(),
+                            message: e.to_string(),
+                        });
+                (validator.name(), validator_result)
+            })
+            .collect();
 
         let duration = start_time.elapsed();
 
@@ -433,8 +403,7 @@ impl ValidationEngine {
         let start_time = Instant::now();
 
         // Create validation context
-        let context =
-            context_factory::owned_context(object, &self.scanner, &self.config, &self.thread_pool);
+        let context = context_factory::owned_context(object, &self.scanner, &self.config);
 
         let active_validators: Vec<_> = validators
             .iter()
@@ -445,21 +414,20 @@ impl ValidationEngine {
             return Ok(ValidationResult::success());
         }
 
-        // Execute validators in parallel using this instance's dedicated thread pool (collect all errors)
-        let results: Vec<(&str, Result<()>)> = self.thread_pool.install(|| {
-            active_validators
-                .par_iter()
-                .map(|validator| {
-                    let validator_result = validator.validate_owned(&context).map_err(|e| {
-                        Error::ValidationOwnedFailed {
+        // Execute validators in parallel on the global pool (collect all errors)
+        let results: Vec<(&str, Result<()>)> = active_validators
+            .par_iter()
+            .map(|validator| {
+                let validator_result =
+                    validator
+                        .validate_owned(&context)
+                        .map_err(|e| Error::ValidationOwnedFailed {
                             validator: validator.name().to_string(),
                             message: e.to_string(),
-                        }
-                    });
-                    (validator.name(), validator_result)
-                })
-                .collect()
-        });
+                        });
+                (validator.name(), validator_result)
+            })
+            .collect();
 
         let duration = start_time.elapsed();
 

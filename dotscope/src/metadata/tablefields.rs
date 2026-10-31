@@ -506,6 +506,24 @@ pub fn get_heap_fields(table_id: TableId, table_info: &TableInfoRef) -> Vec<Heap
             });
         }
 
+        // MethodDebugInformation: Document(Document index) + SequencePoints(blob)
+        TableId::MethodDebugInformation => {
+            fields.push(HeapFieldDescriptor {
+                offset: table_info.table_index_bytes(TableId::Document) as usize,
+                size: blob_size,
+                heap_type: HeapType::Blob,
+            });
+        }
+
+        // ImportScope: Parent(ImportScope index) + Imports(blob)
+        TableId::ImportScope => {
+            fields.push(HeapFieldDescriptor {
+                offset: table_info.table_index_bytes(TableId::ImportScope) as usize,
+                size: blob_size,
+                heap_type: HeapType::Blob,
+            });
+        }
+
         // Tables without heap references
         TableId::FieldPtr
         | TableId::MethodPtr
@@ -528,10 +546,8 @@ pub fn get_heap_fields(table_id: TableId, table_info: &TableInfoRef) -> Vec<Heap
         | TableId::AssemblyRefOS
         | TableId::NestedClass
         | TableId::GenericParamConstraint
-        | TableId::MethodDebugInformation
         | TableId::LocalScope
-        | TableId::StateMachineMethod
-        | TableId::ImportScope => {
+        | TableId::StateMachineMethod => {
             // No heap references
         }
     }

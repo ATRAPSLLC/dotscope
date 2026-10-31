@@ -10,7 +10,7 @@ use crate::{
     metadata::{
         diagnostics::DiagnosticCategory,
         loader::{LoaderContext, MetadataLoader},
-        tables::TableId,
+        tables::{ImportScopeRaw, TableId},
     },
     utils::TryForEachInOrder,
     Result,
@@ -40,10 +40,13 @@ pub struct ImportScopeLoader;
 
 impl MetadataLoader for ImportScopeLoader {
     fn load(&self, context: &LoaderContext) -> Result<()> {
-        let (Some(header), Some(blobs)) = (context.meta, context.blobs) else {
+        let Some(pdb) = &context.pdb else {
             return Ok(());
         };
-        let Some(table) = header.table::<crate::metadata::tables::ImportScopeRaw>() else {
+        let (Some(header), Some(blobs)) = (pdb.meta, pdb.blobs) else {
+            return Ok(());
+        };
+        let Some(table) = header.table::<ImportScopeRaw>() else {
             return Ok(());
         };
 
@@ -51,12 +54,13 @@ impl MetadataLoader for ImportScopeLoader {
             .par_iter()
             .enumerate()
             .try_for_each_in_order(|(index, row)| {
-                let Some(row) = context.handle_row(row, index)? else {
+                let Some(row) = context.handle_row_in(pdb.lenient, row, index)? else {
                     return Ok(());
                 };
                 let token_msg = || format!("import scope 0x{:08x}", row.token.value());
 
-                let Some(import_scope) = context.handle_result(
+                let Some(import_scope) = context.handle_result_in(
+                    pdb.lenient,
                     row.to_owned(blobs),
                     DiagnosticCategory::Table,
                     token_msg,
@@ -65,8 +69,8 @@ impl MetadataLoader for ImportScopeLoader {
                     return Ok(());
                 };
 
-                context
-                    .import_scope
+                pdb.target
+                    .import_scopes
                     .insert(import_scope.token, import_scope);
                 Ok(())
             })

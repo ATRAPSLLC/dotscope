@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    cilassembly::{CilAssembly, CleanupRequest},
+    cilassembly::{execute_cleanup, CilAssembly, CleanupRequest},
     compiler::EventKind,
     deobfuscation::context::AnalysisContext,
     metadata::{
@@ -18,8 +18,9 @@ use crate::{
             TableDataOwned, TableId, TypeDefRaw,
         },
         token::Token,
+        validation::ValidationConfig,
     },
-    CilObject,
+    CilAssemblyView, CilObject,
 };
 
 /// The raw metadata a repair reads: the tables and the heaps they index.
@@ -326,8 +327,10 @@ struct Duplicate {
 }
 
 impl DuplicateTypeDefs {
-    /// The key of every TypeDef row, and the rows repeating an earlier row's key.
-    fn find(metadata: &RawMetadata) -> (HashSet<TypeKey>, Vec<Duplicate>) {
+    /// The key of every TypeDef row outside `gone`, and the rows repeating an earlier row's
+    /// key. A row cleanup deletes collides with nothing, so of the rows sharing a key the
+    /// first that stays keeps its name.
+    fn find(metadata: &RawMetadata, gone: &HashSet<Token>) -> (HashSet<TypeKey>, Vec<Duplicate>) {
         let Some(strings) = metadata.strings else {
             return (HashSet::new(), Vec::new());
         };
@@ -342,14 +345,15 @@ impl DuplicateTypeDefs {
             })
             .unwrap_or_default();
 
-        let mut keys = HashSet::new();
-        let mut duplicates = Vec::new();
+        let mut groups: Vec<(TypeKey, Vec<TypeDefRaw>)> = Vec::new();
+        let mut group_of: HashMap<TypeKey, usize> = HashMap::new();
         for row in metadata
             .tables
             .table::<TypeDefRaw>()
             .into_iter()
             .flatten()
             .filter_map(skip_unreadable)
+            .filter(|row| !gone.contains(&row.token))
         {
             let key = (
                 strings
@@ -362,21 +366,66 @@ impl DuplicateTypeDefs {
                     .to_string(),
                 enclosing_of.get(&row.rid).copied().unwrap_or(0),
             );
-            if !keys.insert(key.clone()) {
-                duplicates.push(Duplicate { row, key });
+            match group_of.get(&key).and_then(|&index| groups.get_mut(index)) {
+                Some((_, rows)) => rows.push(row),
+                None => {
+                    group_of.insert(key.clone(), groups.len());
+                    groups.push((key, vec![row]));
+                }
             }
         }
-        (keys, duplicates)
+
+        let duplicates = groups
+            .iter()
+            .flat_map(|(key, rows)| {
+                rows.iter().skip(1).map(|row| Duplicate {
+                    row: row.clone(),
+                    key: key.clone(),
+                })
+            })
+            .collect();
+        (group_of.into_keys().collect(), duplicates)
+    }
+
+    /// The TypeDef rows cleanup deletes: `request` executed on a copy of `assembly`, so the
+    /// rows it empties and removes count as well as those it names. Failing that, the rows
+    /// `request` names.
+    fn gone(assembly: &CilAssembly, request: &CleanupRequest) -> HashSet<Token> {
+        let named = || request.types().copied().collect();
+        let view = match CilAssemblyView::from_mem_with_validation(
+            assembly.view().data().to_vec(),
+            ValidationConfig::disabled(),
+        ) {
+            Ok(view) => view,
+            Err(e) => {
+                log::warn!("Failed to copy the assembly to run its cleanup on: {e}");
+                return named();
+            }
+        };
+        let mut copy = CilAssembly::new(view);
+        if let Err(e) = execute_cleanup(&mut copy, request) {
+            log::warn!("Failed to run the cleanup on a copy of the assembly: {e}");
+            return named();
+        }
+        (1..=copy.original_table_row_count(TableId::TypeDef))
+            .filter(|&rid| copy.changes().is_row_deleted(TableId::TypeDef, rid))
+            .map(|rid| Token::from_parts(TableId::TypeDef, rid))
+            .collect()
     }
 }
 
 impl MetadataRepair for DuplicateTypeDefs {
     fn detect(&self, metadata: &RawMetadata) -> bool {
-        !Self::find(metadata).1.is_empty()
+        !Self::find(metadata, &HashSet::new()).1.is_empty()
     }
 
     fn propose(&self, metadata: &RawMetadata, request: &mut CleanupRequest) {
-        request.add_types(Self::find(metadata).1.iter().map(|d| d.row.token));
+        request.add_types(
+            Self::find(metadata, &HashSet::new())
+                .1
+                .iter()
+                .map(|d| d.row.token),
+        );
     }
 
     fn apply(
@@ -385,18 +434,18 @@ impl MetadataRepair for DuplicateTypeDefs {
         request: &mut CleanupRequest,
         ctx: &AnalysisContext,
     ) {
+        // Among the rows that survive cleanup: the code generator's
+        // `<PrivateImplementationDetails>` keeps its name once cleanup removes the one the
+        // obfuscator emptied
+        let gone = Self::gone(assembly, request);
         let Some((mut keys, duplicates)) =
-            RawMetadata::of_assembly(assembly).map(|m| Self::find(&m))
+            RawMetadata::of_assembly(assembly).map(|m| Self::find(&m, &gone))
         else {
             return;
         };
 
-        let removed: HashSet<Token> = request.types().copied().collect();
         let mut renamed = 0usize;
         for Duplicate { mut row, key } in duplicates {
-            if removed.contains(&row.token) {
-                continue;
-            }
             let (name, namespace, enclosing) = key;
             let mut unique = format!("{name}_{}", row.rid);
             while !keys.insert((unique.clone(), namespace.clone(), enclosing)) {
@@ -546,7 +595,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        analysis::CallGraph, metadata::validation::ValidationConfig, testkit::helpers::load_sample,
+        analysis::CallGraph,
+        cilassembly::ClassBuilder,
+        metadata::{signatures::TypeSignature, tables::TypeDefBuilder},
+        testkit::helpers::load_sample,
         Error,
     };
 
@@ -697,7 +749,7 @@ mod tests {
     fn duplicates(assembly: &CilObject) -> Vec<Token> {
         RawMetadata::of_object(assembly)
             .map(|m| {
-                DuplicateTypeDefs::find(&m)
+                DuplicateTypeDefs::find(&m, &HashSet::new())
                     .1
                     .iter()
                     .map(|d| d.row.token)
@@ -748,6 +800,115 @@ mod tests {
             types,
             "no type is removed"
         );
+    }
+
+    /// A duplicate whose twin cleanup removes collides with nothing and keeps its name: the
+    /// code generator's `<PrivateImplementationDetails>` came out `_26` once the obfuscator's
+    /// was gone.
+    #[test]
+    fn a_duplicate_whose_twin_is_removed_keeps_its_name() {
+        // Two types of one name, written out as the code generator's lands before cleanup
+        let mut assembly = load_sample("packers/confuserex/1.6.0/original.exe").into_assembly();
+        for _ in 0..2 {
+            TypeDefBuilder::new()
+                .name("Twin")
+                .namespace("Repairs")
+                .build(&mut assembly)
+                .unwrap();
+        }
+        let twins = CilObject::from_mem_with_validation(
+            assembly.to_memory().unwrap(),
+            ValidationConfig::analysis(),
+        )
+        .unwrap();
+        let mut tokens: Vec<Token> = twins
+            .types()
+            .iter()
+            .filter(|entry| entry.value().namespace == "Repairs")
+            .map(|entry| *entry.key())
+            .collect();
+        tokens.sort();
+        assert_eq!(tokens.len(), 2);
+
+        // Empty types kept: the twins have no members, and only the duplicate is in question
+        let mut request = CleanupRequest::with_settings(true, false);
+        request.add_type(tokens[0]);
+        let mut assembly = twins.into_assembly();
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        apply_repairs(&mut assembly, &mut request, &ctx);
+        assembly.add_cleanup(&request);
+        let repaired = CilObject::from_mem_with_validation(
+            assembly.to_memory().unwrap(),
+            ValidationConfig::analysis(),
+        )
+        .unwrap();
+
+        let names: Vec<String> = repaired
+            .types()
+            .iter()
+            .filter(|entry| entry.value().namespace == "Repairs")
+            .map(|entry| entry.value().name.clone())
+            .collect();
+        assert_eq!(names, ["Twin"]);
+    }
+
+    #[test]
+    fn the_name_goes_to_the_duplicate_cleanup_keeps() {
+        // Three types of one name: one cleanup empties of its field, one without members (as
+        // ConfuserEx leaves the compiler's `<PrivateImplementationDetails>`), and one that
+        // stays. Cleanup removes the first two, so the third keeps the name.
+        let mut assembly = load_sample("packers/confuserex/1.6.0/original.exe").into_assembly();
+        ClassBuilder::new("Twin")
+            .namespace("Repairs")
+            .static_field("data", TypeSignature::I4)
+            .build(&mut assembly)
+            .unwrap();
+        TypeDefBuilder::new()
+            .name("Twin")
+            .namespace("Repairs")
+            .build(&mut assembly)
+            .unwrap();
+        ClassBuilder::new("Twin")
+            .namespace("Repairs")
+            .static_field("data", TypeSignature::I4)
+            .build(&mut assembly)
+            .unwrap();
+        let twins = CilObject::from_mem_with_validation(
+            assembly.to_memory().unwrap(),
+            ValidationConfig::analysis(),
+        )
+        .unwrap();
+        let mut tokens: Vec<Token> = twins
+            .types()
+            .iter()
+            .filter(|entry| entry.value().namespace == "Repairs")
+            .map(|entry| *entry.key())
+            .collect();
+        tokens.sort();
+        assert_eq!(tokens.len(), 3);
+        let emptied = twins.types().get(&tokens[0]).unwrap();
+
+        let mut request = CleanupRequest::with_settings(true, true);
+        for (_, field) in emptied.fields.iter() {
+            request.add_field(field.token);
+        }
+        let mut assembly = twins.into_assembly();
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        apply_repairs(&mut assembly, &mut request, &ctx);
+        assembly.add_cleanup(&request);
+        let repaired = CilObject::from_mem_with_validation(
+            assembly.to_memory().unwrap(),
+            ValidationConfig::analysis(),
+        )
+        .unwrap();
+
+        let names: Vec<String> = repaired
+            .types()
+            .iter()
+            .filter(|entry| entry.value().namespace == "Repairs")
+            .map(|entry| entry.value().name.clone())
+            .collect();
+        assert_eq!(names, ["Twin"]);
     }
 
     #[test]

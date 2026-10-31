@@ -835,12 +835,18 @@ pub fn write_le_at<T: CilIO>(data: &mut [u8], offset: &mut usize, value: T) -> R
 ///
 /// * `data` - The mutable byte buffer to write to
 /// * `offset` - Mutable reference to the offset position (will be advanced after writing)
-/// * `value` - The u32 value to write (may be truncated to u16)
-/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, truncates to u16 and writes 2 bytes
+/// * `value` - The u32 value to write
+/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, writes 2 bytes as u16
 ///
 /// # Returns
 ///
 /// Returns `Ok(())` on success or [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] if there are insufficient bytes.
+///
+/// # Errors
+///
+/// When there are too few bytes, and when `is_large` is `false` and `value` does not fit two
+/// bytes: an index too wide for its column is refused rather than cut to its low bytes, which
+/// would point at another row or heap entry.
 ///
 /// # Examples
 ///
@@ -850,7 +856,7 @@ pub fn write_le_at<T: CilIO>(data: &mut [u8], offset: &mut usize, value: T) -> R
 /// let mut data = [0u8; 6];
 /// let mut offset = 0;
 ///
-/// // Write 2 bytes (truncated from u32)
+/// // Write 2 bytes
 /// write_le_at_dyn(&mut data, &mut offset, 1, false)?;
 /// assert_eq!(offset, 2);
 ///
@@ -874,8 +880,9 @@ pub fn write_le_at_dyn(
     if is_large {
         write_le_at::<u32>(data, offset, value)?;
     } else {
-        #[allow(clippy::cast_possible_truncation)]
-        write_le_at::<u16>(data, offset, value as u16)?;
+        let narrow = u16::try_from(value)
+            .map_err(|_| malformed_error!("{value:#x} does not fit a two-byte index column"))?;
+        write_le_at::<u16>(data, offset, narrow)?;
     }
 
     Ok(())
@@ -977,12 +984,18 @@ pub fn write_be_at<T: CilIO>(data: &mut [u8], offset: &mut usize, value: T) -> R
 ///
 /// * `data` - The mutable byte buffer to write to
 /// * `offset` - Mutable reference to the offset position (will be advanced after writing)
-/// * `value` - The u32 value to write (may be truncated to u16)
-/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, truncates to u16 and writes 2 bytes
+/// * `value` - The u32 value to write
+/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, writes 2 bytes as u16
 ///
 /// # Returns
 ///
 /// Returns `Ok(())` on success or [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] if there are insufficient bytes.
+///
+/// # Errors
+///
+/// When there are too few bytes, and when `is_large` is `false` and `value` does not fit two
+/// bytes: an index too wide for its column is refused rather than cut to its low bytes, which
+/// would point at another row or heap entry.
 ///
 /// # Examples
 ///
@@ -992,7 +1005,7 @@ pub fn write_be_at<T: CilIO>(data: &mut [u8], offset: &mut usize, value: T) -> R
 /// let mut data = [0u8; 6];
 /// let mut offset = 0;
 ///
-/// // Write 2 bytes (truncated from u32)
+/// // Write 2 bytes
 /// write_be_at_dyn(&mut data, &mut offset, 1, false)?;
 /// assert_eq!(offset, 2);
 ///
@@ -1016,8 +1029,9 @@ pub fn write_be_at_dyn(
     if is_large {
         write_be_at::<u32>(data, offset, value)?;
     } else {
-        #[allow(clippy::cast_possible_truncation)]
-        write_be_at::<u16>(data, offset, value as u16)?;
+        let narrow = u16::try_from(value)
+            .map_err(|_| malformed_error!("{value:#x} does not fit a two-byte index column"))?;
+        write_be_at::<u16>(data, offset, narrow)?;
     }
 
     Ok(())
@@ -1027,11 +1041,7 @@ pub fn write_be_at_dyn(
 ///
 /// These methods provide the counterpart to the read methods, enabling binary
 /// data serialization using the same formats and encodings.
-/// Write a compressed unsigned integer using ECMA-335 format.
-///
-/// Encodes an unsigned integer using .NET's compressed integer format.
-/// This format uses variable-length encoding to minimize space usage
-/// for small values while supporting the full 32-bit range.
+/// Write a compressed unsigned integer using ECMA-335 format (II.23.2).
 ///
 /// # Encoding Format
 ///
@@ -1041,34 +1051,46 @@ pub fn write_be_at_dyn(
 ///
 /// # Arguments
 ///
-/// * `value` - The unsigned integer to encode
+/// * `value` - The unsigned integer to encode, at most `0x1FFF_FFFF`
 /// * `buffer` - The output buffer to write encoded bytes to
+///
+/// # Errors
+///
+/// When `value` exceeds `0x1FFF_FFFF`, which the format cannot state; nothing is written.
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```rust
 /// # use dotscope::io::write_compressed_uint;
 /// let mut buffer = Vec::new();
-/// write_compressed_uint(127, &mut buffer);
+/// write_compressed_uint(127, &mut buffer)?;
 /// assert_eq!(buffer, vec![127]);
 ///
 /// let mut buffer = Vec::new();
-/// write_compressed_uint(128, &mut buffer);
+/// write_compressed_uint(128, &mut buffer)?;
 /// assert_eq!(buffer, vec![0x80, 0x80]);
+///
+/// assert!(write_compressed_uint(0x2000_0000, &mut buffer).is_err());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[allow(clippy::cast_possible_truncation)]
-pub fn write_compressed_uint(value: u32, buffer: &mut Vec<u8>) {
+pub fn write_compressed_uint(value: u32, buffer: &mut Vec<u8>) -> Result<()> {
     if value < 0x80 {
         buffer.push(value as u8);
     } else if value < 0x4000 {
         buffer.push(0x80 | ((value >> 8) as u8));
         buffer.push(value as u8);
-    } else {
+    } else if value <= 0x1FFF_FFFF {
         buffer.push(0xC0 | ((value >> 24) as u8));
         buffer.push((value >> 16) as u8);
         buffer.push((value >> 8) as u8);
         buffer.push(value as u8);
+    } else {
+        return Err(malformed_error!(
+            "{value:#x} is outside the range of a compressed unsigned integer"
+        ));
     }
+    Ok(())
 }
 
 /// Write a compressed signed integer using ECMA-335 format (II.23.2).
@@ -1969,6 +1991,20 @@ mod tests {
         assert_eq!(buffer, [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]);
     }
 
+    /// A value past two bytes is refused for a two-byte write, in either byte order, and
+    /// nothing is written: it was cut to its low two bytes, which name another row.
+    #[test]
+    fn a_value_too_wide_for_two_bytes_is_refused() {
+        for write in [write_le_at_dyn, write_be_at_dyn] {
+            let mut buffer = [0xAAu8; 4];
+            let mut offset = 0;
+            assert!(write(&mut buffer, &mut offset, 0x1_0000, false).is_err());
+            assert_eq!((buffer, offset), ([0xAA; 4], 0));
+            write(&mut buffer, &mut offset, 0xFFFF, false).unwrap();
+            assert_eq!(offset, 2);
+        }
+    }
+
     #[test]
     fn write_errors() {
         let mut buffer = [0u8; 2];
@@ -2032,7 +2068,7 @@ mod tests {
 
         for (value, expected) in test_cases {
             let mut buffer = Vec::new();
-            write_compressed_uint(value, &mut buffer);
+            write_compressed_uint(value, &mut buffer).unwrap();
             assert_eq!(buffer, expected, "Failed for value {value}");
         }
     }
@@ -2047,7 +2083,7 @@ mod tests {
 
         for (value, expected) in test_cases {
             let mut buffer = Vec::new();
-            write_compressed_uint(value, &mut buffer);
+            write_compressed_uint(value, &mut buffer).unwrap();
             assert_eq!(buffer, expected, "Failed for value {value}");
         }
     }
@@ -2061,8 +2097,22 @@ mod tests {
 
         for (value, expected) in test_cases {
             let mut buffer = Vec::new();
-            write_compressed_uint(value, &mut buffer);
+            write_compressed_uint(value, &mut buffer).unwrap();
             assert_eq!(buffer, expected, "Failed for value {value}");
+        }
+    }
+
+    /// A value past 29 bits has no compressed form: it is refused, where it was written as
+    /// four bytes whose top bits named another length.
+    #[test]
+    fn a_value_past_29_bits_is_refused() {
+        for value in [0x2000_0000, 0x8000_0000, u32::MAX] {
+            let mut buffer = vec![0xAA];
+            assert!(
+                write_compressed_uint(value, &mut buffer).is_err(),
+                "{value:#x}"
+            );
+            assert_eq!(buffer, vec![0xAA], "nothing is written for {value:#x}");
         }
     }
 

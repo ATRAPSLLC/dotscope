@@ -335,15 +335,15 @@ impl CompilerContext {
     /// Returns methods in reverse topological order (callees before callers).
     #[must_use]
     pub fn methods_reverse_topological(&self) -> Vec<Token> {
-        let mut order = self.call_graph.topological_order().to_vec();
-        order.reverse();
-        order
+        self.call_graph.topological_order().to_vec()
     }
 
     /// Returns methods in topological order (callers before callees).
     #[must_use]
     pub fn methods_topological(&self) -> Vec<Token> {
-        self.call_graph.topological_order().to_vec()
+        let mut order = self.call_graph.topological_order().to_vec();
+        order.reverse();
+        order
     }
 
     /// Returns an iterator over all method tokens that have SSA functions.

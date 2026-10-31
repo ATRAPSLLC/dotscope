@@ -4,7 +4,7 @@
 //! the high-level, resolved form of `LocalConstant` table entries with
 //! all heap references resolved to actual string and binary data.
 
-use crate::metadata::{signatures::SignatureField, token::Token};
+use crate::metadata::{pdb::LocalConstantSig, token::Token};
 
 /// High-level representation of a `LocalConstant` table entry
 ///
@@ -52,19 +52,19 @@ pub struct LocalConstant {
     /// anonymous or compiler-generated constants where no name was specified.
     pub name: String,
 
-    /// Parsed constant signature describing the constant's type
+    /// Parsed constant signature: the constant's type and its value
     ///
-    /// The structured representation of the constant's type signature, parsed from
-    /// the #Blob heap. This provides immediate access to the constant's type information
-    /// including the base type and any custom modifiers, without requiring additional
-    /// parsing steps.
+    /// The structured representation of the LocalConstantSig blob the Signature column
+    /// names. Unlike a field signature, it holds the value as well as the type:
     ///
-    /// The signature describes:
-    /// - **Base Type**: The fundamental type of the constant (int, string, etc.)
-    /// - **Custom Modifiers**: Optional type annotations for advanced scenarios
-    /// - **Type Constraints**: Generic type parameters and their constraints
+    /// - **Custom modifiers**: the modifiers on the constant's type, in signature order
+    /// - **Primitive constants**: `bool`, `char`, the integer and floating-point types and
+    ///   `string`, with their value
+    /// - **Enum constants**: the underlying value, with the enum type's token
+    /// - **General constants**: `decimal` and `DateTime` values, a null reference of any
+    ///   class type, and the default value of any other type
     ///
-    /// Parsing is performed automatically during the conversion from raw to owned
-    /// representation, providing structured access to type information.
-    pub signature: SignatureField,
+    /// [`LocalConstantSig`] documents each form. A row has to have a signature: a nil
+    /// Signature column fails the row, since a constant has no meaning without its value.
+    pub signature: LocalConstantSig,
 }

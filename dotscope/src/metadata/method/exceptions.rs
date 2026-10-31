@@ -161,6 +161,8 @@
 //! [`ExceptionHandler`] instances are immutable and safe to share across threads.
 //! Exception type references use reference-counted smart pointers for efficient sharing.
 
+use std::collections::{BTreeSet, HashSet};
+
 use crate::{
     assembly::{FlowType, Instruction},
     metadata::typesystem::CilTypeRc,
@@ -744,333 +746,524 @@ impl ExceptionHandler {
     }
 }
 
-/// Encodes exception handlers according to ECMA-335 II.25.4.6.
+/// How a method body's exception handling section was written, beyond the clauses it holds:
+/// the section's format and its `DataSize` (ECMA-335 II.25.4.5).
 ///
-/// Exception handler sections are encoded after the method body with the following format:
-/// - Section header (4 bytes for small format, 12 bytes for fat format)
-/// - Exception handler entries (12 bytes each for small, 24 bytes each for fat)
+/// Either format holds any clause the small one can, and the runtime reads the clause count
+/// as `DataSize` divided by the clause size, so a `DataSize` that leaves out the section's
+/// 4-byte header (as AsmResolver writes it) reads as the same clauses. Encoding with the
+/// format a body was read with writes its section back as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExceptionSectionFormat {
+    /// The fat format: 24-byte clauses and a 3-byte `DataSize`, where the small format has
+    /// 12-byte clauses and a 1-byte one
+    pub fat: bool,
+    /// The section's `DataSize` as written
+    pub data_size: u32,
+}
+
+/// Orders exception clauses as ECMA-335 II.19 requires: a nested clause before the clauses
+/// that enclose it.
 ///
-/// Format selection:
-/// - Small format: if all offsets and lengths fit in 16 bits
-/// - Fat format: if any offset or length requires 32 bits
-///
-/// # Limitations
-///
-/// **Warning**: This function cannot fully encode `EXCEPTION` (catch) handlers. The type token
-/// for catch clauses is written as `0` because the original metadata token is not preserved
-/// in [`ExceptionHandler`]. This means:
-///
-/// - **Round-trip operations** (read method → modify → write back) will produce invalid
-///   exception handlers for catch blocks
-/// - **FILTER, FINALLY, and FAULT handlers** encode correctly as they don't require type tokens
-/// - Use this function only for **newly created handlers** where type tokens will be resolved
-///   separately, or for handlers that don't catch specific exception types
-///
-/// To properly support round-trip encoding of catch handlers, the `ExceptionHandler` struct
-/// would need to preserve the original `ClassToken` value from parsing.
+/// A clause is nested in another when its protected region lies inside the other's protected
+/// or handler region. Clauses move only as far as that requires: an order that already
+/// satisfies it, as a compiler's does, comes back unchanged, and the handlers of one protected
+/// region stay in the order they are tried.
 ///
 /// # Arguments
 ///
-/// * `handlers` - The exception handlers to encode
+/// * `handlers` - The clauses, in any order.
 ///
 /// # Returns
 ///
-/// The encoded exception handler section bytes, or an empty vector if no handlers.
+/// The same clauses, each after every clause nested in it.
+#[must_use]
+pub fn order_nested_first(handlers: Vec<ExceptionHandler>) -> Vec<ExceptionHandler> {
+    let span = |offset: u32, length: u32| (offset, offset.saturating_add(length));
+    let within = |inner: (u32, u32), outer: (u32, u32)| {
+        outer.0 <= inner.0 && inner.1 <= outer.1 && inner != outer
+    };
+    let nested_in = |inner: &ExceptionHandler, outer: &ExceptionHandler| {
+        let protected = span(inner.try_offset, inner.try_length);
+        within(protected, span(outer.try_offset, outer.try_length))
+            || within(protected, span(outer.handler_offset, outer.handler_length))
+    };
+
+    // Each clause waits for the clauses nested in it; of the clauses free to go, the first in
+    // the given order goes next
+    let count = handlers.len();
+    let mut waiting_for = vec![0usize; count];
+    let mut enclosing: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (inner, inner_clause) in handlers.iter().enumerate() {
+        for (outer, outer_clause) in handlers.iter().enumerate() {
+            if inner != outer && nested_in(inner_clause, outer_clause) {
+                if let (Some(waits), Some(encloses)) =
+                    (waiting_for.get_mut(outer), enclosing.get_mut(inner))
+                {
+                    *waits = waits.saturating_add(1);
+                    encloses.push(outer);
+                }
+            }
+        }
+    }
+    let mut free: BTreeSet<usize> = (0..count)
+        .filter(|&index| waiting_for.get(index) == Some(&0))
+        .collect();
+    let mut order = Vec::with_capacity(count);
+    while let Some(next) = free.pop_first() {
+        order.push(next);
+        for &outer in enclosing.get(next).map(Vec::as_slice).unwrap_or_default() {
+            if let Some(waits) = waiting_for.get_mut(outer) {
+                *waits = waits.saturating_sub(1);
+                if *waits == 0 {
+                    free.insert(outer);
+                }
+            }
+        }
+    }
+
+    let mut slots: Vec<Option<ExceptionHandler>> = handlers.into_iter().map(Some).collect();
+    let mut ordered: Vec<ExceptionHandler> = order
+        .into_iter()
+        .filter_map(|index| slots.get_mut(index).and_then(Option::take))
+        .collect();
+    // Containment is a strict order, so every clause is placed; any left would keep its place
+    ordered.extend(slots.into_iter().flatten());
+    ordered
+}
+
+/// Encodes exception handlers as a method body's exception handling section (ECMA-335
+/// II.25.4.5-6), padded to 4 bytes; empty when there are none.
+///
+/// With `format`, the section has that format if it can hold the clauses, and its
+/// `DataSize` when that still states as many clauses; otherwise, and without `format`, the
+/// small format when it can hold them and a `DataSize` that counts the section header.
+///
+/// A catch clause's class token is its resolved type's token, or its raw `filter_offset`
+/// field when unresolved; a filter's is its filter offset; and a finally or fault clause
+/// writes its raw field back.
 ///
 /// # Errors
 ///
-/// Returns an error if encoding fails or values exceed expected ranges.
+/// When a clause cannot be encoded: more clauses than a fat section's 24-bit `DataSize`
+/// states.
 ///
 /// # Examples
 ///
-/// ```rust,no_run
+/// ```rust
 /// use dotscope::metadata::method::{ExceptionHandler, ExceptionHandlerFlags, encode_exception_handlers};
 ///
-/// let handlers = vec![
-///     ExceptionHandler {
-///         flags: ExceptionHandlerFlags::FINALLY,
-///         try_offset: 0,
-///         try_length: 10,
-///         handler_offset: 10,
-///         handler_length: 5,
-///         handler: None,
-///         filter_offset: 0,
-///     }
-/// ];
+/// let handlers = vec![ExceptionHandler {
+///     flags: ExceptionHandlerFlags::FINALLY,
+///     try_offset: 0,
+///     try_length: 10,
+///     handler_offset: 10,
+///     handler_length: 5,
+///     handler: None,
+///     filter_offset: 0,
+/// }];
 ///
-/// let encoded = encode_exception_handlers(&handlers)?;
+/// let section = encode_exception_handlers(&handlers, None)?;
+/// assert_eq!(&section[..4], &[0x01, 0x10, 0x00, 0x00]); // small EH table, 16 bytes
 /// # Ok::<(), dotscope::Error>(())
 /// ```
-pub fn encode_exception_handlers(handlers: &[ExceptionHandler]) -> Result<Vec<u8>> {
+pub fn encode_exception_handlers(
+    handlers: &[ExceptionHandler],
+    format: Option<ExceptionSectionFormat>,
+) -> Result<Vec<u8>> {
     if handlers.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Determine if we need fat or small format.
-    // Small format limits (ECMA-335 §II.25.4.5/.6):
-    // - try_offset/handler_offset fit in u16 (0xFFFF)
-    // - try_length/handler_length fit in u8 (0xFF)
-    // - the whole section must fit the 1-byte DataSize field: 4-byte header +
-    //   12 bytes per clause <= 255, i.e. at most 20 clauses. Beyond that the
-    //   fat format is mandatory; otherwise the DataSize byte would overflow.
-    const SMALL_FORMAT_MAX_CLAUSES: usize = (0xFF - 4) / 12; // = 20
-    let needs_fat_format = handlers.len() > SMALL_FORMAT_MAX_CLAUSES
-        || handlers.iter().any(|eh| {
-            eh.try_offset > 0xFFFF
-                || eh.try_length > 0xFF
-                || eh.handler_offset > 0xFFFF
-                || eh.handler_length > 0xFF
+    // The small format holds 16-bit offsets, 8-bit lengths, and as many clauses as its 1-byte
+    // DataSize can state after the 4-byte header: (0xFF - 4) / 12 = 20.
+    const SMALL_FORMAT_MAX_CLAUSES: usize = (0xFF - 4) / 12;
+    let small_fits = handlers.len() <= SMALL_FORMAT_MAX_CLAUSES
+        && handlers.iter().all(|eh| {
+            eh.try_offset <= 0xFFFF
+                && eh.try_length <= 0xFF
+                && eh.handler_offset <= 0xFFFF
+                && eh.handler_length <= 0xFF
         });
+    let fat = !small_fits || format.is_some_and(|format| format.fat);
+    let clause_size: usize = if fat { 24 } else { 12 };
+    let data_size = format
+        .filter(|format| format.fat == fat)
+        .map(|format| format.data_size)
+        .filter(|size| (*size as usize).checked_div(clause_size) == Some(handlers.len()))
+        .map_or_else(
+            || {
+                handlers
+                    .len()
+                    .checked_mul(clause_size)
+                    .and_then(|size| size.checked_add(4))
+                    .and_then(|size| u32::try_from(size).ok())
+                    .filter(|size| *size <= 0x00FF_FFFF)
+                    .ok_or_else(|| {
+                        malformed_error!(
+                            "{} exception handlers exceed a section's DataSize",
+                            handlers.len()
+                        )
+                    })
+            },
+            Ok,
+        )?;
 
-    let mut section = Vec::new();
-
-    if needs_fat_format {
-        // Fat format: 4-byte header + 24 bytes per handler
-        let section_size = 4usize.saturating_add(handlers.len().saturating_mul(24));
-
-        // Section header (fat format, ECMA-335 §II.25.4.5): exactly 4 bytes.
-        //   Kind     (1 byte)  = EHTable | FatFormat (0x41)
-        //   DataSize (3 bytes) little-endian, includes the 4-byte header
+    let mut section =
+        Vec::with_capacity(handlers.len().saturating_mul(clause_size).saturating_add(4));
+    if fat {
         section.push(0x41); // Kind = EHTable | FatFormat
-        let section_size_u32 = u32::try_from(section_size)
-            .map_err(|_| malformed_error!("Exception section size exceeds u32 range"))?;
-        section.extend_from_slice(&section_size_u32.to_le_bytes()[..3]); // DataSize (3 bytes)
-
-        // Write each exception handler (24 bytes each)
-        for eh in handlers {
-            // Flags (4 bytes)
-            section.extend_from_slice(&u32::from(eh.flags.bits()).to_le_bytes());
-
-            // TryOffset (4 bytes)
-            section.extend_from_slice(&eh.try_offset.to_le_bytes());
-
-            // TryLength (4 bytes)
-            section.extend_from_slice(&eh.try_length.to_le_bytes());
-
-            // HandlerOffset (4 bytes)
-            section.extend_from_slice(&eh.handler_offset.to_le_bytes());
-
-            // HandlerLength (4 bytes)
-            section.extend_from_slice(&eh.handler_length.to_le_bytes());
-
-            // ClassToken or FilterOffset (4 bytes)
-            if eh.flags.contains(ExceptionHandlerFlags::FILTER) {
-                // FILTER: filter_offset is the code offset where filter starts
-                section.extend_from_slice(&eh.filter_offset.to_le_bytes());
-            } else if let Some(handler_type) = &eh.handler {
-                // EXCEPTION with resolved type: use the type's token
-                section.extend_from_slice(&handler_type.token.value().to_le_bytes());
-            } else if eh.flags == ExceptionHandlerFlags::EXCEPTION {
-                // EXCEPTION with unresolved type: filter_offset contains the raw type token
-                section.extend_from_slice(&eh.filter_offset.to_le_bytes());
-            } else {
-                // FINALLY (0x02) or FAULT (0x04): no type token needed
-                section.extend_from_slice(&0u32.to_le_bytes());
-            }
-        }
+        section.extend_from_slice(&data_size.to_le_bytes()[..3]);
     } else {
-        // Small format: 4-byte header + 12 bytes per handler
-        let section_size = 4usize.saturating_add(handlers.len().saturating_mul(12));
-
-        // Section header (small format)
-        let section_size_u8 = u8::try_from(section_size).map_err(|_| {
-            malformed_error!("Exception section size exceeds u8 range for small format")
+        // Small: Kind = EHTable, a 1-byte DataSize and two reserved bytes
+        let data_size = u8::try_from(data_size).map_err(|_| {
+            malformed_error!(
+                "Small exception section DataSize {} exceeds a byte",
+                data_size
+            )
         })?;
-        section.extend_from_slice(&[
-            0x01,            // Kind = EHTable (small format)
-            section_size_u8, // DataSize (1 byte)
-            0x00,
-            0x00, // Reserved
-        ]);
+        section.extend_from_slice(&[0x01, data_size, 0x00, 0x00]);
+    }
 
-        // Write each exception handler (12 bytes each)
-        for eh in handlers {
-            // Flags (2 bytes)
-            section.extend_from_slice(&eh.flags.bits().to_le_bytes());
-
-            // TryOffset (2 bytes)
-            let try_offset_u16 = u16::try_from(eh.try_offset)
-                .map_err(|_| malformed_error!("Exception handler try_offset exceeds u16 range"))?;
-            section.extend_from_slice(&try_offset_u16.to_le_bytes());
-
-            // TryLength (1 byte)
-            let try_length_u8 = u8::try_from(eh.try_length)
-                .map_err(|_| malformed_error!("Exception handler try_length exceeds u8 range"))?;
-            section.push(try_length_u8);
-
-            // HandlerOffset (2 bytes)
-            let handler_offset_u16 = u16::try_from(eh.handler_offset).map_err(|_| {
-                malformed_error!("Exception handler handler_offset exceeds u16 range")
-            })?;
-            section.extend_from_slice(&handler_offset_u16.to_le_bytes());
-
-            // HandlerLength (1 byte)
-            let handler_length_u8 = u8::try_from(eh.handler_length).map_err(|_| {
-                malformed_error!("Exception handler handler_length exceeds u8 range")
-            })?;
-            section.push(handler_length_u8);
-
-            // ClassToken or FilterOffset (4 bytes)
-            if eh.flags.contains(ExceptionHandlerFlags::FILTER) {
-                // FILTER: filter_offset is the code offset where filter starts
-                section.extend_from_slice(&eh.filter_offset.to_le_bytes());
-            } else if let Some(handler_type) = &eh.handler {
-                // EXCEPTION with resolved type: use the type's token
-                section.extend_from_slice(&handler_type.token.value().to_le_bytes());
-            } else if eh.flags == ExceptionHandlerFlags::EXCEPTION {
-                // EXCEPTION with unresolved type: filter_offset contains the raw type token
-                section.extend_from_slice(&eh.filter_offset.to_le_bytes());
-            } else {
-                // FINALLY (0x02) or FAULT (0x04): no type token needed
-                section.extend_from_slice(&0u32.to_le_bytes());
+    for eh in handlers {
+        // ClassToken or FilterOffset
+        let token_or_offset = match &eh.handler {
+            Some(handler_type) if !eh.flags.contains(ExceptionHandlerFlags::FILTER) => {
+                handler_type.token.value()
             }
+            _ => eh.filter_offset,
+        };
+        if fat {
+            section.extend_from_slice(&u32::from(eh.flags.bits()).to_le_bytes());
+            section.extend_from_slice(&eh.try_offset.to_le_bytes());
+            section.extend_from_slice(&eh.try_length.to_le_bytes());
+            section.extend_from_slice(&eh.handler_offset.to_le_bytes());
+            section.extend_from_slice(&eh.handler_length.to_le_bytes());
+        } else {
+            let narrow = |value: u32, bits: u32| {
+                if value >> bits == 0 {
+                    Ok(value)
+                } else {
+                    Err(malformed_error!(
+                        "Exception handler field {} exceeds the small format",
+                        value
+                    ))
+                }
+            };
+            section.extend_from_slice(&eh.flags.bits().to_le_bytes());
+            section.extend_from_slice(&narrow(eh.try_offset, 16)?.to_le_bytes()[..2]);
+            section.push(narrow(eh.try_length, 8)?.to_le_bytes()[0]);
+            section.extend_from_slice(&narrow(eh.handler_offset, 16)?.to_le_bytes()[..2]);
+            section.push(narrow(eh.handler_length, 8)?.to_le_bytes()[0]);
         }
+        section.extend_from_slice(&token_or_offset.to_le_bytes());
     }
 
     // Align to 4-byte boundary
-    while section.len() % 4 != 0 {
+    while !section.len().is_multiple_of(4) {
         section.push(0);
     }
 
     Ok(section)
 }
 
-/// One byte range an exception clause names, and what kind of range it is.
-#[derive(Debug, Clone, Copy)]
-struct ProtectedPart {
-    /// First byte of the range.
-    start: u32,
-    /// One past its last byte.
-    end: u32,
-    /// Whether control may only arrive by an exception: a handler or a filter.
-    entered_by_exception: bool,
+/// What a range an exception clause names is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    /// A protected (`try`) range.
+    Try,
+    /// A catch handler.
+    Catch,
+    /// A finally or fault handler, which `endfinally` ends.
+    Finally,
+    /// A filter, which `endfilter` ends.
+    Filter,
 }
 
-impl ProtectedPart {
-    fn contains(self, offset: u32) -> bool {
+/// One range an exception clause names: `start..end` in IL offsets.
+#[derive(Debug, Clone, Copy)]
+struct Block {
+    start: u64,
+    end: u64,
+    kind: BlockKind,
+    clause: usize,
+}
+
+impl Block {
+    fn contains(self, offset: u64) -> bool {
         offset >= self.start && offset < self.end
+    }
+
+    /// Whether control enters the block only by an exception: a handler or a filter.
+    fn entered_by_exception(self) -> bool {
+        self.kind != BlockKind::Try
+    }
+
+    fn describe(self) -> String {
+        let kind = match self.kind {
+            BlockKind::Try => "try",
+            BlockKind::Catch => "catch handler",
+            BlockKind::Finally => "finally or fault handler",
+            BlockKind::Filter => "filter",
+        };
+        format!(
+            "{kind} {:#x}..{:#x} of clause {}",
+            self.start, self.end, self.clause
+        )
     }
 }
 
-/// Checks that control enters and leaves every protected range the way
-/// ECMA-335 allows (Partition I, 12.4.2.8).
+/// The defects in how a method body's exception clauses structure its code (ECMA-335
+/// Partition I, 12.4.2.5-8, and Partition II, 19), each stated with the offsets it is at.
 ///
-/// - A handler or filter is entered only by an exception: no branch and no
-///   fall-through from outside lands in one.
-/// - A `try` region is entered only at its first instruction.
-/// - A region is left only by `leave`, `throw`, `rethrow`, `endfinally` or
-///   `endfilter`: no branch or fall-through crosses its end, and no `ret` is
-///   inside one.
+/// - No clause boundary falls inside an instruction, and every branch target is one's start.
+/// - Clause ranges nest or are disjoint; several clauses may protect the same `try`, but a
+///   clause's handler or filter does not overlap its own `try`.
+/// - A handler or filter is entered only by an exception: no branch or fall-through from
+///   outside lands in one, and a `try` is entered only at its first instruction.
+/// - A range is left only by `leave`, `throw`, `rethrow`, `endfinally` or `endfilter`: no
+///   branch or fall-through crosses its end, no `ret` is inside one, and a `leave` does not
+///   leave a filter, finally or fault handler.
+/// - `endfinally` is only in a finally or fault handler, and `endfilter` only ends a filter.
 ///
-/// Clause ranges that are merely in bounds can still break all three - a
-/// region that covers code the method falls into from outside is in bounds and
-/// invalid - and the runtime rejects such a body when it is first called.
+/// The stack is not checked: a call's effect on it is its signature's, which the
+/// instructions do not state.
 ///
 /// # Arguments
 ///
-/// * `instructions` - The method body, decoded, with offsets from its start.
-/// * `handlers` - Its exception clauses.
-///
-/// # Errors
-///
-/// Returns an error naming the first transfer that breaks a rule.
-pub fn validate_protected_region_flow(
+/// * `instructions` - The method's instructions, decoded; the one at the lowest RVA starts
+///   the code, and an instruction's IL offset is its RVA less that one's
+/// * `handlers` - Its exception clauses
+#[must_use]
+pub fn exception_structure_defects(
     instructions: &[Instruction],
     handlers: &[ExceptionHandler],
-) -> Result<()> {
-    let mut parts: Vec<ProtectedPart> = Vec::new();
-    for handler in handlers {
-        parts.push(ProtectedPart {
-            start: handler.try_offset,
-            end: handler.try_offset.saturating_add(handler.try_length),
-            entered_by_exception: false,
+) -> Vec<String> {
+    let mut defects = Vec::new();
+    let mut blocks: Vec<Block> = Vec::new();
+    for (clause, handler) in handlers.iter().enumerate() {
+        let range = |start: u32, length: u32| {
+            (
+                u64::from(start),
+                u64::from(start).saturating_add(u64::from(length)),
+            )
+        };
+        let (start, end) = range(handler.try_offset, handler.try_length);
+        blocks.push(Block {
+            start,
+            end,
+            kind: BlockKind::Try,
+            clause,
         });
-        parts.push(ProtectedPart {
-            start: handler.handler_offset,
-            end: handler
-                .handler_offset
-                .saturating_add(handler.handler_length),
-            entered_by_exception: true,
+        let (start, end) = range(handler.handler_offset, handler.handler_length);
+        let kind = if handler.flags.contains(ExceptionHandlerFlags::FINALLY)
+            || handler.flags.contains(ExceptionHandlerFlags::FAULT)
+        {
+            BlockKind::Finally
+        } else {
+            BlockKind::Catch
+        };
+        blocks.push(Block {
+            start,
+            end,
+            kind,
+            clause,
         });
         if handler.flags.contains(ExceptionHandlerFlags::FILTER) {
-            parts.push(ProtectedPart {
-                start: handler.filter_offset,
-                end: handler.handler_offset,
-                entered_by_exception: true,
+            blocks.push(Block {
+                start: u64::from(handler.filter_offset),
+                end: u64::from(handler.handler_offset),
+                kind: BlockKind::Filter,
+                clause,
             });
         }
     }
-    if parts.is_empty() {
-        return Ok(());
+    if blocks.is_empty() {
+        return defects;
     }
 
+    let base = instructions
+        .iter()
+        .map(|instruction| instruction.rva)
+        .min()
+        .unwrap_or_default();
+    let offset_of = |rva: u64| rva.saturating_sub(base);
     let code_end = instructions
-        .last()
-        .map_or(0, |last| last.offset.saturating_add(last.size));
-    let violation = |message: String| Err(Error::CodegenFailed(message));
+        .iter()
+        .map(|instruction| offset_of(instruction.rva).saturating_add(instruction.size))
+        .max()
+        .unwrap_or_default();
+    let boundaries: HashSet<u64> = instructions
+        .iter()
+        .map(|instruction| offset_of(instruction.rva))
+        .chain([code_end])
+        .collect();
 
-    for instr in instructions {
-        let (Ok(from), Ok(next)) = (
-            u32::try_from(instr.offset),
-            u32::try_from(instr.offset.saturating_add(instr.size)),
-        ) else {
-            return violation(format!(
-                "instruction at {:#x} is out of range",
-                instr.offset
-            ));
-        };
-
-        if instr.flow_type == FlowType::Return {
-            if let Some(part) = parts.iter().find(|part| part.contains(from)) {
-                return violation(format!(
-                    "`ret` at {from:#x} inside protected range {:#x}..{:#x}",
-                    part.start, part.end
+    // Clause boundaries are instruction boundaries. Code no path reaches need not be decoded,
+    // so a boundary there is only wrong inside an instruction that is.
+    for block in &blocks {
+        for at in [block.start, block.end] {
+            if let Some(instruction) = instructions.iter().find(|instruction| {
+                let start = offset_of(instruction.rva);
+                start < at && at < start.saturating_add(instruction.size)
+            }) {
+                defects.push(format!(
+                    "{} has a boundary at {at:#x}, inside {} at {:#x}",
+                    block.describe(),
+                    instruction.mnemonic,
+                    offset_of(instruction.rva)
                 ));
+            }
+        }
+    }
+
+    // Ranges nest or are disjoint; a clause's handler and filter lie outside its try
+    for (index, one) in blocks.iter().enumerate() {
+        for other in blocks.iter().skip(index.saturating_add(1)) {
+            let overlap = one.start < other.end && other.start < one.end;
+            if !overlap {
+                continue;
+            }
+            let same = one.start == other.start && one.end == other.end;
+            let nested = (one.start <= other.start && other.end <= one.end)
+                || (other.start <= one.start && one.end <= other.end);
+            let own_try = one.clause == other.clause
+                && (one.kind == BlockKind::Try || other.kind == BlockKind::Try);
+            if own_try {
+                defects.push(format!("{} overlaps {}", one.describe(), other.describe()));
+            } else if same {
+                if one.kind != BlockKind::Try || other.kind != BlockKind::Try {
+                    defects.push(format!("{} is also {}", one.describe(), other.describe()));
+                }
+            } else if !nested {
+                defects.push(format!(
+                    "{} and {} overlap without nesting",
+                    one.describe(),
+                    other.describe()
+                ));
+            }
+        }
+    }
+
+    // The innermost range around an offset
+    let innermost = |offset: u64| {
+        blocks
+            .iter()
+            .filter(|block| block.contains(offset))
+            .min_by_key(|block| block.end.saturating_sub(block.start))
+            .copied()
+    };
+
+    for instruction in instructions {
+        let from = offset_of(instruction.rva);
+        let next = from.saturating_add(instruction.size);
+        let mnemonic = instruction.mnemonic;
+
+        match mnemonic {
+            "endfinally" if innermost(from).map(|block| block.kind) != Some(BlockKind::Finally) => {
+                defects.push(format!(
+                    "endfinally at {from:#x} is outside a finally or fault handler"
+                ));
+            }
+            "endfilter"
+                if !innermost(from)
+                    .is_some_and(|block| block.kind == BlockKind::Filter && block.end == next) =>
+            {
+                defects.push(format!("endfilter at {from:#x} does not end a filter"));
+            }
+            _ => {}
+        }
+
+        if instruction.flow_type == FlowType::Return {
+            if let Some(block) = blocks.iter().find(|block| block.contains(from)) {
+                defects.push(format!("ret at {from:#x} inside {}", block.describe()));
             }
             continue;
         }
 
-        let leaves = instr.flow_type == FlowType::Leave;
+        let leaves = instruction.flow_type == FlowType::Leave;
         let falls_through = matches!(
-            instr.flow_type,
+            instruction.flow_type,
             FlowType::Sequential | FlowType::Call | FlowType::ConditionalBranch | FlowType::Switch
         );
-        let mut successors: Vec<u32> = instr
+        let mut successors: Vec<u64> = instruction
             .branch_targets
             .iter()
-            .filter_map(|&target| u32::try_from(target).ok())
+            .map(|target| offset_of(*target))
             .collect();
-        if falls_through && instr.offset.saturating_add(instr.size) < code_end {
+        for target in &successors {
+            if !boundaries.contains(target) || *target >= code_end {
+                defects.push(format!(
+                    "{mnemonic} at {from:#x} branches to {target:#x}, which no instruction starts"
+                ));
+            }
+        }
+        if falls_through && next < code_end {
             successors.push(next);
         }
 
         for target in successors {
-            for part in &parts {
-                let (inside_from, inside_to) = (part.contains(from), part.contains(target));
+            for block in &blocks {
+                let (inside_from, inside_to) = (block.contains(from), block.contains(target));
                 if !inside_from && inside_to {
-                    if part.entered_by_exception {
-                        return violation(format!(
-                            "{} at {from:#x} enters handler range {:#x}..{:#x} at {target:#x}",
-                            instr.mnemonic, part.start, part.end
+                    if block.entered_by_exception() {
+                        defects.push(format!(
+                            "{mnemonic} at {from:#x} enters {} at {target:#x}",
+                            block.describe()
                         ));
-                    }
-                    if target != part.start {
-                        return violation(format!(
-                            "{} at {from:#x} enters try range {:#x}..{:#x} at {target:#x}, not its start",
-                            instr.mnemonic, part.start, part.end
+                    } else if target != block.start {
+                        defects.push(format!(
+                            "{mnemonic} at {from:#x} enters {} at {target:#x}, not its start",
+                            block.describe()
                         ));
                     }
                 }
-                if inside_from && !inside_to && !leaves {
-                    return violation(format!(
-                        "{} at {from:#x} leaves range {:#x}..{:#x} for {target:#x} without `leave`",
-                        instr.mnemonic, part.start, part.end
-                    ));
+                if inside_from && !inside_to {
+                    if !leaves {
+                        defects.push(format!(
+                            "{mnemonic} at {from:#x} leaves {} for {target:#x} without leave",
+                            block.describe()
+                        ));
+                    } else if block.entered_by_exception() && block.kind != BlockKind::Catch {
+                        defects.push(format!(
+                            "leave at {from:#x} leaves {} for {target:#x}",
+                            block.describe()
+                        ));
+                    }
                 }
             }
         }
     }
-    Ok(())
+    defects
+}
+
+/// Checks that control enters and leaves every protected range the way ECMA-335 allows, and
+/// that the clauses structure the code as it requires: the first of
+/// [`exception_structure_defects`], as an error.
+///
+/// Clause ranges that are merely in bounds can still break these rules - a region that
+/// covers code the method falls into from outside is in bounds and invalid - and the
+/// runtime rejects such a body when it is first called.
+///
+/// # Arguments
+///
+/// * `instructions` - The method body, decoded.
+/// * `handlers` - Its exception clauses.
+///
+/// # Errors
+///
+/// Returns an error naming the first defect.
+pub fn validate_protected_region_flow(
+    instructions: &[Instruction],
+    handlers: &[ExceptionHandler],
+) -> Result<()> {
+    match exception_structure_defects(instructions, handlers)
+        .into_iter()
+        .next()
+    {
+        Some(defect) => Err(Error::CodegenFailed(defect)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1124,13 +1317,16 @@ mod tests {
         handlers[0].handler_length += 1;
         let err = validate_protected_region_flow(&instructions, &handlers)
             .expect_err("a leave into a handler range is invalid");
-        assert!(format!("{err}").contains("enters handler range"), "{err}");
+        assert!(
+            format!("{err}").contains("enters finally or fault handler"),
+            "{err}"
+        );
     }
 
     #[test]
     fn test_encode_exception_handlers_empty() {
         let handlers = vec![];
-        let result = encode_exception_handlers(&handlers).unwrap();
+        let result = encode_exception_handlers(&handlers, None).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1146,7 +1342,7 @@ mod tests {
             filter_offset: 0,
         }];
 
-        let result = encode_exception_handlers(&handlers).unwrap();
+        let result = encode_exception_handlers(&handlers, None).unwrap();
 
         // Should use small format: 4-byte header + 12 bytes per handler = 16 bytes
         assert_eq!(result.len(), 16);
@@ -1170,7 +1366,7 @@ mod tests {
             filter_offset: 0,
         }];
 
-        let result = encode_exception_handlers(&handlers).unwrap();
+        let result = encode_exception_handlers(&handlers, None).unwrap();
 
         // Should use fat format: 4-byte header + 24 bytes per handler = 28 bytes,
         // already 4-byte aligned.
@@ -1197,7 +1393,7 @@ mod tests {
             filter_offset: 15,
         }];
 
-        let result = encode_exception_handlers(&handlers).unwrap();
+        let result = encode_exception_handlers(&handlers, None).unwrap();
 
         // Should successfully encode filter handler
         assert_eq!(result.len(), 16); // Small format
@@ -1375,5 +1571,232 @@ mod tests {
         assert_eq!(format!("{}", ExceptionHandlerKind::Filter), "filter");
         assert_eq!(format!("{}", ExceptionHandlerKind::Finally), "finally");
         assert_eq!(format!("{}", ExceptionHandlerKind::Fault), "fault");
+    }
+
+    /// A clause over `code` decoded from offset 0.
+    fn clause(
+        flags: ExceptionHandlerFlags,
+        try_range: (u32, u32),
+        handler_range: (u32, u32),
+        filter_offset: u32,
+    ) -> ExceptionHandler {
+        ExceptionHandler {
+            flags,
+            try_offset: try_range.0,
+            try_length: try_range.1 - try_range.0,
+            handler_offset: handler_range.0,
+            handler_length: handler_range.1 - handler_range.0,
+            filter_offset,
+            handler: None,
+        }
+    }
+
+    fn defects(code: &[u8], clauses: &[ExceptionHandler]) -> Vec<String> {
+        let instructions = decode_stream(&mut Parser::new(code), 0).unwrap();
+        exception_structure_defects(&instructions, clauses)
+    }
+
+    /// `try { nop; leave 6 } catch { pop; leave 6 } 6: ret`: the valid shape the rules below
+    /// break, with the try at 0..3 and the catch at 3..6.
+    const TRY_CATCH: [u8; 7] = [0x00, 0xDE, 0x03, 0x26, 0xDE, 0x00, 0x2A];
+
+    #[test]
+    fn a_valid_try_catch_has_no_defects() {
+        let catch = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 3),
+            (3, 6),
+            0x0100_0001,
+        );
+        assert_eq!(defects(&TRY_CATCH, &[catch]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ranges_that_overlap_without_nesting_are_defects() {
+        // A second clause whose try straddles the first's try and handler
+        let first = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 3),
+            (3, 6),
+            0x0100_0001,
+        );
+        let straddling = clause(ExceptionHandlerFlags::FAULT, (1, 4), (4, 6), 0);
+        let found = defects(&TRY_CATCH, &[first, straddling]);
+        assert!(
+            found.iter().any(|d| d.contains("overlap without nesting")),
+            "{found:?}"
+        );
+
+        // A handler inside its own try
+        let own = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 6),
+            (3, 6),
+            0x0100_0001,
+        );
+        assert!(defects(&TRY_CATCH, &[own])
+            .iter()
+            .any(|d| d.contains("overlaps")));
+
+        // Two clauses with one handler range
+        let one = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 3),
+            (3, 6),
+            0x0100_0001,
+        );
+        let shared = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 3),
+            (3, 6),
+            0x0100_0002,
+        );
+        assert!(defects(&TRY_CATCH, &[one, shared])
+            .iter()
+            .any(|d| d.contains("is also")));
+    }
+
+    #[test]
+    fn several_clauses_may_protect_one_try() {
+        // try { nop; leave } catch { pop; leave } catch { pop; leave } ret
+        let code = [0x00, 0xDE, 0x06, 0x26, 0xDE, 0x03, 0x26, 0xDE, 0x00, 0x2A];
+        let first = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 3),
+            (3, 6),
+            0x0100_0001,
+        );
+        let second = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 3),
+            (6, 9),
+            0x0100_0002,
+        );
+        assert_eq!(defects(&code, &[first, second]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn endfinally_outside_a_finally_and_endfilter_not_ending_a_filter_are_defects() {
+        // endfinally in a catch handler
+        let code = [0x00, 0xDE, 0x01, 0xDC, 0x2A];
+        let catch = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 3),
+            (3, 4),
+            0x0100_0001,
+        );
+        assert!(defects(&code, &[catch])
+            .iter()
+            .any(|d| d.contains("endfinally at 0x3")));
+
+        // endfilter in the middle of a filter: filter 3..7 is endfilter, nop, ...
+        let code = [0x00, 0xDE, 0x06, 0xFE, 0x11, 0x00, 0x26, 0xDE, 0x00, 0x2A];
+        let filter = clause(ExceptionHandlerFlags::FILTER, (0, 3), (6, 9), 3);
+        assert!(defects(&code, &[filter])
+            .iter()
+            .any(|d| d.contains("endfilter at 0x3 does not end a filter")));
+    }
+
+    #[test]
+    fn a_leave_out_of_a_finally_is_a_defect() {
+        // try { nop; leave 6 } finally { leave 6 } 6: ret
+        let code = [0x00, 0xDE, 0x03, 0xDE, 0x01, 0xDC, 0x2A];
+        let finally = clause(ExceptionHandlerFlags::FINALLY, (0, 3), (3, 6), 0);
+        assert!(defects(&code, &[finally])
+            .iter()
+            .any(|d| d.contains("leave at 0x3 leaves finally")));
+    }
+
+    #[test]
+    fn a_boundary_or_branch_inside_an_instruction_is_a_defect() {
+        // A try ending inside the leave
+        let catch = clause(
+            ExceptionHandlerFlags::EXCEPTION,
+            (0, 2),
+            (3, 6),
+            0x0100_0001,
+        );
+        assert!(defects(&TRY_CATCH, &[catch])
+            .iter()
+            .any(|d| d.contains("boundary at 0x2, inside leave.s")));
+
+        // br.s into the middle of a ldc.i4 (offset 3 of 2..7)
+        let code = [0x2B, 0x01, 0x20, 0x00, 0x00, 0x00, 0x00, 0x2A];
+        let instructions = decode_stream(&mut Parser::new(&code[..2]), 0)
+            .unwrap()
+            .into_iter()
+            .chain(decode_stream(&mut Parser::new(&code[2..]), 2).unwrap())
+            .collect::<Vec<_>>();
+        let fault = clause(ExceptionHandlerFlags::FAULT, (2, 7), (7, 8), 0);
+        let found = exception_structure_defects(&instructions, &[fault]);
+        assert!(
+            found
+                .iter()
+                .any(|d| d.contains("which no instruction starts")),
+            "{found:?}"
+        );
+    }
+
+    /// A finally clause `(try offset, try length, handler offset, handler length)`.
+    fn finally(
+        try_offset: u32,
+        try_length: u32,
+        handler: u32,
+        handler_length: u32,
+    ) -> ExceptionHandler {
+        ExceptionHandler {
+            flags: ExceptionHandlerFlags::FINALLY,
+            try_offset,
+            try_length,
+            handler_offset: handler,
+            handler_length,
+            handler: None,
+            filter_offset: 0,
+        }
+    }
+
+    fn spans(clauses: &[ExceptionHandler]) -> Vec<(u32, u32)> {
+        clauses
+            .iter()
+            .map(|c| (c.try_offset, c.try_length))
+            .collect()
+    }
+
+    /// An order that already puts every nested clause first comes back unchanged: Roslyn's
+    /// clauses of WindowsBase's `Dispose`, which nest at different depths, came back reordered
+    /// by depth, valid but not what the method holds.
+    #[test]
+    fn a_valid_order_comes_back_unchanged() {
+        let clauses = vec![
+            finally(246, 23, 269, 8),
+            finally(199, 40, 239, 39),
+            finally(152, 40, 192, 87),
+            finally(30, 25, 55, 14),
+            finally(76, 69, 145, 135),
+            finally(4, 65, 69, 212),
+        ];
+        assert_eq!(spans(&order_nested_first(clauses.clone())), spans(&clauses));
+    }
+
+    /// A clause listed before one nested in it moves after it, by protected and by handler
+    /// region; the clauses of one protected region keep their order.
+    #[test]
+    fn an_enclosing_clause_moves_after_the_clauses_nested_in_it() {
+        let outer = finally(0, 10, 10, 30);
+        let in_handler = finally(12, 20, 32, 4);
+        let in_try = finally(2, 4, 6, 2);
+        let ordered = order_nested_first(vec![outer.clone(), in_handler.clone(), in_try.clone()]);
+        assert_eq!(spans(&ordered), spans(&[in_handler, in_try, outer]));
+
+        let first = finally(0, 4, 4, 2);
+        let second = finally(0, 4, 6, 2);
+        let same_try = order_nested_first(vec![first.clone(), second.clone()]);
+        assert_eq!(
+            same_try
+                .iter()
+                .map(|c| c.handler_offset)
+                .collect::<Vec<_>>(),
+            [first.handler_offset, second.handler_offset]
+        );
     }
 }

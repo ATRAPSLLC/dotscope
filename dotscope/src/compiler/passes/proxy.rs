@@ -831,7 +831,7 @@ mod tests {
             CompilerContext, SsaPass,
         },
         metadata::{tables::TableId, token::Token},
-        testkit::{fixture, helpers::test_assembly_arc},
+        testkit::{fixture, helpers::test_assembly_arc, passes::run_verified},
         CilObject,
     };
 
@@ -990,9 +990,8 @@ mod tests {
         ctx.set_ssa(proxy_token, proxy_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(caller_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(caller_token), &ctx).unwrap();
 
         assert!(changed, "Should have made changes");
 
@@ -1038,19 +1037,17 @@ mod tests {
         ctx.set_ssa(noop_token, noop_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(caller_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(caller_token), &ctx).unwrap();
 
         assert!(changed, "Should have made changes");
 
-        // Verify the call was replaced with Nop
+        // The call is gone: the block is its return
         let block = caller_ssa.block(0).unwrap();
-        let first_instr = &block.instructions()[0];
         assert!(
-            matches!(first_instr.op(), SsaOp::Nop),
-            "Expected Nop, got {:?}",
-            first_instr.op()
+            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None })),
+            "Expected only the return, got {:?}",
+            block.instructions()
         );
     }
 
@@ -1079,9 +1076,13 @@ mod tests {
         let ctx = test_context();
         ctx.set_ssa(noop_token, noop_ssa);
 
-        ProxyDevirtualizationPass::new()
-            .run_on_method(&mut caller_ssa, &MethodRef::from(caller_token), &ctx)
-            .unwrap();
+        run_verified(
+            &ProxyDevirtualizationPass::new(),
+            &mut caller_ssa,
+            &MethodRef::from(caller_token),
+            &ctx,
+        )
+        .unwrap();
 
         let call = &caller_ssa.block(0).unwrap().instructions()[0];
         assert!(
@@ -1163,9 +1164,8 @@ mod tests {
         ctx.set_ssa(const_token, const_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(caller_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(caller_token), &ctx).unwrap();
 
         assert!(changed, "Should have made changes");
 
@@ -1201,9 +1201,8 @@ mod tests {
         ctx.set_ssa(self_token, self_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(self_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(self_token), &ctx).unwrap();
 
         assert!(!changed, "Should not devirtualize self-recursive calls");
     }

@@ -43,7 +43,7 @@ mod data;
 mod graph;
 mod inheritance;
 
-pub(crate) use context::LoaderContext;
+pub(crate) use context::{LoaderContext, PdbSource};
 pub(crate) use data::CilObjectData;
 
 /// Static registry of all metadata table loaders.

@@ -111,7 +111,7 @@ use std::{
     collections::BTreeSet,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, Weak,
     },
 };
 
@@ -607,9 +607,10 @@ pub struct TypeRegistry {
     /// an index means an `ends_with` scan of every registered fullname on *every* exact-name
     /// miss, and the custom-attribute parser drives two such misses per fixed argument.
     types_by_nested_suffix: DashMap<Arc<str>, BTreeSet<Token>>,
-    /// Registered external TypeRegistries for cross-assembly type resolution
-    /// Maps AssemblyIdentity to external TypeRegistry for cross-assembly lookups
-    external_registries: DashMap<AssemblyIdentity, Arc<TypeRegistry>>,
+    /// Registered external TypeRegistries for cross-assembly type resolution, by assembly.
+    /// The links are weak: registries of a project link to one another, and strong links
+    /// made every project's registries keep each other alive forever.
+    external_registries: DashMap<AssemblyIdentity, Weak<TypeRegistry>>,
     /// Secondary index: MethodDef token to the token of its declaring type.
     ///
     /// Without this, `TypeResolver::declaring_type` answers the MethodDef case by scanning
@@ -1262,7 +1263,9 @@ impl TypeRegistry {
 
         if external {
             for external_registry_entry in &self.external_registries {
-                let external_registry = external_registry_entry.value();
+                let Some(external_registry) = external_registry_entry.value().upgrade() else {
+                    continue;
+                };
                 if let Some(external_type) = external_registry.get_by_fullname(fullname, false) {
                     return Some(external_type);
                 }
@@ -1334,7 +1337,9 @@ impl TypeRegistry {
 
         if include_external {
             for external_registry_entry in &self.external_registries {
-                let external_registry = external_registry_entry.value();
+                let Some(external_registry) = external_registry_entry.value().upgrade() else {
+                    continue;
+                };
                 let external_types = external_registry.get_by_fullname_list(fullname, false);
                 typedef_matches.extend(external_types);
             }
@@ -1785,6 +1790,10 @@ impl TypeRegistry {
     /// a type cannot be found locally. This is essential for resolving TypeRef
     /// tokens that reference external assemblies.
     ///
+    /// The link is weak: it does not keep `registry` alive, whoever owns the external
+    /// assembly does (a project holds each of its assemblies). Once that is dropped, lookups
+    /// no longer search it.
+    ///
     /// # Arguments
     /// * `assembly_identity` - The identity of the external assembly
     /// * `registry` - The TypeRegistry from the external assembly
@@ -1808,14 +1817,15 @@ impl TypeRegistry {
     /// let external_registry = Arc::new(TypeRegistry::new(ext_identity.clone())?);
     /// let external_identity = ext_identity;
     ///
-    /// main_registry.registry_link(external_identity, external_registry);
+    /// main_registry.registry_link(external_identity, &external_registry);
     ///
     /// // Now main_registry can resolve types from the external assembly
     /// # Ok(())
     /// # }
     /// ```
-    pub fn registry_link(&self, assembly_identity: AssemblyIdentity, registry: Arc<TypeRegistry>) {
-        self.external_registries.insert(assembly_identity, registry);
+    pub fn registry_link(&self, assembly_identity: AssemblyIdentity, registry: &Arc<TypeRegistry>) {
+        self.external_registries
+            .insert(assembly_identity, Arc::downgrade(registry));
     }
 
     /// Unlink a TypeRegistry from cross-assembly type resolution.
@@ -1831,7 +1841,7 @@ impl TypeRegistry {
     ) -> Option<Arc<TypeRegistry>> {
         self.external_registries
             .remove(assembly_identity)
-            .map(|(_, registry)| registry)
+            .and_then(|(_, registry)| registry.upgrade())
     }
 
     /// Get a type by fully qualified name across all registries.
@@ -1886,7 +1896,7 @@ impl TypeRegistry {
     ) -> Option<Arc<TypeRegistry>> {
         self.external_registries
             .get(assembly_identity)
-            .map(|entry| entry.value().clone())
+            .and_then(|entry| entry.value().upgrade())
     }
 
     /// Count of registered external registries.
@@ -2991,5 +3001,24 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Registries linked both ways do not keep each other alive: dropping one frees it, and
+    /// the other no longer finds it.
+    #[test]
+    fn linked_registries_do_not_keep_each_other_alive() {
+        let identity_a = AssemblyIdentity::parse("A, Version=1.0.0.0").unwrap();
+        let identity_b = AssemblyIdentity::parse("B, Version=1.0.0.0").unwrap();
+        let a = Arc::new(TypeRegistry::new(identity_a.clone()).unwrap());
+        let b = Arc::new(TypeRegistry::new(identity_b.clone()).unwrap());
+        a.registry_link(identity_b.clone(), &b);
+        b.registry_link(identity_a, &a);
+        assert!(a.get_external_registry(&identity_b).is_some());
+
+        let weak_b = Arc::downgrade(&b);
+        drop(b);
+        assert!(weak_b.upgrade().is_none());
+        assert!(a.get_external_registry(&identity_b).is_none());
+        assert!(a.resolve_type_global("Missing.Type").is_none());
     }
 }

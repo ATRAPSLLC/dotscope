@@ -78,7 +78,8 @@ pub fn verify_root(root: &Root) {
     assert_eq!(root.signature, CIL_HEADER_MAGIC);
     assert_eq!(root.major_version, 1);
     assert_eq!(root.minor_version, 1);
-    assert_eq!(root.version, "v4.0.30319\0\0");
+    assert_eq!(root.version, "v4.0.30319");
+    assert_eq!(root.length, 12);
     assert_eq!(root.flags, 0);
     assert_eq!(root.stream_number, 5);
 

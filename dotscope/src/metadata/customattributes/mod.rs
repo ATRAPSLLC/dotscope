@@ -117,6 +117,7 @@ mod parser;
 mod types;
 
 pub use encoder::*;
+pub(crate) use parser::CustomAttributeParser;
 pub use parser::{
     parse_custom_attribute_blob, parse_custom_attribute_blob_with_registry,
     parse_custom_attribute_data, parse_custom_attribute_data_with_registry,
@@ -130,7 +131,7 @@ mod tests {
             customattributes::{
                 encode_custom_attribute_value, parse_custom_attribute_data,
                 parse_custom_attribute_data_with_registry, CustomAttributeArgument,
-                CustomAttributeNamedArgument, CustomAttributeValue,
+                CustomAttributeNamedArgument, CustomAttributeValue, FieldOrPropType,
             },
             typesystem::{CilFlavor, CilTypeReference},
         },
@@ -309,9 +310,9 @@ mod tests {
     fn test_roundtrip_character_argument() {
         let original = CustomAttributeValue {
             fixed_args: vec![
-                CustomAttributeArgument::Char('A'),
-                CustomAttributeArgument::Char('π'),
-                CustomAttributeArgument::Char('Z'), // Use BMP character instead of emoji
+                CustomAttributeArgument::Char(0x0041),
+                CustomAttributeArgument::Char(0x03C0),
+                CustomAttributeArgument::Char(0x005A), // Use BMP character instead of emoji
             ],
             named_args: vec![],
             constructor: CilTypeReference::None,
@@ -347,9 +348,9 @@ mod tests {
     fn test_roundtrip_string_arguments() {
         let original = CustomAttributeValue {
             fixed_args: vec![
-                CustomAttributeArgument::String("Hello, World!".to_string()),
-                CustomAttributeArgument::String("".to_string()), // Empty string
-                CustomAttributeArgument::String("Unicode: 你好世界 🌍".to_string()),
+                CustomAttributeArgument::String(Some("Hello, World!".to_string())),
+                CustomAttributeArgument::String(Some("".to_string())), // Empty string
+                CustomAttributeArgument::String(Some("Unicode: 你好世界 🌍".to_string())),
             ],
             named_args: vec![],
             constructor: CilTypeReference::None,
@@ -388,10 +389,10 @@ mod tests {
     fn test_roundtrip_type_arguments() {
         let original = CustomAttributeValue {
             fixed_args: vec![
-                CustomAttributeArgument::Type("System.String".to_string()),
-                CustomAttributeArgument::Type(
+                CustomAttributeArgument::Type(Some("System.String".to_string())),
+                CustomAttributeArgument::Type(Some(
                     "System.Collections.Generic.List`1[System.Int32]".to_string(),
-                ),
+                )),
             ],
             named_args: vec![],
             constructor: CilTypeReference::None,
@@ -427,45 +428,47 @@ mod tests {
         }
     }
 
+    /// Arrays encode their element count as a little-endian uint32, `0xFFFFFFFF` for the null
+    /// array (ECMA-335 II.23.3).
     #[test]
     fn test_roundtrip_array_arguments() {
         let original = CustomAttributeValue {
             fixed_args: vec![
-                CustomAttributeArgument::Array(vec![
-                    CustomAttributeArgument::I4(1),
-                    CustomAttributeArgument::I4(2),
-                    CustomAttributeArgument::I4(3),
-                ]),
-                CustomAttributeArgument::Array(vec![
-                    CustomAttributeArgument::String("first".to_string()),
-                    CustomAttributeArgument::String("second".to_string()),
-                ]),
-                CustomAttributeArgument::Array(vec![]), // Empty array
+                CustomAttributeArgument::Array(
+                    FieldOrPropType::I4,
+                    Some(vec![
+                        CustomAttributeArgument::I4(1),
+                        CustomAttributeArgument::I4(2),
+                    ]),
+                ),
+                CustomAttributeArgument::Array(
+                    FieldOrPropType::String,
+                    Some(vec![CustomAttributeArgument::String(Some(
+                        "ab".to_string(),
+                    ))]),
+                ),
+                CustomAttributeArgument::Array(FieldOrPropType::I4, Some(vec![])),
+                CustomAttributeArgument::Array(FieldOrPropType::I4, None),
             ],
             named_args: vec![],
             constructor: CilTypeReference::None,
             blob_index: 0,
         };
 
-        // Note: Array arguments in fixed args require complex type setup
-        // For this test, we'll verify encoding format directly since parser
-        // requires specific array type information that's complex to mock
-
-        // Encode
         let encoded = encode_custom_attribute_value(&original).unwrap();
 
-        // For arrays, we'll verify the encoding structure directly
-        assert!(
-            encoded.len() > 10,
-            "Encoded array should have substantial size"
+        assert_eq!(
+            encoded,
+            [
+                0x01, 0x00, // prolog
+                0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+                0x00, // int[2]
+                0x01, 0x00, 0x00, 0x00, 0x02, b'a', b'b', // string[1]
+                0x00, 0x00, 0x00, 0x00, // int[0]
+                0xFF, 0xFF, 0xFF, 0xFF, // null int[]
+                0x00, 0x00, // NumNamed
+            ]
         );
-
-        // Check prolog
-        assert_eq!(encoded[0], 0x01);
-        assert_eq!(encoded[1], 0x00);
-
-        // The rest of the structure is complex due to array format,
-        // but we've verified the basic encoding works
     }
 
     #[test]
@@ -533,19 +536,19 @@ mod tests {
                 CustomAttributeNamedArgument {
                     is_field: true,
                     name: "FieldValue".to_string(),
-                    arg_type: "I4".to_string(),
+                    arg_type: FieldOrPropType::I4,
                     value: CustomAttributeArgument::I4(42),
                 },
                 CustomAttributeNamedArgument {
                     is_field: false, // Property
                     name: "PropertyName".to_string(),
-                    arg_type: "String".to_string(),
-                    value: CustomAttributeArgument::String("TestValue".to_string()),
+                    arg_type: FieldOrPropType::String,
+                    value: CustomAttributeArgument::String(Some("TestValue".to_string())),
                 },
                 CustomAttributeNamedArgument {
                     is_field: true,
                     name: "BoolFlag".to_string(),
-                    arg_type: "Boolean".to_string(),
+                    arg_type: FieldOrPropType::Bool,
                     value: CustomAttributeArgument::Bool(true),
                 },
             ],
@@ -567,7 +570,7 @@ mod tests {
         let arg0 = &parsed.named_args[0];
         assert!(arg0.is_field);
         assert_eq!(arg0.name, "FieldValue");
-        assert_eq!(arg0.arg_type, "I4");
+        assert_eq!(arg0.arg_type, FieldOrPropType::I4);
         match &arg0.value {
             CustomAttributeArgument::I4(val) => assert_eq!(*val, 42),
             _ => panic!("Expected I4 value"),
@@ -577,9 +580,9 @@ mod tests {
         let arg1 = &parsed.named_args[1];
         assert!(!arg1.is_field);
         assert_eq!(arg1.name, "PropertyName");
-        assert_eq!(arg1.arg_type, "String");
+        assert_eq!(arg1.arg_type, FieldOrPropType::String);
         match &arg1.value {
-            CustomAttributeArgument::String(val) => assert_eq!(val, "TestValue"),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, "TestValue"),
             _ => panic!("Expected String value"),
         }
 
@@ -587,7 +590,7 @@ mod tests {
         let arg2 = &parsed.named_args[2];
         assert!(arg2.is_field);
         assert_eq!(arg2.name, "BoolFlag");
-        assert_eq!(arg2.arg_type, "Boolean");
+        assert_eq!(arg2.arg_type, FieldOrPropType::Bool);
         match &arg2.value {
             CustomAttributeArgument::Bool(val) => assert!(*val),
             _ => panic!("Expected Bool value"),
@@ -598,14 +601,14 @@ mod tests {
     fn test_roundtrip_mixed_fixed_and_named_arguments() {
         let original = CustomAttributeValue {
             fixed_args: vec![
-                CustomAttributeArgument::String("Constructor Arg".to_string()),
+                CustomAttributeArgument::String(Some("Constructor Arg".to_string())),
                 CustomAttributeArgument::I4(123),
             ],
             named_args: vec![CustomAttributeNamedArgument {
                 is_field: false,
                 name: "AdditionalInfo".to_string(),
-                arg_type: "String".to_string(),
-                value: CustomAttributeArgument::String("Extra Data".to_string()),
+                arg_type: FieldOrPropType::String,
+                value: CustomAttributeArgument::String(Some("Extra Data".to_string())),
             }],
             constructor: CilTypeReference::None,
             blob_index: 0,
@@ -621,7 +624,7 @@ mod tests {
         // Verify fixed arguments
         assert_eq!(parsed.fixed_args.len(), 2);
         match &parsed.fixed_args[0] {
-            CustomAttributeArgument::String(val) => assert_eq!(val, "Constructor Arg"),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, "Constructor Arg"),
             _ => panic!("Expected String in fixed args"),
         }
         match &parsed.fixed_args[1] {
@@ -634,9 +637,9 @@ mod tests {
         let named_arg = &parsed.named_args[0];
         assert!(!named_arg.is_field);
         assert_eq!(named_arg.name, "AdditionalInfo");
-        assert_eq!(named_arg.arg_type, "String");
+        assert_eq!(named_arg.arg_type, FieldOrPropType::String);
         match &named_arg.value {
-            CustomAttributeArgument::String(val) => assert_eq!(val, "Extra Data"),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, "Extra Data"),
             _ => panic!("Expected String in named args"),
         }
     }
@@ -726,14 +729,14 @@ mod tests {
 
         let original = CustomAttributeValue {
             fixed_args: vec![
-                CustomAttributeArgument::String(large_string.clone()),
-                CustomAttributeArgument::Array(large_array.clone()),
+                CustomAttributeArgument::String(Some(large_string.clone())),
+                CustomAttributeArgument::Array(FieldOrPropType::I4, Some(large_array.clone())),
             ],
             named_args: vec![CustomAttributeNamedArgument {
                 is_field: true,
                 name: "LargeField".to_string(),
-                arg_type: "String".to_string(),
-                value: CustomAttributeArgument::String(large_string.clone()),
+                arg_type: FieldOrPropType::String,
+                value: CustomAttributeArgument::String(Some(large_string.clone())),
             }],
             constructor: CilTypeReference::None,
             blob_index: 0,

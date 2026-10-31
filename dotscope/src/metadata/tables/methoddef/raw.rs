@@ -69,10 +69,12 @@ use crate::{
         },
         signatures::parse_method_signature,
         streams::{Blob, Strings},
-        tables::{MetadataTable, ParamMap, ParamPtrMap, TableId, TableInfoRef, TableRow},
+        tables::{
+            MetadataTable, ParamList, ParamMap, ParamPtrMap, TableId, TableInfoRef, TableRow,
+        },
         token::Token,
     },
-    utils::LazyList,
+    utils::{LazyList, RowList},
     Result,
 };
 
@@ -246,7 +248,7 @@ impl MethodDefRaw {
         let signature = parse_method_signature(blob.get(self.signature as usize)?)?;
 
         let type_params = if self.param_list == 0 || params_map.is_empty() {
-            Arc::new(boxcar::Vec::new())
+            ParamList::new()
         } else {
             let next_row_id = self
                 .rid
@@ -268,9 +270,9 @@ impl MethodDefRaw {
             };
 
             if start > params_map.len() || end > params_map.len().saturating_add(1) || end < start {
-                Arc::new(boxcar::Vec::new())
+                ParamList::new()
             } else {
-                let type_params = Arc::new(boxcar::Vec::with_capacity(end.saturating_sub(start)));
+                let type_params = ParamList::new();
                 for counter in start..end {
                     let param_rid = u32::try_from(counter).map_err(|_| {
                         malformed_error!("Param row index out of range: {}", counter)
@@ -325,16 +327,15 @@ impl MethodDefRaw {
             flags_modifiers: MethodModifiers::from_method_flags(self.flags),
             flags_pinvoke: AtomicU32::new(0),
             params: type_params,
-            varargs: Arc::new(boxcar::Vec::new()),
             generic_params: Default::default(),
             generic_args: LazyList::new(),
             signature,
             rva: if self.rva == 0 { None } else { Some(self.rva) },
             body: OnceLock::new(),
-            local_vars: Arc::new(boxcar::Vec::new()),
+            local_vars: LazyList::new(),
             overrides: Default::default(),
             interface_impls: Default::default(),
-            security: OnceLock::new(),
+            security: RowList::new(),
             blocks: OnceLock::new(),
             custom_attributes: Default::default(),
             declaring_type: OnceLock::new(),

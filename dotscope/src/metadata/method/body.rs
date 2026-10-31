@@ -110,16 +110,12 @@ use log::debug;
 
 use crate::{
     metadata::method::{
-        encode_exception_handlers, ExceptionHandler, ExceptionHandlerFlags, MethodBodyFlags,
-        SectionFlags,
+        encode_exception_handlers, ExceptionHandler, ExceptionHandlerFlags, ExceptionSectionFormat,
+        MethodBodyFlags, SectionFlags,
     },
     utils::{read_le, read_le_at},
     Result,
 };
-
-/// Maximum number of exception handlers allowed per method.
-/// Real-world methods typically have < 20 handlers.
-const MAX_EXCEPTION_HANDLERS: usize = 1024;
 
 /// Controls how exception handler validation is performed during parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +252,7 @@ fn validate_exception_handler_bounds(
 /// - All fields are immutable after construction
 /// - No interior mutability or shared state
 /// - Safe to share across threads without synchronization
+#[derive(Debug, Clone)]
 pub struct MethodBody {
     /// Size of the method code (length of all CIL instructions, excluding the header) in bytes
     pub size_code: usize,
@@ -273,6 +270,9 @@ pub struct MethodBody {
     pub is_exception_data: bool,
     /// Collection of exception handlers for this method (empty if no exception handling)
     pub exception_handlers: Vec<ExceptionHandler>,
+    /// How the exception handling section was written, for a body read with one: writing
+    /// the body uses it, so the section comes back as it was.
+    pub exception_format: Option<ExceptionSectionFormat>,
 }
 
 impl MethodBody {
@@ -361,44 +361,12 @@ impl MethodBody {
         Ok(body)
     }
 
-    /// Checks the declared handler count against MAX_EXCEPTION_HANDLERS.
-    ///
-    /// - **Strict**: returns an error
-    /// - **Filter**: no-op (declared count is irrelevant; valid-handler cap is checked per push)
-    /// - **Raw**: logs a warning and signals the caller to break
-    ///
-    /// Returns `Ok(true)` to continue parsing, `Ok(false)` to break (skip this section).
-    fn check_handler_count(handler_count: u32, eh_mode: EhValidationMode) -> Result<bool> {
-        if eh_mode == EhValidationMode::Filter || (handler_count as usize) <= MAX_EXCEPTION_HANDLERS
-        {
-            return Ok(true);
-        }
-
-        match eh_mode {
-            EhValidationMode::Strict => Err(malformed_error!(
-                "Method has too many exception handlers: {} (max: {})",
-                handler_count,
-                MAX_EXCEPTION_HANDLERS
-            )),
-            _ => {
-                log::warn!(
-                    "Method has too many exception handlers: {} (max: {}), skipping",
-                    handler_count,
-                    MAX_EXCEPTION_HANDLERS
-                );
-                Ok(false)
-            }
-        }
-    }
-
     /// Validates and pushes a parsed exception handler according to the validation mode.
     ///
     /// - **Strict**: validates bounds and returns error on failure
     /// - **Filter**: validates bounds; valid handlers are pushed, invalid ones increment
     ///   `filtered_count` silently (caller logs the total)
     /// - **Raw**: pushes unconditionally
-    ///
-    /// Returns `Ok(true)` to continue iterating, `Ok(false)` to stop (max valid handlers reached).
     fn push_handler(
         handler: ExceptionHandler,
         handler_idx: usize,
@@ -406,7 +374,7 @@ impl MethodBody {
         eh_mode: EhValidationMode,
         handlers: &mut Vec<ExceptionHandler>,
         filtered_count: &mut usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         match eh_mode {
             EhValidationMode::Strict => {
                 validate_exception_handler_bounds(&handler, code_size, handler_idx)?;
@@ -415,9 +383,6 @@ impl MethodBody {
             EhValidationMode::Filter => {
                 if validate_exception_handler_bounds(&handler, code_size, handler_idx).is_ok() {
                     handlers.push(handler);
-                    if handlers.len() >= MAX_EXCEPTION_HANDLERS {
-                        return Ok(false);
-                    }
                 } else {
                     *filtered_count = filtered_count
                         .checked_add(1)
@@ -428,7 +393,7 @@ impl MethodBody {
                 handlers.push(handler);
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Internal parsing logic shared by `from()`, `from_lenient()`, and `from_raw()`.
@@ -462,6 +427,7 @@ impl MethodBody {
                         is_init_local: false,
                         is_exception_data: false,
                         exception_handlers: Vec::new(),
+                        exception_format: None,
                     },
                     0,
                 ))
@@ -521,67 +487,70 @@ impl MethodBody {
 
                 let is_init_local = flags_header.contains(MethodBodyFlags::INIT_LOCALS);
 
-                // Exception Handling -> II.25.4.6
-                // The extra sections currently can only contain exception handling data
+                // The data sections after the code (ECMA-335 II.25.4.5), walked as CoreCLR
+                // walks them: each starts 4-aligned after the last, `DataSize` bytes on; a
+                // section whose kind is not the EH table is skipped, and the first EH table
+                // is the method's handlers, any later one ignored.
                 let mut exception_handlers = Vec::new();
+                let mut exception_format = None;
                 let mut filtered_count: usize = 0;
-                if flags_header.contains(MethodBodyFlags::MORE_SECTS) {
-                    // Set cursor to the end of the header + body, to process exception tables
-                    let mut cursor = (size_header as usize)
-                        .checked_add(size_code as usize)
-                        .ok_or_else(|| malformed_error!("EH cursor overflow"))?;
-                    cursor = cursor
-                        .checked_add(3)
-                        .ok_or_else(|| malformed_error!("EH alignment overflow"))?
-                        & !3usize;
+                let mut more = flags_header.contains(MethodBodyFlags::MORE_SECTS);
+                let mut cursor = (size_header as usize)
+                    .checked_add(size_code as usize)
+                    .and_then(|end| end.checked_next_multiple_of(4))
+                    .ok_or_else(|| malformed_error!("EH cursor overflow"))?;
+                while more {
+                    let Some(header) = data.get(cursor..cursor.saturating_add(4)) else {
+                        if eh_mode == EhValidationMode::Strict {
+                            return Err(malformed_error!(
+                                "A data section header at {} runs past the method body",
+                                cursor
+                            ));
+                        }
+                        break;
+                    };
+                    let kind = SectionFlags::new(header.first().copied().unwrap_or_default());
+                    let fat = kind.contains(SectionFlags::FAT_FORMAT);
+                    let data_size = if fat {
+                        u32::from_le_bytes([
+                            header.get(1).copied().unwrap_or_default(),
+                            header.get(2).copied().unwrap_or_default(),
+                            header.get(3).copied().unwrap_or_default(),
+                            0,
+                        ])
+                    } else {
+                        u32::from(header.get(1).copied().unwrap_or_default())
+                    };
+                    more = kind.contains(SectionFlags::MORE_SECTS);
 
-                    loop {
-                        let cursor_plus_4 = cursor
-                            .checked_add(4)
-                            .ok_or_else(|| malformed_error!("EH cursor+4 overflow"))?;
-                        if data.len() <= cursor_plus_4 {
+                    if kind.bits() & SectionFlags::KIND_MASK.bits() == SectionFlags::EHTABLE.bits()
+                        && exception_format.is_none()
+                    {
+                        exception_format = Some(ExceptionSectionFormat { fat, data_size });
+                        // The runtime counts DataSize / clause size clauses, so a DataSize that
+                        // leaves out the 4-byte header (as AsmResolver writes it) reads the same
+                        let clause_size: usize = if fat { 24 } else { 12 };
+                        let handler_count = (data_size as usize)
+                            .checked_div(clause_size)
+                            .unwrap_or_default();
+                        let clauses_end = handler_count
+                            .checked_mul(clause_size)
+                            .and_then(|size| size.checked_add(cursor.saturating_add(4)))
+                            .ok_or_else(|| malformed_error!("EH section size overflow"))?;
+                        if clauses_end > data.len() {
+                            if eh_mode == EhValidationMode::Strict {
+                                return Err(malformed_error!(
+                                    "An exception section of {} clauses runs past the method body",
+                                    handler_count
+                                ));
+                            }
                             break;
                         }
-                        let method_data_section_flags = SectionFlags::new(read_le::<u8>(
-                            data.get(cursor..).ok_or(out_of_bounds_error!())?,
-                        )?);
-                        if !method_data_section_flags.contains(SectionFlags::EHTABLE) {
-                            break;
-                        }
-
-                        if method_data_section_flags.contains(SectionFlags::FAT_FORMAT) {
-                            let cursor_plus_1 = cursor
-                                .checked_add(1)
-                                .ok_or_else(|| malformed_error!("EH cursor+1 overflow"))?;
-                            let method_data_section_size = read_le::<u32>(
-                                data.get(cursor_plus_1..).ok_or(out_of_bounds_error!())?,
-                            )? & 0x00FF_FFFF;
-
-                            // ECMA-335 says DataSize includes the 4-byte section header,
-                            // but some tools emit DataSize without the header. Using
-                            // DataSize/24 handles both cases via integer division
-                            // (matches Mono runtime behavior in metadata.c:parse_section_data).
-                            let handler_count = method_data_section_size / 24;
-                            let needed = (handler_count as usize)
-                                .checked_mul(24)
-                                .and_then(|v| v.checked_add(4))
-                                .ok_or_else(|| malformed_error!("EH FAT section size overflow"))?;
-                            let cursor_end = cursor
-                                .checked_add(needed)
-                                .ok_or_else(|| malformed_error!("EH FAT cursor+needed overflow"))?;
-                            if handler_count == 0 || data.len() < cursor_end {
-                                break;
-                            }
-                            if !Self::check_handler_count(handler_count, eh_mode)? {
-                                break;
-                            }
-
-                            cursor = cursor.checked_add(4).ok_or_else(|| {
-                                malformed_error!("EH FAT cursor advance overflow")
-                            })?;
-
-                            for handler_idx in 0..handler_count {
-                                let flags_u32 = read_le_at::<u32>(data, &mut cursor)?;
+                        exception_handlers.reserve(handler_count);
+                        let mut clause = cursor.saturating_add(4);
+                        for handler_idx in 0..handler_count {
+                            let handler = if fat {
+                                let flags_u32 = read_le_at::<u32>(data, &mut clause)?;
                                 if flags_u32 > 0xFFFF && eh_mode == EhValidationMode::Strict {
                                     return Err(malformed_error!(
                                         "Exception handler {} has invalid flags with upper bits set: 0x{:08X}",
@@ -594,95 +563,58 @@ impl MethodBody {
                                 // accompany garbage offsets that will be rejected there.
                                 #[allow(clippy::cast_possible_truncation)]
                                 let flags = ExceptionHandlerFlags::new(flags_u32 as u16);
-
-                                let handler = ExceptionHandler {
+                                ExceptionHandler {
                                     flags,
-                                    try_offset: read_le_at::<u32>(data, &mut cursor)?,
-                                    try_length: read_le_at::<u32>(data, &mut cursor)?,
-                                    handler_offset: read_le_at::<u32>(data, &mut cursor)?,
-                                    handler_length: read_le_at::<u32>(data, &mut cursor)?,
-                                    filter_offset: read_le_at::<u32>(data, &mut cursor)?,
+                                    try_offset: read_le_at::<u32>(data, &mut clause)?,
+                                    try_length: read_le_at::<u32>(data, &mut clause)?,
+                                    handler_offset: read_le_at::<u32>(data, &mut clause)?,
+                                    handler_length: read_le_at::<u32>(data, &mut clause)?,
+                                    filter_offset: read_le_at::<u32>(data, &mut clause)?,
                                     handler: None,
-                                };
-
-                                if !Self::push_handler(
-                                    handler,
-                                    handler_idx as usize,
-                                    size_code,
-                                    eh_mode,
-                                    &mut exception_handlers,
-                                    &mut filtered_count,
-                                )? {
-                                    break;
                                 }
-                            }
-                        } else {
-                            let cursor_plus_1 = cursor
-                                .checked_add(1)
-                                .ok_or_else(|| malformed_error!("EH small cursor+1 overflow"))?;
-                            let method_data_section_size = u32::from(read_le::<u8>(
-                                data.get(cursor_plus_1..).ok_or(out_of_bounds_error!())?,
-                            )?);
-
-                            // ECMA-335 says DataSize includes the 4-byte section header,
-                            // but some tools (e.g. AsmResolver used by BitMono) emit
-                            // DataSize without the header. Using DataSize/12 handles both
-                            // cases via integer division (matches Mono runtime behavior
-                            // in metadata.c:parse_section_data).
-                            let handler_count = method_data_section_size / 12;
-                            let needed = (handler_count as usize)
-                                .checked_mul(12)
-                                .and_then(|v| v.checked_add(4))
-                                .ok_or_else(|| {
-                                    malformed_error!("EH small section size overflow")
-                                })?;
-                            let cursor_end = cursor.checked_add(needed).ok_or_else(|| {
-                                malformed_error!("EH small cursor+needed overflow")
-                            })?;
-                            if handler_count == 0 || data.len() < cursor_end {
-                                break;
-                            }
-                            if !Self::check_handler_count(handler_count, eh_mode)? {
-                                break;
-                            }
-
-                            cursor = cursor.checked_add(4).ok_or_else(|| {
-                                malformed_error!("EH small cursor advance overflow")
-                            })?;
-                            for handler_idx in 0..handler_count {
-                                let handler = ExceptionHandler {
+                            } else {
+                                ExceptionHandler {
                                     flags: ExceptionHandlerFlags::new(read_le_at::<u16>(
                                         data,
-                                        &mut cursor,
+                                        &mut clause,
                                     )?),
-                                    try_offset: u32::from(read_le_at::<u16>(data, &mut cursor)?),
-                                    try_length: u32::from(read_le_at::<u8>(data, &mut cursor)?),
+                                    try_offset: u32::from(read_le_at::<u16>(data, &mut clause)?),
+                                    try_length: u32::from(read_le_at::<u8>(data, &mut clause)?),
                                     handler_offset: u32::from(read_le_at::<u16>(
                                         data,
-                                        &mut cursor,
+                                        &mut clause,
                                     )?),
-                                    handler_length: u32::from(read_le_at::<u8>(data, &mut cursor)?),
-                                    filter_offset: read_le_at::<u32>(data, &mut cursor)?,
+                                    handler_length: u32::from(read_le_at::<u8>(data, &mut clause)?),
+                                    filter_offset: read_le_at::<u32>(data, &mut clause)?,
                                     handler: None,
-                                };
-
-                                if !Self::push_handler(
-                                    handler,
-                                    handler_idx as usize,
-                                    size_code,
-                                    eh_mode,
-                                    &mut exception_handlers,
-                                    &mut filtered_count,
-                                )? {
-                                    break;
                                 }
-                            }
-                        }
-
-                        if !method_data_section_flags.contains(SectionFlags::MORE_SECTS) {
-                            break;
+                            };
+                            Self::push_handler(
+                                handler,
+                                handler_idx,
+                                size_code,
+                                eh_mode,
+                                &mut exception_handlers,
+                                &mut filtered_count,
+                            )?;
                         }
                     }
+
+                    // The next section, 4-aligned after this one's DataSize
+                    let next = cursor
+                        .checked_add(data_size as usize)
+                        .and_then(|end| end.checked_next_multiple_of(4))
+                        .ok_or_else(|| malformed_error!("EH section cursor overflow"))?;
+                    if next <= cursor {
+                        if eh_mode == EhValidationMode::Strict && more {
+                            return Err(malformed_error!(
+                                "A data section of DataSize {} is followed by another",
+                                data_size
+                            ));
+                        }
+                        break;
+                    }
+                    cursor = next;
                 }
 
                 Ok((
@@ -695,6 +627,7 @@ impl MethodBody {
                         is_init_local,
                         is_exception_data: !exception_handlers.is_empty(),
                         exception_handlers,
+                        exception_format,
                     },
                     filtered_count,
                 ))
@@ -764,9 +697,12 @@ impl MethodBody {
     ///
     /// # Format Selection
     ///
-    /// The format is automatically determined based on method characteristics:
-    /// - **Tiny Format**: Used when code size ≤ 63 bytes, no local variables, and no exceptions
-    /// - **Fat Format**: Used for all other methods
+    /// The format is the body's own, [`Self::is_fat`], so a body writes back with the header
+    /// it was read with:
+    /// - **Tiny Format**: a body that is not fat, while its code is at most 63 bytes, it has
+    ///   no local variables, no exception handlers and a maximum stack of at most 8
+    /// - **Fat Format**: a fat body, keeping its maximum stack and `InitLocals` flag, and a
+    ///   body the tiny format cannot hold
     ///
     /// # Examples
     ///
@@ -802,11 +738,14 @@ impl MethodBody {
         let code_size = il_code.len();
         let has_exceptions = !self.exception_handlers.is_empty();
 
-        // Determine format: use tiny if possible
-        let use_tiny = code_size <= 63
+        // The body's own format, unless the tiny one cannot hold it: it has no InitLocals
+        // flag, which also zeroes `localloc` memory
+        let use_tiny = !self.is_fat
+            && code_size <= 63
             && self.max_stack <= 8
             && self.local_var_sig_token == 0
-            && !has_exceptions;
+            && !has_exceptions
+            && !self.is_init_local;
 
         let mut bytes_written: u64 = 0;
 
@@ -871,7 +810,8 @@ impl MethodBody {
             }
 
             // Use the shared exception handler encoding
-            let exception_bytes = encode_exception_handlers(&self.exception_handlers)?;
+            let exception_bytes =
+                encode_exception_handlers(&self.exception_handlers, self.exception_format)?;
             writer.write_all(&exception_bytes)?;
             bytes_written = bytes_written
                 .checked_add(exception_bytes.len() as u64)
@@ -884,8 +824,13 @@ impl MethodBody {
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prop_assert, prop_assert_eq, test_runner::TestCaseError};
+
     use super::*;
-    use crate::metadata::method::ExceptionHandlerFlags;
+    use crate::{
+        metadata::method::ExceptionHandlerFlags,
+        testkit::{arb, arb::check},
+    };
 
     #[test]
     fn tiny() {
@@ -1263,47 +1208,6 @@ mod tests {
     }
 
     #[test]
-    fn from_strict_errors_on_max_exception_handlers() {
-        // Build a method body with handler_count > MAX_EXCEPTION_HANDLERS (1024).
-        // We use a fat EH section so we can declare a large handler count.
-        let code_size: u32 = 100;
-        let il_code = vec![0x00u8; code_size as usize];
-
-        let flags: u16 = 0x3003 | 0x0008 | 0x0010;
-        let max_stack: u16 = 8;
-        let local_var_sig: u32 = 0;
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&max_stack.to_le_bytes());
-        data.extend_from_slice(&code_size.to_le_bytes());
-        data.extend_from_slice(&local_var_sig.to_le_bytes());
-        data.extend_from_slice(&il_code);
-
-        // Align to 4 bytes
-        let unaligned = 12 + code_size as usize;
-        let aligned = (unaligned + 3) & !3;
-        data.extend(std::iter::repeat_n(0x00, aligned - unaligned));
-
-        // Fat exception section header
-        let handler_count: u32 = 1025; // > MAX_EXCEPTION_HANDLERS
-        let section_size: u32 = 4 + handler_count * 24;
-        data.push(0x41); // section flags: EHTABLE | FAT_FORMAT
-        let size_bytes = section_size.to_le_bytes();
-        data.push(size_bytes[0]);
-        data.push(size_bytes[1]);
-        data.push(size_bytes[2]);
-
-        // Write handler_count fat EH entries (24 bytes each, all zeros)
-        for _ in 0..handler_count {
-            data.extend_from_slice(&[0u8; 24]);
-        }
-
-        // Strict from() should error on too many handlers
-        assert!(MethodBody::from(&data).is_err());
-    }
-
-    #[test]
     fn from_lenient_accepts_malformed_eh() {
         // Construct a fat method with a single exception handler whose
         // try region extends far beyond the code size (malformed).
@@ -1400,5 +1304,201 @@ mod tests {
 
         assert_eq!(body.size_header, 12);
         assert_eq!(body.size_code, 8);
+    }
+
+    /// A fat body writes back fat, though the tiny format would hold its code: its maximum
+    /// stack and `InitLocals` are part of what it says.
+    #[test]
+    fn a_fat_body_writes_back_fat() {
+        // Fat header: InitLocals, max stack 3, 2 bytes of code, no locals
+        let mut data = vec![
+            0x13, 0x30, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        data.extend_from_slice(&[0x17, 0x2A]);
+        let body = MethodBody::from(&data).unwrap();
+        assert!(body.is_fat);
+
+        let mut written = Vec::new();
+        body.write_to(&mut written, &data[12..]).unwrap();
+        assert_eq!(written, data);
+    }
+
+    /// A fat body of 8 bytes of code whose header says sections follow, then `sections`.
+    fn with_sections(sections: &[&[u8]]) -> Vec<u8> {
+        let mut body = vec![0x0B, 0x30, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0, 0, 0, 0];
+        body.extend_from_slice(&[0x00; 7]);
+        body.push(0x2A);
+        for section in sections {
+            body.extend_from_slice(section);
+        }
+        body
+    }
+
+    /// A small section header and its clauses.
+    fn small_section(kind: u8, data_size: u8, clauses: &[[u8; 12]]) -> Vec<u8> {
+        let mut section = vec![kind, data_size, 0x00, 0x00];
+        for clause in clauses {
+            section.extend_from_slice(clause);
+        }
+        section
+    }
+
+    /// A small finally clause protecting [0, 2) with a handler at [2, 4), and `token` in its
+    /// class token field.
+    fn finally_clause(token: u32) -> [u8; 12] {
+        let mut clause = [0x02, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x02, 0, 0, 0, 0];
+        clause[8..].copy_from_slice(&token.to_le_bytes());
+        clause
+    }
+
+    fn rewritten(data: &[u8]) -> Vec<u8> {
+        let body = MethodBody::from(data).unwrap();
+        let mut written = Vec::new();
+        body.write_to(&mut written, &data[12..20]).unwrap();
+        written
+    }
+
+    #[test]
+    fn an_exception_section_is_written_back_in_the_format_it_was_read() {
+        // A fat section for a clause the small format holds (CoreLib's compilers write them)
+        let mut fat = vec![0x41, 0x1C, 0x00, 0x00];
+        fat.extend_from_slice(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0]);
+        fat.extend_from_slice(&[0x02, 0, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 0]);
+        let data = with_sections(&[&fat]);
+        let body = MethodBody::from(&data).unwrap();
+        assert_eq!(
+            body.exception_format,
+            Some(ExceptionSectionFormat {
+                fat: true,
+                data_size: 0x1C
+            })
+        );
+        assert_eq!(rewritten(&data), data);
+
+        // A small section whose DataSize leaves out its header, as AsmResolver writes it
+        let clauses = [finally_clause(0), finally_clause(0)];
+        let data = with_sections(&[&small_section(0x01, 24, &clauses)]);
+        assert_eq!(MethodBody::from(&data).unwrap().exception_handlers.len(), 2);
+        assert_eq!(rewritten(&data), data);
+
+        // A finally clause's class token field is written back as it was
+        let data = with_sections(&[&small_section(0x01, 16, &[finally_clause(0x0100_0001)])]);
+        assert_eq!(rewritten(&data), data);
+    }
+
+    #[test]
+    fn a_new_clause_count_gets_the_ecma_data_size() {
+        let data = with_sections(&[&small_section(0x01, 12, &[finally_clause(0)])]);
+        let mut body = MethodBody::from(&data).unwrap();
+        body.exception_handlers
+            .push(body.exception_handlers[0].clone());
+        let mut written = Vec::new();
+        body.write_to(&mut written, &data[12..20]).unwrap();
+        assert_eq!(&written[20..24], &[0x01, 28, 0x00, 0x00]);
+        assert_eq!(
+            MethodBody::from(&written).unwrap().exception_handlers.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn data_sections_are_walked_as_the_runtime_walks_them() {
+        // A section of another kind before the EH table is skipped, not the end
+        let other = [0x82, 0x08, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+        let eh = small_section(0x01, 16, &[finally_clause(0)]);
+        let body = MethodBody::from(&with_sections(&[&other, &eh])).unwrap();
+        assert_eq!(body.exception_handlers.len(), 1);
+
+        // Only the first EH table holds the method's handlers: a later one is ignored
+        let first = small_section(0x81, 16, &[finally_clause(0)]);
+        let decoy = small_section(0x01, 28, &[finally_clause(0), finally_clause(0)]);
+        let body = MethodBody::from(&with_sections(&[&first, &decoy])).unwrap();
+        assert_eq!(body.exception_handlers.len(), 1);
+
+        // A kind with more than the EH table bit set is not an EH table
+        let both = small_section(0x03, 16, &[finally_clause(0)]);
+        let body = MethodBody::from(&with_sections(&[&both])).unwrap();
+        assert!(body.exception_handlers.is_empty());
+    }
+
+    #[test]
+    fn a_method_may_have_any_number_of_handlers() {
+        let mut fat = Vec::new();
+        let count: u32 = 1500;
+        fat.push(0x41);
+        fat.extend_from_slice(&(4 + count * 24).to_le_bytes()[..3]);
+        for _ in 0..count {
+            for field in [0x02u32, 0, 2, 2, 2, 0] {
+                fat.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        let data = with_sections(&[&fat]);
+        assert_eq!(
+            MethodBody::from(&data).unwrap().exception_handlers.len(),
+            1500
+        );
+        assert_eq!(rewritten(&data), data);
+    }
+
+    #[test]
+    fn a_truncated_exception_section_is_an_error_unless_lenient() {
+        let mut eh = small_section(0x01, 28, &[finally_clause(0)]);
+        eh.truncate(10);
+        let data = with_sections(&[&eh]);
+        assert!(MethodBody::from(&data).is_err());
+        let (body, _) = MethodBody::from_lenient(&data).unwrap();
+        assert!(body.exception_handlers.is_empty());
+
+        // MoreSects with no section after the code
+        let data = with_sections(&[]);
+        assert!(MethodBody::from(&data).is_err());
+    }
+
+    /// Every body decodes to what was written: its header, code, clauses and exception section
+    /// format, and writing what was decoded gives the same bytes.
+    #[test]
+    fn every_body_decodes_to_what_was_written() {
+        check(arb::method_body(), |(body, code)| {
+            let mut bytes = Vec::new();
+            body.write_to(&mut bytes, &code)
+                .map_err(|error| TestCaseError::fail(format!("does not encode: {error}")))?;
+            let decoded = MethodBody::from(&bytes).map_err(|error| {
+                TestCaseError::fail(format!("{bytes:02x?} does not decode: {error}"))
+            })?;
+            prop_assert_eq!(decoded.is_fat, body.is_fat);
+            prop_assert_eq!(decoded.size_header, body.size_header);
+            prop_assert_eq!(decoded.size_code, body.size_code);
+            prop_assert_eq!(decoded.max_stack, body.max_stack);
+            prop_assert_eq!(decoded.local_var_sig_token, body.local_var_sig_token);
+            prop_assert_eq!(decoded.is_init_local, body.is_init_local);
+            prop_assert_eq!(
+                &bytes[decoded.size_header..decoded.size_header + decoded.size_code],
+                &code[..]
+            );
+            let clause = |eh: &ExceptionHandler| {
+                (
+                    eh.flags,
+                    eh.try_offset,
+                    eh.try_length,
+                    eh.handler_offset,
+                    eh.handler_length,
+                    eh.filter_offset,
+                )
+            };
+            let read: Vec<_> = decoded.exception_handlers.iter().map(clause).collect();
+            let written: Vec<_> = body.exception_handlers.iter().map(clause).collect();
+            prop_assert_eq!(read, written);
+            if body.exception_format.is_some() {
+                prop_assert_eq!(decoded.exception_format, body.exception_format);
+            }
+            prop_assert!(decoded.is_exception_data == !body.exception_handlers.is_empty());
+
+            let mut again = Vec::new();
+            decoded
+                .write_to(&mut again, &code)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            prop_assert_eq!(again, bytes);
+            Ok(())
+        });
     }
 }

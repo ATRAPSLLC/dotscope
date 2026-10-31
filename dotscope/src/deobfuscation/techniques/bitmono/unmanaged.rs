@@ -217,11 +217,7 @@ fn extract_native_string(
     let method = assembly.method(&native_token).ok()?;
     let rva = method.rva.filter(|&r| r > 0)?;
 
-    let file = assembly.file();
-    let offset = file.rva_to_offset(rva as usize).ok()?;
-    let data = file.data();
-
-    let native_bytes = data.get(offset..)?;
+    let native_bytes = assembly.file().section_bounded(rva as usize).ok()?;
 
     // Use traversal-based disassembly to find where the code ends.
     // This follows control flow edges (including trampolines, call targets,

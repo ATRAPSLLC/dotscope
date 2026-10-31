@@ -23,8 +23,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     cilassembly::{
-        changes::HeapChanges,
-        writer::{output::Output, signatures::SignatureRemap},
+        changes::{ChangeRef, ChangeRefRc, HeapChanges},
+        writer::{blobs::BlobRemap, output::Output},
     },
     metadata::streams::{Blob, Guid, Strings, UserStrings},
     utils::{compressed_uint_size, to_u32, write_compressed_uint},
@@ -151,7 +151,7 @@ fn emit_orphaned_substrings(
     original_end: u32,
     original_bytes: &[u8],
     referenced_offsets: &HashSet<u32>,
-    dedup_map: &mut FxHashMap<String, u32>,
+    dedup_map: &mut FxHashMap<Vec<u8>, u32>,
     pos: &mut u64,
     result: &mut StreamResult,
 ) -> Result<()> {
@@ -170,15 +170,15 @@ fn emit_orphaned_substrings(
                 continue;
             }
 
-            // Extract the null-terminated substring from the original string bytes
+            // The substring runs from the referenced byte to the entry's terminator; its bytes
+            // are copied as they are, UTF-8 or not
             let sub_bytes = original_bytes.get(delta..).ok_or(out_of_bounds_error!())?;
-            let sub_str = std::str::from_utf8(sub_bytes).unwrap_or("");
-            if sub_str.is_empty() {
+            if sub_bytes.is_empty() {
                 result.remapping.insert(ref_offset, 0);
                 continue;
             }
 
-            if let Some(&existing) = dedup_map.get(sub_str) {
+            if let Some(&existing) = dedup_map.get(sub_bytes) {
                 result.remapping.insert(ref_offset, existing);
                 continue;
             }
@@ -202,7 +202,7 @@ fn emit_orphaned_substrings(
                 .checked_add(sub_bytes.len() as u64)
                 .and_then(|p| p.checked_add(1))
                 .ok_or_else(|| writer_overflow("heap_position"))?;
-            dedup_map.insert(sub_str.to_owned(), new_sub_offset);
+            dedup_map.insert(sub_bytes.to_vec(), new_sub_offset);
             result.remapping.insert(ref_offset, new_sub_offset);
         }
     }
@@ -242,8 +242,8 @@ fn process_strings_heap(
     let mut pos: u64 = 1; // Start after null byte
 
     // Content -> new offset, for deduplication; offset 0 is the empty string
-    let mut dedup_map: FxHashMap<String, u32> = FxHashMap::default();
-    dedup_map.insert(String::new(), 0);
+    let mut dedup_map: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
+    dedup_map.insert(Vec::new(), 0);
 
     // Write null byte if in write mode
     if let Some(out) = output.as_mut() {
@@ -251,8 +251,21 @@ fn process_strings_heap(
     }
 
     // Process source heap
-    if let Ok(strings) = Strings::from(source_data) {
-        for (old_offset, original_str) in strings.iter() {
+    // Every entry, as bytes: one that is not UTF-8 is written as it was, and does not end
+    // the heap for the entries after it
+    // A source that does not parse cannot have changes applied to it: dropping it would
+    // leave every reference into it dangling. Only an absent heap starts empty.
+    let source = match Strings::from(source_data) {
+        Ok(heap) => Some(heap),
+        Err(_) if source_data.is_empty() => None,
+        Err(e) => {
+            return Err(Error::LayoutFailed(format!(
+                "the #Strings heap to write does not parse ({e}), so its changes cannot be applied"
+            )))
+        }
+    };
+    if let Some(strings) = source {
+        for (old_offset, original_bytes) in strings.entries() {
             let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
                 Error::LayoutFailed(format!("String offset {old_offset} exceeds u32 range"))
             })?;
@@ -260,7 +273,6 @@ fn process_strings_heap(
             // Calculate the original string's byte range for substring detection.
             // This must use the ORIGINAL length, not the modified length, because
             // other tables may reference substring offsets within the original range.
-            let original_bytes = original_str.as_bytes();
             let original_end = old_offset_u32
                 .checked_add(to_u32(original_bytes.len())?)
                 .and_then(|v| v.checked_add(1))
@@ -284,9 +296,9 @@ fn process_strings_heap(
             }
 
             let modification = changes.get_modification(old_offset_u32);
-            let final_str = modification.map_or(original_str, |s| s.as_str());
+            let final_bytes = modification.map_or(original_bytes, |s| s.as_bytes());
 
-            if let Some(&existing_offset) = dedup_map.get(final_str) {
+            if let Some(&existing_offset) = dedup_map.get(final_bytes) {
                 if old_offset_u32 != existing_offset {
                     result.remapping.insert(old_offset_u32, existing_offset);
                 }
@@ -310,7 +322,7 @@ fn process_strings_heap(
             let new_offset = u32::try_from(pos).map_err(|_| {
                 Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range"))
             })?;
-            let str_bytes = final_str.as_bytes();
+            let str_bytes = final_bytes;
             let entry_size = (str_bytes.len() as u64)
                 .checked_add(1)
                 .ok_or_else(|| writer_overflow("heap_entry_size"))?; // +1 for null terminator
@@ -330,7 +342,7 @@ fn process_strings_heap(
             pos = pos
                 .checked_add(entry_size)
                 .ok_or_else(|| writer_overflow("heap_position"))?;
-            dedup_map.insert(final_str.to_owned(), new_offset);
+            dedup_map.insert(final_bytes.to_vec(), new_offset);
 
             // Add primary offset remapping if changed
             if old_offset_u32 != new_offset {
@@ -383,7 +395,7 @@ fn process_strings_heap(
             .get_modification(placeholder)
             .map_or(new_string.as_str(), |s| s.as_str());
 
-        if let Some(&existing_offset) = dedup_map.get(final_str) {
+        if let Some(&existing_offset) = dedup_map.get(final_str.as_bytes()) {
             change_ref.resolve_to_offset(existing_offset);
             continue;
         }
@@ -419,7 +431,7 @@ fn process_strings_heap(
         pos = pos
             .checked_add(entry_size)
             .ok_or_else(|| writer_overflow("heap_position"))?;
-        dedup_map.insert(final_str.to_owned(), new_offset);
+        dedup_map.insert(final_str.as_bytes().to_vec(), new_offset);
         change_ref.resolve_to_offset(new_offset);
     }
 
@@ -430,8 +442,9 @@ fn process_strings_heap(
 /// Streams the #Blob heap to output with deduplication and modifications.
 ///
 /// Processes the source blob heap data, applying any modifications from the changes,
-/// and writes the result to the output file with deduplication. The blobs `signatures` names
-/// as signatures have their type tokens renumbered after row deletions.
+/// and writes the result to the output file with deduplication. The blobs `blobs` names as
+/// naming rows have those rows renumbered, and the blobs it names as naming blobs are written
+/// last, with the offsets the rebuilt heap gives the blobs they name.
 ///
 /// # Arguments
 ///
@@ -439,7 +452,8 @@ fn process_strings_heap(
 /// * `start_offset` - The file offset where the heap should start
 /// * `source_data` - The original #Blob heap data
 /// * `changes` - Heap modifications (additions, removals, modifications)
-/// * `signatures` - Which blobs are signatures, and how the write renumbers tokens
+/// * `blobs` - Which blobs name rows or blobs, and how the write renumbers tokens
+/// * `referenced` - Every blob offset the written tables name
 ///
 /// # Returns
 ///
@@ -447,15 +461,24 @@ fn process_strings_heap(
 ///
 /// # Errors
 ///
-/// Returns an error if writing to the output fails.
+/// Returns an error if writing to the output fails, if the source heap cannot be read, or if
+/// the rebuilt heap reaches a referenced offset that names nothing.
 pub fn stream_blob_heap(
     output: &mut Output,
     start_offset: u64,
     source_data: &[u8],
     changes: &HeapChanges<Vec<u8>>,
-    signatures: &SignatureRemap<'_>,
+    blobs: &BlobRemap<'_>,
+    referenced: &HashSet<u32>,
 ) -> Result<StreamResult> {
-    process_blob_heap(Some(output), start_offset, source_data, changes, signatures)
+    process_blob_heap(
+        Some(output),
+        start_offset,
+        source_data,
+        changes,
+        blobs,
+        referenced,
+    )
 }
 
 /// Pre-computes blob heap offsets and resolves ChangeRefs WITHOUT writing.
@@ -467,7 +490,7 @@ pub fn stream_blob_heap(
 ///
 /// * `source_data` - The original #Blob heap data
 /// * `changes` - Heap modifications (additions, removals, modifications)
-/// * `signatures` - Which blobs are signatures, and how the write renumbers tokens
+/// * `blobs` - Which blobs name rows or blobs, and how the write renumbers tokens
 ///
 /// # Returns
 ///
@@ -479,21 +502,104 @@ pub fn stream_blob_heap(
 pub fn compute_blob_heap_offsets(
     source_data: &[u8],
     changes: &HeapChanges<Vec<u8>>,
-    signatures: &SignatureRemap<'_>,
+    blobs: &BlobRemap<'_>,
+    referenced: &HashSet<u32>,
 ) -> Result<StreamResult> {
-    process_blob_heap(None, 0, source_data, changes, signatures)
+    process_blob_heap(None, 0, source_data, changes, blobs, referenced)
+}
+
+/// The referenced offsets the heap's own walk does not start an entry at (an offset inside
+/// another entry's bytes), in order; placeholders of entries a change adds are not offsets.
+fn interior_offsets(referenced: &HashSet<u32>, walked: &HashSet<u32>) -> Vec<u32> {
+    let mut interior: Vec<u32> = referenced
+        .iter()
+        .copied()
+        .filter(|&offset| {
+            offset != 0 && !ChangeRef::is_heap_placeholder(offset) && !walked.contains(&offset)
+        })
+        .collect();
+    interior.sort_unstable();
+    interior
+}
+
+/// Checks that the referenced offsets which named nothing in the source heap still name
+/// nothing: they are written as they are, so the rebuilt heap must end before each, its
+/// padding to four bytes included (a zero byte of padding reads as an empty entry). An offset
+/// the rebuilt heap reaches would name whatever landed there.
+///
+/// # Errors
+///
+/// When the rebuilt heap, `end` bytes long, reaches one of `nameless`.
+fn still_nameless(nameless: &[u32], end: u64, heap: &str) -> Result<()> {
+    let padded = end
+        .checked_next_multiple_of(4)
+        .ok_or_else(|| writer_overflow("heap_end"))?;
+    match nameless.iter().find(|&&offset| u64::from(offset) < padded) {
+        Some(offset) => Err(Error::LayoutFailed(format!(
+            "{heap} offset {offset:#x} names nothing, and the rebuilt heap reaches it"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Writes `blob` as the heap's next entry at `*pos`, or names the entry already holding the
+/// same bytes, and returns its offset.
+fn emit_blob(
+    output: &mut Option<&mut Output>,
+    start_offset: u64,
+    pos: &mut u64,
+    dedup_map: &mut FxHashMap<Vec<u8>, u32>,
+    blob: &[u8],
+) -> Result<u32> {
+    if let Some(&existing) = dedup_map.get(blob) {
+        return Ok(existing);
+    }
+    let new_offset = u32::try_from(*pos)
+        .map_err(|_| Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range")))?;
+    let entry_size = compressed_uint_size(blob.len())
+        .checked_add(blob.len() as u64)
+        .ok_or_else(|| writer_overflow("blob_entry_size"))?;
+    let write_pos = start_offset
+        .checked_add(*pos)
+        .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+    if let Some(out) = output.as_mut() {
+        let blob_len_u32 = u32::try_from(blob.len()).map_err(|_| {
+            Error::LayoutFailed(format!("Blob length {} exceeds u32 range", blob.len()))
+        })?;
+        let mut len_bytes = Vec::with_capacity(4);
+        write_compressed_uint(blob_len_u32, &mut len_bytes)?;
+        let data_pos = write_pos
+            .checked_add(len_bytes.len() as u64)
+            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+        out.write_at(write_pos, &len_bytes)?;
+        out.write_at(data_pos, blob)?;
+    }
+    *pos = pos
+        .checked_add(entry_size)
+        .ok_or_else(|| writer_overflow("heap_position"))?;
+    dedup_map.insert(blob.to_vec(), new_offset);
+    Ok(new_offset)
 }
 
 /// Unified blob heap processor.
 ///
-/// The blobs `signatures` names as signatures have their type tokens renumbered; every other
-/// blob is written as it is.
+/// The blobs `blobs` names as naming rows have those rows renumbered; every other blob is
+/// written as it is. Every entry of the heap's walk is written, and so is the blob at every
+/// `referenced` offset the walk does not start an entry at: a table may name an offset inside
+/// another blob's bytes, whose bytes then move when the heap is rebuilt. A referenced offset
+/// that names no blob is written as it is, while it still names none.
+///
+/// A blob that names blobs (a document name, an imports blob, a composite a change adds) is
+/// held back: it is written after every other blob, encoded with the offsets the blobs it
+/// names were given. A blob it names that no other entry placed (one inside another blob's
+/// bytes) is written then, so that it has an offset to name.
 fn process_blob_heap(
     mut output: Option<&mut Output>,
     start_offset: u64,
     source_data: &[u8],
     changes: &HeapChanges<Vec<u8>>,
-    signatures: &SignatureRemap<'_>,
+    blobs: &BlobRemap<'_>,
+    referenced: &HashSet<u32>,
 ) -> Result<StreamResult> {
     let mut result = StreamResult::new();
     let mut pos: u64 = 1; // Start after null byte
@@ -502,6 +608,12 @@ fn process_blob_heap(
     // empty blob elsewhere is a real entry (an empty signature), which offset 0 would make a
     // null reference.
     let mut dedup_map: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
+    let mut nameless = Vec::new();
+    // The input offsets whose blob is placed: at its own offset, or where the remapping says
+    let mut placed: HashSet<u32> = HashSet::new();
+    // The blobs that name blobs, written last: their index, the change that adds an appended
+    // one, and their bytes
+    let mut deferred: Vec<(u32, Option<&ChangeRefRc>, Vec<u8>)> = Vec::new();
 
     // Write null byte if in write mode
     if let Some(out) = output.as_mut() {
@@ -509,11 +621,24 @@ fn process_blob_heap(
     }
 
     // Process source heap
-    if let Ok(blobs) = Blob::from(source_data) {
-        for (old_offset, original_blob) in blobs.iter() {
+    // A source that does not parse cannot have changes applied to it: dropping it would
+    // leave every reference into it dangling. Only an absent heap starts empty.
+    let source = match Blob::from(source_data) {
+        Ok(heap) => Some(heap),
+        Err(_) if source_data.is_empty() => None,
+        Err(e) => {
+            return Err(Error::LayoutFailed(format!(
+                "the #Blob heap to write does not parse ({e}), so its changes cannot be applied"
+            )))
+        }
+    };
+    if let Some(heap) = &source {
+        let mut walked = HashSet::new();
+        for (old_offset, original_blob) in heap.iter() {
             let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
                 Error::LayoutFailed(format!("Blob offset {old_offset} exceeds u32 range"))
             })?;
+            walked.insert(old_offset_u32);
 
             if changes.is_removed(old_offset_u32) {
                 continue;
@@ -524,52 +649,51 @@ fn process_blob_heap(
                 .get_modification(old_offset_u32)
                 .map_or(original_blob, Vec::as_slice);
 
-            // Renumber the type tokens of a signature blob
-            let remapped_blob = signatures.remap(old_offset_u32, base_blob)?;
-
-            let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(base_blob);
-
-            if let Some(&existing_offset) = dedup_map.get(final_blob) {
-                if old_offset_u32 != existing_offset {
-                    result.remapping.insert(old_offset_u32, existing_offset);
-                }
+            if blobs.defers(old_offset_u32, None) {
+                deferred.push((old_offset_u32, None, base_blob.to_vec()));
                 continue;
             }
 
-            let new_offset = u32::try_from(pos).map_err(|_| {
-                Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range"))
-            })?;
-            let len_size = compressed_uint_size(final_blob.len());
-            let entry_size = len_size
-                .checked_add(final_blob.len() as u64)
-                .ok_or_else(|| writer_overflow("blob_entry_size"))?;
+            // Renumber the rows a blob names
+            let remapped_blob = blobs.remap(old_offset_u32, base_blob)?;
+            let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(base_blob);
 
-            let write_pos = start_offset
-                .checked_add(pos)
-                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-            if let Some(out) = output.as_mut() {
-                let blob_len_u32 = u32::try_from(final_blob.len()).map_err(|_| {
-                    Error::LayoutFailed(format!(
-                        "Blob length {} exceeds u32 range",
-                        final_blob.len()
-                    ))
-                })?;
-                let mut len_bytes = Vec::with_capacity(4);
-                write_compressed_uint(blob_len_u32, &mut len_bytes);
-                let data_pos = write_pos
-                    .checked_add(len_bytes.len() as u64)
-                    .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-                out.write_at(write_pos, &len_bytes)?;
-                out.write_at(data_pos, final_blob)?;
-            }
-
-            pos = pos
-                .checked_add(entry_size)
-                .ok_or_else(|| writer_overflow("heap_position"))?;
-            dedup_map.insert(final_blob.to_vec(), new_offset);
-            // Only add to remapping if the offset actually changed
+            let new_offset = emit_blob(
+                &mut output,
+                start_offset,
+                &mut pos,
+                &mut dedup_map,
+                final_blob,
+            )?;
+            placed.insert(old_offset_u32);
             if old_offset_u32 != new_offset {
                 result.remapping.insert(old_offset_u32, new_offset);
+            }
+        }
+
+        for offset in interior_offsets(referenced, &walked) {
+            // An offset that names no blob (past the heap: junk an obfuscator leaves in a
+            // column) has nothing at it to keep, and is written as it is
+            let Ok(blob) = heap.get(offset as usize) else {
+                nameless.push(offset);
+                continue;
+            };
+            if blobs.defers(offset, None) {
+                deferred.push((offset, None, blob.to_vec()));
+                continue;
+            }
+            let remapped_blob = blobs.remap(offset, blob)?;
+            let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(blob);
+            let new_offset = emit_blob(
+                &mut output,
+                start_offset,
+                &mut pos,
+                &mut dedup_map,
+                final_blob,
+            )?;
+            placed.insert(offset);
+            if offset != new_offset {
+                result.remapping.insert(offset, new_offset);
             }
         }
     }
@@ -588,9 +712,15 @@ fn process_blob_heap(
             .get_modification(placeholder)
             .map_or(new_blob.as_slice(), Vec::as_slice);
 
-        // Renumber the type tokens of new signature blobs as well: regenerated methods'
-        // local signatures name types whose rows a deletion shifts
-        let remapped_blob = signatures.remap(placeholder, base_blob)?;
+        if blobs.defers(placeholder, Some(change_ref.id())) {
+            deferred.push((placeholder, Some(change_ref), base_blob.to_vec()));
+            continue;
+        }
+
+        // Renumber the rows new blobs name as well: regenerated methods' local signatures
+        // name types whose rows a deletion shifts, and a builder's blob names the rows a
+        // change adds by placeholder
+        let remapped_blob = blobs.remap(placeholder, base_blob)?;
 
         let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(base_blob);
 
@@ -599,51 +729,86 @@ fn process_blob_heap(
             continue;
         }
 
-        // Skip positions that are remapping keys to avoid collision with old offsets
-        // that would be incorrectly remapped when heap patching is applied
-        // PE and metadata heap sizes are limited to 4GB, so this cast is safe
-        #[allow(clippy::cast_possible_truncation)]
-        while result.remapping.contains_key(&(pos as u32)) {
-            pos = pos
-                .checked_add(1)
-                .ok_or_else(|| writer_overflow("heap_position"))?;
-        }
+        skip_remapping_keys(&result, &mut pos)?;
 
-        let new_offset = u32::try_from(pos)
-            .map_err(|_| Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range")))?;
-        let len_size = compressed_uint_size(final_blob.len());
-        let entry_size = len_size
-            .checked_add(final_blob.len() as u64)
-            .ok_or_else(|| writer_overflow("blob_entry_size"))?;
-
-        let write_pos = start_offset
-            .checked_add(pos)
-            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-        if let Some(out) = output.as_mut() {
-            let blob_len_u32 = u32::try_from(final_blob.len()).map_err(|_| {
-                Error::LayoutFailed(format!(
-                    "Blob length {} exceeds u32 range",
-                    final_blob.len()
-                ))
-            })?;
-            let mut len_bytes = Vec::with_capacity(4);
-            write_compressed_uint(blob_len_u32, &mut len_bytes);
-            let data_pos = write_pos
-                .checked_add(len_bytes.len() as u64)
-                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-            out.write_at(write_pos, &len_bytes)?;
-            out.write_at(data_pos, final_blob)?;
-        }
-
-        pos = pos
-            .checked_add(entry_size)
-            .ok_or_else(|| writer_overflow("heap_position"))?;
-        dedup_map.insert(final_blob.to_vec(), new_offset);
+        let new_offset = emit_blob(
+            &mut output,
+            start_offset,
+            &mut pos,
+            &mut dedup_map,
+            final_blob,
+        )?;
         change_ref.resolve_to_offset(new_offset);
     }
 
+    // The blobs that name blobs, now that every blob they name has its offset
+    for (index, change_ref, bytes) in deferred {
+        let final_blob = blobs.encode_deferred(
+            index,
+            change_ref.map(|change_ref| change_ref.id()),
+            &bytes,
+            &mut |offset| {
+                if offset == 0 {
+                    return Ok(0);
+                }
+                if placed.contains(&offset) {
+                    return Ok(result.remapping.get(&offset).copied().unwrap_or(offset));
+                }
+                if changes.is_removed(offset) {
+                    return Err(Error::LayoutFailed(format!(
+                        "a blob names #Blob offset {offset:#x}, which the write removes"
+                    )));
+                }
+                // A blob no entry placed (inside another blob's bytes): written now
+                let named = source
+                    .as_ref()
+                    .and_then(|heap| heap.get(offset as usize).ok())
+                    .ok_or_else(|| {
+                        Error::LayoutFailed(format!(
+                            "a blob names #Blob offset {offset:#x}, which holds no blob"
+                        ))
+                    })?;
+                skip_remapping_keys(&result, &mut pos)?;
+                emit_blob(&mut output, start_offset, &mut pos, &mut dedup_map, named)
+            },
+        )?;
+        let new_offset = match dedup_map.get(final_blob.as_slice()) {
+            Some(&existing) => existing,
+            None => {
+                skip_remapping_keys(&result, &mut pos)?;
+                emit_blob(
+                    &mut output,
+                    start_offset,
+                    &mut pos,
+                    &mut dedup_map,
+                    &final_blob,
+                )?
+            }
+        };
+        match change_ref {
+            Some(change_ref) => change_ref.resolve_to_offset(new_offset),
+            None => {
+                if index != new_offset {
+                    result.remapping.insert(index, new_offset);
+                }
+            }
+        }
+    }
+
+    still_nameless(&nameless, pos, "#Blob")?;
     result.bytes_written = pos;
     Ok(result)
+}
+
+/// Moves `pos` past every offset the remapping has a key for: an entry written there would
+/// be taken for the old entry the key names when the tables' heap columns are patched.
+fn skip_remapping_keys(result: &StreamResult, pos: &mut u64) -> Result<()> {
+    while u32::try_from(*pos).is_ok_and(|offset| result.remapping.contains_key(&offset)) {
+        *pos = pos
+            .checked_add(1)
+            .ok_or_else(|| writer_overflow("heap_position"))?;
+    }
+    Ok(())
 }
 
 /// Streams the #GUID heap to output with deduplication and modifications.
@@ -729,7 +894,18 @@ fn process_guid_heap(
     let mut dedup_map: FxHashMap<[u8; 16], u32> = FxHashMap::default();
     let mut current_index: u32 = 1;
 
-    if let Ok(guids) = Guid::from(source_data) {
+    // A source that does not parse cannot have changes applied to it: dropping it would
+    // leave every reference into it dangling. Only an absent heap starts empty.
+    let source = match Guid::from(source_data) {
+        Ok(heap) => Some(heap),
+        Err(_) if source_data.is_empty() => None,
+        Err(e) => {
+            return Err(Error::LayoutFailed(format!(
+                "the #GUID heap to write does not parse ({e}), so its changes cannot be applied"
+            )))
+        }
+    };
+    if let Some(guids) = source {
         for (old_index, guid) in guids.iter() {
             let old_index_u32 = u32::try_from(old_index).map_err(|_| {
                 Error::LayoutFailed(format!("GUID index {old_index} exceeds u32 range"))
@@ -830,6 +1006,7 @@ fn process_guid_heap(
 /// * `start_offset` - The file offset where the heap should start
 /// * `source_data` - The original #US heap data
 /// * `changes` - Heap modifications (additions, removals, modifications)
+/// * `referenced` - Every `#US` offset an `ldstr` of a written body names
 ///
 /// # Returns
 ///
@@ -837,14 +1014,16 @@ fn process_guid_heap(
 ///
 /// # Errors
 ///
-/// Returns an error if writing to the output fails.
+/// Returns an error if writing to the output fails, if the source heap cannot be read, or if
+/// the rebuilt heap reaches a referenced offset that names nothing.
 pub fn stream_userstring_heap(
     output: &mut Output,
     start_offset: u64,
     source_data: &[u8],
     changes: &HeapChanges<String>,
+    referenced: &HashSet<u32>,
 ) -> Result<StreamResult> {
-    process_userstring_heap(Some(output), start_offset, source_data, changes)
+    process_userstring_heap(Some(output), start_offset, source_data, changes, referenced)
 }
 
 /// Pre-computes userstring heap offsets and resolves ChangeRefs WITHOUT writing.
@@ -867,19 +1046,54 @@ pub fn stream_userstring_heap(
 pub fn compute_userstring_heap_offsets(
     source_data: &[u8],
     changes: &HeapChanges<String>,
+    referenced: &HashSet<u32>,
 ) -> Result<StreamResult> {
-    process_userstring_heap(None, 0, source_data, changes)
+    process_userstring_heap(None, 0, source_data, changes, referenced)
+}
+
+/// Writes the string of UTF-16 `units` as the heap's next entry at `*pos`, or names the entry
+/// already holding the same string, and returns its offset.
+fn emit_userstring(
+    output: &mut Option<&mut Output>,
+    start_offset: u64,
+    pos: &mut u64,
+    dedup_map: &mut FxHashMap<Vec<u16>, u32>,
+    units: Vec<u16>,
+) -> Result<u32> {
+    if let Some(&existing) = dedup_map.get(&units) {
+        return Ok(existing);
+    }
+    let new_offset = u32::try_from(*pos)
+        .map_err(|_| Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range")))?;
+    let entry_size = userstring_entry_size(&units)?;
+    let write_pos = start_offset
+        .checked_add(*pos)
+        .ok_or_else(|| writer_overflow("userstring_write_offset"))?;
+    if let Some(out) = output.as_mut() {
+        write_userstring_entry(out, write_pos, &units)?;
+    }
+    *pos = pos
+        .checked_add(entry_size)
+        .ok_or_else(|| writer_overflow("userstring_heap_position"))?;
+    dedup_map.insert(units, new_offset);
+    Ok(new_offset)
 }
 
 /// Unified userstring heap processor.
 ///
 /// When `output` is `Some(output)`, writes to output at `start_offset`.
 /// When `output` is `None`, only computes offsets (for pre-computation).
+///
+/// Every entry of the heap's walk is written, and so is the string at every `referenced`
+/// offset the walk does not start an entry at: an `ldstr` may name an offset inside another
+/// entry's bytes, whose bytes then move when the heap is rebuilt. A referenced offset that
+/// names no string is written as it is, while it still names none.
 fn process_userstring_heap(
     mut output: Option<&mut Output>,
     start_offset: u64,
     source_data: &[u8],
     changes: &HeapChanges<String>,
+    referenced: &HashSet<u32>,
 ) -> Result<StreamResult> {
     let mut result = StreamResult::new();
 
@@ -904,17 +1118,31 @@ fn process_userstring_heap(
     // deduplication. The zero-length entry at offset 0 is no string: an `ldstr ""` names an
     // entry of its own.
     let mut dedup_map: FxHashMap<Vec<u16>, u32> = FxHashMap::default();
+    let mut nameless = Vec::new();
 
     // Write null byte if in write mode
     if let Some(out) = output.as_mut() {
         out.write_at(start_offset, &[0u8])?;
     }
 
-    if let Ok(userstrings) = UserStrings::from(source_data) {
+    // A source that does not parse cannot have changes applied to it: dropping it would
+    // leave every reference into it dangling. Only an absent heap starts empty.
+    let source = match UserStrings::from(source_data) {
+        Ok(heap) => Some(heap),
+        Err(_) if source_data.is_empty() => None,
+        Err(e) => {
+            return Err(Error::LayoutFailed(format!(
+                "the #US heap to write does not parse ({e}), so its changes cannot be applied"
+            )))
+        }
+    };
+    if let Some(userstrings) = source {
+        let mut walked = HashSet::new();
         for (old_offset, original) in userstrings.iter() {
             let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
                 Error::LayoutFailed(format!("UserString offset {old_offset} exceeds u32 range"))
             })?;
+            walked.insert(old_offset_u32);
 
             if changes.is_removed(old_offset_u32) {
                 continue;
@@ -923,35 +1151,28 @@ fn process_userstring_heap(
             let units = changes
                 .get_modification(old_offset_u32)
                 .map_or_else(|| original.into_vec(), |s| s.encode_utf16().collect());
-
-            if let Some(&existing_offset) = dedup_map.get(&units) {
-                // Only add to remapping if the offset actually changed
-                if old_offset_u32 != existing_offset {
-                    result.remapping.insert(old_offset_u32, existing_offset);
-                }
-                continue;
-            }
-
-            let new_offset = u32::try_from(pos).map_err(|_| {
-                Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range"))
-            })?;
-            let entry_size = userstring_entry_size(&units)?;
-
-            // Write if in write mode
-            let write_pos = start_offset
-                .checked_add(pos)
-                .ok_or_else(|| writer_overflow("userstring_write_offset"))?;
-            if let Some(out) = output.as_mut() {
-                write_userstring_entry(out, write_pos, &units)?;
-            }
-
-            pos = pos
-                .checked_add(entry_size)
-                .ok_or_else(|| writer_overflow("userstring_heap_position"))?;
-            dedup_map.insert(units, new_offset);
+            let new_offset =
+                emit_userstring(&mut output, start_offset, &mut pos, &mut dedup_map, units)?;
             // Only add to remapping if the offset actually changed
             if old_offset_u32 != new_offset {
                 result.remapping.insert(old_offset_u32, new_offset);
+            }
+        }
+
+        for offset in interior_offsets(referenced, &walked) {
+            // An `ldstr` that names no string (in code that never runs) has nothing at it to
+            // keep, and is written as it is
+            let Ok(units) = userstrings
+                .get(offset as usize)
+                .map(|string| string.into_vec())
+            else {
+                nameless.push(offset);
+                continue;
+            };
+            let new_offset =
+                emit_userstring(&mut output, start_offset, &mut pos, &mut dedup_map, units)?;
+            if offset != new_offset {
+                result.remapping.insert(offset, new_offset);
             }
         }
     }
@@ -969,29 +1190,12 @@ fn process_userstring_heap(
             .encode_utf16()
             .collect();
 
-        if let Some(&existing_offset) = dedup_map.get(&units) {
-            change_ref.resolve_to_offset(existing_offset);
-            continue;
-        }
-
-        let new_offset = u32::try_from(pos)
-            .map_err(|_| Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range")))?;
-        let entry_size = userstring_entry_size(&units)?;
-
-        let write_pos = start_offset
-            .checked_add(pos)
-            .ok_or_else(|| writer_overflow("userstring_write_offset"))?;
-        if let Some(out) = output.as_mut() {
-            write_userstring_entry(out, write_pos, &units)?;
-        }
-
-        pos = pos
-            .checked_add(entry_size)
-            .ok_or_else(|| writer_overflow("userstring_heap_position"))?;
-        dedup_map.insert(units, new_offset);
+        let new_offset =
+            emit_userstring(&mut output, start_offset, &mut pos, &mut dedup_map, units)?;
         change_ref.resolve_to_offset(new_offset);
     }
 
+    still_nameless(&nameless, pos, "#US")?;
     result.bytes_written = pos;
     Ok(result)
 }
@@ -1035,7 +1239,7 @@ fn write_userstring_entry(output: &mut Output, pos: u64, units: &[u16]) -> Resul
         Error::LayoutFailed(format!("UserString length {total_len} exceeds u32 range"))
     })?;
     let mut len_bytes = Vec::with_capacity(4);
-    write_compressed_uint(total_len_u32, &mut len_bytes);
+    write_compressed_uint(total_len_u32, &mut len_bytes)?;
     output.write_at(pos, &len_bytes)?;
 
     // Write UTF-16LE bytes
@@ -1057,7 +1261,17 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::cilassembly::writer::remapper::TokenRemap;
+    use crate::{
+        cilassembly::{
+            writer::{
+                blobs::{BlobKind, TypedBlob},
+                remapper::TokenRemap,
+            },
+            AssemblyChanges, ChangeIds,
+        },
+        metadata::{pdb::document_name, token::Token},
+        Referrer,
+    };
 
     /// The #US heap `stream_userstring_heap` writes for `source` and `changes`.
     fn written_userstrings(
@@ -1065,7 +1279,8 @@ mod tests {
         changes: &HeapChanges<String>,
     ) -> (Vec<u8>, StreamResult) {
         let mut output = Output::create_in_memory(4096).unwrap();
-        let result = stream_userstring_heap(&mut output, 0, source, changes).unwrap();
+        let result =
+            stream_userstring_heap(&mut output, 0, source, changes, &HashSet::new()).unwrap();
         let len = usize::try_from(result.bytes_written).unwrap();
         (output.as_slice()[..len].to_vec(), result)
     }
@@ -1075,7 +1290,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let mut output = Output::create(temp_file.path(), 4096).unwrap();
 
-        let changes = HeapChanges::<String>::new_strings();
+        let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let empty_refs = HashSet::new();
         let result = stream_strings_heap(&mut output, 0, &[0u8], &changes, &empty_refs).unwrap();
 
@@ -1095,7 +1310,7 @@ mod tests {
             b'W', b'o', b'r', b'l', b'd', 0x00, // "World" at offset 7
         ];
 
-        let changes = HeapChanges::<String>::new_strings();
+        let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let empty_refs = HashSet::new();
         let result = stream_strings_heap(&mut output, 0, &source, &changes, &empty_refs).unwrap();
 
@@ -1114,7 +1329,7 @@ mod tests {
             b'H', b'e', b'l', b'l', b'o', 0x00, // "Hello" at offset 7 (duplicate)
         ];
 
-        let changes = HeapChanges::<String>::new_strings();
+        let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let empty_refs = HashSet::new();
         let result = stream_strings_heap(&mut output, 0, &source, &changes, &empty_refs).unwrap();
 
@@ -1124,11 +1339,46 @@ mod tests {
         assert_eq!(result.remapping.get(&7), Some(&1));
     }
 
+    /// The #Strings heap `stream_strings_heap` writes for `source`, with `referenced` the
+    /// offsets tables name.
+    fn written_strings(source: &[u8], referenced: &[u32]) -> (Vec<u8>, StreamResult) {
+        let mut output = Output::create_in_memory(4096).unwrap();
+        let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
+        let referenced: HashSet<u32> = referenced.iter().copied().collect();
+        let result = stream_strings_heap(&mut output, 0, source, &changes, &referenced).unwrap();
+        let len = usize::try_from(result.bytes_written).unwrap();
+        (output.as_slice()[..len].to_vec(), result)
+    }
+
+    #[test]
+    fn a_string_that_is_not_utf8_is_written_with_those_after_it() {
+        // null + "A" at 1 + 0xFF 0xFE at 3 + "B" at 6
+        let source = [0x00, b'A', 0x00, 0xFF, 0xFE, 0x00, b'B', 0x00];
+        let (heap, result) = written_strings(&source, &[]);
+        assert_eq!(heap, source);
+        assert!(result.remapping.is_empty());
+    }
+
+    #[test]
+    fn a_substring_of_a_string_that_is_not_utf8_keeps_its_bytes() {
+        // A removed entry 0xFF 'x' 'y' at 1, whose tail "xy" at 2 a table still names
+        let source = [0x00, 0xFF, b'x', b'y', 0x00];
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
+        changes.add_removal(1);
+        let mut output = Output::create_in_memory(4096).unwrap();
+        let referenced = HashSet::from([2u32]);
+        let result = stream_strings_heap(&mut output, 0, &source, &changes, &referenced).unwrap();
+        let tail = *result.remapping.get(&2).expect("the tail is kept");
+        assert_ne!(tail, 0, "the tail is not the empty string");
+        let start = usize::try_from(tail).unwrap();
+        assert_eq!(&output.as_slice()[start..start + 3], b"xy\0");
+    }
+
     #[test]
     fn an_empty_user_string_keeps_an_entry_of_its_own() {
         // null + "x" at 1 + "" at 5: offset 0 is no string, so `ldstr ""` cannot move there.
         let source = [0x00, 0x03, b'x', 0x00, 0x00, 0x01, 0x00];
-        let mut changes = HeapChanges::<String>::new_userstrings();
+        let mut changes = HeapChanges::<String>::new_userstrings(ChangeIds::new());
         let appended = changes.append(String::new());
 
         let (heap, result) = written_userstrings(&source, &changes);
@@ -1142,7 +1392,7 @@ mod tests {
     fn user_strings_with_unpaired_surrogates_are_written_as_they_are() {
         // null + "\u{D800}" at 1 + "\u{DC00}" at 5: neither is valid UTF-16, and the two differ.
         let source = [0x00, 0x03, 0x00, 0xD8, 0x01, 0x03, 0x00, 0xDC, 0x01];
-        let changes = HeapChanges::<String>::new_userstrings();
+        let changes = HeapChanges::<String>::new_userstrings(ChangeIds::new());
 
         let (heap, result) = written_userstrings(&source, &changes);
 
@@ -1171,19 +1421,248 @@ mod tests {
 
     #[test]
     fn an_appended_empty_blob_is_not_the_null_blob() {
-        let mut changes = HeapChanges::<Vec<u8>>::new_blobs();
+        let mut changes = HeapChanges::<Vec<u8>>::new_blobs(ChangeIds::new());
         let appended = changes.append(Vec::new());
         let blobs = HashMap::new();
         let tokens = TokenRemap::default();
-        let signatures = SignatureRemap {
+        let assembly_changes = AssemblyChanges::new();
+        let signatures = BlobRemap {
             blobs: &blobs,
             tokens: &tokens,
+            changes: &assembly_changes,
         };
         let mut output = Output::create_in_memory(4096).unwrap();
 
-        let result = stream_blob_heap(&mut output, 0, &[0x00], &changes, &signatures).unwrap();
+        let result = stream_blob_heap(
+            &mut output,
+            0,
+            &[0x00],
+            &changes,
+            &signatures,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(result.bytes_written, 2);
         assert_eq!(appended.offset(), Some(1));
+    }
+
+    /// A blob a table names inside another blob's bytes keeps its bytes when the heap is
+    /// rebuilt. The walk reads `AA` at 1 and 3, `01 02 00` at 5 and an empty blob at 9, and
+    /// deduplicates the second `AA`, so every later entry moves; a table also names offset 7,
+    /// where the byte `02` is the length of the blob `00 00`, which no entry of the walk holds.
+    #[test]
+    fn a_blob_inside_another_keeps_its_bytes() {
+        let source = [0x00, 0x01, 0xAA, 0x01, 0xAA, 0x03, 0x01, 0x02, 0x00, 0x00];
+        let changes = HeapChanges::<Vec<u8>>::new_blobs(ChangeIds::new());
+        let blobs = HashMap::new();
+        let tokens = TokenRemap::default();
+        let assembly_changes = AssemblyChanges::new();
+        let signatures = BlobRemap {
+            blobs: &blobs,
+            tokens: &tokens,
+            changes: &assembly_changes,
+        };
+        // 0x7FFF is past the heap: it names nothing, and is written as it is
+        let referenced: HashSet<u32> = [1, 3, 5, 7, 9, 0x7FFF].into_iter().collect();
+        let mut output = Output::create_in_memory(4096).unwrap();
+
+        let result =
+            stream_blob_heap(&mut output, 0, &source, &changes, &signatures, &referenced).unwrap();
+
+        let len = usize::try_from(result.bytes_written).unwrap();
+        let written = Blob::from(&output.as_slice()[..len]).unwrap();
+        let read = |offset: u32| {
+            let offset = result.remapping.get(&offset).copied().unwrap_or(offset);
+            written.get(offset as usize).unwrap().to_vec()
+        };
+        assert!(!result.remapping.contains_key(&0x7FFF));
+        let original = Blob::from(&source[..]).unwrap();
+        for offset in referenced.into_iter().filter(|&offset| offset != 0x7FFF) {
+            assert_eq!(
+                read(offset),
+                original.get(offset as usize).unwrap(),
+                "offset {offset}"
+            );
+        }
+    }
+
+    /// A document name follows the parts it names when the heap is rebuilt. The walk reads
+    /// `AA` at 1 and 3, "src" at 5, "a.cs" at 9 and the name `/ 5 9` at 14; the second `AA`
+    /// is deduplicated, so the parts move, and the name, held back until they are placed, is
+    /// written naming their new offsets.
+    #[test]
+    fn a_document_name_follows_its_parts() {
+        let source = [
+            0x00, 0x01, 0xAA, 0x01, 0xAA, 0x03, b's', b'r', b'c', 0x04, b'a', b'.', b'c', b's',
+            0x03, b'/', 0x05, 0x09,
+        ];
+        let changes = HeapChanges::<Vec<u8>>::new_blobs(ChangeIds::new());
+        let mut blobs = HashMap::new();
+        blobs.insert(
+            14,
+            TypedBlob {
+                kind: BlobKind::DocumentName,
+                referrer: Referrer::Column {
+                    row: Token::new(0x3000_0001),
+                    column: "Name",
+                },
+            },
+        );
+        let tokens = TokenRemap::default();
+        let assembly_changes = AssemblyChanges::new();
+        let remap = BlobRemap {
+            blobs: &blobs,
+            tokens: &tokens,
+            changes: &assembly_changes,
+        };
+        let referenced: HashSet<u32> = [1, 3, 5, 9, 14].into_iter().collect();
+        let mut output = Output::create_in_memory(4096).unwrap();
+
+        let result =
+            stream_blob_heap(&mut output, 0, &source, &changes, &remap, &referenced).unwrap();
+
+        let len = usize::try_from(result.bytes_written).unwrap();
+        let written = Blob::from(&output.as_slice()[..len]).unwrap();
+        assert_eq!(result.remapping.get(&5), Some(&3));
+        let name = result.remapping.get(&14).copied().unwrap();
+        assert_eq!(
+            document_name(written.get(name as usize).unwrap(), &written).unwrap(),
+            "src/a.cs"
+        );
+    }
+
+    /// rebuilt. The walk reads "A" at 1 and 5 and a seven-byte entry at 9, and deduplicates
+    /// the second "A", so the long entry moves; an `ldstr` names offset 12, where the byte `03`
+    /// is the length of the string "B" (`42 00`) and its terminal byte.
+    #[test]
+    fn a_user_string_inside_another_keeps_its_text() {
+        let source = [
+            0x00, 0x03, 0x41, 0x00, 0x00, 0x03, 0x41, 0x00, 0x00, 0x07, 0x41, 0x00, 0x03, 0x42,
+            0x00, 0x00, 0x00,
+        ];
+        let changes = HeapChanges::<String>::new_userstrings(ChangeIds::new());
+        // 0x7FFF is past the heap: it names nothing, and is written as it is
+        let referenced: HashSet<u32> = [1, 5, 9, 12, 0x7FFF].into_iter().collect();
+        let mut output = Output::create_in_memory(4096).unwrap();
+
+        let result =
+            stream_userstring_heap(&mut output, 0, &source, &changes, &referenced).unwrap();
+
+        let len = usize::try_from(result.bytes_written).unwrap();
+        let written = UserStrings::from(&output.as_slice()[..len]).unwrap();
+        assert!(!result.remapping.contains_key(&0x7FFF));
+        let original = UserStrings::from(&source[..]).unwrap();
+        for offset in referenced.into_iter().filter(|&offset| offset != 0x7FFF) {
+            let moved = result.remapping.get(&offset).copied().unwrap_or(offset);
+            assert_eq!(
+                written.get(moved as usize).unwrap(),
+                original.get(offset as usize).unwrap(),
+                "offset {offset}"
+            );
+        }
+    }
+
+    /// A referenced offset past the heap names nothing and is written as it is, so a heap that
+    /// grows over it is refused: the offset would name what landed there. Padding counts,
+    /// since a zero byte of it reads as an empty entry.
+    #[test]
+    fn a_heap_that_grows_over_an_offset_naming_nothing_is_refused() {
+        let blobs = HashMap::new();
+        let tokens = TokenRemap::default();
+        let assembly_changes = AssemblyChanges::new();
+        let signatures = BlobRemap {
+            blobs: &blobs,
+            tokens: &tokens,
+            changes: &assembly_changes,
+        };
+        let mut output = Output::create_in_memory(4096).unwrap();
+        let source = [0x00, 0x01, 0xAA];
+        // Past the source heap, and past the rebuilt one's padding: written as it is
+        let changes = HeapChanges::<Vec<u8>>::new_blobs(ChangeIds::new());
+        let referenced = HashSet::from([4u32]);
+        assert!(
+            stream_blob_heap(&mut output, 0, &source, &changes, &signatures, &referenced).is_ok()
+        );
+        // Past the source heap, inside the rebuilt one's padding
+        let referenced = HashSet::from([3u32]);
+        assert!(
+            stream_blob_heap(&mut output, 0, &source, &changes, &signatures, &referenced).is_err()
+        );
+        // Past the source heap, inside an entry a change appends
+        let mut changes = HeapChanges::<Vec<u8>>::new_blobs(ChangeIds::new());
+        changes.append(vec![0xBB; 8]);
+        let referenced = HashSet::from([6u32]);
+        assert!(
+            stream_blob_heap(&mut output, 0, &source, &changes, &signatures, &referenced).is_err()
+        );
+
+        let source = [0x00, 0x03, 0x41, 0x00, 0x00];
+        let changes = HeapChanges::<String>::new_userstrings(ChangeIds::new());
+        assert!(
+            stream_userstring_heap(&mut output, 0, &source, &changes, &HashSet::from([8u32]))
+                .is_ok()
+        );
+        assert!(
+            stream_userstring_heap(&mut output, 0, &source, &changes, &HashSet::from([6u32]))
+                .is_err()
+        );
+    }
+
+    /// A heap that cannot be read is an error, whichever heap it is: writing it without its
+    /// entries would leave every reference into it naming other bytes.
+    #[test]
+    fn an_unreadable_heap_is_refused() {
+        let ids = ChangeIds::new();
+        let blobs = HashMap::new();
+        let tokens = TokenRemap::default();
+        let assembly_changes = AssemblyChanges::new();
+        let signatures = BlobRemap {
+            blobs: &blobs,
+            tokens: &tokens,
+            changes: &assembly_changes,
+        };
+        let none = HashSet::new();
+        let mut output = Output::create_in_memory(4096).unwrap();
+        // #Strings, #US and #Blob start with an empty entry; #GUID holds whole GUIDs
+        let unreadable = [0x05u8, 0x01];
+        assert!(stream_strings_heap(
+            &mut output,
+            0,
+            &unreadable,
+            &HeapChanges::new_strings(ids.clone()),
+            &none
+        )
+        .is_err());
+        assert!(stream_userstring_heap(
+            &mut output,
+            0,
+            &unreadable,
+            &HeapChanges::new_userstrings(ids.clone()),
+            &none
+        )
+        .is_err());
+        assert!(stream_blob_heap(
+            &mut output,
+            0,
+            &unreadable,
+            &HeapChanges::new_blobs(ids.clone()),
+            &signatures,
+            &none
+        )
+        .is_err());
+        assert!(
+            stream_guid_heap(&mut output, 0, &unreadable, &HeapChanges::new_guids(ids)).is_err()
+        );
+        assert!(
+            stream_guid_heap(
+                &mut output,
+                0,
+                &[],
+                &HeapChanges::new_guids(ChangeIds::new())
+            )
+            .is_ok(),
+            "an absent heap starts empty"
+        );
     }
 }

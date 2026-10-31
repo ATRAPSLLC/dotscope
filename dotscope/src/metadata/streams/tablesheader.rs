@@ -1031,6 +1031,25 @@ impl<'a> TablesHeader<'a> {
     /// - [`crate::metadata::tables::TableInfo`]: Table metadata and row count information
     /// - [ECMA-335 II.24.2.6](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Tables header specification
     pub fn from(data: &'a [u8], wide_columns: bool) -> Result<TablesHeader<'a>> {
+        Self::parse(data, wide_columns, None)
+    }
+
+    /// Parses a Portable PDB's tables stream: its columns index the assembly's tables by the
+    /// row counts `type_system_rows` gives them (the `#Pdb` stream's,
+    /// [`crate::metadata::streams::PdbStream::type_system_rows`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TablesHeader::from`].
+    pub fn from_pdb(data: &'a [u8], type_system_rows: &[u32; 64]) -> Result<TablesHeader<'a>> {
+        Self::parse(data, false, Some(type_system_rows))
+    }
+
+    fn parse(
+        data: &'a [u8],
+        wide_columns: bool,
+        type_system_rows: Option<&[u32; 64]>,
+    ) -> Result<TablesHeader<'a>> {
         let truncated = |expected: usize, found: usize| ParseFailure::Truncated {
             stage: ParseStage::TildeStream,
             expected,
@@ -1087,7 +1106,10 @@ impl<'a> TablesHeader<'a> {
                 data.get(16..)
                     .ok_or_else(|| Error::from(truncated(24, data.len())))?,
             )?,
-            info: Arc::new(TableInfo::new(data, valid_bitvec, wide_columns)?),
+            info: Arc::new(match type_system_rows {
+                Some(rows) => TableInfo::with_external_rows(data, valid_bitvec, rows)?,
+                None => TableInfo::new(data, valid_bitvec, wide_columns)?,
+            }),
             tables_offset,
             tables: Vec::with_capacity(table_capacity),
         };
@@ -1235,9 +1257,10 @@ impl<'a> TablesHeader<'a> {
         table_type: TableId,
         current_offset: &mut usize,
     ) -> Result<()> {
+        // Only the tables the stream declares are in it: a Portable PDB's row counts for the
+        // assembly's tables size its indexes, and their rows are not here
         let t_info = self.info.get(table_type);
-        if t_info.rows == 0 {
-            // We filtered out empty tables earlier, this case shouldn't happen here
+        if t_info.rows == 0 || self.valid & (1u64 << (table_type as u8)) == 0 {
             return Ok(());
         }
 
@@ -1495,7 +1518,11 @@ impl<'a> TablesHeader<'a> {
     /// This method is thread-safe and can be called concurrently from multiple threads.
     #[must_use]
     pub fn table_row_count(&self, table_id: TableId) -> u32 {
-        self.info.get(table_id).rows
+        if self.has_table(table_id) {
+            self.info.get(table_id).rows
+        } else {
+            0
+        }
     }
 
     /// Get a summary of all present metadata tables with their row counts.

@@ -138,6 +138,7 @@ impl ConstantRawBuilder {
             token: self.token,
             offset: self.offset,
             base: self.base,
+            padding: 0,
             parent: self.parent,
             value: self.value,
         }
