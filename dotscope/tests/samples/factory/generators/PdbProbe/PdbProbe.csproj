@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    An assembly whose Portable PDB holds a row of every PDB table and a record of every custom
+    debug information kind the C# compiler writes. Built per debug form by the factory's `pdb`
+    family; each source file says which records it is there for.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>PdbProbe</RootNamespace>
+    <!-- EmbeddedSource records, and a SourceLink record from the map beside the project -->
+    <EmbedAllSources>true</EmbedAllSources>
+    <SourceLink>$(MSBuildProjectDirectory)/sourcelink.json</SourceLink>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../PdbProbeLib/PdbProbeLib.csproj" Aliases="probelib" />
+  </ItemGroup>
+</Project>

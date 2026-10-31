@@ -26,7 +26,7 @@ ensure_image() {
 ensure_image
 
 if [ "${1:-}" = "--all" ]; then
-    set -- confuserex bitmono obfuscar jiejie variants debug winmd oracle
+    set -- confuserex bitmono obfuscar jiejie variants sections debug pdb winmd oracle
 fi
 [ "$#" -gt 0 ] || { echo "usage: build.sh [--force] <family>... | --all" >&2; exit 2; }
 

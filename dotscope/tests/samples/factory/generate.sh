@@ -8,12 +8,12 @@
 #   generate.sh [--force] <family>...
 #
 # families: confuserex bitmono obfuscar jiejie (the packer samples), variants (metadata
-# layouts and stream-directory experiments), debug (debug-information forms), winmd, and
-# oracle.
+# layouts and stream-directory experiments), sections (section layout experiments), debug
+# (debug-information forms), pdb (Portable PDB probes), winmd, and oracle.
 #
 # `oracle` runs every sample on the .NET Framework 4.8 (under Wine), CoreCLR and Mono, and
 # writes `factory/oracle.tsv`: whether each runtime runs the sample, and whether its output
-# matches its unprotected build's (for the stream experiments, the output itself).
+# matches its unprotected build's (for the stream and section experiments, the output itself).
 
 set -euo pipefail
 
@@ -294,6 +294,22 @@ family_variants() {
     dotnet "$variants/MetadataVariants.dll" streams "$probe/StreamProbe.exe" "$streams" >&2
 }
 
+family_sections() {
+    local sections=$SAMPLES/metadata/sections
+    if [ "$FORCE" = 0 ] && [ -d "$sections" ]; then
+        return
+    fi
+    log "sections"
+    local layouts probe
+    layouts=$(build_copy "$FACTORY/generators/SectionLayouts")
+    probe=$(mktemp -d)
+    # mcs leaves room in the headers for the section each experiment adds
+    mcs -out:"$probe/SectionProbe.exe" "$FACTORY/generators/SectionProbe/Program.cs" >&2
+    rm -rf "$sections"
+    dotnet "$layouts/SectionLayouts.dll" "$probe/SectionProbe.exe" "$sections" >&2
+    rm -rf "$probe" "$(dirname "$layouts")"
+}
+
 family_debug() {
     # TestApp built once per debug-information form, each in a directory of its own so the
     # `.pdb` beside an image is the one built with it.
@@ -318,6 +334,45 @@ family_debug() {
     done
 }
 
+family_pdb() {
+    # PdbProbe, whose Portable PDB holds a row of every PDB table and a record of every custom
+    # debug information kind C# writes, built per variant into a directory of its own. Debug
+    # builds add the Edit and Continue and hoisted-scope records; the path map gives documents
+    # the `/_/` names its SourceLink map covers, and a deterministic build a stable PDB id.
+    local variant src out
+    for variant in portable embedded release unmapped; do
+        out=$SAMPLES/pdb/$variant
+        wanted "$out/PdbProbe.dll" || continue
+        log "pdb: $variant"
+        src=$(mktemp -d)
+        cp -r "$FACTORY/generators/PdbProbe" "$FACTORY/generators/PdbProbeLib" "$src/"
+        local props=(-c Debug -p:DebugType=portable -p:Deterministic=true -p:PathMap="$src=/_/")
+        case $variant in
+            embedded) props=(-c Debug -p:DebugType=embedded -p:Deterministic=true -p:PathMap="$src=/_/") ;;
+            release) props=(-c Release -p:DebugType=portable -p:Deterministic=true -p:PathMap="$src=/_/") ;;
+            # Absolute document paths, no path map, and a PDB id that is not content-derived
+            unmapped) props=(-c Debug -p:DebugType=portable -p:Deterministic=false) ;;
+        esac
+        dotnet build "$src/PdbProbe/PdbProbe.csproj" "${props[@]}" -o "$src/out" >&2
+        mkdir -p "$out"
+        cp "$src/out/PdbProbe.dll" "$src/out/PdbProbeLib.dll" "$out/"
+        [ ! -f "$src/out/PdbProbe.pdb" ] || cp "$src/out/PdbProbe.pdb" "$out/"
+        rm -rf "$src"
+    done
+    # The Visual Basic probe, for the records only Visual Basic writes
+    out=$SAMPLES/pdb/vb
+    if wanted "$out/PdbProbeVb.dll"; then
+        log "pdb: vb"
+        src=$(mktemp -d)
+        cp -r "$FACTORY/generators/PdbProbeVb" "$src/"
+        dotnet build "$src/PdbProbeVb/PdbProbeVb.vbproj" -c Debug -p:DebugType=portable \
+            -p:Deterministic=true -p:PathMap="$src=/_/" -o "$src/out" >&2
+        mkdir -p "$out"
+        cp "$src/out/PdbProbeVb.dll" "$src/out/PdbProbeVb.pdb" "$out/"
+        rm -rf "$src"
+    fi
+}
+
 family_winmd() {
     local out=$SAMPLES/winmd/Windows.Wdk.winmd
     wanted "$out" || return 0
@@ -328,7 +383,7 @@ family_winmd() {
 
 # Every sample and the reference its output is compared with: a packer sample with the
 # unprotected build in its own directory, a layout or debug-form variant with TestApp, and a
-# stream experiment with nothing (its output is recorded instead).
+# stream or section experiment with nothing (its output is recorded instead).
 oracle_samples() {
     local exe
     find "$SAMPLES/packers" -name '*.exe' | sort | while read -r exe; do
@@ -337,7 +392,7 @@ oracle_samples() {
     find "$SAMPLES/metadata/layouts" "$SAMPLES/debug" -name '*.exe' | sort | while read -r exe; do
         echo "$exe $ORIGINAL"
     done
-    find "$SAMPLES/metadata/streams" -name '*.exe' | sort | while read -r exe; do
+    find "$SAMPLES/metadata/streams" "$SAMPLES/metadata/sections" -name '*.exe' | sort | while read -r exe; do
         echo "$exe -"
     done
 }
@@ -376,8 +431,8 @@ family_oracle() {
             "$(mono --version | sed -n '1s/.*version \([^ ]*\).*/\1/p')"
         printf '# runs: the process exited 0. matches: its stdout\n'
         printf '# equals its unprotected build'"'"'s on the same runtime; unordered: the same lines in\n'
-        printf '# another order (JIEJIE reorders manifest resources); - for a stream experiment.\n'
-        printf '# output: a stream experiment'"'"'s stdout, lines joined by |.\n'
+        printf '# another order (JIEJIE reorders manifest resources); - for a stream or section experiment.\n'
+        printf '# output: a stream or section experiment'"'"'s stdout, lines joined by |.\n'
         printf 'path\tsha256'
         printf '\t%s_runs\t%s_matches\t%s_output' netfx netfx netfx coreclr coreclr coreclr mono mono mono
         printf '\n'
@@ -415,7 +470,7 @@ if [ "${1:-}" = "--force" ]; then FORCE=1; shift; fi
 mkdir -p "$CACHE"
 for family in "$@"; do
     case $family in
-        confuserex | bitmono | obfuscar | jiejie | variants | debug | winmd | oracle) "family_$family" ;;
+        confuserex | bitmono | obfuscar | jiejie | variants | sections | debug | pdb | winmd | oracle) "family_$family" ;;
         *) echo "unknown family '$family'" >&2; exit 2 ;;
     esac
 done

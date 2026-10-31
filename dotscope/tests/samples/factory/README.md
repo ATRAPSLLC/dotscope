@@ -29,7 +29,9 @@ New or regenerated outputs change `tests/samples/MANIFEST.toml`'s hashes: refres
 | `obfuscar` | `packers/obfuscar/2.2.50/<config>.exe` | the .NET Framework `Obfuscar.Console.exe` from the NuGet package, under Wine |
 | `jiejie` | `packers/jiejie/source/<variant>.exe` | JIEJIE.NET d28aa56 built for net48, under Wine (see below) |
 | `variants` | `metadata/layouts/*.exe`, `metadata/streams/*.exe` | `generators/MetadataVariants` (dnlib) over TestApp and `generators/StreamProbe` |
+| `sections` | `metadata/sections/*.exe` | `generators/SectionLayouts` over `generators/SectionProbe` (built with `mcs`, whose headers leave room for one more section) |
 | `debug` | `debug/<form>/TestApp.exe` (+ `.pdb`) | TestApp built with portable, embedded, deterministic and no debug information |
+| `pdb` | `pdb/<variant>/PdbProbe.dll` (+ `.pdb`, `PdbProbeLib.dll`) | `generators/PdbProbe`, whose Portable PDB has a row of every PDB table and a record of every custom debug information kind C# writes: Debug with a standalone PDB (`portable`), embedded (`embedded`), Release (`release`), and Debug without a path map or determinism (`unmapped`); and `pdb/vb/PdbProbeVb.dll` from `generators/PdbProbeVb`, for the records only Visual Basic writes |
 | `winmd` | `winmd/Windows.Wdk.winmd` | the metadata-only assembly from the win32metadata project |
 | `oracle` | `oracle.tsv` | every sample run on three runtimes (below) |
 
@@ -113,6 +115,27 @@ Otherwise, of the headers repeating a heap's name it reads:
 - The `#~` header's ExtraData word (HeapSizes `0x40`) is skipped, `#-` metadata with
   HasDelete (`0x80`) loads, and HeapSizes bits `0x08`, `0x10` and `0x20` are ignored
   (`metadata/layouts`).
+
+## How the runtimes read the bytes at an RVA
+
+Measured with `metadata/sections`: SectionProbe prints the 32 bytes of an RVA field and calls
+a method, and each experiment adds a section `.probe` of chosen VirtualSize, SizeOfRawData
+and PointerToRawData, filled with a pattern that names each byte's offset, and moves the
+field's data and the method's body into it.
+
+| Experiment | .NET Framework | CoreCLR | Mono |
+|---|---|---|---|
+| data and body inside the raw data and VirtualSize (`inside`) | the file's bytes, runs | the same | the same |
+| data past SizeOfRawData, within VirtualSize (`zero_fill`, `data_straddles_raw_end`) | zeros | zeros | zeros (crashes on `zero_fill`) |
+| data past VirtualSize, within the raw data (`data_past_virtual_size*`, `data_straddles_virtual_size`) | the file's bytes | zeros | the file's bytes |
+| a body past VirtualSize, in part or whole (`body_*`) | `BadImageFormatException` | `BadImageFormatException` | runs |
+| data at an RVA in the headers (`header_rva`) | the bytes 16 before it | the header's bytes | crashes |
+| VirtualSize 0, PointerToRawData not a multiple of FileAlignment, raw data past the file (`virtual_size_zero`, `pointer_unaligned`, `raw_past_file`) | refuses the image | refuses the image | runs the first, crashes on the others |
+
+So a section is its VirtualSize bytes, the raw data then zeros, and nothing else is read the
+same by both Microsoft runtimes. dotscope's `file::sectionmap` reads only that and
+`tests/it/sections.rs` holds it to these rows. The .NET Framework column is measured under
+Wine's loader, not Windows'.
 
 ## Other layout fixtures
 
