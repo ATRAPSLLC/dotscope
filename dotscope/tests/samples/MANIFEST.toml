@@ -9121,3 +9121,24 @@ sha256 = "54b8e48866b0a7e066981b63bb6f82fc6947fe8c57e2b5cb4513b1537aa836c2"
 source = "win32metadata project: Windows.Wdk.winmd"
 license = "MIT (microsoft/win32metadata)"
 suites = []
+
+[[fixture]]
+path = "resources/localized_form.resources"
+sha256 = "7fb618befc02c44c9344bd6feae24c5f76cc58086d0eb245328336d62428a397"
+source = "built for dotscope's tests: Mono's resgen of resources/localized_form.resx, a localizable WinForms form's layout (System.Drawing.Point and Size values beside strings and an Int32)"
+license = "Apache-2.0"
+suites = []
+
+[[fixture]]
+path = "resources/localized_form.resx"
+sha256 = "dbb7a3220bc966c8fb5d1cc3743eaca27ffc3724c04b327888499ebf9c57f979"
+source = "built for dotscope's tests: the source of resources/localized_form.resources"
+license = "Apache-2.0"
+suites = []
+
+[[fixture]]
+path = "resources/wpf_window.g.resources"
+sha256 = "5820f0d9d6926dbe618321f25afb04bc35e741ed6f49c7f03c102639117aeabc"
+source = "built for dotscope's tests: the wpfwindow.g.resources set the .NET 9 SDK's markup compiler embeds for a WPF project (a Canvas window, LoginWindow.xaml, with named controls and two Click handlers, and a Grid user control, StatusPanel.xaml), cut from the assembly; its sources are visus's tests/samples/dotnet/wpf"
+license = "Apache-2.0"
+suites = []

@@ -38,7 +38,8 @@
 //!
 //! ## Basic Resource Enumeration
 //!
-//! ```no_run
+//! ```
+//! use dotscope::metadata::tables::ManifestResourceAttributes;
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -53,7 +54,7 @@
 //!              resource.name, resource.data_size, resource.data_offset);
 //!     
 //!     // Check resource visibility using flags
-//!     if resource.flags_visibility.is_public() {
+//!     if resource.flags.contains(ManifestResourceAttributes::PUBLIC) {
 //!         println!("  - Public resource");
 //!     } else {
 //!         println!("  - Private resource");
@@ -90,7 +91,7 @@
 //!
 //! ## Comprehensive Resource Analysis
 //!
-//! ```no_run
+//! ```
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -112,7 +113,7 @@
 //!         }
 //!         Some(ref source) => {
 //!             external_count += 1;
-//!             println!("External: {} -> {}", resource.name, source.name);
+//!             println!("External: {} -> {:?}", resource.name, source.name());
 //!         }
 //!     }
 //! }
@@ -157,7 +158,9 @@
 //! - **Bounds Checking**: All data access is bounds-checked for safety
 //! - **Format Validation**: Resource headers validated during parsing
 //! - **Memory Safety**: No unsafe code in resource data access paths
+pub mod baml;
 mod encoder;
+pub mod nrbf;
 mod parser;
 mod types;
 
@@ -277,13 +280,15 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::resources::Resources;
+    /// use dotscope::File;
     /// use std::sync::Arc;
     ///
-    /// let file = Arc::new(file_instance);
+    /// let file = Arc::new(File::from_path("tests/samples/crafted_2.exe")?);
     /// let resources = Resources::new(file);
     /// assert!(resources.is_empty());
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn new(file: Arc<File>) -> Self {
@@ -457,11 +462,11 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::metadata::resources::ResourceTypeRef;
     /// use dotscope::CilObject;
-    /// use std::path::Path;
     ///
-    /// let assembly = CilObject::from_path("MyApp.dll")?;
+    /// let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
     /// let resources = assembly.resources();
     ///
     /// // Find .resources files
@@ -519,10 +524,19 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// // This is typically called internally during metadata loading
-    /// let resource = ManifestResourceRc::new(/* ... */);
+    /// ```
+    /// use std::sync::Arc;
+    /// use dotscope::metadata::resources::Resources;
+    /// use dotscope::{CilObject, File};
+    ///
+    /// // This is typically called internally during metadata loading: here a
+    /// // resource the loaded assembly holds goes into a fresh collection
+    /// let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
+    /// let resource = assembly.resources().iter().next().expect("a resource").value().clone();
+    /// let resources = Resources::new(Arc::new(File::from_path("tests/samples/WindowsBase.dll")?));
     /// resources.insert(resource);
+    /// assert_eq!(resources.len(), 1);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn insert(&self, resource: ManifestResourceRc) {
         self.data.insert(resource.token, resource);

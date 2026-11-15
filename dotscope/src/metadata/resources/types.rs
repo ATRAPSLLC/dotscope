@@ -20,10 +20,13 @@
 //!
 //! ## Basic Type Parsing
 //!
-//! ```no_run
+//! ```
 //! use dotscope::metadata::resources::ResourceType;
 //! use dotscope::metadata::resources::RESOURCE_MAGIC;
 //! use dotscope::Parser;
+//!
+//! // The magic, then a string resource: type byte 0x01 and "hi"
+//! let data = [0xCE, 0xCA, 0xEF, 0xBE, 0x01, 0x02, b'h', b'i'];
 //!
 //! // Parse a resource file header
 //! let mut parser = Parser::new(&data);
@@ -45,10 +48,12 @@
 //!
 //! ## Type Name Resolution
 //!
-//! ```no_run
+//! ```
 //! use dotscope::metadata::resources::ResourceType;
 //! use dotscope::Parser;
 //!
+//! // A string resource's data: its length, then "hi"
+//! let data = [0x02, b'h', b'i'];
 //! let mut parser = Parser::new(&data);
 //!
 //! // Parse using type name instead of type byte
@@ -85,10 +90,12 @@ use crate::{file::parser::Parser, Error::TypeError, Result};
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// use dotscope::metadata::resources::ResourceType;
 /// use dotscope::Parser;
 ///
+/// // A string ("hi"), an int32 (42) and a byte array of two bytes
+/// let data = [0x02, b'h', b'i', 42, 0, 0, 0, 2, 0, 0, 0, 0xAB, 0xCD];
 /// // Parse different resource types
 /// let mut parser = Parser::new(&data);
 ///
@@ -230,6 +237,18 @@ pub enum ResourceType {
     Stream(Vec<u8>),
     /// Marker for the beginning of user-defined types (type code 0x40+)
     StartOfUserTypes,
+    /// A value of a user-defined type (type code 0x40 and above, the type
+    /// table's entry `code - 0x40`): its assembly-qualified type name and the
+    /// bytes the writer serialized it as, a `BinaryFormatter` stream
+    /// (MS-NRBF) in a .NET Framework resource set, which
+    /// [`nrbf::read_object`](crate::metadata::resources::nrbf::read_object)
+    /// reads.
+    Serialized {
+        /// The type's assembly-qualified name, as the type table states it.
+        type_name: String,
+        /// The serialized value: the bytes up to the next entry's data.
+        data: Vec<u8>,
+    },
 }
 
 impl ResourceType {
@@ -280,7 +299,9 @@ impl ResourceType {
             ResourceType::ByteArray(_) => Some("System.Byte[]"),
             ResourceType::Stream(_) => Some("System.IO.Stream"),
             // Types without .NET equivalents
-            ResourceType::Null | ResourceType::StartOfUserTypes => None,
+            ResourceType::Null
+            | ResourceType::StartOfUserTypes
+            | ResourceType::Serialized { .. } => None,
         }
     }
 
@@ -348,7 +369,9 @@ impl ResourceType {
             ResourceType::ByteArray(_) => Some(16),
             ResourceType::Stream(_) => Some(17),
             // Types without .NET equivalents
-            ResourceType::Null | ResourceType::StartOfUserTypes => None,
+            ResourceType::Null
+            | ResourceType::StartOfUserTypes
+            | ResourceType::Serialized { .. } => None,
         }
     }
 
@@ -421,7 +444,9 @@ impl ResourceType {
             ResourceType::ByteArray(_) => Some(0x20),
             ResourceType::Stream(_) => Some(0x21),
             // Types without .NET equivalents
-            ResourceType::Null | ResourceType::StartOfUserTypes => None,
+            ResourceType::Null
+            | ResourceType::StartOfUserTypes
+            | ResourceType::Serialized { .. } => None,
         }
     }
 
@@ -481,7 +506,9 @@ impl ResourceType {
                 4_u32.checked_add(data_size)
             }
             // Types without .NET equivalents
-            ResourceType::Null | ResourceType::StartOfUserTypes => None,
+            ResourceType::Null
+            | ResourceType::StartOfUserTypes
+            | ResourceType::Serialized { .. } => None,
         }
     }
 
@@ -519,10 +546,12 @@ impl ResourceType {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::resources::ResourceType;
     /// use dotscope::Parser;
     ///
+    /// // A string ("hi") and an int32 (42)
+    /// let data = [0x02, b'h', b'i', 42, 0, 0, 0];
     /// let mut parser = Parser::new(&data);
     ///
     /// // Parse a string resource (type code 0x01)
@@ -694,10 +723,12 @@ impl ResourceType {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::resources::ResourceType;
     /// use dotscope::Parser;
     ///
+    /// // A string ("hi"), an int32 (42) and a byte array of two bytes
+    /// let data = [0x02, b'h', b'i', 42, 0, 0, 0, 2, 0, 0, 0, 0xAB, 0xCD];
     /// let mut parser = Parser::new(&data);
     ///
     /// // Parse using .NET type names
@@ -789,10 +820,16 @@ pub struct ResourceEntry {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use dotscope::metadata::resources::parse_dotnet_resource_ref;
+/// ```
+/// use dotscope::metadata::resources::{
+///     parse_dotnet_resource_ref, DotNetResourceEncoder, ResourceTypeRef,
+/// };
 ///
-/// let resource_data = std::fs::read("MyApp.resources")?;
+/// // A resource file holding a string and an embedded ZIP archive's bytes
+/// let mut encoder = DotNetResourceEncoder::new();
+/// encoder.add_string("Greeting", "hello")?;
+/// encoder.add_byte_array("Archive", b"PK\x03\x04")?;
+/// let resource_data = encoder.encode_dotnet_format()?;
 /// let resources = parse_dotnet_resource_ref(&resource_data)?;
 ///
 /// for (name, entry) in &resources {
@@ -801,8 +838,8 @@ pub struct ResourceEntry {
 ///             // Zero-copy access to potentially large byte array
 ///             println!("Resource '{}': {} bytes (no copy!)", name, bytes.len());
 ///
-///             // Can pass directly to functions expecting &[u8]
-///             process_zip_archive(bytes)?;
+///             // A borrowed slice of the resource data, as any `&[u8]` reader takes
+///             assert!(bytes.starts_with(b"PK"));
 ///         }
 ///         ResourceTypeRef::String(s) => {
 ///             // Zero-copy access to string data
@@ -875,6 +912,15 @@ pub enum ResourceTypeRef<'a> {
     Stream(&'a [u8]),
     /// Marker for the beginning of user-defined types (type code 0x40+)
     StartOfUserTypes,
+    /// A value of a user-defined type, its bytes borrowed: see
+    /// [`ResourceType::Serialized`].
+    Serialized {
+        /// The type's assembly-qualified name, as the type table states it
+        /// (owned: the type table is the reader's, not the data's).
+        type_name: String,
+        /// The serialized value: the bytes up to the next entry's data.
+        data: &'a [u8],
+    },
 }
 
 /// A parsed .NET resource entry with borrowed data for zero-copy access.
@@ -890,10 +936,14 @@ pub enum ResourceTypeRef<'a> {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use dotscope::metadata::resources::Resource;
+/// ```
+/// use dotscope::metadata::resources::{DotNetResourceEncoder, Resource, ResourceTypeRef};
 ///
-/// let resource_data = std::fs::read("MyApp.resources")?;
+/// // A resource file holding a string and an embedded ZIP archive's bytes
+/// let mut encoder = DotNetResourceEncoder::new();
+/// encoder.add_string("Greeting", "hello")?;
+/// encoder.add_byte_array("Archive", b"PK\x03\x04")?;
+/// let resource_data = encoder.encode_dotnet_format()?;
 /// let mut resource = Resource::parse(&resource_data)?;
 /// let resources = resource.read_resources_ref(&resource_data)?;
 ///
@@ -905,7 +955,6 @@ pub enum ResourceTypeRef<'a> {
 ///             // Extract embedded ZIP without copying
 ///             if bytes.starts_with(b"PK\x03\x04") {
 ///                 println!("  Found ZIP archive: {} bytes", bytes.len());
-///                 extract_zip(bytes)?;
 ///             }
 ///         }
 ///         ResourceTypeRef::String(s) => {
@@ -956,25 +1005,25 @@ impl<'a> ResourceTypeRef<'a> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::resources::ResourceTypeRef;
     /// use dotscope::Parser;
     ///
-    /// let data = b"\x05hello"; // Type byte 0x01, length 5, "hello"
+    /// let data = b"\x05hello"; // Length 5, then "hello"
     /// let mut parser = Parser::new(data);
     ///
     /// // Parse a string resource (type code 0x01) - zero-copy
-    /// let string_type = ResourceTypeRef::from_type_byte_ref(0x01, &mut parser)?;
+    /// let string_type = ResourceTypeRef::from_type_byte_ref(0x01, &mut parser, data)?;
     /// if let ResourceTypeRef::String(s) = string_type {
-    ///     println!("Found string: {}", s); // No allocation occurred
+    ///     assert_eq!(s, "hello"); // No allocation occurred
     /// }
     ///
     /// // Parse a byte array (type code 0x20) - zero-copy
-    /// let data = b"\x04\x01\x02\x03\x04"; // Length 4, followed by 4 bytes
+    /// let data = b"\x04\x00\x00\x00\x01\x02\x03\x04"; // Length 4 (u32), then 4 bytes
     /// let mut parser = Parser::new(data);
-    /// let bytes_type = ResourceTypeRef::from_type_byte_ref(0x20, &mut parser)?;
+    /// let bytes_type = ResourceTypeRef::from_type_byte_ref(0x20, &mut parser, data)?;
     /// if let ResourceTypeRef::ByteArray(bytes) = bytes_type {
-    ///     println!("Found {} bytes (no copy!)", bytes.len());
+    ///     assert_eq!(bytes, [1, 2, 3, 4]); // A slice of `data`, not a copy
     /// }
     /// # Ok::<(), dotscope::Error>(())
     /// ```
@@ -1122,7 +1171,7 @@ impl<'a> ResourceTypeRef<'a> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::resources::ResourceTypeRef;
     /// use dotscope::Parser;
     ///
@@ -1130,9 +1179,10 @@ impl<'a> ResourceTypeRef<'a> {
     /// let mut parser = Parser::new(data);
     ///
     /// // Parse using .NET type name - zero-copy
-    /// let string_resource = ResourceTypeRef::from_type_name_ref("System.String", &mut parser)?;
+    /// let string_resource =
+    ///     ResourceTypeRef::from_type_name_ref("System.String", &mut parser, data)?;
     /// if let ResourceTypeRef::String(s) = string_resource {
-    ///     println!("String resource: {}", s); // No allocation
+    ///     assert_eq!(s, "hello"); // No allocation
     /// }
     /// # Ok::<(), dotscope::Error>(())
     /// ```

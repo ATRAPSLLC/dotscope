@@ -31,12 +31,18 @@
 //!
 //! ## High-Level Resource Parsing
 //!
-//! ```no_run
-//! use dotscope::metadata::resources::parse_dotnet_resource;
+//! ```
+//! use dotscope::metadata::resources::{parse_dotnet_resource, DotNetResourceEncoder, ResourceType};
+//!
+//! // A resource file holding a string, a number and an embedded ZIP archive
+//! let mut encoder = DotNetResourceEncoder::new();
+//! encoder.add_string("Greeting", "hello")?;
+//! encoder.add_int32("Retries", 3)?;
+//! encoder.add_byte_array("Archive", b"PK\x03\x04")?;
+//! let resource_data = encoder.encode_dotnet_format()?;
 //!
 //! // Parse complete resource file
-//! let resource_data = /* ... resource file bytes ... */;
-//! let resources = parse_dotnet_resource(resource_data)?;
+//! let resources = parse_dotnet_resource(&resource_data)?;
 //!
 //! for (name, entry) in resources {
 //!     println!("Resource: {} (Hash: 0x{:X})", name, entry.name_hash);
@@ -51,12 +57,18 @@
 //!
 //! ## Low-Level Resource Analysis
 //!
-//! ```no_run
-//! use dotscope::metadata::resources::Resource;
+//! ```
+//! use dotscope::metadata::resources::{DotNetResourceEncoder, Resource};
+//!
+//! // A resource file holding a string, a number and an embedded ZIP archive
+//! let mut encoder = DotNetResourceEncoder::new();
+//! encoder.add_string("Greeting", "hello")?;
+//! encoder.add_int32("Retries", 3)?;
+//! encoder.add_byte_array("Archive", b"PK\x03\x04")?;
+//! let resource_data = encoder.encode_dotnet_format()?;
 //!
 //! // Parse resource header and examine structure
-//! let resource_data = /* ... resource file bytes ... */;
-//! let mut resource = Resource::parse(resource_data)?;
+//! let mut resource = Resource::parse(&resource_data)?;
 //!
 //! println!("Resource Manager Version: {}", resource.res_mgr_header_version);
 //! println!("Resource Reader Version: {}", resource.rr_version);
@@ -65,7 +77,8 @@
 //! println!("Debug Build: {}", resource.is_debug);
 //!
 //! // Parse individual resources
-//! let resources = resource.read_resources(resource_data)?;
+//! let resources = resource.read_resources(&resource_data)?;
+//! assert_eq!(resources.len(), 3);
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -77,7 +90,7 @@
 //! - **Format Validation**: Header consistency and section alignment checks
 //! - **Type Safety**: Resource type validation during deserialization
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     file::parser::Parser,
@@ -225,12 +238,9 @@ pub fn parse_dotnet_resource(data: &[u8]) -> Result<BTreeMap<String, ResourceEnt
 ///         if bytes.starts_with(b"PK\x03\x04") {
 ///             println!("Found ZIP: {} ({} bytes)", name, bytes.len());
 ///
-///             // Process ZIP directly from borrowed slice - no allocation!
-///             let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
-///             for i in 0..archive.len() {
-///                 let file = archive.by_index(i)?;
-///                 println!("  - {}", file.name());
-///             }
+///             // A ZIP reader takes the borrowed slice directly - no allocation
+///             let reader = std::io::Cursor::new(*bytes);
+///             assert_eq!(reader.get_ref().len(), bytes.len());
 ///         }
 ///     }
 /// }
@@ -838,6 +848,7 @@ impl Resource {
     /// let resource_data = std::fs::read("MyApp.resources")?;
     /// let mut resource = Resource::parse(&resource_data)?;
     /// let resources = resource.read_resources(&resource_data)?;
+    /// # use dotscope::metadata::resources::ResourceType;
     ///
     /// println!("Found {} resources:", resources.len());
     /// for (name, entry) in &resources {
@@ -871,97 +882,37 @@ impl Resource {
     /// - **Byte Arrays**: Raw binary data with length prefixes
     /// - **Custom Objects**: Serialized .NET objects (parsing depends on type)
     pub fn read_resources(&mut self, data: &[u8]) -> Result<BTreeMap<String, ResourceEntry>> {
-        let count = self.resource_count as usize;
-        if self.name_hashes.len() != count || self.name_positions.len() != count {
-            return Err(malformed_error!(
-                "Resource count {} doesn't match hash/position array lengths ({}/{})",
-                self.resource_count,
-                self.name_hashes.len(),
-                self.name_positions.len()
-            ));
-        }
-
+        let entries = self.entries(data)?;
+        let ends = Self::value_ends(&entries, data.len());
         let mut resources = BTreeMap::new();
         let mut parser = Parser::new(data);
-
-        for i in 0..count {
-            let name_pos_offset = *self
-                .name_positions
-                .get(i)
-                .ok_or_else(|| malformed_error!("name_positions index {} out of bounds", i))?
-                as usize;
-            let name_pos = self
-                .name_section_offset
-                .checked_add(name_pos_offset)
-                .ok_or_else(|| malformed_error!("name position overflow"))?;
-            parser.seek(name_pos)?;
-
-            let name = parser.read_prefixed_string_utf16()?;
-            let type_offset = parser.read_le::<u32>()?;
-
-            let data_pos = if self.is_embedded_resource {
-                // Embedded resources: offset calculated from magic number position, need +4 for size field
-                self.data_section_offset
-                    .checked_add(type_offset as usize)
-                    .and_then(|v| v.checked_add(4))
-                    .ok_or_else(|| malformed_error!("embedded resource data position overflow"))?
-            } else {
-                // Standalone .resources files: use direct offset
-                self.data_section_offset
-                    .checked_add(type_offset as usize)
-                    .ok_or_else(|| malformed_error!("standalone resource data position overflow"))?
-            };
-
-            // Validate data position bounds
-            if data_pos >= data.len() {
-                return Err(malformed_error!(
-                    "Resource data offset {} is beyond file bounds",
-                    data_pos
-                ));
-            }
-
+        for (i, (name, data_pos)) in entries.into_iter().enumerate() {
             parser.seek(data_pos)?;
-
-            let resource_data = if self.rr_version == 1 {
-                // V1 format: type index (7-bit encoded) followed by data
-                let type_index = parser.read_7bit_encoded_int()?;
-                if type_index == u32::MAX {
-                    // -1 encoded as 7-bit represents null
-                    ResourceType::Null
-                } else if let Some(type_name) = self.type_names.get(type_index as usize) {
-                    ResourceType::from_type_name(type_name, &mut parser)?
-                } else {
-                    return Err(malformed_error!("Invalid type index: {}", type_index));
+            let end = ends.get(&data_pos).copied().unwrap_or(data.len());
+            let resource_data = match self.value_type(&mut parser)? {
+                ValueType::Null => ResourceType::Null,
+                ValueType::Code(code) => ResourceType::from_type_byte(code, &mut parser)?,
+                ValueType::Named(primitive) => {
+                    ResourceType::from_type_name(primitive, &mut parser)?
                 }
-            } else {
-                // V2 format: type code (7-bit encoded) followed by data
-                #[allow(clippy::cast_possible_truncation)]
-                let type_code = parser.read_7bit_encoded_int()? as u8;
-
-                if self.type_names.is_empty() {
-                    // No type table - this file uses only primitive types (direct type codes)
-                    // Common in resource files that contain only strings/primitives
-                    ResourceType::from_type_byte(type_code, &mut parser)?
-                } else if let Some(type_name) = self.type_names.get(type_code as usize) {
-                    ResourceType::from_type_name(type_name, &mut parser)?
-                } else {
-                    return Err(malformed_error!("Invalid type index: {}", type_code));
-                }
+                ValueType::User(type_name) => ResourceType::Serialized {
+                    type_name: type_name.to_owned(),
+                    data: data.get(parser.pos()..end).unwrap_or_default().to_vec(),
+                },
             };
-
             let name_hash = *self
                 .name_hashes
                 .get(i)
                 .ok_or_else(|| malformed_error!("name_hashes index {} out of bounds", i))?;
-            let result = ResourceEntry {
-                name: name.clone(),
-                name_hash,
-                data: resource_data,
-            };
-
-            resources.insert(name, result);
+            resources.insert(
+                name.clone(),
+                ResourceEntry {
+                    name,
+                    name_hash,
+                    data: resource_data,
+                },
+            );
         }
-
         Ok(resources)
     }
 
@@ -1056,10 +1007,10 @@ impl Resource {
     ///         if bytes.len() > 4 && &bytes[0..4] == b"PK\x03\x04" {
     ///             println!("Found embedded ZIP: {} ({} bytes)", name, bytes.len());
     ///
-    ///             // Extract ZIP without copying the data
-    ///             // Pass borrowed slice directly to ZIP library
-    ///             let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
-    ///             println!("  Contains {} files", archive.len());
+    ///             // Extract ZIP without copying the data: a ZIP reader takes
+    ///             // the borrowed slice directly
+    ///             let reader = std::io::Cursor::new(*bytes);
+    ///             assert_eq!(reader.get_ref().len(), bytes.len());
     ///         }
     ///     }
     /// }
@@ -1074,6 +1025,45 @@ impl Resource {
         &mut self,
         data: &'a [u8],
     ) -> Result<BTreeMap<String, ResourceEntryRef<'a>>> {
+        let entries = self.entries(data)?;
+        let ends = Self::value_ends(&entries, data.len());
+        let mut resources = BTreeMap::new();
+        let mut parser = Parser::new(data);
+        for (i, (name, data_pos)) in entries.into_iter().enumerate() {
+            parser.seek(data_pos)?;
+            let end = ends.get(&data_pos).copied().unwrap_or(data.len());
+            let resource_data = match self.value_type(&mut parser)? {
+                ValueType::Null => ResourceTypeRef::Null,
+                ValueType::Code(code) => {
+                    ResourceTypeRef::from_type_byte_ref(code, &mut parser, data)?
+                }
+                ValueType::Named(primitive) => {
+                    ResourceTypeRef::from_type_name_ref(primitive, &mut parser, data)?
+                }
+                ValueType::User(type_name) => ResourceTypeRef::Serialized {
+                    type_name: type_name.to_owned(),
+                    data: data.get(parser.pos()..end).unwrap_or_default(),
+                },
+            };
+            let name_hash = *self
+                .name_hashes
+                .get(i)
+                .ok_or_else(|| malformed_error!("name_hashes index {} out of bounds", i))?;
+            resources.insert(
+                name.clone(),
+                ResourceEntryRef {
+                    name,
+                    name_hash,
+                    data: resource_data,
+                },
+            );
+        }
+        Ok(resources)
+    }
+
+    /// Reads every entry's name and the position of its value, in the name
+    /// section's order, each position checked to lie inside `data`.
+    fn entries(&self, data: &[u8]) -> Result<Vec<(String, usize)>> {
         let count = self.resource_count as usize;
         if self.name_hashes.len() != count || self.name_positions.len() != count {
             return Err(malformed_error!(
@@ -1083,86 +1073,84 @@ impl Resource {
                 self.name_positions.len()
             ));
         }
-
-        let mut resources = BTreeMap::new();
         let mut parser = Parser::new(data);
-
-        for i in 0..count {
-            let name_pos_offset = *self
-                .name_positions
-                .get(i)
-                .ok_or_else(|| malformed_error!("name_positions index {} out of bounds", i))?
-                as usize;
+        let mut entries = Vec::with_capacity(count);
+        for &offset in &self.name_positions {
             let name_pos = self
                 .name_section_offset
-                .checked_add(name_pos_offset)
+                .checked_add(offset as usize)
                 .ok_or_else(|| malformed_error!("name position overflow"))?;
             parser.seek(name_pos)?;
-
             let name = parser.read_prefixed_string_utf16()?;
             let type_offset = parser.read_le::<u32>()?;
-
-            let data_pos = if self.is_embedded_resource {
-                self.data_section_offset
-                    .checked_add(type_offset as usize)
-                    .and_then(|v| v.checked_add(4))
-                    .ok_or_else(|| malformed_error!("embedded resource data position overflow"))?
+            // An embedded resource's offsets count from its size field, four
+            // bytes before the magic number a standalone file starts with.
+            let base = if self.is_embedded_resource {
+                self.data_section_offset.checked_add(4)
             } else {
-                self.data_section_offset
-                    .checked_add(type_offset as usize)
-                    .ok_or_else(|| malformed_error!("standalone resource data position overflow"))?
+                Some(self.data_section_offset)
             };
-
-            // Validate data position bounds
+            let data_pos = base
+                .and_then(|base| base.checked_add(type_offset as usize))
+                .ok_or_else(|| malformed_error!("resource data position overflow"))?;
             if data_pos >= data.len() {
                 return Err(malformed_error!(
                     "Resource data offset {} is beyond file bounds",
                     data_pos
                 ));
             }
-
-            parser.seek(data_pos)?;
-
-            let resource_data = if self.rr_version == 1 {
-                // V1 format: type index (7-bit encoded) followed by data
-                let type_index = parser.read_7bit_encoded_int()?;
-                if type_index == u32::MAX {
-                    // -1 encoded as 7-bit represents null
-                    ResourceTypeRef::Null
-                } else if let Some(type_name) = self.type_names.get(type_index as usize) {
-                    ResourceTypeRef::from_type_name_ref(type_name, &mut parser, data)?
-                } else {
-                    return Err(malformed_error!("Invalid type index: {}", type_index));
-                }
-            } else {
-                // V2 format: type code (7-bit encoded) followed by data
-                #[allow(clippy::cast_possible_truncation)]
-                let type_code = parser.read_7bit_encoded_int()? as u8;
-
-                if self.type_names.is_empty() {
-                    // No type table - this file uses only primitive types (direct type codes)
-                    ResourceTypeRef::from_type_byte_ref(type_code, &mut parser, data)?
-                } else if let Some(type_name) = self.type_names.get(type_code as usize) {
-                    ResourceTypeRef::from_type_name_ref(type_name, &mut parser, data)?
-                } else {
-                    return Err(malformed_error!("Invalid type index: {}", type_code));
-                }
-            };
-
-            let name_hash = *self
-                .name_hashes
-                .get(i)
-                .ok_or_else(|| malformed_error!("name_hashes index {} out of bounds", i))?;
-            let result = ResourceEntryRef {
-                name: name.clone(),
-                name_hash,
-                data: resource_data,
-            };
-
-            resources.insert(name, result);
+            entries.push((name, data_pos));
         }
+        Ok(entries)
+    }
 
-        Ok(resources)
+    /// Where each value ends: the next value's start, the last one's at
+    /// `len`, the end of the data. A serialized user type states no length of
+    /// its own, so its bytes run to the next value.
+    fn value_ends(entries: &[(String, usize)], len: usize) -> BTreeMap<usize, usize> {
+        let starts: BTreeSet<usize> = entries.iter().map(|(_, start)| *start).collect();
+        let mut ends = BTreeMap::new();
+        let mut next = len;
+        for &start in starts.iter().rev() {
+            ends.insert(start, next);
+            next = start;
+        }
+        ends
+    }
+
+    /// Reads the type of the value `parser` is positioned at and leaves it
+    /// at the value's data: a version 1 file names it by its type table entry
+    /// (a primitive by its name, any other type a user type); a version 2 file
+    /// by its `ResourceTypeCode`, a code below `0x40` a primitive and one from
+    /// `0x40` up the type table's entry `code - 0x40` (`ResourceReader`'s
+    /// `_typeTable[typeCode - ResourceTypeCode.StartOfUserTypes]`).
+    fn value_type<'a>(&'a self, parser: &mut Parser<'_>) -> Result<ValueType<'a>> {
+        let code = parser.read_7bit_encoded_int()?;
+        if self.rr_version == 1 {
+            if code == u32::MAX {
+                return Ok(ValueType::Null);
+            }
+            let type_name = self
+                .type_names
+                .get(code as usize)
+                .ok_or_else(|| malformed_error!("Invalid type index: {}", code))?;
+            return Ok(match primitive_type_name(type_name) {
+                Some(primitive) => ValueType::Named(primitive),
+                None => ValueType::User(type_name),
+            });
+        }
+        match code.checked_sub(USER_TYPES) {
+            None => {
+                Ok(ValueType::Code(u8::try_from(code).map_err(|_| {
+                    malformed_error!("Invalid type code: {}", code)
+                })?))
+            }
+            Some(index) => self
+                .type_names
+                .get(index as usize)
+                .map(|type_name| ValueType::User(type_name))
+                .ok_or_else(|| malformed_error!("Invalid user type code: {}", code)),
+        }
     }
 
     /// Validate that the reader type is supported by this parser.
@@ -1182,14 +1170,140 @@ impl Resource {
     }
 }
 
+/// The first `ResourceTypeCode` of a user type (`StartOfUserTypes`, 0x40):
+/// the codes from it up index the type table.
+const USER_TYPES: u32 = 0x40;
+
+/// The type a value states before its data ([`Resource::value_type`]).
+enum ValueType<'a> {
+    /// The null value.
+    Null,
+    /// A primitive, by its `ResourceTypeCode`.
+    Code(u8),
+    /// A primitive, by its type name (a version 1 file).
+    Named(&'a str),
+    /// A user type, by its assembly-qualified name.
+    User(&'a str),
+}
+
+/// The primitive a type table entry names, its name without the assembly
+/// that qualifies it (`System.String, mscorlib, ...` is `System.String`), or
+/// `None` for any other type.
+fn primitive_type_name(type_name: &str) -> Option<&str> {
+    let base = type_name.split(',').next().unwrap_or(type_name).trim();
+    matches!(
+        base,
+        "System.Null"
+            | "System.String"
+            | "System.Boolean"
+            | "System.Char"
+            | "System.Byte"
+            | "System.SByte"
+            | "System.Int16"
+            | "System.UInt16"
+            | "System.Int32"
+            | "System.UInt32"
+            | "System.Int64"
+            | "System.UInt64"
+            | "System.Single"
+            | "System.Double"
+            | "System.Decimal"
+            | "System.DateTime"
+            | "System.TimeSpan"
+            | "System.Byte[]"
+            | "System.IO.Stream"
+    )
+    .then_some(base)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::testkit::verify_wbdll_resource_buffer;
+    use super::*;
+    use crate::{
+        metadata::resources::nrbf::{read_object, NrbfValue},
+        testkit::verify_wbdll_resource_buffer,
+    };
 
     #[test]
     fn wb_example() {
         let data =
             include_bytes!("../../../tests/samples/WB_FxResources.WindowsBase.SR.resources.bin");
         verify_wbdll_resource_buffer(data);
+    }
+
+    /// A localizable form's resource set, as Mono's `resgen` writes it: a type
+    /// table of `System.Drawing.Size` and `Point` beside strings and an
+    /// `Int32` stated by their primitive codes.
+    const LOCALIZED: &[u8] =
+        include_bytes!("../../../tests/samples/resources/localized_form.resources");
+
+    /// The integer members `names` of the serialized value `value`.
+    fn members(value: &ResourceType, names: &[&str]) -> (String, Vec<i64>) {
+        let ResourceType::Serialized { type_name, data } = value else {
+            panic!("a serialized value: {value:?}");
+        };
+        let object = read_object(data).expect("the value reads");
+        assert!(
+            type_name.starts_with(&format!("{}, ", object.class_name)),
+            "{type_name}"
+        );
+        let values = names
+            .iter()
+            .map(|name| {
+                object
+                    .member(name)
+                    .and_then(NrbfValue::as_i64)
+                    .expect("an integer member")
+            })
+            .collect();
+        (object.class_name, values)
+    }
+
+    /// **A primitive is read by its code and a user type by the type table.**
+    /// A version 2 resource set states a primitive by its `ResourceTypeCode`
+    /// (below `0x40`) and a user type by `0x40` plus its type table entry, so
+    /// beside a type table the strings and the `Int32` read as themselves and
+    /// each `Point` and `Size` as the value it serializes, with the bytes up to
+    /// the next value, in both readers.
+    #[test]
+    fn a_primitive_is_read_by_its_code_and_a_user_type_by_the_table() {
+        let owned = parse_dotnet_resource(LOCALIZED).expect("the resource set reads");
+        let text = |name: &str| match &owned[name].data {
+            ResourceType::String(text) => text.clone(),
+            other => panic!("{name}: {other:?}"),
+        };
+        assert_eq!(text("ok.Text"), "OK");
+        assert_eq!(text("$this.Text"), "Localized");
+        assert!(matches!(owned["ok.TabIndex"].data, ResourceType::Int32(0)));
+        assert_eq!(
+            members(&owned["ok.Location"].data, &["x", "y"]),
+            ("System.Drawing.Point".to_owned(), vec![197, 126])
+        );
+        assert_eq!(
+            members(&owned["ok.Size"].data, &["width", "height"]),
+            ("System.Drawing.Size".to_owned(), vec![75, 23])
+        );
+        assert_eq!(
+            members(&owned["$this.ClientSize"].data, &["width", "height"]),
+            ("System.Drawing.Size".to_owned(), vec![284, 161])
+        );
+
+        let borrowed = parse_dotnet_resource_ref(LOCALIZED).expect("the resource set reads");
+        assert_eq!(borrowed.len(), owned.len());
+        let ResourceTypeRef::Serialized { type_name, data } = &borrowed["ok.Location"].data else {
+            panic!("a serialized value");
+        };
+        assert!(type_name.starts_with("System.Drawing.Point, "));
+        let ResourceType::Serialized {
+            data: owned_data, ..
+        } = &owned["ok.Location"].data
+        else {
+            panic!("a serialized value");
+        };
+        assert_eq!(*data, owned_data.as_slice());
+        assert!(matches!(
+            borrowed["ok.Text"].data,
+            ResourceTypeRef::String("OK")
+        ));
     }
 }
