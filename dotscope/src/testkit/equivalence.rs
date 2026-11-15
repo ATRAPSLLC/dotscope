@@ -16,12 +16,12 @@ use std::collections::BTreeMap;
 
 use crate::{
     analysis::{
-        ConstValue, ControlFlowGraph, SsaConverter, SsaEvaluator, SsaFunction, SsaOp, SsaType,
-        TypeProvider, VariableOrigin,
+        CilTarget, ConstValue, ControlFlowGraph, SsaConverter, SsaEvaluator, SsaFunction, SsaOp,
+        SsaType, TypeProvider, VariableOrigin,
     },
     assembly::decode_blocks,
     compiler::SsaCodeGenerator,
-    metadata::{token::Token, typesystem::PointerSize},
+    metadata::token::Token,
     CilObject, Result,
 };
 
@@ -275,7 +275,7 @@ fn samples(ty: &SsaType) -> Vec<ConstValue> {
 /// What `ssa` returns on `args`, as text (`void` for a return without a value), or `None`
 /// when the evaluator cannot finish the run.
 fn execute(ssa: &SsaFunction, args: &BTreeMap<u16, ConstValue>) -> Option<String> {
-    let mut evaluator = SsaEvaluator::new(ssa, PointerSize::Bit64);
+    let mut evaluator = SsaEvaluator::new(ssa, CilTarget::x64().machine());
     for variable in ssa.argument_variables() {
         if let VariableOrigin::Argument(index) = variable.origin() {
             if let Some(value) = args.get(&index) {
@@ -289,10 +289,12 @@ fn execute(ssa: &SsaFunction, args: &BTreeMap<u16, ConstValue>) -> Option<String
     }
     let last = ssa.block(trace.last_block()?)?;
     match last.control_terminator()? {
-        SsaOp::Return { value: None } => Some("void".to_string()),
+        SsaOp::Return { value: None, .. } => Some("void".to_string()),
         // As the evaluation stack holds it, in Debug text: a NaN equals a NaN, -0.0
         // differs from 0.0
-        SsaOp::Return { value: Some(value) } => evaluator
+        SsaOp::Return {
+            value: Some(value), ..
+        } => evaluator
             .get_concrete(*value)
             .map(|value| format!("{:?}", on_stack(value))),
         _ => None,
@@ -447,9 +449,7 @@ mod tests {
             right: second,
             flags: None,
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(sum),
-        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(sum))));
         ssa.add_block(block);
         ssa.recompute_uses();
 

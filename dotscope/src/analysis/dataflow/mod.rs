@@ -46,7 +46,6 @@ mod tests {
     use super::*;
     use crate::{
         assembly::InstructionAssembler,
-        metadata::typesystem::PointerSize,
         testkit::{build_cfg, build_ssa, TestTypeProvider},
     };
 
@@ -273,7 +272,7 @@ mod tests {
         let (_, cfg) = build_cfg(asm).expect("assembles and decodes");
         let ssa = build_ssa(&cfg, &TestTypeProvider::all_i32(0, 0)).expect("SSA construction");
 
-        let mut sccp = ConstantPropagation::new(PointerSize::Bit64);
+        let mut sccp = ConstantPropagation::new(CilTarget::x64().machine());
         let results = sccp.analyze(&ssa, &cfg);
 
         // The entry block should be executable
@@ -317,7 +316,7 @@ mod tests {
         let (_, cfg) = build_cfg(asm).expect("assembles and decodes");
         let ssa = build_ssa(&cfg, &TestTypeProvider::all_i32(0, 1)).expect("SSA construction");
 
-        let mut sccp = ConstantPropagation::new(PointerSize::Bit64);
+        let mut sccp = ConstantPropagation::new(CilTarget::x64().machine());
         let results = sccp.analyze(&ssa, &cfg);
 
         // Entry block should be executable
@@ -359,7 +358,7 @@ mod tests {
         let (_, cfg) = build_cfg(asm).expect("assembles and decodes");
         let ssa = build_ssa(&cfg, &TestTypeProvider::all_i32(1, 1)).expect("SSA construction");
 
-        let mut sccp = ConstantPropagation::new(PointerSize::Bit64);
+        let mut sccp = ConstantPropagation::new(CilTarget::x64().machine());
         let results = sccp.analyze(&ssa, &cfg);
 
         // All blocks should be executable

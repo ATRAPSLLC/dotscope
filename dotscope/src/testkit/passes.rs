@@ -1,8 +1,8 @@
 //! Running a pass in a test the way the scheduler runs it, verified.
 //!
 //! A test that calls [`SsaPass::run_on_method`] itself skips what the scheduler does around
-//! the pass: the edit-failure check, and the SSA repair or rebuild the pass's modification
-//! scope asks for. And it verifies nothing, so a pass that leaves invalid SSA passes its test.
+//! the pass: the edit-failure check, and the SSA repair the pass's modification scope asks
+//! for. And it verifies nothing, so a pass that leaves invalid SSA passes its test.
 //! [`run_verified`] runs the scheduler's own step and verifies the result as a pipeline under
 //! `verify_hard` does. It verifies what it is handed first, so a test whose own SSA is invalid
 //! is told apart from a pass that breaks valid SSA.
@@ -20,8 +20,9 @@ use crate::{
 ///
 /// # Errors
 ///
-/// When `ssa` is invalid before the pass runs, or when the pass fails or panics, its change needs a rebuild that fails, or it leaves SSA the
-/// verifier rejects (with the verifier's errors); `ssa` is then as it was before the pass.
+/// When `ssa` is invalid before the pass runs, or when the pass fails or panics, changes the
+/// control flow without repairing its SSA, or leaves SSA the verifier rejects (with the
+/// verifier's errors); `ssa` is then as it was before the pass.
 pub fn run_verified(
     pass: &dyn SsaPass<CilTarget, CompilerContext>,
     ssa: &mut SsaFunction,
@@ -80,9 +81,7 @@ mod tests {
         ) -> analyssa::Result<bool> {
             if let Some(block) = ssa.block_mut(0) {
                 if let Some(last) = block.instructions_mut().last_mut() {
-                    last.set_op(SsaOp::Return {
-                        value: Some(SsaVarId::from_index(999)),
-                    });
+                    last.set_op(SsaOp::returns(Some(SsaVarId::from_index(999))));
                 }
             }
             Ok(true)

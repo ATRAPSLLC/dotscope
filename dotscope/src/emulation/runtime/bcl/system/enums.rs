@@ -163,8 +163,9 @@ fn enum_is_defined_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 
 /// Hook for `Enum.GetUnderlyingType(Type)`.
 ///
-/// Reads the enum's `value__` instance field to determine the actual underlying
-/// type. Falls back to `System.Int32` if metadata is unavailable.
+/// Reads the enum's underlying type from its one instance field
+/// ([`CilType::enum_underlying`](crate::metadata::typesystem::CilType::enum_underlying)).
+/// Falls back to `System.Int32` if metadata is unavailable.
 fn enum_get_underlying_type_pre(
     ctx: &HookContext<'_>,
     thread: &mut EmulationThread,
@@ -172,29 +173,22 @@ fn enum_get_underlying_type_pre(
     if let Some(EmValue::ObjectRef(type_ref)) = ctx.args.first() {
         if let Some(type_token) = try_hook!(thread.heap().get_reflection_type_token(*type_ref)) {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(cil_type) = asm.types().resolve(&type_token) {
-                    // Find the special "value__" instance field (non-static, non-literal)
-                    for (_, field) in cil_type.fields.iter() {
-                        if !field.flags.is_static() && !field.flags.is_literal() {
-                            let underlying_token = TypeResolver::new(asm.types())
-                                .resolve(&field.signature.base)
-                                .map(|t| t.token)
-                                .unwrap_or_else(|_| CilPrimitiveKind::I4.token());
-                            match thread
-                                .heap_mut()
-                                .alloc_reflection_type(underlying_token, None)
-                            {
-                                Ok(href) => {
-                                    return PreHookResult::Bypass(Some(EmValue::ObjectRef(href)))
-                                }
-                                Err(e) => {
-                                    return PreHookResult::Error(format!(
-                                        "heap allocation failed: {e}"
-                                    ))
-                                }
-                            }
-                        }
-                    }
+                if let Some(underlying) = asm
+                    .types()
+                    .resolve(&type_token)
+                    .and_then(|cil_type| cil_type.enum_underlying().cloned())
+                {
+                    let underlying_token = TypeResolver::new(asm.types())
+                        .resolve(&underlying)
+                        .map(|t| t.token)
+                        .unwrap_or_else(|_| CilPrimitiveKind::I4.token());
+                    return match thread
+                        .heap_mut()
+                        .alloc_reflection_type(underlying_token, None)
+                    {
+                        Ok(href) => PreHookResult::Bypass(Some(EmValue::ObjectRef(href))),
+                        Err(e) => PreHookResult::Error(format!("heap allocation failed: {e}")),
+                    };
                 }
             }
         }

@@ -62,11 +62,14 @@
 //!
 //! # Traversal-Based Example
 //!
-//! ```no_run
+//! ```
 //! use dotscope::analysis::{x86_decode_traversal, X86Function};
 //!
+//! // push ebp; mov ebp, esp; xor eax, eax; pop ebp; ret
+//! let bytes = [0x55, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3];
+//!
 //! // Decode using control-flow following (more robust)
-//! let result = x86_decode_traversal(bytes, 32, 0x1000, 0)?;
+//! let result = x86_decode_traversal(&bytes, 32, 0x1000, 0)?;
 //! println!("Decoded {} instructions", result.instructions.len());
 //! println!("Has indirect jumps: {}", result.has_indirect_control_flow);
 //!
@@ -116,11 +119,15 @@
 //!
 //! The [`ssa`] module provides translation from x86 CFG to SSA form:
 //!
-//! ```no_run
+//! ```
 //! use dotscope::analysis::{x86_decode_all, X86Function, X86ToSsaTranslator};
 //!
+//! // A stub is entered with nothing in its registers, so it writes each before
+//! // reading it: mov eax, 5; add eax, 3; ret
+//! let bytes = [0xB8, 0x05, 0x00, 0x00, 0x00, 0x83, 0xC0, 0x03, 0xC3];
+//!
 //! // Decode and build CFG
-//! let instructions = x86_decode_all(bytes, 32, 0x1000)?;
+//! let instructions = x86_decode_all(&bytes, 32, 0x1000)?;
 //! let cfg = X86Function::new(&instructions, 32, 0x1000);
 //!
 //! // Translate to SSA
@@ -157,15 +164,12 @@ pub use types::{
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        analysis::{
-            x86::{
-                x86_decode_all, x86_detect_prologue, X86Function, X86Instruction, X86Operand,
-                X86PrologueKind, X86Register, X86ToSsaTranslator,
-            },
-            ConstValue, SsaEvaluator, SsaOp,
+    use crate::analysis::{
+        x86::{
+            x86_decode_all, x86_detect_prologue, X86Function, X86Instruction, X86Operand,
+            X86PrologueKind, X86Register, X86ToSsaTranslator,
         },
-        metadata::typesystem::PointerSize,
+        CilTarget, ConstValue, SsaEvaluator, SsaOp,
     };
 
     /// Test the full pipeline: decode -> build CFG
@@ -324,7 +328,7 @@ mod tests {
             .expect("no argument variable");
         let arg_id = arg_var.id();
 
-        let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit32);
+        let mut eval = SsaEvaluator::new(&ssa, CilTarget::x86().machine());
         eval.set_concrete(arg_id, ConstValue::I32(input));
         let trace = eval.execute(0, None, 50);
         assert!(trace.is_complete(), "evaluation did not complete");
@@ -334,6 +338,7 @@ mod tests {
         for instr in block.instructions() {
             if let SsaOp::Return {
                 value: Some(ret_var),
+                ..
             } = instr.op()
             {
                 return eval
@@ -369,7 +374,7 @@ mod tests {
         let block = ssa.block(0).unwrap();
         let last = block.instructions().last().expect("no instructions");
         assert!(
-            matches!(last.op(), SsaOp::Return { value: Some(_) }),
+            matches!(last.op(), SsaOp::Return { value: Some(_), .. }),
             "expected Return with value, got {:?}",
             last.op()
         );

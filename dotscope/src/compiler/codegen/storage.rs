@@ -28,10 +28,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use analyssa::{
     analysis::{
         folding::{FoldForest, FoldPolicy},
-        webs::{Gathered, Gathering, Group},
+        webs::{Conflicts, Gathered, Gathering, Group},
     },
     PointerSize,
 };
+use rustc_hash::FxHashMap;
 
 use crate::{
     analysis::{
@@ -83,6 +84,51 @@ pub(crate) struct Storage {
     /// By slot: the method's own local the slot is, which keeps its original
     /// declaration in the signature; `None` for a slot the generator added.
     declared: Vec<Option<u16>>,
+}
+
+/// What decides whether a value may share a place with another: its type, the
+/// argument it is fixed in on entry, whether it is a local's entry value, the
+/// address-taken local it versions and whether a finally resumes into it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Placement {
+    /// The type the value is stored as.
+    ty: Option<SsaType>,
+    /// The argument a value arriving on entry is fixed in.
+    home: Option<u16>,
+    /// Whether the value is a local's entry value, zero-initialised there.
+    entry_local: bool,
+    /// The address-taken local whose slot holds the value.
+    taken: Option<u16>,
+    /// Whether the value is a phi copied before an `endfinally`.
+    resumes: bool,
+}
+
+impl Placement {
+    /// Whether a value placed as `self` and one placed as `other` may not
+    /// share a place.
+    fn conflicts(&self, other: &Self) -> bool {
+        let (Some(ta), Some(tb)) = (&self.ty, &other.ty) else {
+            return true;
+        };
+        if !slot_compatible(ta, tb) {
+            return true;
+        }
+        // Two fixed homes, or a fixed home and a zero-initialised entry.
+        if self.home.is_some() && other.home.is_some() && self.home != other.home {
+            return true;
+        }
+        if (self.home.is_some() && other.entry_local) || (other.home.is_some() && self.entry_local)
+        {
+            return true;
+        }
+        // An address-taken local's slot holds its versions and nothing else.
+        if self.taken != other.taken {
+            return true;
+        }
+        // A phi copied before an `endfinally` is written on every way out of
+        // the finally, while an exception unwinds through it included.
+        self.resumes || other.resumes
+    }
 }
 
 /// dotscope's folding decisions on top of the generic rules.
@@ -247,31 +293,38 @@ impl Storage {
         };
         let resume_phis = finally_resume_phis(ssa);
 
-        let conflicts = |a: SsaVarId, b: SsaVarId| -> bool {
-            let (Some(ta), Some(tb)) = (types.get(a.index()), types.get(b.index())) else {
-                return true;
-            };
-            if !slot_compatible(ta, tb) {
-                return true;
+        // What keeps two values out of one place is a question of what each
+        // is - its type, its fixed home, whether it is an address-taken
+        // local's or a phi a finally resumes into - so each distinct answer is
+        // one kind, and the gathering compares places by the few kinds they
+        // hold.
+        let mut interned: FxHashMap<Placement, u32> = FxHashMap::default();
+        let mut placements: Vec<Placement> = Vec::new();
+        let kinds: Vec<u32> = (0..count)
+            .map(|index| {
+                let var = SsaVarId::from_index(index);
+                let placement = Placement {
+                    ty: types.get(index).cloned(),
+                    home: entry_arg.get(&var).copied(),
+                    entry_local: entry_local.contains(&var),
+                    taken: taken_local(var),
+                    resumes: resume_phis.contains(&var),
+                };
+                *interned.entry(placement.clone()).or_insert_with(|| {
+                    placements.push(placement);
+                    u32::try_from(placements.len().saturating_sub(1)).unwrap_or(u32::MAX)
+                })
+            })
+            .collect();
+        let conflict = |a: u32, b: u32| -> bool {
+            match (placements.get(a as usize), placements.get(b as usize)) {
+                (Some(a), Some(b)) => a.conflicts(b),
+                _ => true,
             }
-            // Two fixed homes, or a fixed home and a zero-initialised entry.
-            let home_a = entry_arg.get(&a);
-            let home_b = entry_arg.get(&b);
-            if home_a.is_some() && home_b.is_some() && home_a != home_b {
-                return true;
-            }
-            if (home_a.is_some() && entry_local.contains(&b))
-                || (home_b.is_some() && entry_local.contains(&a))
-            {
-                return true;
-            }
-            // An address-taken local's slot holds its versions and nothing else.
-            if taken_local(a) != taken_local(b) {
-                return true;
-            }
-            // A phi copied before an `endfinally` is written on every way out
-            // of the finally, while an exception unwinds through it included.
-            resume_phis.contains(&a) || resume_phis.contains(&b)
+        };
+        let conflicts = Conflicts {
+            kinds: &kinds,
+            conflict: &conflict,
         };
 
         // Groups: each argument's and local's versions, entry value first; then
@@ -316,17 +369,15 @@ impl Storage {
         let gathered: Gathered = Gathering {
             rowless: &rowless,
             groups,
-            conflicts: Some(&conflicts),
+            conflicts: Some(conflicts),
+            must_share: &must_share,
         }
         // A phi operand without a row is produced on the edge and has no place
         // to share: offered to the result's web, the copy that writes the
         // result would be dropped as one that reads and writes one variable.
-        .run_with(
-            ssa,
-            &defuse,
-            |_, _, operand| !rowless.get(operand).copied().unwrap_or(false),
-            &must_share,
-        );
+        .run(ssa, &defuse, |_, _, operand| {
+            !rowless.get(operand).copied().unwrap_or(false)
+        });
 
         // A version of an address-taken slot read after something may have
         // written the slot through its address is no longer what the slot
@@ -810,7 +861,7 @@ fn infer_type_inner(
         {
             let operand = *operand;
             let ty = infer_type_inner(ssa, operand, visited)?;
-            return ty.arithmetic_class().ok_or_else(|| {
+            return ty.unary_numeric().ok_or_else(|| {
                 Error::CodegenFailed(format!("{var:?} computes on {ty:?}, which is no number"))
             });
         }

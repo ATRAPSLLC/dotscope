@@ -7,10 +7,10 @@ use std::{collections::HashSet, fmt};
 
 use crate::{
     analysis::{
-        CallGraph, ConstantPropagation, ControlFlowGraph, DataFlowSolver, LiveVariables, NodeId,
-        ReachingDefinitions, SsaFunction,
+        CallGraph, CilTarget, ConstantPropagation, ControlFlowGraph, DataFlowSolver, LiveVariables,
+        NodeId, ReachingDefinitions, SsaFunction,
     },
-    metadata::{method::Method, typesystem::PointerSize},
+    metadata::method::Method,
     testkit::analysis::expectations::{
         CallGraphExpectation, CfgExpectation, DataFlowExpectation, SsaExpectation,
     },
@@ -415,7 +415,7 @@ pub fn verify_dataflow(
     let mut errors = Vec::new();
 
     // Run SCCP to check for constants and dead code
-    let mut sccp = ConstantPropagation::new(PointerSize::Bit64);
+    let mut sccp = ConstantPropagation::new(CilTarget::x64().machine());
     let sccp_result = sccp.analyze(ssa, cfg);
 
     // Check for constants

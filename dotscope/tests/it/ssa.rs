@@ -1650,7 +1650,7 @@ fn test_ssa_is_not_void_return() -> Result<()> {
     // But checking the Return instruction reveals it has a value
     let has_value_return = ssa
         .all_instructions()
-        .any(|instr| matches!(instr.op(), SsaOp::Return { value: Some(_) }));
+        .any(|instr| matches!(instr.op(), SsaOp::Return { value: Some(_), .. }));
     assert!(has_value_return);
 
     Ok(())

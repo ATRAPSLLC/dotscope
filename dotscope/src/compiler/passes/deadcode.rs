@@ -16,7 +16,7 @@ use analyssa::{passes::deadcode, World};
 
 use crate::{
     analysis::{CilTarget, MethodRef, SsaFunction},
-    compiler::{pass::SsaPass, CompilerContext},
+    compiler::{pass::SsaPass, CompilerContext, ModificationScope},
     metadata::token::Token,
 };
 
@@ -49,6 +49,12 @@ impl SsaPass<CilTarget, CompilerContext> for DeadMethodEliminationPass {
 
     fn is_global(&self) -> bool {
         true
+    }
+
+    /// Its per-method entry changes nothing; the global run marks methods
+    /// dead and edits no function.
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::UsesOnly
     }
 
     fn requires_full_scan(&self) -> bool {
@@ -142,7 +148,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::analysis::{CallGraph, SsaFunctionBuilder};
+    use crate::analysis::{CallGraph, Callee, SsaFunctionBuilder};
 
     /// A method reached from an entry point through the calls its SSA makes is live; one no
     /// live method calls is marked dead.
@@ -161,7 +167,7 @@ mod tests {
         let calls_called = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(called), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(called)), &[]);
                     b.ret();
                 });
             })

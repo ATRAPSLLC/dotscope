@@ -34,11 +34,11 @@ use std::collections::BTreeMap;
 
 use crate::{
     analysis::{
-        CilTarget, DefSite, MethodRef, ReturnInfo, SsaFunction, SsaInstruction, SsaOp, SsaType,
-        SsaVarId, VariableOrigin,
+        Callee, CilTarget, DefSite, MethodRef, ReturnInfo, SsaFunction, SsaInstruction, SsaOp,
+        SsaType, SsaVarId, VariableOrigin,
     },
     compiler::{
-        pass::{PassCapability, SsaPass},
+        pass::{ModificationScope, PassCapability, SsaPass},
         CompilerContext, EventKind, EventLog,
     },
     metadata::{tables::TableId, token::Token},
@@ -181,7 +181,7 @@ impl<'a> InliningContext<'a> {
                 }
 
                 // Check purity - only inline pure or read-only methods
-                if !callee_ssa.purity().can_inline() {
+                if !callee_ssa.purity(|_| None).can_inline() {
                     return false;
                 }
 
@@ -211,7 +211,7 @@ impl<'a> InliningContext<'a> {
     fn has_recursive_call(&self, method_token: Token, ssa: &SsaFunction) -> bool {
         for block in ssa.blocks() {
             for instr in block.instructions() {
-                if let SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } = instr.op() {
+                if let Some(method) = instr.op().as_call().and_then(|call| call.callee.method()) {
                     if method.token() == method_token {
                         return true;
                     }
@@ -262,9 +262,12 @@ impl<'a> InliningContext<'a> {
         let mut candidates = Vec::new();
 
         for (block_idx, instr_idx, instr) in self.caller_ssa.iter_instructions() {
-            let raw_callee_token = match instr.op() {
-                SsaOp::Call { method, .. } => method.token(),
-                SsaOp::CallVirt { method, .. } => {
+            let Some(call) = instr.op().as_call() else {
+                continue;
+            };
+            let raw_callee_token = match &call.callee {
+                Callee::Direct(method) => method.token(),
+                Callee::Virtual(method) => {
                     let token = method.token();
                     // Check if this is actually polymorphic
                     if self
@@ -277,7 +280,10 @@ impl<'a> InliningContext<'a> {
                     }
                     token
                 }
-                _ => continue,
+                // A constrained call's receiver is the address of the value,
+                // which the named body does not take: the runtime boxes it,
+                // dereferences it or calls the constraint type's own method.
+                Callee::Constrained { .. } | Callee::Indirect { .. } => continue,
             };
 
             // Resolve MemberRef tokens to MethodDef tokens for SSA lookup
@@ -368,11 +374,11 @@ impl<'a> InliningContext<'a> {
         callee_token: Token,
     ) -> bool {
         // Extract call information
-        let (dest, args) = match call_op {
-            SsaOp::Call { dest, args, .. } | SsaOp::CallVirt { dest, args, .. } => {
-                (*dest, args.clone())
-            }
-            _ => return false,
+        let Some((dest, args)) = call_op
+            .as_named_call()
+            .map(|call| (call.dest, call.args.clone()))
+        else {
+            return false;
         };
 
         // The shortcuts below replace the call with its result, or delete it,
@@ -563,7 +569,7 @@ impl<'a> InliningContext<'a> {
 
         for instr in callee_block.instructions() {
             let op = instr.op();
-            if let SsaOp::Return { value } = op {
+            if let SsaOp::Return { value, .. } = op {
                 return_value = *value;
             } else {
                 let Some(remapped_op) =
@@ -764,6 +770,12 @@ impl SsaPass<CilTarget, CompilerContext> for InliningPass {
         "Inlines small, pure methods at their call sites"
     }
 
+    /// Only single-block callees are spliced, into the middle of the calling
+    /// block, so no edge changes.
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::InstructionsOnly
+    }
+
     fn reads_peer_ssa(&self) -> bool {
         true
     }
@@ -815,8 +827,8 @@ mod tests {
 
     use crate::{
         analysis::{
-            CallGraph, ConstValue, MethodRef, ReturnInfo, SsaFunction, SsaFunctionBuilder, SsaOp,
-            SsaType, SsaVarId,
+            CallGraph, Callee, ConstValue, MethodRef, ReturnInfo, SsaFunction, SsaFunctionBuilder,
+            SsaOp, SsaType, SsaVarId,
         },
         compiler::{
             passes::inlining::{InliningContext, InliningPass},
@@ -871,7 +883,11 @@ mod tests {
             let ssa = SsaFunctionBuilder::new(0, 0)
                 .build_with(|f| {
                     f.block(0, |b| {
-                        let dest = b.call(MethodRef::new(callee_token), &[], SsaType::I32);
+                        let dest = b.call(
+                            Callee::Direct(MethodRef::new(callee_token)),
+                            &[],
+                            SsaType::I32,
+                        );
                         dest_out = dest;
                         b.ret_val(dest);
                     });
@@ -948,12 +964,12 @@ mod tests {
             let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
                 .build_with(|f| {
                     f.block(0, |b| {
-                        let callee = MethodRef::new(Token::new(0x06000002));
+                        let callee = || Callee::Direct(MethodRef::new(Token::new(0x06000002)));
                         if expects_value {
-                            let result = b.call(callee, &[], SsaType::I32);
+                            let result = b.call(callee(), &[], SsaType::I32);
                             b.ret_val(result);
                         } else {
-                            b.call_void(callee, &[]);
+                            b.call_void(callee(), &[]);
                             b.ret();
                         }
                     });
@@ -965,7 +981,7 @@ mod tests {
             );
             assert!(matches!(
                 caller_ssa.block(0).unwrap().instructions()[0].op(),
-                SsaOp::Call { .. }
+                SsaOp::Call(_)
             ));
         }
     }
@@ -982,16 +998,20 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    let result = b.call(MethodRef::new(Token::new(0x06000002)), &[], SsaType::I32);
+                    let result = b.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[],
+                        SsaType::I32,
+                    );
                     b.ret_val(result);
                 });
             })
             .unwrap();
         assert!(!inline_first_call(&callee_ssa, &mut caller_ssa, 0));
-        assert!(matches!(
-            caller_ssa.block(0).unwrap().instructions()[0].op(),
-            SsaOp::Call { dest: Some(_), .. }
-        ));
+        assert!(caller_ssa.block(0).unwrap().instructions()[0]
+            .op()
+            .as_call()
+            .is_some_and(|call| call.dest.is_some()));
     }
 
     /// A body that may throw is inlined whole, and when it returns nothing
@@ -1012,7 +1032,7 @@ mod tests {
                 let (x, y) = (f.arg(0, SsaType::I32), f.arg(1, SsaType::I32));
                 f.block(0, |blk| {
                     let result = blk.call(
-                        MethodRef::new(Token::new(0x06000002)),
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
                         &[x, y],
                         SsaType::I32,
                     );
@@ -1021,10 +1041,10 @@ mod tests {
             })
             .unwrap();
         assert!(!inline_first_call(&callee_ssa, &mut caller_ssa, 0));
-        assert!(matches!(
-            caller_ssa.block(0).unwrap().instructions()[0].op(),
-            SsaOp::Call { dest: Some(_), .. }
-        ));
+        assert!(caller_ssa.block(0).unwrap().instructions()[0]
+            .op()
+            .as_call()
+            .is_some_and(|call| call.dest.is_some()));
     }
 
     #[test]
@@ -1048,7 +1068,7 @@ mod tests {
                 params = (x, y);
                 f.block(0, |blk| {
                     let r = blk.call(
-                        MethodRef::new(Token::new(0x06000002)),
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
                         &[y, x],
                         SsaType::I32,
                     );
@@ -1096,7 +1116,11 @@ mod tests {
             .build_with(|f| {
                 let x = f.arg(0, SsaType::I32);
                 f.block(0, |blk| {
-                    let r = blk.call(MethodRef::new(Token::new(0x06000002)), &[x], SsaType::I32);
+                    let r = blk.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[x],
+                        SsaType::I32,
+                    );
                     blk.ret_val(r);
                 });
             })
@@ -1135,7 +1159,11 @@ mod tests {
             .build_with(|f| {
                 let y = f.arg(1, SsaType::I32);
                 f.block(0, |blk| {
-                    let r = blk.call(MethodRef::new(Token::new(0x06000002)), &[y], SsaType::I32);
+                    let r = blk.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[y],
+                        SsaType::I32,
+                    );
                     blk.ret_val(r);
                 });
             })
@@ -1162,7 +1190,7 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(callee_token), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(callee_token)), &[]);
                     b.ret();
                 });
             })
@@ -1271,7 +1299,11 @@ mod tests {
             .build_with(|f| {
                 f.block(0, |b| {
                     let v0 = b.const_i32(5);
-                    let v1 = b.call(MethodRef::new(callee_token), &[v0], SsaType::I32);
+                    let v1 = b.call(
+                        Callee::Direct(MethodRef::new(callee_token)),
+                        &[v0],
+                        SsaType::I32,
+                    );
                     b.ret_val(v1);
                 });
             })

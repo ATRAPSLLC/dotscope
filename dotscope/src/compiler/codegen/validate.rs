@@ -203,9 +203,10 @@ pub fn validate_lift(ssa: &SsaFunction, method: &Method) -> Result<()> {
         .map(|(index, instr)| (instr.offset, index))
         .collect();
 
-    // Every lifted operation is the instruction it was lifted from, except a
-    // copy: `ldloc`, `ldarg` and `dup` lift to one, and they move a value onto
-    // the stack rather than consume it there.
+    // Every lifted operation is the instruction it was lifted from, with the
+    // prefixes before it, which the lift states on the operation. A copy is
+    // the exception: `ldloc`, `ldarg` and `dup` lift to one, and they move a
+    // value onto the stack rather than consume it there.
     let mut groups = Vec::new();
     let mut layout = Vec::new();
     for (block_idx, block) in ssa.blocks().iter().enumerate() {
@@ -216,13 +217,27 @@ pub fn validate_lift(ssa: &SsaFunction, method: &Method) -> Result<()> {
                 continue;
             }
             let offset = original.offset.saturating_sub(base);
-            start = Some(start.map_or(offset, |start| start.min(offset)));
+            let index = index_at.get(&offset).copied();
+            let first = index.map(|index| {
+                let prefixes = instructions.get(..index).map_or(0, |before| {
+                    before
+                        .iter()
+                        .rev()
+                        .take_while(|before| before.is_prefix())
+                        .count()
+                });
+                index.saturating_sub(prefixes)
+            });
+            let first_offset = first
+                .and_then(|first| instructions.get(first))
+                .map_or(offset, |first| first.offset);
+            start = Some(start.map_or(first_offset, |start| start.min(first_offset)));
             if matches!(instr.op(), SsaOp::Copy { .. }) {
                 continue;
             }
-            if let Some(&index) = index_at.get(&offset) {
+            if let (Some(first), Some(index)) = (first, index) {
                 groups.push(EmitGroup {
-                    start: index,
+                    start: first,
                     end: index.saturating_add(1),
                     tag: OpTag {
                         block: block_idx,

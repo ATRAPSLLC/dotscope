@@ -18,7 +18,9 @@ use std::fmt;
 use analyssa::scheduling::DeobfuscationCapability;
 pub use analyssa::target::Target;
 use analyssa::{
-    ir::{value::ConstValue, FloatFormat, FloatRounding, HandlerKind},
+    analysis::Machine,
+    ir::{value::ConstValue, FloatFormat, FloatRounding, FloatRules, HandlerKind},
+    target::Endianness,
     PointerSize,
 };
 
@@ -34,6 +36,7 @@ use crate::{
         method::{ExceptionHandlerFlags, ExceptionHandlerKind},
         signatures::SignatureLocalVariable,
     },
+    CilObject,
 };
 
 /// `Target` impl for .NET CIL.
@@ -57,6 +60,34 @@ impl CilTarget {
     #[must_use]
     pub const fn x86() -> Self {
         Self { ptr_bytes: 4 }
+    }
+
+    /// Returns the machine a CIL method computes on: this target's pointer
+    /// width, little-endian, and no float rule.
+    ///
+    /// ECMA-335 leaves a conversion of a float its integer does not hold, the
+    /// NaN an invalid operation gives and the NaN `conv.r4` makes of a
+    /// double's unspecified, so folding any would state one runtime's answer
+    /// for every runtime.
+    #[must_use]
+    pub const fn machine(self) -> Machine {
+        let ptr_size = if self.ptr_bytes == 4 {
+            PointerSize::Bit32
+        } else {
+            PointerSize::Bit64
+        };
+        Machine::new(ptr_size, Some(Endianness::Little), FloatRules::NONE)
+    }
+
+    /// The target `assembly` runs on: 32-bit where its PE header says so, and
+    /// 64-bit otherwise.
+    #[must_use]
+    pub fn of(assembly: &CilObject) -> Self {
+        if assembly.file().pe().is_64bit {
+            Self::x64()
+        } else {
+            Self::x86()
+        }
     }
 
     /// Construct a `CilTarget` with an explicit pointer width.
@@ -643,9 +674,7 @@ mod tests {
         };
         let mut block = SsaBlock::new(0);
         block.add_instruction(SsaInstruction::synthetic(op.clone()));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(narrowed),
-        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(narrowed))));
         ssa.add_block(block);
         ssa.recompute_uses();
 
@@ -684,7 +713,12 @@ mod tests {
                 dest_type,
             );
             let op = if compare {
-                SsaOp::Ceq { dest, left, right }
+                SsaOp::Ceq {
+                    dest,
+                    left,
+                    right,
+                    signaling: false,
+                }
             } else {
                 SsaOp::Xor {
                     dest,
@@ -695,9 +729,7 @@ mod tests {
             };
             let mut block = SsaBlock::new(0);
             block.add_instruction(SsaInstruction::synthetic(op));
-            block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-                value: Some(dest),
-            }));
+            block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest))));
             ssa.add_block(block);
             ssa.recompute_uses();
             SsaVerifier::new(&ssa)
@@ -785,9 +817,7 @@ mod tests {
                 flags: None,
             },
             or.clone(),
-            SsaOp::Return {
-                value: Some(rotated),
-            },
+            SsaOp::returns(Some(rotated)),
         ] {
             block.add_instruction(SsaInstruction::synthetic(op));
         }
@@ -1000,9 +1030,7 @@ mod tests {
             right: const_var,
             flags: None,
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-            value: Some(sum),
-        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(sum))));
         assert_eq!(block.instruction_count(), 3);
         func.add_block(block);
 

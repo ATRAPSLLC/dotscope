@@ -8,9 +8,10 @@ use analyssa::{
 
 use crate::{
     analysis::{
-        BlockRange, BreakpointOp, ConstValue, ControlFlowGraph, DefSite, FieldRef, MethodRef,
-        PhiNode, PhiOperand, SsaBlock, SsaConverter, SsaExceptionHandler, SsaFunction,
-        SsaFunctionBuilder, SsaInstruction, SsaOp, SsaType, SsaVarId, TypeRef, VariableOrigin,
+        AccessQualifiers, BlockRange, BreakpointOp, CallData, Callee, CilTarget, ConstValue,
+        ControlFlowGraph, DefSite, FieldRef, MethodRef, PhiNode, PhiOperand, SsaBlock,
+        SsaConverter, SsaExceptionHandler, SsaFunction, SsaFunctionBuilder, SsaInstruction, SsaOp,
+        SsaType, SsaVarId, TypeRef, VariableOrigin,
     },
     assembly::{
         decode_blocks_with_handlers, decode_stream, Immediate, Instruction, InstructionAssembler,
@@ -23,7 +24,6 @@ use crate::{
         method::{ExceptionHandler, ExceptionHandlerFlags, Method, MethodBody},
         tables::{MemberRefRaw, MethodDefRaw, TableDataOwned, TableId},
         token::Token,
-        typesystem::PointerSize,
         validation::ValidationConfig,
     },
     testkit::{
@@ -159,7 +159,7 @@ fn test_optimized_return() {
         right: v1,
         flags: None,
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v2) }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v2))));
     ssa.add_block(block);
     ssa.recompute_uses();
 
@@ -951,7 +951,7 @@ fn test_break_instruction() {
     block.add_instruction(SsaInstruction::synthetic(SsaOp::Break(
         BreakpointOp::Breakpoint,
     )));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     ssa.add_block(block);
     assert_generates(&ssa, &["break", "ret"]);
 }
@@ -989,6 +989,7 @@ fn test_ldfld() {
                         dest,
                         object,
                         field: FieldRef::new(field_token),
+                        access: AccessQualifiers::FLAT,
                     },
                     SsaType::I32,
                 );
@@ -1010,6 +1011,7 @@ fn test_stfld() {
                     object,
                     field: FieldRef::new(field_token),
                     value,
+                    access: AccessQualifiers::FLAT,
                 });
                 b.ret();
             });
@@ -1030,10 +1032,11 @@ fn test_ldsfld() {
         SsaInstruction::synthetic(SsaOp::LoadStaticField {
             dest: v0,
             field: FieldRef::new(field_token),
+            access: AccessQualifiers::FLAT,
         })
         .with_result_type(SsaType::I32),
     );
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
     ssa.add_block(block);
 
     assert_generates(&ssa, &["ldsfld", "ret"]);
@@ -1049,6 +1052,7 @@ fn test_stsfld() {
                 b.op(SsaOp::StoreStaticField {
                     field: FieldRef::new(field_token),
                     value,
+                    access: AccessQualifiers::FLAT,
                 });
                 b.ret();
             });
@@ -1095,7 +1099,7 @@ fn test_ldsflda() {
         })
         .with_result_type(SsaType::ByRef(Box::new(SsaType::I32))),
     );
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
     ssa.add_block(block);
 
     assert_generates(&ssa, &["ldsflda", "ret"]);
@@ -1157,15 +1161,17 @@ fn test_call() {
     register_variables(&mut ssa, 1);
     let mut block = SsaBlock::new(0);
     block.add_instruction(
-        SsaInstruction::synthetic(SsaOp::Call {
-            dest: Some(v0),
-            method: MethodRef::new(method_token),
-            args: vec![],
-            effects: None,
-        })
+        SsaInstruction::synthetic(
+            CallData::new(
+                Some(v0),
+                Callee::Direct(MethodRef::new(method_token)),
+                vec![],
+            )
+            .into(),
+        )
         .with_result_type(SsaType::I32),
     );
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
     ssa.add_block(block);
 
     assert_generates(&ssa, &["call", "ret"]);
@@ -1177,13 +1183,10 @@ fn test_call_void() {
 
     let mut ssa = SsaFunction::new(0, 0);
     let mut block = SsaBlock::new(0);
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Call {
-        dest: None,
-        method: MethodRef::new(method_token),
-        args: vec![],
-        effects: None,
-    }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    block.add_instruction(SsaInstruction::synthetic(
+        CallData::new(None, Callee::Direct(MethodRef::new(method_token)), vec![]).into(),
+    ));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     ssa.add_block(block);
 
     assert_generates(&ssa, &["call", "ret"]);
@@ -1198,12 +1201,12 @@ fn test_call_with_args() {
             let dest = f.var();
             f.block(0, |b| {
                 b.op_typed(
-                    SsaOp::Call {
-                        dest: Some(dest),
-                        method: MethodRef::new(method_token),
-                        args: vec![arg0, arg1],
-                        effects: None,
-                    },
+                    CallData::new(
+                        Some(dest),
+                        Callee::Direct(MethodRef::new(method_token)),
+                        vec![arg0, arg1],
+                    )
+                    .into(),
                     SsaType::I32,
                 );
                 b.ret_val(dest);
@@ -1222,12 +1225,12 @@ fn test_callvirt() {
             let dest = f.var();
             f.block(0, |b| {
                 b.op_typed(
-                    SsaOp::CallVirt {
-                        dest: Some(dest),
-                        method: MethodRef::new(method_token),
-                        args: vec![object],
-                        effects: None,
-                    },
+                    CallData::new(
+                        Some(dest),
+                        Callee::Virtual(MethodRef::new(method_token)),
+                        vec![object],
+                    )
+                    .into(),
                     SsaType::I32,
                 );
                 b.ret_val(dest);
@@ -1235,6 +1238,136 @@ fn test_callvirt() {
         })
         .unwrap();
     assert_generates(&ssa, &["ldarg.0", "callvirt", "ret"]);
+}
+
+/// **A call writes back the prefixes it states.** A constrained call of an
+/// instance method is a `callvirt` after `constrained.`, of a static virtual
+/// method a `call`; a tail call is its call after `tail.`, and both together
+/// put `tail.` last, directly before the call.
+#[test]
+fn a_call_writes_back_its_prefixes() {
+    let method = MethodRef::new(Token::new(0x0600_0001));
+    let constraint = TypeRef::new(Token::new(0x0200_0003));
+    let constrained = |instance| Callee::Constrained {
+        method,
+        constraint_type: constraint,
+        instance,
+    };
+    let cases = [
+        (
+            CallData::new(None, constrained(true), vec![]),
+            vec!["ldarg.0", "constrained.", "callvirt", "ret"],
+        ),
+        (
+            CallData::new(None, constrained(false), vec![]),
+            vec!["ldarg.0", "constrained.", "call", "ret"],
+        ),
+        (
+            CallData::new(None, Callee::Direct(method), vec![]).made_tail(),
+            vec!["ldarg.0", "tail.", "call", "ret"],
+        ),
+        (
+            CallData::new(None, constrained(true), vec![]).made_tail(),
+            vec!["ldarg.0", "constrained.", "tail.", "callvirt", "ret"],
+        ),
+    ];
+    for (call, expected) in cases {
+        let ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let receiver = f.arg(0, SsaType::I32);
+                f.block(0, |b| {
+                    b.op(CallData {
+                        args: vec![receiver],
+                        ..call.clone()
+                    }
+                    .into());
+                    b.ret();
+                });
+            })
+            .unwrap();
+        assert_generates(&ssa, &expected);
+    }
+
+    // A tail call returning a value returns it straight away: `tail.` is
+    // valid only with a `ret` right after the call.
+    let ssa = SsaFunctionBuilder::new(1, 0)
+        .build_with(|f| {
+            let argument = f.arg(0, SsaType::I32);
+            let result = f.var();
+            f.block(0, |b| {
+                b.op_typed(
+                    CallData::new(Some(result), Callee::Direct(method), vec![argument])
+                        .made_tail()
+                        .into(),
+                    SsaType::I32,
+                );
+                b.ret_val(result);
+            });
+        })
+        .unwrap();
+    assert_generates(&ssa, &["ldarg.0", "tail.", "call", "ret"]);
+}
+
+/// **An access writes back its qualifiers as prefixes.** A volatile field
+/// load is `volatile. ldfld`, an unaligned volatile one `unaligned.`
+/// first, and a read-only element address `readonly. ldelema`.
+#[test]
+fn an_access_writes_back_its_prefixes() {
+    let field = FieldRef::new(Token::new(0x0400_0001));
+    let one = std::num::NonZeroU8::new(1).unwrap();
+    let cases = [
+        (
+            AccessQualifiers::FLAT.made_volatile(),
+            vec!["ldarg.0", "volatile.", "ldfld", "ret"],
+        ),
+        (
+            AccessQualifiers::FLAT.made_volatile().with_alignment(one),
+            vec!["ldarg.0", "unaligned.", "volatile.", "ldfld", "ret"],
+        ),
+    ];
+    for (access, expected) in cases {
+        let ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let object = f.arg(0, SsaType::I32);
+                let dest = f.var();
+                f.block(0, |b| {
+                    b.op_typed(
+                        SsaOp::LoadField {
+                            dest,
+                            object,
+                            field,
+                            access,
+                        },
+                        SsaType::I32,
+                    );
+                    b.ret_val(dest);
+                });
+            })
+            .unwrap();
+        assert_generates(&ssa, &expected);
+    }
+
+    let element_type = TypeRef::new(Token::new(0x0200_0003));
+    let ssa = SsaFunctionBuilder::new(2, 0)
+        .build_with(|f| {
+            let (array, index) = (f.arg(0, SsaType::Object), f.arg(1, SsaType::I32));
+            let dest = f.var();
+            f.block(0, |b| {
+                b.op_typed(
+                    SsaOp::LoadElementAddr {
+                        dest,
+                        array,
+                        index,
+                        elem_type: element_type,
+                        readonly: true,
+                    },
+                    SsaType::NativeInt,
+                );
+                b.ret_val(dest);
+            });
+        })
+        .unwrap();
+    assert_generates(&ssa, &["ldarg.0", "ldarg.1", "readonly.", "ldelema", "ret"]);
 }
 
 #[test]
@@ -1250,7 +1383,7 @@ fn test_newobj() {
         ctor: MethodRef::new(ctor_token),
         args: vec![],
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
     ssa.add_block(block);
 
     assert_generates(&ssa, &["newobj", "ret"]);
@@ -1466,7 +1599,7 @@ fn test_sizeof() {
         dest: v0,
         value_type: TypeRef(type_token),
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
     ssa.add_block(block);
 
     assert_generates(&ssa, &["sizeof", "ret"]);
@@ -1502,6 +1635,7 @@ fn test_ldobj() {
                     dest,
                     src_addr,
                     value_type: TypeRef(type_token),
+                    access: AccessQualifiers::FLAT,
                 });
                 b.ret_val(dest);
             });
@@ -1521,6 +1655,7 @@ fn test_stobj() {
                     dest_addr,
                     value,
                     value_type: TypeRef(type_token),
+                    access: AccessQualifiers::FLAT,
                 });
                 b.ret();
             });
@@ -1541,7 +1676,7 @@ fn test_ldtoken() {
         dest: v0,
         token: TypeRef(token),
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
     ssa.add_block(block);
 
     assert_generates(&ssa, &["ldtoken", "ret"]);
@@ -1608,22 +1743,31 @@ fn test_refanyval_and_arglist() {
     assert_generates(&ssa, &["ldarg.0", "refanyval", "pop", "arglist", "ret"]);
 }
 
+/// A function pointer load is `ldftn`, and of a type's implementation of a
+/// static virtual method `ldftn` after `constrained.`.
 #[test]
 fn test_ldftn() {
     let method_token = Token::new(0x06000001);
     let v0 = SsaVarId::from_index(0);
+    let constraint = TypeRef::new(Token::new(0x0200_0003));
 
-    let mut ssa = SsaFunction::new(0, 0);
-    register_variables(&mut ssa, 1);
-    let mut block = SsaBlock::new(0);
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::LoadFunctionPtr {
-        dest: v0,
-        method: MethodRef::new(method_token),
-    }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
-    ssa.add_block(block);
+    for (constraint, expected) in [
+        (None, vec!["ldftn", "ret"]),
+        (Some(constraint), vec!["constrained.", "ldftn", "ret"]),
+    ] {
+        let mut ssa = SsaFunction::new(0, 0);
+        register_variables(&mut ssa, 1);
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::LoadFunctionPtr {
+            dest: v0,
+            method: MethodRef::new(method_token),
+            constraint,
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
+        ssa.add_block(block);
 
-    assert_generates(&ssa, &["ldftn", "ret"]);
+        assert_generates(&ssa, &expected);
+    }
 }
 
 #[test]
@@ -1653,7 +1797,11 @@ fn test_localloc() {
             let size = f.arg(0, SsaType::I32);
             let dest = f.var();
             f.block(0, |b| {
-                b.op(SsaOp::LocalAlloc { dest, size });
+                b.op(SsaOp::LocalAlloc {
+                    dest,
+                    size,
+                    zeroed: true,
+                });
                 b.ret_val(dest);
             });
         })
@@ -1827,6 +1975,7 @@ fn test_loop_variable_phi_nodes() {
         left: i_phi_id,
         right: n_id,
         unsigned: false,
+        signaling: false,
     }));
     block1.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
         condition: cond_id,
@@ -1852,9 +2001,7 @@ fn test_loop_variable_phi_nodes() {
 
     // Block 3: exit - return i
     let mut block3 = SsaBlock::new(3);
-    block3.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(i_phi_id),
-    }));
+    block3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(i_phi_id))));
     ssa.add_block(block3);
 
     // Generate and check that it includes:
@@ -2048,6 +2195,7 @@ fn test_fibonacci_style_loop() {
         left: i_phi_id,
         right: n_id,
         unsigned: false,
+        signaling: false,
     }));
     block1.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
         condition: cond_id,
@@ -2081,9 +2229,7 @@ fn test_fibonacci_style_loop() {
 
     // Block 3: exit - return b
     let mut block3 = SsaBlock::new(3);
-    block3.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(b_phi_id),
-    }));
+    block3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(b_phi_id))));
     ssa.add_block(block3);
 
     // Generate code
@@ -2406,6 +2552,7 @@ fn test_factorial_style_loop() {
         left: i_phi_id,
         right: one_id,
         unsigned: false,
+        signaling: false,
     }));
     block1.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
         condition: cond_id,
@@ -2433,9 +2580,9 @@ fn test_factorial_style_loop() {
 
     // Block 3: exit
     let mut block3 = SsaBlock::new(3);
-    block3.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(result_phi_id),
-    }));
+    block3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(
+        result_phi_id,
+    ))));
     ssa.add_block(block3);
 
     // Generate and verify
@@ -2622,6 +2769,7 @@ fn test_nested_loop_pattern() {
         left: i_phi_id,
         right: n_id,
         unsigned: false,
+        signaling: false,
     }));
     block1.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
         condition: outer_cond_id,
@@ -2656,6 +2804,7 @@ fn test_nested_loop_pattern() {
         left: j_phi_id,
         right: m_id,
         unsigned: false,
+        signaling: false,
     }));
     block3.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
         condition: inner_cond_id,
@@ -2702,9 +2851,9 @@ fn test_nested_loop_pattern() {
 
     // Block 6: exit
     let mut block6 = SsaBlock::new(6);
-    block6.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(sum_outer_id),
-    }));
+    block6.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(
+        sum_outer_id,
+    ))));
     ssa.add_block(block6);
 
     // Generate and verify
@@ -2840,6 +2989,7 @@ fn test_accumulator_with_early_exit() {
         left: i_phi_id,
         right: n_id,
         unsigned: false,
+        signaling: false,
     }));
     block1.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
         condition: loop_cond_id,
@@ -2865,6 +3015,7 @@ fn test_accumulator_with_early_exit() {
         left: sum_next_id,
         right: hundred_id,
         unsigned: false,
+        signaling: false,
     }));
     block2.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
         condition: break_cond_id,
@@ -2891,9 +3042,7 @@ fn test_accumulator_with_early_exit() {
     // Block 4: exit (merge point for normal exit and break)
     // Note: in real SSA, we'd have another phi here for sum, but we simplify
     let mut block4 = SsaBlock::new(4);
-    block4.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(sum_phi_id),
-    }));
+    block4.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(sum_phi_id))));
     ssa.add_block(block4);
 
     // Generate and verify
@@ -3234,7 +3383,7 @@ fn a_method_that_fails_after_interning_leaves_the_assembly_unchanged() {
     ssa.add_block(b1);
     ssa.add_block(SsaBlock::new(2));
     let mut b3 = SsaBlock::new(3);
-    b3.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    b3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     ssa.add_block(b3);
     ssa.set_exception_handlers(vec![SsaExceptionHandler {
         flags: ExceptionHandlerFlags::FINALLY,
@@ -3555,7 +3704,7 @@ fn a_rotate_idiom_folded_by_the_algebraic_pass_still_computes_the_rotate() {
         &mut ssa,
         &MethodRef::new(Token::new(0x0600_0001)),
         &NullListener,
-        algebraic::Machine::new(PointerSize::Bit64, None),
+        CilTarget::x64().machine(),
     );
     assert!(changed, "the idiom should fold");
     assert!(
@@ -3696,7 +3845,7 @@ fn two_versions_of_one_local_live_at_once_do_not_share_its_slot() {
             right: p,
             flags: None,
         },
-        SsaOp::Return { value: Some(r) },
+        SsaOp::returns(Some(r)),
     ] {
         block.add_instruction(SsaInstruction::synthetic(op));
     }
@@ -3975,6 +4124,7 @@ fn phi_copies_that_swap_two_values_swap_them() {
             left: n,
             right: zero,
             unsigned: false,
+            signaling: false,
         },
         SsaOp::Branch {
             condition: more,
@@ -4005,7 +4155,7 @@ fn phi_copies_that_swap_two_values_swap_them() {
     ssa.add_block(body);
 
     let mut exit = SsaBlock::new(3);
-    exit.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(a) }));
+    exit.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(a))));
     ssa.add_block(exit);
     ssa.recompute_uses();
 
@@ -4068,9 +4218,7 @@ fn a_copy_read_in_a_later_block_is_stored_even_when_its_first_use_reads_the_sour
             right: d,
             flags: None,
         },
-        SsaOp::Return {
-            value: Some(product),
-        },
+        SsaOp::returns(Some(product)),
     ] {
         b1.add_instruction(SsaInstruction::synthetic(op));
     }
@@ -4129,9 +4277,7 @@ fn a_copy_feeding_a_copy_root_is_stored_when_read_in_a_later_block() {
             right: g,
             flags: None,
         },
-        SsaOp::Return {
-            value: Some(product),
-        },
+        SsaOp::returns(Some(product)),
     ] {
         b1.add_instruction(SsaInstruction::synthetic(op));
     }
@@ -4214,7 +4360,7 @@ fn a_copy_within_one_slot_still_orders_its_readers_after_the_source() {
     }
     ssa.add_block(b0);
     let mut b1 = SsaBlock::new(1);
-    b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(l3) }));
+    b1.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(l3))));
     ssa.add_block(b1);
     ssa.recompute_uses();
 
@@ -4280,7 +4426,7 @@ fn a_branch_after_a_copy_root_computes_what_it_branches_on() {
     }
     ssa.add_block(b0);
     let mut b1 = SsaBlock::new(1);
-    b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(c) }));
+    b1.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(c))));
     ssa.add_block(b1);
     let mut b2 = SsaBlock::new(2);
     for op in [
@@ -4288,7 +4434,7 @@ fn a_branch_after_a_copy_root_computes_what_it_branches_on() {
             dest: zero,
             value: ConstValue::I32(0),
         },
-        SsaOp::Return { value: Some(zero) },
+        SsaOp::returns(Some(zero)),
     ] {
         b2.add_instruction(SsaInstruction::synthetic(op));
     }
@@ -4360,7 +4506,7 @@ fn a_copy_root_reading_a_copy_left_for_its_reader_reads_what_that_copies() {
     }
     ssa.add_block(b0);
     let mut b1 = SsaBlock::new(1);
-    b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(c2) }));
+    b1.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(c2))));
     ssa.add_block(b1);
     ssa.recompute_uses();
 
@@ -4445,7 +4591,7 @@ fn a_value_computed_in_a_try_reaches_the_code_after_its_finally() {
     resumed.add_operand(PhiOperand::new(z, 0));
     resumed.add_operand(PhiOperand::new(p, 2));
     b3.add_phi(resumed);
-    b3.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(r) }));
+    b3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(r))));
     ssa.add_block(b3);
     ssa.set_exception_handlers(vec![SsaExceptionHandler {
         flags: ExceptionHandlerFlags::FINALLY,
@@ -4535,7 +4681,7 @@ fn a_value_handed_to_a_finally_and_read_after_it_keeps_its_value() {
         right: x,
         flags: None,
     }));
-    b3.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(r) }));
+    b3.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(r))));
     ssa.add_block(b3);
     ssa.set_exception_handlers(vec![SsaExceptionHandler {
         flags: ExceptionHandlerFlags::FINALLY,
@@ -4622,6 +4768,7 @@ fn a_local_reset_each_iteration_keeps_its_value_through_a_finally() {
                 left: i,
                 right: n,
                 unsigned: false,
+                signaling: false,
             },
             SsaOp::Branch {
                 condition: more,
@@ -4694,7 +4841,7 @@ fn a_local_reset_each_iteration_keeps_its_value_through_a_finally() {
             SsaOp::Jump { target: 1 },
         ],
     ));
-    ssa.add_block(block(7, vec![SsaOp::Return { value: Some(acc) }]));
+    ssa.add_block(block(7, vec![SsaOp::returns(Some(acc))]));
     ssa.set_exception_handlers(vec![SsaExceptionHandler {
         flags: ExceptionHandlerFlags::FINALLY,
         try_offset: 0,
@@ -4798,7 +4945,7 @@ fn a_chain_into_the_middle_of_a_try_lays_the_try_out_whole() {
             SsaOp::Jump { target: 2 },
             SsaOp::Leave { target: 4 },
             SsaOp::Leave { target: 4 },
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
             SsaOp::Jump { target: 2 },
         ],
         &[((1, 3), (3, 4))],
@@ -4822,7 +4969,7 @@ fn nested_regions_are_each_laid_out_whole() {
             SsaOp::Leave { target: 7 },
             SsaOp::Leave { target: 7 },
             SsaOp::Jump { target: 3 },
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
         ],
         &[((2, 3), (3, 4)), ((1, 5), (5, 6))],
     );
@@ -4842,10 +4989,10 @@ fn nested_regions_are_each_laid_out_whole() {
 fn a_handler_whose_try_nothing_reaches_is_not_emitted() {
     let ssa = region_layout_function(
         vec![
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
             SsaOp::Leave { target: 3 },
             SsaOp::Leave { target: 3 },
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
         ],
         &[((1, 2), (2, 3))],
     );
@@ -4872,7 +5019,7 @@ fn a_reached_try_keeps_its_handler_and_clause() {
             SsaOp::Jump { target: 1 },
             SsaOp::Leave { target: 3 },
             SsaOp::Leave { target: 3 },
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
         ],
         &[((1, 2), (2, 3))],
     );
@@ -4897,7 +5044,7 @@ fn a_region_interleaved_with_other_code_is_refused() {
             SsaOp::Jump { target: 2 },
             SsaOp::Leave { target: 4 },
             SsaOp::Leave { target: 4 },
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
         ],
         &[((1, 3), (3, 4))],
     );
@@ -4932,7 +5079,7 @@ fn a_clause_emitted_without_its_handler_is_refused() {
             SsaOp::Jump { target: 1 },
             SsaOp::Leave { target: 3 },
             SsaOp::Leave { target: 3 },
-            SsaOp::Return { value: None },
+            SsaOp::returns(None),
         ],
         &[((1, 2), (2, 3))],
     );
@@ -4972,6 +5119,103 @@ fn called_tokens(ssa: &SsaFunction) -> Vec<Token> {
             _ => None,
         })
         .collect()
+}
+
+/// **A prefix in the IL is stated on the operation it prefixes, and comes
+/// back in front of it.** `volatile. ldsfld` lifts to a volatile static load
+/// and `unaligned. 1 volatile. ldind.i4` to an unaligned volatile indirect
+/// load, with no operation of their own; the generated body writes both
+/// prefixes again, directly before their opcodes.
+#[test]
+fn an_il_prefix_is_stated_on_its_operation_and_written_back() {
+    let mut asm = InstructionAssembler::new();
+    asm.emit_opcode(0xFE13, None)
+        .unwrap()
+        .ldsfld(Token::new(0x0400_0001))
+        .unwrap()
+        .pop()
+        .unwrap();
+    asm.ldarg_0()
+        .unwrap()
+        .emit_opcode(0xFE12, Some(Operand::Immediate(Immediate::UInt8(1))))
+        .unwrap()
+        .emit_opcode(0xFE13, None)
+        .unwrap()
+        .emit_opcode(0x4A, None)
+        .unwrap()
+        .ret()
+        .unwrap();
+    let ssa = lift_il(asm, 1, 0);
+    let ops: Vec<&SsaOp> = ssa
+        .blocks()
+        .iter()
+        .flat_map(|block| block.instructions())
+        .map(|instr| instr.op())
+        .collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            SsaOp::LoadStaticField { access, .. } if access.volatile && access.alignment.is_none()
+        )),
+        "{ssa}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            SsaOp::LoadIndirect { access, .. }
+                if access.volatile && access.alignment.map(std::num::NonZeroU8::get) == Some(1)
+        )),
+        "{ssa}"
+    );
+    let mnemonics = generate_mnemonics(&ssa);
+    assert!(
+        mnemonics.windows(2).any(|w| w == ["volatile.", "ldsfld"]),
+        "{mnemonics:?}"
+    );
+    assert!(
+        mnemonics
+            .windows(3)
+            .any(|w| w == ["unaligned.", "volatile.", "ldind.i4"]),
+        "{mnemonics:?}"
+    );
+}
+
+/// A prefix the IL leaves with nothing after it in its block, or puts before
+/// an instruction it may not prefix, is malformed IL, which the lift refuses
+/// rather than dropping the prefix.
+#[test]
+fn a_prefix_that_prefixes_nothing_it_may_is_refused() {
+    let lift = |asm: InstructionAssembler| {
+        let (bytecode, _max_stack, handlers) = asm.finish().unwrap();
+        build_ssa_with_handlers(&bytecode, &handlers, &TestTypeProvider::all_i32(1, 0))
+    };
+    // A branch into the instruction after the prefix ends the prefix's block
+    // with it.
+    let mut dangling = InstructionAssembler::new();
+    dangling
+        .ldarg_0()
+        .unwrap()
+        .brfalse_s("end")
+        .unwrap()
+        .emit_opcode(0xFE13, None)
+        .unwrap()
+        .label("end")
+        .unwrap()
+        .ret()
+        .unwrap();
+    assert!(lift(dangling).is_err(), "volatile. ending its block");
+    let mut before_ret = InstructionAssembler::new();
+    before_ret.emit_opcode(0xFE13, None).unwrap().ret().unwrap();
+    assert!(lift(before_ret).is_err(), "volatile. before ret");
+    let mut misplaced = InstructionAssembler::new();
+    misplaced
+        .emit_opcode(0xFE13, None)
+        .unwrap()
+        .ldarg_0()
+        .unwrap()
+        .ret()
+        .unwrap();
+    assert!(lift(misplaced).is_err(), "volatile. before ldarg.0");
 }
 
 /// `a = a++ * 3 + a++ * 5 + a++ * 7; return a - that`, consumed last-first.
@@ -5054,9 +5298,9 @@ fn calls_run_in_program_order() {
     let ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
             f.block(0, |blk| {
-                let v = blk.call(MethodRef::new(a), &[], SsaType::I32);
-                blk.call_void(MethodRef::new(b), &[]);
-                blk.call_void(MethodRef::new(c), &[v]);
+                let v = blk.call(Callee::Direct(MethodRef::new(a)), &[], SsaType::I32);
+                blk.call_void(Callee::Direct(MethodRef::new(b)), &[]);
+                blk.call_void(Callee::Direct(MethodRef::new(c)), &[v]);
                 blk.ret();
             });
         })
@@ -5073,10 +5317,11 @@ fn a_call_is_not_moved_past_a_store() {
         .build_with(|f| {
             let x = f.arg(0, SsaType::I32);
             f.block(0, |blk| {
-                let v = blk.call(MethodRef::new(a), &[], SsaType::I32);
+                let v = blk.call(Callee::Direct(MethodRef::new(a)), &[], SsaType::I32);
                 blk.op(SsaOp::StoreStaticField {
                     field: FieldRef::new(field),
                     value: x,
+                    access: AccessQualifiers::FLAT,
                 });
                 blk.ret_val(v);
             });
@@ -5135,12 +5380,14 @@ fn a_load_is_not_moved_past_a_store_to_the_same_field() {
                     SsaOp::LoadStaticField {
                         dest,
                         field: FieldRef::new(field),
+                        access: AccessQualifiers::FLAT,
                     },
                     SsaType::I32,
                 );
                 blk.op(SsaOp::StoreStaticField {
                     field: FieldRef::new(field),
                     value: x,
+                    access: AccessQualifiers::FLAT,
                 });
                 blk.ret_val(dest);
             });

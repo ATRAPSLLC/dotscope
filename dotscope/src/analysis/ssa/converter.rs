@@ -15,16 +15,24 @@
 //!
 //! # Usage
 //!
-//! ```no_run
-//! use dotscope::analysis::{ControlFlowGraph, SsaConverter};
+//! ```
+//! use dotscope::analysis::{ControlFlowGraph, SsaConverter, TypeContext};
 //! use dotscope::assembly::decode_blocks;
+//! use dotscope::CilObject;
 //!
-//! // Build CFG from decoded blocks
-//! let blocks = decode_blocks(data, offset, rva, Some(size))?;
+//! // Build CFG from decoded blocks: `ldarg.0; ret`
+//! let il = [0x02u8, 0x2A];
+//! let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 //! let cfg = ControlFlowGraph::from_basic_blocks(blocks)?;
 //!
+//! // Types answered by a method of a real assembly
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! # let entry = assembly.methods().iter().next().expect("the sample has methods");
+//! # let method = entry.value();
+//! let type_provider = TypeContext::new(method, &assembly);
+//!
 //! // Construct SSA form
-//! let ssa = SsaConverter::build(&cfg, 2, 3, &type_provider, Vec::new())?; // 2 args, 3 locals
+//! let ssa = SsaConverter::build(&cfg, 1, 0, &type_provider, Vec::new())?; // 1 arg, no locals
 //!
 //! // Analyze the SSA form
 //! for block in ssa.blocks() {
@@ -51,9 +59,10 @@ use crate::{
     analysis::{
         cfg::ControlFlowGraph,
         ssa::{
-            decompose::decompose_instruction, resolve_corelib_valuetype, ConstValue, DefSite,
-            RuntimeValueKind, SimulationResult, SsaBlock, SsaExceptionHandler, SsaFunction,
-            SsaInstruction, SsaOp, SsaType, SsaVarId, StackSimulator, TypeProvider, VariableOrigin,
+            decompose::{decompose_instruction, Decomposed},
+            resolve_corelib_valuetype, Callee, CilPrefix, ConstValue, DefSite, RuntimeValueKind,
+            SimulationResult, SsaBlock, SsaExceptionHandler, SsaFunction, SsaInstruction, SsaOp,
+            SsaType, SsaVarId, StackSimulator, TypeProvider, VariableOrigin,
         },
     },
     assembly::{opcodes, Immediate, Instruction, Operand},
@@ -163,7 +172,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
     /// Infers the result type of an instruction that produces a stack value.
     ///
     /// Uses the type context to resolve:
-    /// - Call/CallVirt: return type from method signature
+    /// - Call: return type from the method's or the standalone signature
     /// - NewObj: type of the constructed object
     /// - Const: type based on the constant value
     /// - Conv: target type of conversion
@@ -184,22 +193,34 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         self.infer_op_result_type(instr.op())
     }
 
-    /// The class `value` computes in as an operand of arithmetic, when its type
-    /// is known ([`SsaType::arithmetic_class`]).
+    /// The type `value` has on the evaluation stack: its own, but an enum's
+    /// underlying integer for a value of an enum the provider resolves
+    /// ([`TypeProvider::enum_underlying`]), which is what its arithmetic
+    /// computes in.
+    fn stack_value_type(&self, value: SsaVarId) -> Option<SsaType> {
+        let ty = self.function.variable(value)?.var_type();
+        Some(
+            ty.value_type_ref()
+                .and_then(|value_type| self.type_provider.enum_underlying(&value_type))
+                .unwrap_or_else(|| ty.clone()),
+        )
+    }
+
+    /// The type a unary operation on `value` computes in, when its type is
+    /// known ([`SsaType::unary_numeric`] of [`Self::stack_value_type`]).
     fn operand_stack_type(&self, value: SsaVarId) -> Option<SsaType> {
-        self.function.variable(value)?.var_type().arithmetic_class()
+        self.stack_value_type(value)?.unary_numeric()
     }
 
     /// The result type of a binary numeric operation on `left` and `right`
-    /// ([`SsaType::binary_numeric`]); `Unknown` while an operand's type is,
-    /// which the phi typing fixpoint asks again once it is known
-    /// ([`Self::resolve_phi_types`]).
+    /// ([`SsaType::binary_numeric`] of their [`Self::stack_value_type`]s);
+    /// `Unknown` while an operand's type is, which the phi typing fixpoint
+    /// asks again once it is known ([`Self::resolve_phi_types`]).
     fn binary_numeric_type(&self, left: SsaVarId, right: SsaVarId, additive: bool) -> SsaType {
-        let (Some(a), Some(b)) = (self.function.variable(left), self.function.variable(right))
-        else {
+        let (Some(a), Some(b)) = (self.stack_value_type(left), self.stack_value_type(right)) else {
             return SsaType::Unknown;
         };
-        SsaType::binary_numeric(a.var_type(), b.var_type(), additive).unwrap_or(SsaType::Unknown)
+        SsaType::binary_numeric(&a, &b, additive).unwrap_or(SsaType::Unknown)
     }
 
     /// Infers the result type of an SSA operation using the TypeContext.
@@ -210,10 +231,18 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
     /// at construction time so it survives through deobfuscation transforms.
     fn infer_op_result_type(&self, op: &SsaOp) -> SsaType {
         match op {
-            // Call instructions - look up return type from method signature
-            SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => {
-                self.type_provider.call_return_type(method.token())
-            }
+            // Calls - the return type of the method's signature, or of the
+            // standalone signature an indirect call names
+            SsaOp::Call(call) => match &call.callee {
+                Callee::Direct(method)
+                | Callee::Virtual(method)
+                | Callee::Constrained { method, .. } => {
+                    self.type_provider.call_return_type(method.token())
+                }
+                Callee::Indirect { signature, .. } => {
+                    self.type_provider.call_indirect_return_type(signature.token())
+                }
+            },
 
             // NewObj - look up constructed type from constructor
             SsaOp::NewObj { ctor, .. } => self.type_provider.newobj_type(ctor.token()),
@@ -447,11 +476,6 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             // Ckfinite — operates on F64 stack type
             SsaOp::Ckfinite { .. } => SsaType::F64,
 
-            // CallIndirect — resolve return type from standalone signature
-            SsaOp::CallIndirect { signature, .. } => {
-                self.type_provider.call_indirect_return_type(signature.token())
-            }
-
             // Copy — inherit type from source operand
             SsaOp::Copy { src, .. } => self
                 .function
@@ -459,9 +483,8 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                 .map(|v| v.var_type().clone())
                 .unwrap_or(SsaType::Unknown),
 
-            // Phi — types resolved during resolve_phi_types() after rename.
-            // Non-value-producing operations — exhaustive list so new SsaOp
-            // variants cause a compiler error instead of silently returning Unknown
+            // Phi: types resolved during resolve_phi_types() after rename.
+            // The operations the CIL lift makes that produce no value.
             SsaOp::Phi { .. }
             | SsaOp::StoreField { .. }
             | SsaOp::StoreStaticField { .. }
@@ -485,15 +508,10 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             | SsaOp::CopyObj { .. }
             | SsaOp::Nop
             | SsaOp::Break(_)
-            | SsaOp::Constrained { .. }
-            | SsaOp::Volatile
-            | SsaOp::Unaligned { .. }
-            | SsaOp::TailPrefix
             | SsaOp::BranchFlags { .. }
             | SsaOp::Fence { .. }
             | SsaOp::InterruptReturn
-            | SsaOp::Unreachable
-            | SsaOp::Readonly => SsaType::Unknown,
+            | SsaOp::Unreachable => SsaType::Unknown,
             // Native architecture ops (x86/arm/riscv intrinsics, system, vector
             // crypto/SVE/SME, BCD, …) are never produced by dotscope's CIL
             // lifter, so their result type is left unresolved.
@@ -1308,6 +1326,9 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         let successors = &cfg_block.successors;
 
         let instr_count = cfg_block.instructions.len();
+        // The prefixes read since the last operation, which the next one
+        // states (ECMA-335 III.2).
+        let mut prefixes: Vec<CilPrefix> = Vec::new();
         for (instr_idx, cil_instr) in cfg_block.instructions.iter().enumerate() {
             let result = Self::simulate_instruction(simulator, cil_instr, assembly)?;
 
@@ -1320,13 +1341,32 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             };
 
             // Decompose the CIL instruction into an SsaOp
-            let op = decompose_instruction(
+            let mut op = match decompose_instruction(
                 cil_instr,
                 &result.uses,
                 result.def,
                 instr_successors,
                 assembly,
-            )?;
+            )? {
+                Decomposed::Op(op) => op,
+                Decomposed::Prefix(prefix) => {
+                    prefixes.push(prefix);
+                    continue;
+                }
+            };
+            for prefix in prefixes.drain(..) {
+                prefix.apply(&mut op).map_err(|error| {
+                    Error::SsaError(format!(
+                        "{} at RVA 0x{:08X}: {error}",
+                        cil_instr.mnemonic, cil_instr.rva
+                    ))
+                })?;
+            }
+            // A method that zeroes its locals (`localsinit`) zeroes what its
+            // `localloc` allocates too.
+            if let SsaOp::LocalAlloc { zeroed, .. } = &mut op {
+                *zeroed = self.type_provider.locals_zero_initialized();
+            }
 
             // Create SSA instruction with the decomposed operation and resolved type
             let result_type = self.infer_op_result_type(&op);
@@ -1339,6 +1379,11 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             if let Some(block) = self.function.block_mut(block_idx) {
                 block.add_instruction(ssa_instr);
             }
+        }
+        if !prefixes.is_empty() {
+            return Err(Error::SsaError(format!(
+                "block {block_idx} ends in the prefixes {prefixes:?}, which prefix no instruction"
+            )));
         }
 
         // If the block doesn't end with a terminator and has a single successor (fallthrough),
@@ -1799,7 +1844,10 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             }
             // An arithmetic result whose operands no evidence types is the
             // stack's default `int32`, as an untyped integer computation is;
-            // what is computed from it is typed again from there.
+            // what is computed from it is typed again from there. An operand
+            // that is an enum whose integer the provider does not know is
+            // evidence against that default, since a `ulong` enum computes as
+            // a `long`.
             if !self.default_untyped_arithmetic() {
                 break;
             }
@@ -1807,8 +1855,9 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         self.propagate_group_types();
     }
 
-    /// Types every `Unknown` arithmetic result `int32`. Returns whether any
-    /// was typed.
+    /// Types every `Unknown` arithmetic result `int32` none of whose operands
+    /// is an enum the provider does not resolve. Returns whether any was
+    /// typed.
     fn default_untyped_arithmetic(&mut self) -> bool {
         let mut typed = false;
         let var_count = self.function.variables().len();
@@ -1826,24 +1875,29 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                 .block(var.def_site().block)
                 .and_then(|block| block.instruction(instr))
                 .is_some_and(|instruction| {
-                    matches!(
-                        instruction.op(),
-                        SsaOp::Add { .. }
-                            | SsaOp::AddOvf { .. }
-                            | SsaOp::Sub { .. }
-                            | SsaOp::SubOvf { .. }
-                            | SsaOp::Mul { .. }
-                            | SsaOp::MulOvf { .. }
-                            | SsaOp::Div { .. }
-                            | SsaOp::Rem { .. }
-                            | SsaOp::And { .. }
-                            | SsaOp::Or { .. }
-                            | SsaOp::Xor { .. }
-                            | SsaOp::Shl { .. }
-                            | SsaOp::Shr { .. }
-                            | SsaOp::Neg { .. }
-                            | SsaOp::Not { .. }
-                    )
+                    let no_enum_unresolved = instruction.op().uses().iter().all(|operand| {
+                        self.stack_value_type(*operand)
+                            .is_none_or(|ty| ty.value_type_ref().is_none())
+                    });
+                    no_enum_unresolved
+                        && matches!(
+                            instruction.op(),
+                            SsaOp::Add { .. }
+                                | SsaOp::AddOvf { .. }
+                                | SsaOp::Sub { .. }
+                                | SsaOp::SubOvf { .. }
+                                | SsaOp::Mul { .. }
+                                | SsaOp::MulOvf { .. }
+                                | SsaOp::Div { .. }
+                                | SsaOp::Rem { .. }
+                                | SsaOp::And { .. }
+                                | SsaOp::Or { .. }
+                                | SsaOp::Xor { .. }
+                                | SsaOp::Shl { .. }
+                                | SsaOp::Shr { .. }
+                                | SsaOp::Neg { .. }
+                                | SsaOp::Not { .. }
+                        )
                 });
             if arithmetic {
                 if let Some(var) = self.function.variable_mut(var_id) {
@@ -2077,13 +2131,17 @@ fn join_merge_types(a: &SsaType, b: &SsaType) -> SsaType {
             {
                 SsaType::NativeInt
             }
-            (SsaType::ValueType(_), other) | (other, SsaType::ValueType(_))
-                if width(other).is_some() =>
+            (enumeration, other) | (other, enumeration)
+                if enumeration.value_type_ref().is_some() && width(other).is_some() =>
             {
                 SsaType::I32
             }
-            (SsaType::ValueType(_), SsaType::I64 | SsaType::U64)
-            | (SsaType::I64 | SsaType::U64, SsaType::ValueType(_)) => SsaType::I64,
+            (enumeration, SsaType::I64 | SsaType::U64)
+            | (SsaType::I64 | SsaType::U64, enumeration)
+                if enumeration.value_type_ref().is_some() =>
+            {
+                SsaType::I64
+            }
             (SsaType::Null, other) | (other, SsaType::Null) if other.is_reference() => {
                 other.clone()
             }
@@ -2228,7 +2286,7 @@ mod tests {
             .iter()
             .flat_map(|block| block.instructions())
             .find_map(|instr| match instr.op() {
-                SsaOp::Return { value } => *value,
+                SsaOp::Return { value, .. } => *value,
                 _ => None,
             })
             .expect("a value-returning ret");
@@ -2282,6 +2340,80 @@ mod tests {
         ssa.variable(returned_value(&ssa))
             .map(|variable| variable.var_type().clone())
             .expect("the returned value is a variable")
+    }
+
+    /// An enum's values compute as its underlying integer (ECMA-335 I.8.5.2,
+    /// III.1.5): `flags1 & flags2` and `~flags` of a `ulong` enum are `long`s,
+    /// an enum nested in a generic type (`Outer<T>.Flags`, an instantiation of
+    /// it) included.
+    ///
+    /// The value type alone does not say which integer an enum is, so an
+    /// operation of two enum values, or of one alone, was typed nothing, and a
+    /// comparison of its result with an `int64` zero read as computing over
+    /// 32 and 64 bits (`System.Uri`'s `Flags`). An enum the provider does not
+    /// resolve computes as itself: two of its values have one integer,
+    /// whichever it is, where the stack's `int32` default guessed it; with an
+    /// integer it computes as that integer (`flags & 16` of an instantiated
+    /// enum, `System.Xml`'s `ScopeRecord`). Two values of one generic
+    /// parameter compute as a value of it (ConfuserEx's type scrambling turns
+    /// `int Add(int, int)` into one over `T`).
+    #[test]
+    fn an_enum_computes_as_its_underlying_integer() {
+        let flags = TypeRef::new(Token::new(0x0100_0005));
+        let typed = |asm: InstructionAssembler, operand: SsaType, resolved: bool| {
+            let (_, cfg) = build_cfg(asm).expect("assembles and decodes");
+            let mut provider = TestTypeProvider::typed([operand.clone(), operand], []);
+            if resolved {
+                provider = provider.enumeration(flags, SsaType::U64);
+            }
+            let ssa = build_ssa(&cfg, &provider).expect("SSA construction");
+            ssa.variable(returned_value(&ssa))
+                .map(|variable| variable.var_type().clone())
+                .expect("the returned value is a variable")
+        };
+        let and = || {
+            let mut asm = InstructionAssembler::new();
+            asm.ldarg_0()
+                .unwrap()
+                .ldarg_1()
+                .unwrap()
+                .and()
+                .unwrap()
+                .ret()
+                .unwrap();
+            asm
+        };
+        let not = || {
+            let mut asm = InstructionAssembler::new();
+            asm.ldarg_0().unwrap().not().unwrap().ret().unwrap();
+            asm
+        };
+        let masked = || {
+            let mut asm = InstructionAssembler::new();
+            asm.ldarg_0()
+                .unwrap()
+                .ldc_i4_s(16)
+                .unwrap()
+                .and()
+                .unwrap()
+                .ret()
+                .unwrap();
+            asm
+        };
+        let enum_value = SsaType::ValueType(flags);
+        let nested = SsaType::GenericInst(
+            Box::new(SsaType::ValueType(flags)),
+            vec![SsaType::GenericParam(0)],
+        );
+        assert_eq!(typed(and(), enum_value.clone(), true), SsaType::I64);
+        assert_eq!(typed(not(), enum_value.clone(), true), SsaType::I64);
+        assert_eq!(typed(and(), nested.clone(), true), SsaType::I64);
+        assert_eq!(typed(and(), enum_value.clone(), false), enum_value);
+        assert_eq!(typed(not(), enum_value.clone(), false), enum_value);
+        assert_eq!(typed(masked(), nested.clone(), false), SsaType::I32);
+        assert_eq!(typed(and(), nested.clone(), false), nested);
+        let parameter = SsaType::MethodGenericParam(0);
+        assert_eq!(typed(and(), parameter.clone(), false), parameter);
     }
 
     /// Arithmetic is typed by what it computes on (ECMA-335 III.1.5), not
@@ -2433,6 +2565,35 @@ mod tests {
             defining_op(&ssa, returned_value(&ssa)).is_none(),
             "the local's initial contents are unspecified:\n{ssa}"
         );
+    }
+
+    /// What `localloc` allocates is zeroed exactly in a method that zeroes its
+    /// locals (`localsinit`), and holds what the stack did otherwise.
+    #[test]
+    fn a_local_allocation_is_zeroed_as_the_methods_locals_are() {
+        let zeroed = |provider: &TestTypeProvider| {
+            let mut asm = InstructionAssembler::new();
+            asm.ldarg_0()
+                .unwrap()
+                .emit_opcode(0xFE0F, None)
+                .unwrap()
+                .ret()
+                .unwrap();
+            let (_, cfg) = build_cfg(asm).expect("assembles and decodes");
+            let ssa = build_ssa(&cfg, provider).expect("SSA construction failed");
+            ssa.blocks()
+                .iter()
+                .flat_map(|block| block.instructions())
+                .find_map(|instr| match instr.op() {
+                    SsaOp::LocalAlloc { zeroed, .. } => Some(*zeroed),
+                    _ => None,
+                })
+                .expect("a local allocation")
+        };
+        assert!(zeroed(&TestTypeProvider::all_i32(1, 0)));
+        assert!(!zeroed(
+            &TestTypeProvider::all_i32(1, 0).without_locals_init()
+        ));
     }
 
     #[test]
@@ -3175,6 +3336,7 @@ mod tests {
 
         if let SsaOp::Return {
             value: Some(ret_var),
+            ..
         } = ret_instr.op()
         {
             // The return value should come from a PHI (def_site.instruction should be None)

@@ -43,8 +43,9 @@ use analyssa::analysis::copies::ParallelCopy;
 
 use crate::{
     analysis::{
-        BlockRange, CmpKind, ConstValue, FloatFormat, HandlerKind, RuntimeValueKind, SsaBlock,
-        SsaFunction, SsaOp, SsaType, SsaVarId, SsaVerifier, VerifierError, VerifyLevel,
+        BlockRange, Callee, CilPrefix, CmpKind, ConstValue, FloatFormat, HandlerKind,
+        RuntimeValueKind, SsaBlock, SsaFunction, SsaOp, SsaType, SsaVarId, SsaVerifier,
+        VerifierError, VerifyLevel,
     },
     assembly::{decode_stream, Immediate, InstructionEncoder, Operand},
     cilassembly::CilAssembly,
@@ -231,10 +232,6 @@ struct MethodState {
     emit_groups: Vec<EmitGroup>,
     /// Where each value an instruction defines is defined.
     def_sites: BTreeMap<SsaVarId, OpTag>,
-    /// For each instruction, the prefix instructions (`constrained.`,
-    /// `volatile.`, ...) directly before it, which are emitted directly
-    /// before its own opcode.
-    prefixes: BTreeMap<OpTag, Vec<OpTag>>,
     /// The place the last emitted instruction loaded, with the instruction
     /// count after it: a load of the same place right after it is a `dup`.
     last_load: Option<(Place, usize)>,
@@ -846,7 +843,6 @@ impl SsaCodeGenerator {
             ..MethodState::default()
         };
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
-            let mut pending: Vec<OpTag> = Vec::new();
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
                 let tag = OpTag {
                     block: block_idx,
@@ -855,18 +851,6 @@ impl SsaCodeGenerator {
                 for dest in instr.op().defs() {
                     self.method.def_sites.insert(dest, tag);
                 }
-                if Self::is_prefix(instr.op()) {
-                    pending.push(tag);
-                } else if !pending.is_empty() {
-                    self.method
-                        .prefixes
-                        .insert(tag, std::mem::take(&mut pending));
-                }
-            }
-            if !pending.is_empty() {
-                return Err(Error::CodegenFailed(format!(
-                    "block {block_idx} ends in a prefix with nothing to modify"
-                )));
             }
         }
 
@@ -2007,8 +1991,9 @@ impl SsaCodeGenerator {
     }
 
     /// Emits the instruction `tag` names, assuming its operands are on the
-    /// stack, preceded by any prefix instructions that modify it, and records
-    /// the instructions as implementing it, for the translation validator.
+    /// stack, preceded by the prefixes it states ([`CilPrefix::of`]), and
+    /// records the instructions as implementing it, for the translation
+    /// validator.
     fn generate_op_core(
         &mut self,
         encoder: &mut InstructionEncoder,
@@ -2016,14 +2001,11 @@ impl SsaCodeGenerator {
         tag: OpTag,
         next_entry: Option<LayoutEntry>,
     ) -> Result<()> {
-        for prefix in self.method.prefixes.get(&tag).cloned().unwrap_or_default() {
-            let op = Self::op_at(ssa, prefix)?;
-            let start = encoder.instruction_count();
-            self.generate_op_core_untracked(encoder, ssa, prefix.block, op, None)?;
-            self.record_group(start, encoder.instruction_count(), prefix);
-        }
         let op = Self::op_at(ssa, tag)?;
         let start = encoder.instruction_count();
+        for prefix in CilPrefix::of(op) {
+            Self::generate_prefix(encoder, &prefix)?;
+        }
         self.generate_op_core_untracked(encoder, ssa, tag.block, op, next_entry)?;
         self.record_group(start, encoder.instruction_count(), tag);
         Ok(())
@@ -2113,10 +2095,7 @@ impl SsaCodeGenerator {
             }
 
             // Call operations
-            SsaOp::Call { .. }
-            | SsaOp::CallVirt { .. }
-            | SsaOp::CallIndirect { .. }
-            | SsaOp::NewObj { .. } => Self::generate_call_op(encoder, op)?,
+            SsaOp::Call(_) | SsaOp::NewObj { .. } => Self::generate_call_op(encoder, op)?,
 
             // Load, store, and memory operations
             SsaOp::Copy { .. }
@@ -2183,35 +2162,6 @@ impl SsaCodeGenerator {
 
             SsaOp::Break(_) => {
                 encoder.emit_instruction("break", None)?;
-            }
-
-            // Prefix instructions
-            SsaOp::Constrained {
-                constraint_type, ..
-            } => {
-                encoder.emit_instruction(
-                    "constrained.",
-                    Some(Operand::Token(constraint_type.token())),
-                )?;
-            }
-
-            SsaOp::Volatile => {
-                encoder.emit_instruction("volatile.", None)?;
-            }
-
-            SsaOp::Unaligned { alignment } => {
-                encoder.emit_instruction(
-                    "unaligned.",
-                    Some(Operand::Immediate(Immediate::UInt8(*alignment))),
-                )?;
-            }
-
-            SsaOp::TailPrefix => {
-                encoder.emit_instruction("tail.", None)?;
-            }
-
-            SsaOp::Readonly => {
-                encoder.emit_instruction("readonly.", None)?;
             }
 
             // CIL has no rotate or byte-swap instruction, but both are what the
@@ -2659,57 +2609,40 @@ impl SsaCodeGenerator {
 
     /// Generates CIL for call operations.
     ///
-    /// Handles: `Call`, `CallVirt`, `CallIndirect`, `NewObj`.
-    /// Arguments are already on the evaluation stack.
+    /// Handles `Call`, as `call`, `callvirt` or `calli` by its callee, and
+    /// `NewObj`. Arguments are already on the evaluation stack.
     fn generate_call_op(encoder: &mut InstructionEncoder, op: &SsaOp) -> Result<()> {
         match op {
-            SsaOp::Call {
-                dest, method, args, ..
-            } => {
-                // num_args: the method arguments that were pushed on stack
-                let num_args = call_arity(args.len())?;
-                let has_result = dest.is_some();
+            SsaOp::Call(call) => {
+                // The stack holds the method arguments, and after them an
+                // indirect call's function pointer. The result, if any, is
+                // left on the stack for the caller.
+                let (mnemonic, token, pushed) = match &call.callee {
+                    // A static virtual method's constrained call is a `call`.
+                    Callee::Direct(method)
+                    | Callee::Constrained {
+                        method,
+                        instance: false,
+                        ..
+                    } => ("call", method.token(), call.args.len()),
+                    Callee::Virtual(method)
+                    | Callee::Constrained {
+                        method,
+                        instance: true,
+                        ..
+                    } => ("callvirt", method.token(), call.args.len()),
+                    Callee::Indirect { signature, .. } => (
+                        "calli",
+                        signature.token(),
+                        call.args.len().saturating_add(1),
+                    ),
+                };
                 encoder.emit_call(
-                    "call",
-                    Some(Operand::Token(method.token())),
-                    num_args,
-                    has_result,
+                    mnemonic,
+                    Some(Operand::Token(token)),
+                    call_arity(pushed)?,
+                    call.dest.is_some(),
                 )?;
-                // Result left on stack - handled by caller
-                let _ = dest;
-            }
-
-            SsaOp::CallVirt {
-                dest, method, args, ..
-            } => {
-                // num_args: the method arguments that were pushed on stack
-                let num_args = call_arity(args.len())?;
-                let has_result = dest.is_some();
-                encoder.emit_call(
-                    "callvirt",
-                    Some(Operand::Token(method.token())),
-                    num_args,
-                    has_result,
-                )?;
-                let _ = dest;
-            }
-
-            SsaOp::CallIndirect {
-                dest,
-                signature,
-                args,
-                ..
-            } => {
-                // num_args: function pointer + the method arguments
-                let num_args = call_arity(args.len().saturating_add(1))?;
-                let has_result = dest.is_some();
-                encoder.emit_call(
-                    "calli",
-                    Some(Operand::Token(signature.token())),
-                    num_args,
-                    has_result,
-                )?;
-                let _ = dest;
             }
 
             SsaOp::NewObj { dest, ctor, args } => {
@@ -2755,9 +2688,8 @@ impl SsaCodeGenerator {
                 encoder.emit_instruction("stfld", Some(Operand::Token(field.token())))?;
             }
 
-            SsaOp::LoadStaticField { dest, field } => {
+            SsaOp::LoadStaticField { field, .. } => {
                 encoder.emit_instruction("ldsfld", Some(Operand::Token(field.token())))?;
-                let _ = dest;
             }
 
             SsaOp::StoreStaticField { field, .. } => {
@@ -2892,9 +2824,9 @@ impl SsaCodeGenerator {
                 let _ = dest;
             }
 
-            SsaOp::LoadFunctionPtr { dest, method } => {
+            // A constraint is written before it as `constrained.`.
+            SsaOp::LoadFunctionPtr { method, .. } => {
                 encoder.emit_instruction("ldftn", Some(Operand::Token(method.token())))?;
-                let _ = dest;
             }
 
             SsaOp::LoadVirtFunctionPtr { dest, method, .. } => {
@@ -3123,7 +3055,7 @@ impl SsaCodeGenerator {
             | SsaOp::Ckfinite { operand, .. } => vec![*operand],
 
             // Return with value
-            SsaOp::Return { value: Some(v) } => vec![*v],
+            SsaOp::Return { value: Some(v), .. } => vec![*v],
 
             // Branch condition
             SsaOp::Branch { condition, .. } => vec![*condition],
@@ -3209,28 +3141,26 @@ impl SsaCodeGenerator {
                 dest_addr,
                 value,
                 size,
-                reverse: _,
+                ..
             } => vec![*dest_addr, *value, *size],
             SsaOp::CopyBlk {
                 dest_addr,
                 src_addr,
                 size,
-                reverse: _,
+                ..
             } => vec![*dest_addr, *src_addr, *size],
 
             // Exception handling
             SsaOp::EndFilter { result } => vec![*result],
 
-            // Call operations: use the op's uses() method
-            SsaOp::Call { .. } | SsaOp::CallVirt { .. } | SsaOp::NewObj { .. } => op.uses(),
-
-            // `calli` takes its arguments first and the function pointer on
-            // top of them; `uses` names the pointer first.
-            SsaOp::CallIndirect { fptr, args, .. } => {
-                let mut operands = args.clone();
-                operands.push(*fptr);
+            // A call takes its arguments in order, and `calli` the function
+            // pointer on top of them.
+            SsaOp::Call(call) => {
+                let mut operands = call.args.clone();
+                operands.extend(call.callee.fptr());
                 operands
             }
+            SsaOp::NewObj { args, .. } => args.clone(),
 
             // Operations with no operands. An operation with operands that is
             // missing above has no lowering either, and `generate_op_core`
@@ -3979,7 +3909,7 @@ impl SsaCodeGenerator {
                 block: block_idx,
                 instr: instr_idx,
             };
-            if matches!(op, SsaOp::Nop | SsaOp::Phi { .. }) || Self::is_prefix(op) {
+            if matches!(op, SsaOp::Nop | SsaOp::Phi { .. }) {
                 continue;
             }
             if let SsaOp::Copy { dest, src } = op {
@@ -4309,15 +4239,20 @@ impl SsaCodeGenerator {
         }
     }
 
-    /// Whether `op` is a prefix that modifies the instruction after it.
-    fn is_prefix(op: &SsaOp) -> bool {
-        matches!(
-            op,
-            SsaOp::Constrained { .. }
-                | SsaOp::Volatile
-                | SsaOp::Unaligned { .. }
-                | SsaOp::TailPrefix
-                | SsaOp::Readonly
-        )
+    /// Emits the prefix instruction `prefix`.
+    fn generate_prefix(encoder: &mut InstructionEncoder, prefix: &CilPrefix) -> Result<()> {
+        match prefix {
+            CilPrefix::Unaligned(bytes) => encoder.emit_instruction(
+                "unaligned.",
+                Some(Operand::Immediate(Immediate::UInt8(bytes.get()))),
+            ),
+            CilPrefix::Volatile => encoder.emit_instruction("volatile.", None),
+            CilPrefix::Readonly => encoder.emit_instruction("readonly.", None),
+            CilPrefix::Constrained(constraint_type) => encoder.emit_instruction(
+                "constrained.",
+                Some(Operand::Token(constraint_type.token())),
+            ),
+            CilPrefix::Tail => encoder.emit_instruction("tail.", None),
+        }
     }
 }

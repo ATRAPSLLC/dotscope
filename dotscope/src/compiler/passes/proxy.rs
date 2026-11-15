@@ -9,7 +9,7 @@
 //!
 //! A proxy method is one that:
 //! 1. Has a single basic block
-//! 2. Contains exactly one `Call`/`CallVirt` instruction
+//! 2. Contains exactly one direct or virtual call
 //! 3. Forwards parameters directly as arguments (possibly reordered)
 //! 4. Returns the call result (if non-void)
 //! 5. Has no other side effects besides the forwarded call
@@ -44,8 +44,8 @@
 
 use crate::{
     analysis::{
-        CilTarget, ConstValue, ConstValueCilExt, DefSite, MethodRef, ReturnInfo, SsaFunction,
-        SsaInstruction, SsaOp, SsaVarId, VariableOrigin,
+        Callee, CilTarget, ConstValue, ConstValueCilExt, DefSite, MethodRef, ReturnInfo,
+        SsaFunction, SsaInstruction, SsaOp, SsaVarId, VariableOrigin,
     },
     compiler::{CompilerContext, EventKind, EventLog, ModificationScope, PassCapability, SsaPass},
     metadata::{
@@ -124,7 +124,7 @@ impl ProxyDevirtualizationPass {
     ///
     /// A proxy method:
     /// 1. Has a single basic block
-    /// 2. Contains exactly one `Call`/`CallVirt`/`NewObj` instruction
+    /// 2. Contains exactly one direct or virtual call, or one `NewObj`
     /// 3. All call arguments come directly from method parameters
     /// 4. If non-void, returns the call result directly
     /// 5. Has no other instructions besides parameter loads, the call, and return
@@ -134,7 +134,7 @@ impl ProxyDevirtualizationPass {
     /// If this is a proxy, returns `Some((target_method, arg_mapping, kind))` where:
     /// - `target_method` is the forwarding target
     /// - `arg_mapping` maps caller argument index to callee parameter index
-    /// - `kind` indicates Call, CallVirt, or NewObj forwarding
+    /// - `kind` indicates direct call, virtual call, or NewObj forwarding
     pub fn detect_proxy_pattern(
         ssa: &SsaFunction,
     ) -> Option<(MethodRef, Vec<ProxyArgSource>, ForwardKind)> {
@@ -168,23 +168,23 @@ impl ProxyDevirtualizationPass {
 
         let instructions = block.instructions();
 
-        // Find the call instruction (Call, CallVirt, or NewObj)
+        // Find the call instruction (a call or a NewObj)
         let mut call_info: Option<(&MethodRef, &[SsaVarId], Option<SsaVarId>, ForwardKind)> = None;
         let mut call_count: usize = 0;
 
         for instr in instructions {
             match instr.op() {
-                SsaOp::Call {
-                    method, args, dest, ..
-                } => {
+                // A proxy forwards by naming its target: a constrained call
+                // takes the address of its receiver, and an indirect one names
+                // no method.
+                SsaOp::Call(call) => {
+                    let (method, kind) = match &call.callee {
+                        Callee::Direct(method) => (method, ForwardKind::Call),
+                        Callee::Virtual(method) => (method, ForwardKind::CallVirt),
+                        Callee::Constrained { .. } | Callee::Indirect { .. } => return None,
+                    };
                     call_count = call_count.saturating_add(1);
-                    call_info = Some((method, args, *dest, ForwardKind::Call));
-                }
-                SsaOp::CallVirt {
-                    method, args, dest, ..
-                } => {
-                    call_count = call_count.saturating_add(1);
-                    call_info = Some((method, args, *dest, ForwardKind::CallVirt));
+                    call_info = Some((method, &call.args, call.dest, kind));
                 }
                 SsaOp::NewObj { ctor, args, dest } => {
                     call_count = call_count.saturating_add(1);
@@ -239,6 +239,7 @@ impl ProxyDevirtualizationPass {
         for instr in instructions {
             if let SsaOp::Return {
                 value: Some(ret_var),
+                ..
             } = instr.op()
             {
                 if Some(*ret_var) != call_dest {
@@ -423,7 +424,7 @@ impl ProxyDevirtualizationPass {
 
         ctx.with_ssa(callee_token, |callee_ssa| {
             // Must have no side effects to safely eliminate
-            if !callee_ssa.purity().can_eliminate_if_unused() {
+            if !callee_ssa.purity(|_| None).can_eliminate_if_unused() {
                 return None;
             }
 
@@ -447,10 +448,13 @@ impl ProxyDevirtualizationPass {
         let mut candidates = Vec::new();
 
         for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
-            let (raw_callee_token, is_virtual) = match instr.op() {
-                SsaOp::Call { method, .. } => (method.token(), false),
-                SsaOp::CallVirt { method, .. } => (method.token(), true),
-                _ => continue,
+            // A constrained call passes the address of its receiver, which
+            // the forwarded call does not take.
+            let (raw_callee_token, is_virtual) = match instr.op().as_call().map(|call| &call.callee)
+            {
+                Some(Callee::Direct(method)) => (method.token(), false),
+                Some(Callee::Virtual(method)) => (method.token(), true),
+                Some(Callee::Constrained { .. } | Callee::Indirect { .. }) | None => continue,
             };
 
             // Resolve MemberRef tokens to MethodDef tokens for SSA lookup
@@ -575,12 +579,10 @@ impl ProxyDevirtualizationPass {
         caller_token: Token,
         changes: &mut EventLog,
     ) -> bool {
-        let (dest, original_args) = match call_op {
-            SsaOp::Call { dest, args, .. } | SsaOp::CallVirt { dest, args, .. } => {
-                (*dest, args.clone())
-            }
-            _ => return false,
+        let Some(call) = call_op.as_named_call() else {
+            return false;
         };
+        let (dest, original_args) = (call.dest, &call.args);
 
         // Build arguments for the target call from the proxy's arg sources
         let mut remapped_args = Vec::with_capacity(arg_sources.len());
@@ -626,18 +628,12 @@ impl ProxyDevirtualizationPass {
                     args: remapped_args,
                 }
             }
-            ForwardKind::CallVirt => SsaOp::CallVirt {
-                dest,
-                method: target_method,
-                args: remapped_args,
-                effects: None,
-            },
-            ForwardKind::Call => SsaOp::Call {
-                dest,
-                method: target_method,
-                args: remapped_args,
-                effects: None,
-            },
+            ForwardKind::CallVirt => call
+                .redirected(Callee::Virtual(target_method), remapped_args)
+                .into(),
+            ForwardKind::Call => call
+                .redirected(Callee::Direct(target_method), remapped_args)
+                .into(),
         };
 
         // Replace the instruction, inserting any constant definitions before the call
@@ -691,10 +687,10 @@ impl ProxyDevirtualizationPass {
         // A void callee defines nothing, so a call whose result is read has
         // not bound the method it names; dropping it would leave that read
         // without a definition.
-        if !matches!(
-            call_op,
-            SsaOp::Call { dest: None, .. } | SsaOp::CallVirt { dest: None, .. }
-        ) {
+        if !call_op
+            .as_named_call()
+            .is_some_and(|call| call.dest.is_none())
+        {
             return false;
         }
 
@@ -726,9 +722,8 @@ impl ProxyDevirtualizationPass {
         caller_token: Token,
         changes: &mut EventLog,
     ) -> bool {
-        let dest = match call_op {
-            SsaOp::Call { dest, .. } | SsaOp::CallVirt { dest, .. } => *dest,
-            _ => return false,
+        let Some(dest) = call_op.as_named_call().map(|call| call.dest) else {
+            return false;
         };
 
         if let Some(dest_var) = dest {
@@ -825,7 +820,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        analysis::{CallGraph, ConstValue, MethodRef, SsaFunctionBuilder, SsaOp, SsaType},
+        analysis::{CallGraph, Callee, ConstValue, MethodRef, SsaFunctionBuilder, SsaOp, SsaType},
         compiler::{
             passes::proxy::{ForwardKind, ProxyArgSource, ProxyDevirtualizationPass},
             CompilerContext, SsaPass,
@@ -856,7 +851,7 @@ mod tests {
             .build_with(|f| {
                 let param0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(target_token), &[param0]);
+                    b.call_void(Callee::Direct(MethodRef::new(target_token)), &[param0]);
                     b.ret();
                 });
             })
@@ -881,7 +876,7 @@ mod tests {
                 let param1 = f.arg(1, SsaType::I32);
                 f.block(0, |b| {
                     let result = b.call(
-                        MethodRef::new(target_token),
+                        Callee::Direct(MethodRef::new(target_token)),
                         &[param0, param1],
                         SsaType::I32,
                     );
@@ -912,7 +907,7 @@ mod tests {
                 let param1 = f.arg(1, SsaType::I32);
                 f.block(0, |b| {
                     let result = b.call(
-                        MethodRef::new(target_token),
+                        Callee::Direct(MethodRef::new(target_token)),
                         &[param1, param0],
                         SsaType::I32,
                     );
@@ -943,7 +938,11 @@ mod tests {
                 f.block(0, |b| {
                     let one = b.const_i32(1);
                     let sum = b.add(param0, one);
-                    let result = b.call(MethodRef::new(target_token), &[sum], SsaType::I32);
+                    let result = b.call(
+                        Callee::Direct(MethodRef::new(target_token)),
+                        &[sum],
+                        SsaType::I32,
+                    );
                     b.ret_val(result);
                 });
             })
@@ -968,7 +967,7 @@ mod tests {
             .build_with(|f| {
                 let param0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(target_token), &[param0]);
+                    b.call_void(Callee::Direct(MethodRef::new(target_token)), &[param0]);
                     b.ret();
                 });
             })
@@ -980,7 +979,7 @@ mod tests {
             .build_with(|f| {
                 let arg0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(proxy_token), &[arg0]);
+                    b.call_void(Callee::Direct(MethodRef::new(proxy_token)), &[arg0]);
                     b.ret();
                 });
             })
@@ -998,8 +997,8 @@ mod tests {
         // Verify the call target was changed
         let block = caller_ssa.block(0).unwrap();
         let first_instr = &block.instructions()[0];
-        match first_instr.op() {
-            SsaOp::Call { method, .. } => {
+        match first_instr.op().as_call().map(|call| &call.callee) {
+            Some(Callee::Direct(method)) => {
                 assert_eq!(
                     method.token(),
                     target_token,
@@ -1027,7 +1026,7 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(noop_token), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(noop_token)), &[]);
                     b.ret();
                 });
             })
@@ -1045,7 +1044,7 @@ mod tests {
         // The call is gone: the block is its return
         let block = caller_ssa.block(0).unwrap();
         assert!(
-            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None })),
+            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None, .. })),
             "Expected only the return, got {:?}",
             block.instructions()
         );
@@ -1067,7 +1066,11 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    let read = b.call(MethodRef::new(noop_token), &[], SsaType::I32);
+                    let read = b.call(
+                        Callee::Direct(MethodRef::new(noop_token)),
+                        &[],
+                        SsaType::I32,
+                    );
                     b.ret_val(read);
                 });
             })
@@ -1086,7 +1089,7 @@ mod tests {
 
         let call = &caller_ssa.block(0).unwrap().instructions()[0];
         assert!(
-            matches!(call.op(), SsaOp::Call { dest: Some(_), .. }),
+            call.op().as_call().is_some_and(|call| call.dest.is_some()),
             "the call defining a read result must stay, got {:?}",
             call.op()
         );
@@ -1154,7 +1157,11 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    let result = b.call(MethodRef::new(const_token), &[], SsaType::I32);
+                    let result = b.call(
+                        Callee::Direct(MethodRef::new(const_token)),
+                        &[],
+                        SsaType::I32,
+                    );
                     b.ret_val(result);
                 });
             })
@@ -1189,7 +1196,7 @@ mod tests {
             .build_with(|f| {
                 let param0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(self_token), &[param0]);
+                    b.call_void(Callee::Direct(MethodRef::new(self_token)), &[param0]);
                     b.ret();
                 });
             })

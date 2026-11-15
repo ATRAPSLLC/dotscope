@@ -1,147 +1,49 @@
-//! Unified constant resolution for SSA variables.
+//! What earlier passes proved about a CIL function's values, loaded into
+//! analyssa's demand-driven constant resolver ([`ValueResolver`]).
 //!
-//! [`ValueResolver`] composes [`ConstEvaluator`](crate::analysis::ssa::ConstEvaluator),
-//! [`PhiAnalyzer`](crate::analysis::ssa::PhiAnalyzer), and optionally
-//! [`SsaEvaluator`](crate::analysis::ssa::SsaEvaluator) into a single reusable entry point
-//! for demand-driven constant resolution. It replaces ad-hoc tracing logic (like the
-//! former `trace_to_constant`) with a three-tier fallback strategy:
-//!
-//! 1. **ConstEvaluator** — handles all instruction-defined ops (arithmetic, bitwise,
-//!    comparisons, conversions) with caching and cycle detection.
-//! 2. **PhiAnalyzer** — checks whether all PHI operands resolve to the same constant.
-//! 3. **SsaEvaluator** (path-aware fallback) — uses `resolve_with_trace` for
-//!    instruction-defined vars that `ConstEvaluator` couldn't fold (e.g., XOR with
-//!    a Call operand).
+//! The resolver composes the constant evaluator, the uniform-phi analysis
+//! and, optionally, path-aware tracing; this crate adds what only CIL facts
+//! say: constant propagation and the decryptors record what they proved on the
+//! variable itself ([`CilVariableFacts::known_value`]).
 //!
 //! # Example
 //!
 //! ```no_run
-//! use dotscope::analysis::{ValueResolver, SsaFunction};
-//! use dotscope::metadata::typesystem::PointerSize;
+//! use dotscope::analysis::{CilTarget, SsaFunction, ValueResolver, ValueResolverCilExt};
 //!
-//! let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64)
-//!     .with_path_aware_fallback();
-//! resolver.load_known_values(ctx, method_token);
+//! # fn resolve(ssa: &SsaFunction, some_var: dotscope::analysis::SsaVarId) {
+//! let mut resolver = ValueResolver::new(ssa, CilTarget::x64().machine()).with_path_aware_fallback();
+//! resolver.load_known_values();
 //!
 //! if let Some(value) = resolver.resolve(some_var) {
 //!     println!("Resolved to: {:?}", value);
 //! }
+//! # }
 //! ```
+//!
+//! [`CilVariableFacts::known_value`]: crate::analysis::ssa::facts::CilVariableFacts::known_value
 
-use crate::{
-    analysis::ssa::{
-        target::{CilTarget, Target},
-        ConstEvaluator, ConstValue, PhiAnalyzer, SsaEvaluator, SsaFunction, SsaVarId,
-    },
-    metadata::typesystem::PointerSize,
-};
+use crate::analysis::ssa::{target::CilTarget, ConstValue, SsaVarId, ValueResolver};
 
-/// Demand-driven constant resolver composing multiple analysis components.
-///
-/// Provides a unified API for resolving SSA variables to constant values,
-/// combining the strengths of [`ConstEvaluator`](crate::analysis::ssa::ConstEvaluator)
-/// (instruction folding), [`PhiAnalyzer`](crate::analysis::ssa::PhiAnalyzer) (uniform
-/// PHI detection), and optionally [`SsaEvaluator`](crate::analysis::ssa::SsaEvaluator)
-/// (path-aware tracing for variables that pure constant folding can't handle).
-pub struct ValueResolver<'a, T: Target = CilTarget> {
-    ssa: &'a SsaFunction<T>,
-    evaluator: ConstEvaluator<'a, T>,
-    phi: PhiAnalyzer<'a, T>,
-    resolve_phis: bool,
-    path_aware_fallback: bool,
-    ptr_size: PointerSize,
-}
-
-impl<'a, T: Target> ValueResolver<'a, T> {
-    /// Creates a new resolver with PHI resolution enabled and path-aware fallback disabled.
-    #[must_use]
-    pub fn new(ssa: &'a SsaFunction<T>, ptr_size: PointerSize) -> Self {
-        Self {
-            ssa,
-            evaluator: ConstEvaluator::new(ssa, ptr_size),
-            phi: PhiAnalyzer::new(ssa),
-            resolve_phis: true,
-            path_aware_fallback: false,
-            ptr_size,
-        }
-    }
-
-    /// Enables the path-aware fallback via [`SsaEvaluator`].
-    ///
-    /// When enabled, variables that `ConstEvaluator` can't fold (e.g., XOR where
-    /// one operand comes from a Call) will be attempted via `resolve_with_trace`.
-    #[must_use]
-    pub fn with_path_aware_fallback(mut self) -> Self {
-        self.path_aware_fallback = true;
-        self
-    }
-
-    /// Injects a single known value into the resolver.
-    pub fn set_known(&mut self, var: SsaVarId, value: ConstValue<T>) {
-        self.evaluator.set_known(var, value);
-    }
-
-    /// Resolves a variable to a constant using a three-tier fallback strategy.
-    ///
-    /// 1. Try [`ConstEvaluator`](crate::analysis::ssa::ConstEvaluator) (all instruction-defined ops).
-    /// 2. If PHI-defined, check for uniform constant via
-    ///    [`PhiAnalyzer`](crate::analysis::ssa::PhiAnalyzer).
-    /// 3. If path-aware fallback is enabled, try
-    ///    [`SsaEvaluator::resolve_with_trace`](crate::analysis::ssa::SsaEvaluator).
-    pub fn resolve(&mut self, var: SsaVarId) -> Option<ConstValue<T>> {
-        // 1. Try ConstEvaluator (handles Const, arithmetic, bitwise, etc. with caching)
-        if let Some(val) = self.evaluator.evaluate_var(var) {
-            return Some(val);
-        }
-
-        // 2. PHI uniform constant check
-        if self.resolve_phis {
-            if let Some((_, phi)) = self.ssa.find_phi_defining(var) {
-                let result = self.phi.uniform_constant(phi, &mut self.evaluator);
-                if result.is_some() {
-                    return result;
-                }
-            }
-        }
-
-        // 3. Path-aware fallback via SsaEvaluator (for instruction-defined vars
-        //    that ConstEvaluator couldn't fold, e.g. XOR with a Call operand)
-        if self.path_aware_fallback && self.ssa.get_definition(var).is_some() {
-            let mut eval = SsaEvaluator::new(self.ssa, self.ptr_size);
-            if let Some(resolved) = eval.resolve_with_trace(var, 15) {
-                if let Some(c) = resolved.as_constant() {
-                    self.evaluator.set_known(var, c.clone());
-                    return Some(c.clone());
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Resolves all variables to constants. Returns `None` if any variable can't be resolved.
-    pub fn resolve_all(&mut self, vars: &[SsaVarId]) -> Option<Vec<ConstValue<T>>> {
-        let mut result = Vec::with_capacity(vars.len());
-        for &var in vars {
-            result.push(self.resolve(var)?);
-        }
-        Some(result)
-    }
-}
-
-impl ValueResolver<'_, CilTarget> {
+/// Loads what earlier passes proved about a CIL function's values into a
+/// [`ValueResolver`].
+pub trait ValueResolverCilExt {
     /// Loads what earlier passes proved about this function's values into the
-    /// evaluator.
+    /// resolver.
     ///
     /// Read from the values themselves - constant propagation and the
     /// decryptors record what they proved on the variable - so this needs
     /// neither a method token nor a context. It cannot be asked about a
-    /// function other than the one being resolved, which is the mistake the
-    /// token made possible: the context's copy of a method is not the copy a
-    /// pass is transforming.
-    pub fn load_known_values(&mut self) {
+    /// function other than the one being resolved, which is the mistake a
+    /// token would make possible: the context's copy of a method is not the
+    /// copy a pass is transforming.
+    fn load_known_values(&mut self);
+}
+
+impl ValueResolverCilExt for ValueResolver<'_, CilTarget> {
+    fn load_known_values(&mut self) {
         let known: Vec<(SsaVarId, ConstValue)> = self
-            .ssa
+            .ssa()
             .variables()
             .iter()
             .filter_map(|variable| {
@@ -152,7 +54,7 @@ impl ValueResolver<'_, CilTarget> {
             })
             .collect();
         for (var, value) in known {
-            self.evaluator.set_known(var, value);
+            self.set_known(var, value);
         }
     }
 }
@@ -160,12 +62,12 @@ impl ValueResolver<'_, CilTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        analysis::ssa::{
+    use crate::analysis::{
+        ssa::{
             ConstValue, DefSite, PhiNode, PhiOperand, SsaBlock, SsaFunction, SsaInstruction, SsaOp,
             SsaType, SsaVarId, VariableOrigin,
         },
-        metadata::typesystem::PointerSize,
+        CilTarget,
     };
 
     #[test]
@@ -184,10 +86,10 @@ mod tests {
             dest: var_id,
             value: ConstValue::I32(42),
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(block);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         assert_eq!(resolver.resolve(var_id), Some(ConstValue::I32(42)));
     }
 
@@ -234,10 +136,10 @@ mod tests {
             right: v1_id,
             flags: None,
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(block);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         assert_eq!(resolver.resolve(v2_id), Some(ConstValue::I32(13)));
     }
 
@@ -290,10 +192,10 @@ mod tests {
         phi.add_operand(PhiOperand::new(v0_id, 0));
         phi.add_operand(PhiOperand::new(v1_id, 1));
         block2.add_phi(phi);
-        block2.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block2.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(block2);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         assert_eq!(resolver.resolve(phi_result_id), Some(ConstValue::I32(42)));
     }
 
@@ -346,10 +248,10 @@ mod tests {
         phi.add_operand(PhiOperand::new(v0_id, 0));
         phi.add_operand(PhiOperand::new(v1_id, 1));
         block2.add_phi(phi);
-        block2.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block2.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(block2);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         assert_eq!(resolver.resolve(phi_result_id), None);
     }
 
@@ -358,7 +260,7 @@ mod tests {
         let ssa: SsaFunction = SsaFunction::new(0, 0);
         let var_id = SsaVarId::from_index(0);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         resolver.set_known(var_id, ConstValue::I32(999));
 
         assert_eq!(resolver.resolve(var_id), Some(ConstValue::I32(999)));
@@ -376,7 +278,7 @@ mod tests {
             }
         }
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         resolver.load_known_values();
 
         assert_eq!(resolver.resolve(var1), Some(ConstValue::I32(10)));
@@ -390,7 +292,7 @@ mod tests {
         let var1 = SsaVarId::from_index(0);
         let var2 = SsaVarId::from_index(1);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         resolver.set_known(var1, ConstValue::I32(1));
         resolver.set_known(var2, ConstValue::I32(2));
 
@@ -405,7 +307,7 @@ mod tests {
         let var1 = SsaVarId::from_index(0);
         let var2 = SsaVarId::from_index(1);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         resolver.set_known(var1, ConstValue::I32(1));
         // var2 unknown
 
@@ -415,7 +317,7 @@ mod tests {
     #[test]
     fn test_resolve_all_empty() {
         let ssa: SsaFunction = SsaFunction::new(0, 0);
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
 
         assert_eq!(resolver.resolve_all(&[]), Some(vec![]));
     }
@@ -425,7 +327,7 @@ mod tests {
         let ssa: SsaFunction = SsaFunction::new(0, 0);
         let unknown = SsaVarId::from_index(0);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         assert_eq!(resolver.resolve(unknown), None);
     }
 
@@ -469,10 +371,10 @@ mod tests {
             right: v1_id,
             flags: None,
         }));
-        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(block);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         assert_eq!(resolver.resolve(v2_id), Some(ConstValue::I32(0xF0)));
     }
 }

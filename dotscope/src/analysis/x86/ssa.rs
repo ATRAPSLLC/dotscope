@@ -49,8 +49,8 @@ use analyssa::{
 use crate::{
     analysis::{
         ssa::{
-            CmpKind, ConstValue, DefSite, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType,
-            SsaVarId, SsaVariable, VariableOrigin,
+            AccessQualifiers, CmpKind, ConstValue, DefSite, SsaBlock, SsaFunction, SsaInstruction,
+            SsaOp, SsaType, SsaVarId, SsaVariable, VariableOrigin,
         },
         x86::{
             cfg::X86Function,
@@ -488,6 +488,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: res_var,
                     right: dst_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 flags.set_carry(cf);
             }
@@ -519,6 +520,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: dst_var,
                     right: src_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 flags.set_carry(cf);
             }
@@ -591,6 +593,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     dest: cf,
                     left: dst_var,
                     right: zero,
+                    signaling: false,
                 }));
                 // Ceq gives 1 if equal, but CF = (operand != 0), so we need NOT of Ceq
                 // CF = 1 - Ceq(operand, 0)  or equivalently CF = Cgt(operand, 0, unsigned)
@@ -694,6 +697,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: temp_var,
                     right: dst_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 let cf2 = self.create_variable(
                     VariableOrigin::Phi,
@@ -705,6 +709,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: res_var,
                     right: temp_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 let new_cf = self.create_variable(
                     VariableOrigin::Phi,
@@ -765,6 +770,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: dst_var,
                     right: src_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 let cf2 = self.create_variable(
                     VariableOrigin::Phi,
@@ -776,6 +782,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: temp_var,
                     right: cf_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 let new_cf = self.create_variable(
                     VariableOrigin::Phi,
@@ -1127,6 +1134,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: res_var,
                     right: dst_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 flags.set_carry(cf);
             }
@@ -1294,6 +1302,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left: left_var,
                     right: right_var,
                     unsigned: true,
+                    signaling: false,
                 }));
                 flags.set_carry(cf);
             }
@@ -1378,7 +1387,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     X86Register::Eax
                 };
                 let ret_val = reg_state.get(ret_reg);
-                result.push(SsaInstruction::synthetic(SsaOp::Return { value: ret_val }));
+                result.push(SsaInstruction::synthetic(SsaOp::returns(ret_val)));
             }
 
             X86Instruction::Call { target: _ } => {
@@ -1504,7 +1513,10 @@ impl<'a> X86ToSsaTranslator<'a> {
             dest: result,
             addr,
             value_type,
-            address_space: address_space_for(mem),
+            access: AccessQualifiers {
+                address_space: address_space_for(mem),
+                ..AccessQualifiers::FLAT
+            },
         }));
 
         Ok(result)
@@ -1532,7 +1544,10 @@ impl<'a> X86ToSsaTranslator<'a> {
             addr,
             value,
             value_type,
-            address_space: address_space_for(mem),
+            access: AccessQualifiers {
+                address_space: address_space_for(mem),
+                ..AccessQualifiers::FLAT
+            },
         }));
 
         Ok(())
@@ -1621,6 +1636,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     dest: result,
                     left,
                     right,
+                    signaling: false,
                 }));
             }
             CmpKind::Ne => {
@@ -1634,6 +1650,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     dest: eq_result,
                     left,
                     right,
+                    signaling: false,
                 }));
                 let one = self.get_constant(1, instrs, block_idx);
                 instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
@@ -1649,6 +1666,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left,
                     right,
                     unsigned,
+                    signaling: false,
                 }));
             }
             CmpKind::Gt => {
@@ -1657,6 +1675,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left,
                     right,
                     unsigned,
+                    signaling: false,
                 }));
             }
             CmpKind::Le => {
@@ -1671,6 +1690,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left,
                     right,
                     unsigned,
+                    signaling: false,
                 }));
                 let one = self.get_constant(1, instrs, block_idx);
                 instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
@@ -1692,6 +1712,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     left,
                     right,
                     unsigned,
+                    signaling: false,
                 }));
                 let one = self.get_constant(1, instrs, block_idx);
                 instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
@@ -2004,6 +2025,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                     dest: of_bit,
                     left: neg_result,
                     right: int_min,
+                    signaling: false,
                 }));
                 of_bit
             }
@@ -2377,7 +2399,7 @@ mod tests {
         let spaces: Vec<Option<u16>> = ssa
             .iter_instructions()
             .filter_map(|(_, _, instr)| match instr.op() {
-                SsaOp::LoadIndirect { address_space, .. } => Some(*address_space),
+                SsaOp::LoadIndirect { access: space, .. } => Some(space.address_space),
                 _ => None,
             })
             .collect();

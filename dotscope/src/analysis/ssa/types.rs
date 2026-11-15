@@ -19,16 +19,19 @@
 
 use std::fmt;
 
-use crate::metadata::{
-    cilobject::CilObject,
-    method::{ExceptionHandlerFlags, Method},
-    signatures::{
-        parse_local_var_signature, CustomModifiers, SignatureArray, SignatureLocalVariable,
-        SignatureMethod, SignatureParameter, SignaturePointer, SignatureSzArray, TypeSignature,
+use crate::{
+    metadata::{
+        cilobject::CilObject,
+        method::{ExceptionHandlerFlags, Method},
+        signatures::{
+            parse_local_var_signature, CustomModifiers, SignatureArray, SignatureLocalVariable,
+            SignatureMethod, SignatureParameter, SignaturePointer, SignatureSzArray, TypeSignature,
+        },
+        tables::{MemberRefSignature, StandAloneSigRaw, StandAloneSignature, TableId, TypeSpecRaw},
+        token::Token,
+        typesystem::{wellknown, ArrayDimensions, CilFlavor},
     },
-    tables::{MemberRefSignature, StandAloneSigRaw, StandAloneSignature, TypeSpecRaw},
-    token::Token,
-    typesystem::{wellknown, ArrayDimensions, CilFlavor},
+    utils::EnumUtils,
 };
 
 /// How deeply a type may nest before it is treated as unknown.
@@ -336,6 +339,62 @@ pub enum TypeClass {
 }
 
 impl SsaType {
+    /// Calls `visit` with every metadata token the type names, however deep:
+    /// a class or value type, the base and arguments of an instantiation, the
+    /// element or pointee of an array, pointer or reference, and a function
+    /// pointer's return and parameter types and custom modifiers. A load or
+    /// store of the type, or the TypeSpec interned for it, writes them.
+    pub fn visit_tokens(&self, visit: &mut impl FnMut(Token)) {
+        match self {
+            Self::Class(type_ref) | Self::ValueType(type_ref) => visit(type_ref.token()),
+            Self::GenericInst(base, args) => {
+                base.visit_tokens(visit);
+                for arg in args {
+                    arg.visit_tokens(visit);
+                }
+            }
+            Self::Array(element, _) | Self::Pointer(element) | Self::ByRef(element) => {
+                element.visit_tokens(visit);
+            }
+            Self::FnPtr(signature) => {
+                signature.ret.visit_tokens(visit);
+                for param in &signature.params {
+                    param.visit_tokens(visit);
+                }
+                for modifier in signature
+                    .ret_modifiers
+                    .iter()
+                    .chain(signature.param_modifiers.iter().flatten())
+                {
+                    visit(modifier.modifier_type);
+                }
+            }
+            Self::Void
+            | Self::Bool
+            | Self::I8
+            | Self::U8
+            | Self::I16
+            | Self::U16
+            | Self::I32
+            | Self::U32
+            | Self::I64
+            | Self::U64
+            | Self::NativeInt
+            | Self::NativeUInt
+            | Self::F32
+            | Self::F64
+            | Self::Char
+            | Self::Object
+            | Self::String
+            | Self::TypedReference
+            | Self::GenericParam(_)
+            | Self::MethodGenericParam(_)
+            | Self::Null
+            | Self::Unknown
+            | Self::Varying => {}
+        }
+    }
+
     /// This type with its generic parameters replaced by the arguments of the
     /// instantiation it was read through: `!n` by `type_args[n]` and `!!n` by
     /// `method_args[n]`.
@@ -551,6 +610,43 @@ impl SsaType {
         }
     }
 
+    /// The value type a value of this type is, plain or instantiated: an enum
+    /// nested in a generic type (`Outer<T>.Flags`) is an instantiation of it.
+    /// An enum's integer is stated only by its definition, which this names.
+    #[must_use]
+    pub fn value_type_ref(&self) -> Option<TypeRef> {
+        match self {
+            Self::ValueType(type_ref) => Some(*type_ref),
+            Self::GenericInst(base, _) => match **base {
+                Self::ValueType(type_ref) => Some(type_ref),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a value of this type computes as a number the type does not
+    /// state: an enum ([`Self::value_type_ref`]), or a generic parameter,
+    /// whose instantiation says. Two values of one such type compute as a
+    /// value of it.
+    fn computes_unstated(&self) -> bool {
+        self.value_type_ref().is_some()
+            || matches!(self, Self::GenericParam(_) | Self::MethodGenericParam(_))
+    }
+
+    /// The result type of a unary numeric operation on an operand of this
+    /// type (a negation, a complement or a shift of the value, ECMA-335
+    /// III.1.5): the operand's class, and a value of its own type for an enum
+    /// or a generic parameter, whose number is the one its values are. `None`
+    /// for a type that is no number.
+    #[must_use]
+    pub fn unary_numeric(&self) -> Option<Self> {
+        if self.computes_unstated() {
+            return Some(self.clone());
+        }
+        self.arithmetic_class()
+    }
+
     /// The result type of a binary numeric operation on operands of types
     /// `left` and `right`, by ECMA-335's binary numeric table (III.1.5).
     ///
@@ -558,8 +654,10 @@ impl SsaType {
     /// `native int`, floats are the wider float, and - for `add` and `sub`
     /// (`additive`) - a pointer moved by an integer stays that pointer while
     /// the distance between two pointers is a `native int`. A value type -
-    /// an enum - with an integer computes in that integer's class. `None`
-    /// for a combination the table does not allow.
+    /// an enum - with an integer computes in that integer's class; two values
+    /// of one enum or generic parameter are a value of it, and of two enums a
+    /// value of the first, whose integer a valid program shares with the
+    /// second. `None` for a combination the table does not allow.
     #[must_use]
     pub fn binary_numeric(left: &Self, right: &Self, additive: bool) -> Option<Self> {
         // An enum is its underlying integer on the stack, which its type here
@@ -568,8 +666,18 @@ impl SsaType {
         let integer = |ty: &Self| matches!(ty, Self::I32 | Self::I64 | Self::NativeInt);
         let (a, b) = match (left.arithmetic_class(), right.arithmetic_class()) {
             (Some(a), Some(b)) => (a, b),
-            (Some(a), None) if matches!(right, Self::ValueType(_)) && integer(&a) => (a.clone(), a),
-            (None, Some(b)) if matches!(left, Self::ValueType(_)) && integer(&b) => (b.clone(), b),
+            // Two values of one enum, or of one generic parameter, compute as
+            // its number, whichever that is, and the result is a value of it.
+            // Two enums' values compute as the one integer a valid program
+            // gives both, which the first names as well as the second.
+            (None, None)
+                if left.computes_unstated() && left == right
+                    || left.value_type_ref().is_some() && right.value_type_ref().is_some() =>
+            {
+                return Some(left.clone());
+            }
+            (Some(a), None) if right.value_type_ref().is_some() && integer(&a) => (a.clone(), a),
+            (None, Some(b)) if left.value_type_ref().is_some() && integer(&b) => (b.clone(), b),
             _ => return None,
         };
         let pointer = |ty: &Self| matches!(ty, Self::Pointer(_) | Self::ByRef(_));
@@ -1246,6 +1354,17 @@ pub trait TypeProvider {
     /// Returns the assembly reference, if available.
     fn assembly(&self) -> Option<&CilObject>;
 
+    /// Returns the integer an enum value type is on the evaluation stack: its
+    /// underlying type (ECMA-335 II.14.3, I.8.5.2), or `None` for a value type
+    /// that is no enum or whose definition is not known.
+    ///
+    /// An enum's values compute as that integer, so `flags1 & flags2` of a
+    /// `ulong` enum is a `long`; the value type alone does not say which
+    /// integer it is. `None` by default, for a provider with no metadata.
+    fn enum_underlying(&self, _value_type: &TypeRef) -> Option<SsaType> {
+        None
+    }
+
     /// Returns the original local variable type signatures for code generation.
     fn local_type_signatures(&self) -> Option<Vec<SignatureLocalVariable>> {
         None
@@ -1282,11 +1401,17 @@ pub trait TypeProvider {
 ///
 /// # Usage
 ///
-/// ```no_run
-/// let ctx = TypeContext::new(&method, &assembly);
+/// ```
+/// use dotscope::{analysis::TypeContext, CilObject};
+///
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// # let entry = assembly.methods().iter().next().expect("the sample has methods");
+/// # let method = entry.value();
+/// let ctx = TypeContext::new(method, &assembly);
 /// let arg0_type = ctx.arg_type(0);
 /// let local2_type = ctx.local_type(2);
-/// let ret_type = ctx.call_return_type(call_token);
+/// let ret_type = ctx.call_return_type(method.token);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct TypeContext<'a> {
     /// The method being converted to SSA form.
@@ -1687,6 +1812,26 @@ impl TypeProvider for TypeContext<'_> {
         Some(self.assembly)
     }
 
+    /// Read through the loader: a reference resolves to its definition in
+    /// this assembly, or else in an external registry the loader holds.
+    fn enum_underlying(&self, value_type: &TypeRef) -> Option<SsaType> {
+        let types = self.assembly.types();
+        let named = types.resolve(&value_type.token())?;
+        let definition = if named.token.is_table(TableId::TypeRef) {
+            types
+                .get_by_fullname(&named.fullname(), true)
+                .unwrap_or(named)
+        } else {
+            named
+        };
+        if !EnumUtils::is_enum_type(&definition, Some(&types)) {
+            return None;
+        }
+        let underlying = SsaType::from_type_signature(definition.enum_underlying()?, self.assembly);
+        (underlying.is_integer() || matches!(underlying, SsaType::Bool | SsaType::Char))
+            .then_some(underlying)
+    }
+
     fn local_type_signatures(&self) -> Option<Vec<SignatureLocalVariable>> {
         TypeContext::local_type_signatures(self)
     }
@@ -1718,12 +1863,18 @@ mod tests {
     /// ECMA-335's binary numeric table: equal classes keep their class,
     /// `int32` with `native int` widens, floats take the wider, a pointer
     /// moved by an integer stays a pointer and two pointers differ by a
-    /// `native int`; an enum takes the integer it is computed with; the rest
-    /// combine to nothing.
+    /// `native int`; an enum, plain or instantiated, takes the integer it is
+    /// computed with, two values of one enum or one generic parameter compute
+    /// as it, and of two enums as the first; the rest combine to nothing. A
+    /// unary operation keeps its operand's class, an enum's or a parameter's
+    /// value its type.
     #[test]
     fn binary_numeric_follows_the_ecma_table() {
         let pointer = SsaType::Pointer(Box::new(SsaType::I32));
         let flags = SsaType::ValueType(TypeRef::new(Token::new(0x0200_0001)));
+        let other_flags = SsaType::ValueType(TypeRef::new(Token::new(0x0200_0002)));
+        let nested = SsaType::GenericInst(Box::new(flags.clone()), vec![SsaType::GenericParam(0)]);
+        let parameter = SsaType::MethodGenericParam(0);
         let cases = [
             (SsaType::I32, SsaType::U16, false, Some(SsaType::I32)),
             (SsaType::U64, SsaType::I64, false, Some(SsaType::I64)),
@@ -1744,7 +1895,22 @@ mod tests {
             ),
             (pointer.clone(), SsaType::I32, false, None),
             (flags.clone(), SsaType::I64, false, Some(SsaType::I64)),
-            (flags.clone(), flags.clone(), false, None),
+            (flags.clone(), flags.clone(), false, Some(flags.clone())),
+            (
+                flags.clone(),
+                other_flags.clone(),
+                false,
+                Some(flags.clone()),
+            ),
+            (nested.clone(), SsaType::I32, false, Some(SsaType::I32)),
+            (nested.clone(), nested.clone(), false, Some(nested.clone())),
+            (
+                parameter.clone(),
+                parameter.clone(),
+                true,
+                Some(parameter.clone()),
+            ),
+            (parameter.clone(), SsaType::I32, true, None),
             (SsaType::I32, SsaType::I64, false, None),
             (SsaType::I32, SsaType::F64, false, None),
         ];
@@ -1755,6 +1921,11 @@ mod tests {
                 "{left:?} with {right:?}"
             );
         }
+        assert_eq!(SsaType::U16.unary_numeric(), Some(SsaType::I32));
+        assert_eq!(flags.unary_numeric(), Some(flags.clone()));
+        assert_eq!(nested.unary_numeric(), Some(nested.clone()));
+        assert_eq!(parameter.unary_numeric(), Some(parameter.clone()));
+        assert_eq!(SsaType::String.unary_numeric(), None);
     }
 
     #[test]

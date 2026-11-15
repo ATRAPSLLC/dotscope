@@ -59,6 +59,8 @@ mod validator;
 pub mod verification;
 mod windowsbase;
 
+use std::collections::BTreeMap;
+
 pub use builders::*;
 pub use crafted2::*;
 pub use fixtures::{fixture, fixture_bytes};
@@ -69,7 +71,7 @@ pub use validator::*;
 pub use windowsbase::*;
 
 use crate::{
-    analysis::{ControlFlowGraph, SsaConverter, SsaFunction, SsaType, TypeProvider},
+    analysis::{ControlFlowGraph, SsaConverter, SsaFunction, SsaType, TypeProvider, TypeRef},
     assembly::{decode_blocks, decode_blocks_with_handlers, InstructionAssembler},
     metadata::{
         method::{ExceptionHandler, Method},
@@ -86,12 +88,15 @@ use crate::{
 /// [`TestTypeProvider::typed`] slot by slot, with [`TestTypeProvider::arg`] and
 /// [`TestTypeProvider::local`] to change one. A slot past the declared ones is `Unknown`.
 /// Calls, indirect calls and fields are typed `I32` and `newobj` results `Object`: a test that
-/// needs other types for them uses a real assembly.
+/// needs other types for them uses a real assembly. An enum the test declares
+/// ([`TestTypeProvider::enumeration`]) has the underlying integer it is declared with.
 pub struct TestTypeProvider {
     args: Vec<SsaType>,
     locals: Vec<SsaType>,
     /// Whether the body sets `.locals init`.
     locals_init: bool,
+    /// The underlying integer of each enum the test declares, by its type.
+    enums: BTreeMap<Token, SsaType>,
 }
 
 impl TestTypeProvider {
@@ -112,6 +117,7 @@ impl TestTypeProvider {
             args: args.into_iter().collect(),
             locals: locals.into_iter().collect(),
             locals_init: true,
+            enums: BTreeMap::new(),
         }
     }
 
@@ -142,6 +148,13 @@ impl TestTypeProvider {
             .locals
             .get_mut(usize::from(idx))
             .unwrap_or_else(|| panic!("local {idx} of {count}")) = ty;
+        self
+    }
+
+    /// Declares `enumeration` an enum whose underlying type is `underlying`.
+    #[must_use]
+    pub fn enumeration(mut self, enumeration: TypeRef, underlying: SsaType) -> Self {
+        self.enums.insert(enumeration.token(), underlying);
         self
     }
 
@@ -198,6 +211,10 @@ impl TypeProvider for TestTypeProvider {
 
     fn assembly(&self) -> Option<&CilObject> {
         None
+    }
+
+    fn enum_underlying(&self, value_type: &TypeRef) -> Option<SsaType> {
+        self.enums.get(&value_type.token()).cloned()
     }
 
     fn local_type_signatures(&self) -> Option<Vec<SignatureLocalVariable>> {

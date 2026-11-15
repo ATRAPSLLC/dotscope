@@ -187,11 +187,15 @@ macro_rules! malformed_error {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// # use dotscope::out_of_bounds_error;
-/// if index >= data.len() {
-///     return Err(out_of_bounds_error!());
+/// fn byte_at(data: &[u8], index: usize) -> dotscope::Result<u8> {
+///     if index >= data.len() {
+///         return Err(out_of_bounds_error!());
+///     }
+///     Ok(data[index])
 /// }
+/// assert!(byte_at(&[1, 2], 2).is_err());
 /// ```
 #[macro_export]
 macro_rules! out_of_bounds_error {
@@ -1040,8 +1044,8 @@ impl From<EmulationError> for Error {
     }
 }
 
-impl From<analyssa::GraphError> for Error {
-    fn from(err: analyssa::GraphError) -> Self {
+impl From<analyssa::Error> for Error {
+    fn from(err: analyssa::Error) -> Self {
         Error::GraphError(err.0)
     }
 }

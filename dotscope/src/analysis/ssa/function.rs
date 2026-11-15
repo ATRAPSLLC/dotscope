@@ -117,7 +117,7 @@ impl SsaFunctionCilExt for SsaFunction<CilTarget> {
                 }
             }
         }
-        // Renumbering a local moves its rename group too. `rebuild_ssa` groups
+        // Renumbering a local moves its rename group too. Construction groups
         // variables by rename group but resolves argument/local representatives
         // by origin, so leaving the group pointing at the old slot silently
         // splits the value: the two views disagree about which names denote the

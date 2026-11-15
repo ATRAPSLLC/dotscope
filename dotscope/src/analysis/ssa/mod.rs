@@ -49,16 +49,21 @@
 //!
 //! # Usage
 //!
-//! ```no_run
-//! use dotscope::analysis::{ControlFlowGraph, SsaConverter};
+//! ```
+//! use dotscope::analysis::{ControlFlowGraph, SsaConverter, TypeContext};
 //! use dotscope::assembly::decode_blocks;
+//! use dotscope::CilObject;
 //!
-//! // Build CFG from decoded blocks
-//! let blocks = decode_blocks(data, offset, rva, Some(size))?;
+//! // Build CFG from decoded blocks: `ldarg.0; brtrue.s +1; nop; ret`
+//! let il = [0x02u8, 0x2D, 0x01, 0x00, 0x2A];
+//! let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 //! let cfg = ControlFlowGraph::from_basic_blocks(blocks)?;
 //!
-//! // Construct SSA form
-//! let ssa = SsaConverter::build(&cfg, num_args, num_locals, resolver, Vec::new())?;
+//! // Construct SSA form, typed by a method of a real assembly
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! # let entry = assembly.methods().iter().next().expect("the sample has methods");
+//! let resolver = TypeContext::new(entry.value(), &assembly);
+//! let ssa = SsaConverter::build(&cfg, 1, 0, &resolver, Vec::new())?;
 //!
 //! // Analyze phi nodes at merge points
 //! for block in ssa.blocks() {
@@ -110,7 +115,8 @@ pub use exception::{
 pub use facts::CilVariableFacts;
 pub use function::{SsaFunctionCilExt, SsaFunctionSemanticsExt};
 pub use ops::{
-    BinaryOpKind, BreakpointOp, CmpKind, RuntimeValueKind, SsaOp, SsaOpCilExt, UnaryOpKind,
+    AccessQualifiers, BinaryOpKind, BreakpointOp, CallData, Callee, CilPrefix, CmpKind,
+    RuntimeValueKind, SsaOp, SsaOpCilExt, UnaryOpKind,
 };
 /// CIL-defaulted alias of [`analyssa::ir::function::SsaFunction`].
 pub type SsaFunction<T = CilTarget> = analyssa::ir::function::SsaFunction<T>;
@@ -119,7 +125,6 @@ pub type ReturnInfo<T = CilTarget> = analyssa::ir::function::ReturnInfo<T>;
 pub use analyssa::{
     analysis::{
         address,
-        consts::evaluate_const_op,
         evaluator::ControlFlow,
         memory::{AliasResult, ArrayIndex, IndirectLocation, MemoryDefSite, MemoryPhiOperand},
         phis::PhiAnalyzer,
@@ -131,11 +136,11 @@ pub use analyssa::{
     },
     Target,
 };
-pub use resolver::ValueResolver;
+pub use resolver::ValueResolverCilExt;
 pub use stack::{SimulationResult, StackSimulator};
 #[cfg(feature = "z3")]
 pub use symbolic::Z3Solver;
-pub use symbolic::{SymbolicEvaluator, SymbolicExpr, SymbolicOp};
+pub use symbolic::{NumericOp, SymbolicEvaluator, SymbolicExpr};
 pub use target::CilTarget;
 pub use types::{
     resolve_corelib_valuetype, FieldRef, MethodRef, SsaType, TypeClass, TypeContext, TypeProvider,
@@ -153,6 +158,8 @@ pub type SsaVariable<T = CilTarget> = analyssa::ir::variable::SsaVariable<T>;
 pub type SsaCfg<'a, T = CilTarget> = analyssa::analysis::cfg::SsaCfg<'a, T>;
 /// CIL-defaulted alias of [`analyssa::analysis::consts::ConstEvaluator`].
 pub type ConstEvaluator<'a, T = CilTarget> = analyssa::analysis::consts::ConstEvaluator<'a, T>;
+/// CIL-defaulted alias of [`analyssa::analysis::ValueResolver`].
+pub type ValueResolver<'a, T = CilTarget> = analyssa::analysis::ValueResolver<'a, T>;
 /// CIL-defaulted alias of [`analyssa::analysis::evaluator::SsaEvaluator`].
 pub type SsaEvaluator<'a, T = CilTarget> = analyssa::analysis::evaluator::SsaEvaluator<'a, T>;
 /// CIL-defaulted alias of [`analyssa::analysis::evaluator::EvaluatorMark`].

@@ -12,7 +12,8 @@
 //! The builder uses a closure-based API where all blocks are defined within
 //! a single expression, making the CFG structure visually clear:
 //!
-//! ```no_run
+//! ```
+//! # use dotscope::analysis::{SsaFunctionBuilder, SsaType};
 //! let ssa = SsaFunctionBuilder::new(1, 0).build_with(|f| {
 //!     let cond = f.arg(0, SsaType::I32);
 //!
@@ -33,8 +34,9 @@
 use std::collections::HashMap;
 
 use crate::analysis::ssa::{
-    ConstValue, ConstValueCilExt, DefSite, FunctionVarAllocator, MethodRef, PhiNode, PhiOperand,
-    SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId, VariableOrigin,
+    CallData, Callee, ConstValue, ConstValueCilExt, DefSite, FunctionVarAllocator, MethodRef,
+    PhiNode, PhiOperand, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId,
+    VariableOrigin,
 };
 
 /// Builder for constructing SSA functions programmatically.
@@ -45,8 +47,8 @@ use crate::analysis::ssa::{
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use dotscope::analysis::SsaFunctionBuilder;
+/// ```
+/// use dotscope::analysis::{SsaFunctionBuilder, SsaType};
 ///
 /// // Simple function: return arg0 + arg1
 /// let ssa = SsaFunctionBuilder::new(2, 0).build_with(|f| {
@@ -509,6 +511,23 @@ impl SsaBlockBuilder<'_> {
         dest
     }
 
+    /// Adds: dest = add.ovf(left, right) - trapping on signed overflow
+    #[must_use]
+    pub fn add_ovf(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
+        let op = SsaOp::AddOvf {
+            dest,
+            left,
+            right,
+            unsigned: false,
+            flags: None,
+        };
+        self.block.add_instruction(SsaInstruction::synthetic(op));
+        dest
+    }
+
     /// Adds: dest = left - right
     #[must_use]
     pub fn sub(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
@@ -752,7 +771,12 @@ impl SsaBlockBuilder<'_> {
     #[must_use]
     pub fn ceq(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(SsaType::Bool);
-        let op = SsaOp::Ceq { dest, left, right };
+        let op = SsaOp::Ceq {
+            dest,
+            left,
+            right,
+            signaling: false,
+        };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
     }
@@ -766,6 +790,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: false,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -780,6 +805,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: true,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -794,6 +820,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: false,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -808,6 +835,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: true,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -877,13 +905,13 @@ impl SsaBlockBuilder<'_> {
 
     /// Adds: return (void)
     pub fn ret(&mut self) {
-        let op = SsaOp::Return { value: None };
+        let op = SsaOp::returns(None);
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
     /// Adds: return value
     pub fn ret_val(&mut self, value: SsaVarId) {
-        let op = SsaOp::Return { value: Some(value) };
+        let op = SsaOp::returns(Some(value));
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
@@ -899,64 +927,21 @@ impl SsaBlockBuilder<'_> {
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
-    /// Adds: call method with return value and explicit result type.
+    /// Adds: a call of `callee` with a return value of `result_type`.
     ///
     /// Returns the variable holding the call result.
     #[must_use]
-    pub fn call(&mut self, method: MethodRef, args: &[SsaVarId], result_type: SsaType) -> SsaVarId {
+    pub fn call(&mut self, callee: Callee, args: &[SsaVarId], result_type: SsaType) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(result_type.clone());
-        let op = SsaOp::Call {
-            dest: Some(dest),
-            method,
-            args: args.to_vec(),
-            effects: None,
-        };
+        let op = CallData::new(Some(dest), callee, args.to_vec()).into();
         self.block
             .add_instruction(SsaInstruction::synthetic(op).with_result_type(result_type));
         dest
     }
 
-    /// Adds: call method without return value (void)
-    pub fn call_void(&mut self, method: MethodRef, args: &[SsaVarId]) {
-        let op = SsaOp::Call {
-            dest: None,
-            method,
-            args: args.to_vec(),
-            effects: None,
-        };
-        self.block.add_instruction(SsaInstruction::synthetic(op));
-    }
-
-    /// Adds: callvirt method with return value and explicit result type.
-    ///
-    /// Returns the variable holding the call result.
-    #[must_use]
-    pub fn callvirt(
-        &mut self,
-        method: MethodRef,
-        args: &[SsaVarId],
-        result_type: SsaType,
-    ) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(result_type.clone());
-        let op = SsaOp::CallVirt {
-            dest: Some(dest),
-            method,
-            args: args.to_vec(),
-            effects: None,
-        };
-        self.block
-            .add_instruction(SsaInstruction::synthetic(op).with_result_type(result_type));
-        dest
-    }
-
-    /// Adds: callvirt method without return value (void)
-    pub fn callvirt_void(&mut self, method: MethodRef, args: &[SsaVarId]) {
-        let op = SsaOp::CallVirt {
-            dest: None,
-            method,
-            args: args.to_vec(),
-            effects: None,
-        };
+    /// Adds: a call of `callee` without a return value.
+    pub fn call_void(&mut self, callee: Callee, args: &[SsaVarId]) {
+        let op = CallData::new(None, callee, args.to_vec()).into();
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
