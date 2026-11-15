@@ -376,7 +376,7 @@ impl DocumentBuilder {
     ///     .csharp_language()
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created Document with token: {}", document_token);
+    /// println!("Created Document with token: {:?}", document_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {

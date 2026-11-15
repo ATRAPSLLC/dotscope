@@ -101,7 +101,8 @@ enum LoopAction {
 /// # Example
 ///
 /// ```no_run
-/// use dotscope::emulation::{EmulationController, EmValue, ProcessBuilder};
+/// use dotscope::emulation::{EmValue, ProcessBuilder};
+/// use dotscope::metadata::token::Token;
 /// use dotscope::CilObject;
 /// use std::sync::Arc;
 ///
@@ -111,6 +112,7 @@ enum LoopAction {
 ///     .build()?;
 ///
 /// // Use process.execute_method() instead of controller directly
+/// let method_token = Token::new(0x0600_0001);
 /// let result = process.execute_method(method_token, vec![EmValue::I32(42)])?;
 /// # Ok::<(), dotscope::Error>(())
 /// ```

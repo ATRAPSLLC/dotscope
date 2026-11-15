@@ -228,13 +228,8 @@ impl<'a> Decoder<'a> {
     /// # Usage in Method Integration
     ///
     /// This method is primarily used internally by [`crate::assembly::decode_method`] to efficiently
-    /// transfer decoded blocks to the [`crate::metadata::method::Method`]'s `OnceLock<Vec<BasicBlock>>` field:
-    ///
-    /// ```no_run
-    /// // Internal usage pattern
-    /// let blocks = decoder.into_blocks();
-    /// method.blocks.set(blocks);
-    /// ```
+    /// transfer decoded blocks to the [`crate::metadata::method::Method`]'s `OnceLock<Vec<BasicBlock>>`
+    /// field, and [`crate::assembly::decode_blocks`] returns what it hands over.
     ///
     /// # Examples
     ///

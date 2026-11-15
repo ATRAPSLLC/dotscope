@@ -21,20 +21,20 @@
 //! # let mut assembly = CilAssembly::new(view);
 //!
 //! // Create a field signature for static data
-//! let field_sig = vec![0x06]; // Simple type signature
+//! let field_sig = vec![0x06, 0x08]; // FIELD, ELEMENT_TYPE_I4
 //!
 //! // Create a field first
 //! let field_ref = FieldBuilder::new()
 //!     .name("StaticData")
 //!     .flags(FieldAttributes::STATIC | FieldAttributes::PRIVATE)
 //!     .signature(&field_sig)
-//!     .build(&mut context)?;
+//!     .build(&mut assembly)?;
 //!
 //! // Create a field RVA entry for static field initialization
 //! let field_rva_ref = FieldRVABuilder::new()
 //!     .field(field_ref.placeholder())
 //!     .rva(0x2000) // RVA pointing to initial data
-//!     .build(&mut context)?;
+//!     .build(&mut assembly)?;
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -79,12 +79,16 @@ use crate::{
 /// # use std::path::Path;
 /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 /// # let mut assembly = CilAssembly::new(view);
-/// # let field_ref = context.field_add(...)?;
+/// # let field_ref = FieldBuilder::new()
+/// #     .name("StaticData")
+/// #     .flags(FieldAttributes::STATIC | FieldAttributes::PRIVATE)
+/// #     .signature(&[0x06, 0x08])
+/// #     .build(&mut assembly)?;
 ///
 /// let field_rva_ref = FieldRVABuilder::new()
 ///     .field(field_ref.placeholder())
 ///     .rva(0x2000)
-///     .build(&mut context)?;
+///     .build(&mut assembly)?;
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
@@ -222,7 +226,11 @@ impl FieldRVABuilder {
     /// # use std::path::Path;
     /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
     /// # let mut assembly = CilAssembly::new(view);
-    /// # let field_ref = assembly.field_add(...)?;
+    /// # let field_ref = FieldBuilder::new()
+    /// #     .name("StaticData")
+    /// #     .flags(FieldAttributes::STATIC | FieldAttributes::PRIVATE)
+    /// #     .signature(&[0x06, 0x08])
+    /// #     .build(&mut assembly)?;
     ///
     /// let field_rva_ref = FieldRVABuilder::new()
     ///     .field(field_ref.placeholder())

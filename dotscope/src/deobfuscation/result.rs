@@ -22,7 +22,7 @@ use crate::{
 /// use dotscope::deobfuscation::{DeobfuscationEngine, EngineConfig};
 ///
 /// let engine = DeobfuscationEngine::new(EngineConfig::default());
-/// let result = engine.process_file(&mut assembly)?;
+/// let (_deobfuscated, result) = engine.process_file("obfuscated.dll")?;
 ///
 /// println!("Events: {}", result.events.len());
 /// println!("Stats: {}", result.stats().summary());

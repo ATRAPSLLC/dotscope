@@ -41,20 +41,28 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
+//! ```
 //! use dotscope::metadata::tablefields::{get_heap_fields, HeapType};
 //! use dotscope::metadata::tables::TableId;
+//! use dotscope::CilObject;
+//!
+//! // The heap index widths an assembly's tables were written with
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! let table_info = &assembly.tables().expect("a tables stream").info;
 //!
 //! // Get heap fields for a TypeDef row
-//! let fields = get_heap_fields(TableId::TypeDef, &table_info);
+//! let fields = get_heap_fields(TableId::TypeDef, table_info);
 //!
-//! for field in fields {
+//! for field in &fields {
 //!     match field.heap_type {
 //!         HeapType::String => println!("String at offset {}", field.offset),
 //!         HeapType::Blob => println!("Blob at offset {}", field.offset),
 //!         HeapType::Guid => println!("GUID at offset {}", field.offset),
 //!     }
 //! }
+//! // A TypeDef row names its type's name and namespace in the strings heap
+//! assert_eq!(fields.iter().filter(|field| field.heap_type == HeapType::String).count(), 2);
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use crate::metadata::tables::{CodedIndexType, TableId, TableInfoRef};

@@ -116,10 +116,16 @@ pub type ReflectionPropertyInfo = (Arc<str>, Token, Option<Token>, Option<Token>
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
+/// use dotscope::emulation::ManagedHeap;
+///
+/// let heap = ManagedHeap::new(1024 * 1024);
+/// heap.alloc_string("Hello")?;
+///
 /// for (heap_ref, object) in heap.iter()? {
 ///     println!("{}: {}", heap_ref, object);
 /// }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct HeapIter {
     items: std::vec::IntoIter<(HeapRef, HeapObject)>,
@@ -1201,7 +1207,9 @@ impl ManagedHeap {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::ManagedHeap;
+    ///
     /// let heap = ManagedHeap::new(1024 * 1024);
     /// let string_ref = heap.alloc_string("Hello").unwrap();
     ///

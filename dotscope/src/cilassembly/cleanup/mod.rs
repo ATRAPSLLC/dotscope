@@ -40,23 +40,21 @@
 //! # Usage
 //!
 //! ```no_run
+//! use dotscope::metadata::token::Token;
 //! use dotscope::CilAssembly;
 //! use dotscope::CleanupRequest;
 //!
-//! let mut assembly = CilAssembly::new(view);
+//! let mut assembly = CilAssembly::from_path("protected.exe")?;
 //!
-//! // Build a cleanup request
+//! // Build a cleanup request: the protection's type and its decryptor
 //! let mut request = CleanupRequest::new();
-//! request.add_type(protection_type_token);
-//! request.add_method(decryptor_method_token);
+//! request.add_type(Token::new(0x0200_0002));
+//! request.add_method(Token::new(0x0600_0001));
 //! request.exclude_section(".confuser");
 //!
-//! // Execute cleanup (modifies AssemblyChanges)
-//! let stats = assembly.execute_cleanup(&request)?;
-//! println!("{}", stats);
-//!
-//! // Generate assembly (cleanup is applied)
-//! assembly.write_to_file("output.exe")?;
+//! // Queue the cleanup; it runs once, when the assembly is generated
+//! assembly.add_cleanup(&request);
+//! assembly.to_file("output.exe")?;
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!

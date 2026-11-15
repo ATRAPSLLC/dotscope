@@ -53,15 +53,16 @@ use crate::emulation::{tokens, HeapRef, ManagedHeap};
 ///
 /// # Example
 ///
-/// ```no_run
-/// use dotscope::emulation::{FakeObjects, ManagedHeap};
+/// ```
+/// use dotscope::emulation::{EmValue, FakeObjects, ManagedHeap};
 ///
 /// let heap = ManagedHeap::new(64 * 1024 * 1024);
 /// let fake_objects = FakeObjects::initialize(&heap);
 ///
 /// // BCL hooks can now use these references:
 /// if let Some(asm_ref) = fake_objects.assembly() {
-///     return EmValue::ObjectRef(asm_ref);
+///     let value = EmValue::ObjectRef(asm_ref);
+///     println!("Assembly object: {:?}", value);
 /// }
 /// ```
 #[derive(Debug, Clone)]

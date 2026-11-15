@@ -87,7 +87,7 @@ use crate::{
 ///
 /// The remapper is built from `AssemblyChanges` before writing tables:
 ///
-/// ```no_run
+/// ```text
 /// let remapper = RidRemapper::from_changes(&changes, &original_counts);
 /// ```
 ///
@@ -95,9 +95,8 @@ use crate::{
 ///
 /// During table serialization, call `remap_references` on each row:
 ///
-/// ```no_run
+/// ```text
 /// row.remap_references(&remapper)?;
-/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Debug, Default)]
 pub struct RidRemapper {

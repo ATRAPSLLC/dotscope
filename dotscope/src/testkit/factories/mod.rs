@@ -17,7 +17,7 @@
 //! Factory methods maintain the same signatures and behavior as their original
 //! locations, but are now properly organized and excluded from coverage analysis.
 //!
-//! ```rust
+//! ```text
 //! use crate::testkit::factories::table::cilassembly::create_test_typedef_row;
 //! use crate::testkit::factories::validation::inheritance::create_assembly_with_circular_inheritance;
 //!

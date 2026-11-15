@@ -41,7 +41,7 @@
 //!
 //! let custom_attr = CustomAttributeValue {
 //!     fixed_args: vec![
-//!         CustomAttributeArgument::String("Debug".to_string()),
+//!         CustomAttributeArgument::String(Some("Debug".to_string())),
 //!         CustomAttributeArgument::Bool(true),
 //!     ],
 //!     named_args: vec![],
@@ -59,7 +59,7 @@
 //! ```rust,no_run
 //! use dotscope::metadata::customattributes::{CustomAttributeArgument, encode_custom_attribute_argument};
 //!
-//! let string_arg = CustomAttributeArgument::String("Hello".to_string());
+//! let string_arg = CustomAttributeArgument::String(Some("Hello".to_string()));
 //! let mut encoded_string = Vec::new();
 //! encode_custom_attribute_argument(&string_arg, &mut encoded_string)?;
 //!

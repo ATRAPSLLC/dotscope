@@ -23,17 +23,22 @@
 //! # Usage Examples
 //!
 //! ## Parsing from Goblin PE
-//! ```no_run
+//! ```
 //! use goblin::pe::PE;
 //! use dotscope::Pe;
 //!
-//! let goblin_pe = PE::parse(data)?;
-//! let owned_pe = Pe::from_goblin_pe(&goblin_pe, data)?;
+//! let data = std::fs::read("tests/samples/crafted_2.exe").expect("the sample");
+//! let goblin_pe = PE::parse(&data).expect("a PE image");
+//! let owned_pe = Pe::from_goblin_pe(&goblin_pe, &data)?;
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Serialization for Write Pipeline
-//! ```no_run
+//! ```
+//! # use goblin::pe::PE;
+//! # use dotscope::Pe;
+//! # let data = std::fs::read("tests/samples/crafted_2.exe").expect("the sample");
+//! # let owned_pe = Pe::from_goblin_pe(&PE::parse(&data).expect("a PE image"), &data)?;
 //! let mut buffer = Vec::new();
 //! owned_pe.write_headers(&mut buffer)?;
 //! owned_pe.write_section_table(&mut buffer)?;

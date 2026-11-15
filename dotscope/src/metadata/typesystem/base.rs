@@ -474,8 +474,9 @@ impl From<CilTypeRc> for CilTypeRef {
 /// ## Example
 ///
 /// ```no_run
-/// use dotscope::metadata::typesystem::CilTypeRefListIter;
+/// use dotscope::metadata::typesystem::{CilTypeRefList, CilTypeRefListIter};
 ///
+/// # fn example(nested_types: &CilTypeRefList, types: &CilTypeRefList) {
 /// // Iterate over nested types
 /// for type_ref in CilTypeRefListIter::new(&nested_types) {
 ///     if let Some(resolved) = type_ref.upgrade() {
@@ -487,6 +488,7 @@ impl From<CilTypeRc> for CilTypeRef {
 /// let valid_types: Vec<_> = CilTypeRefListIter::new(&types)
 ///     .filter_map(|r| r.upgrade())
 ///     .collect();
+/// # }
 /// ```
 pub struct CilTypeRefListIter<'a> {
     list: &'a CilTypeRefList,

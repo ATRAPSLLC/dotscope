@@ -16,6 +16,7 @@
 //!
 //! ```no_run
 //! # use dotscope::prelude::*;
+//! # use dotscope::metadata::tables::EventBuilder;
 //! # use std::path::Path;
 //! # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 //! # let mut assembly = CilAssembly::new(view);
@@ -31,18 +32,23 @@
 //! let handler_ref = TypeRefBuilder::new()
 //!     .name("EventHandler")
 //!     .namespace("System")
-//!     .resolution_scope(CodedIndex::new(TableId::AssemblyRef, 1))
+//!     .resolution_scope(CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope))
 //!     .build(&mut assembly)?;
 //!
-//! // Create events
+//! // Create events of the handler type
+//! let handler = CodedIndex::new(
+//!     TableId::TypeRef,
+//!     handler_ref.placeholder(),
+//!     CodedIndexType::TypeDefOrRef,
+//! );
 //! let event1_ref = EventBuilder::new()
 //!     .name("OnDataChanged")
-//!     .event_type(handler_ref.try_into()?)
+//!     .event_type(handler.clone())
 //!     .build(&mut assembly)?;
 //!
 //! let event2_ref = EventBuilder::new()
 //!     .name("OnSizeChanged")
-//!     .event_type(handler_ref.try_into()?)
+//!     .event_type(handler)
 //!     .build(&mut assembly)?;
 //!
 //! // Create an event map entry for the type

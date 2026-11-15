@@ -67,7 +67,7 @@ use crate::{
 /// ```
 ///
 /// ## Complex Array Type
-/// ```rust,no_run
+/// ```rust
 /// use dotscope::metadata::marshalling::{parse_marshalling_descriptor, NativeType, NATIVE_TYPE};
 ///
 /// // Parse array of I4 with parameter and size info
@@ -75,7 +75,7 @@ use crate::{
 /// let info = parse_marshalling_descriptor(bytes)?;
 ///
 /// match info.primary_type {
-///     NativeType::Array { element_type, num_param, num_element } => {
+///     NativeType::Array { element_type, num_param, num_element, .. } => {
 ///         println!("Array of {:?}, param: {:?}, size: {:?}",
 ///                  element_type, num_param, num_element);
 ///     }

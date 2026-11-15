@@ -23,10 +23,12 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
-//! use crate::cilassembly::changes::AssemblyChanges;
+//! ```
+//! use dotscope::CilAssembly;
 //!
-//! let mut changes = AssemblyChanges::new();
+//! let mut assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
+//! assembly.string_add("added")?;
+//! let changes = assembly.changes();
 //!
 //! // Check if any changes have been made
 //! if changes.has_changes() {
@@ -36,7 +38,8 @@
 //! // Get modification statistics
 //! let table_count = changes.modified_table_count();
 //! let string_count = changes.string_additions_count();
-//! # Ok::<(), crate::Error>(())
+//! assert_eq!(string_count, 1);
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -76,17 +79,18 @@ pub(crate) const FIELD_DATA_PLACEHOLDER_BASE: u32 = 0xE000_0000;
 ///
 /// # Usage Examples
 ///
-/// ```no_run
-/// use crate::cilassembly::changes::AssemblyChanges;
+/// ```
+/// use dotscope::CilAssembly;
 ///
-/// let changes = AssemblyChanges::new();
+/// let assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
+/// let changes = assembly.changes();
 ///
 /// // Check modification status
 /// if changes.has_changes() {
 ///     let table_count = changes.modified_table_count();
 ///     println!("Modified {} tables", table_count);
 /// }
-/// # Ok::<(), crate::Error>(())
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety

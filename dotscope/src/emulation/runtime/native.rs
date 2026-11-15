@@ -45,8 +45,8 @@
 //!
 //! ## Adding Custom Native Hooks
 //!
-//! ```no_run
-//! use dotscope::emulation::{Hook, PreHookResult, EmValue};
+//! ```
+//! use dotscope::emulation::{EmValue, Hook, HookManager, PreHookResult};
 //!
 //! let manager = HookManager::new();
 //!
@@ -57,7 +57,8 @@
 //!             // Return a fixed tick count for deterministic emulation
 //!             PreHookResult::Bypass(Some(EmValue::I32(12345678)))
 //!         })
-//! );
+//! )?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Use Cases

@@ -27,7 +27,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use dotscope::testkit::analysis::{AnalysisTestRunner, AnalysisTestCase};
+//! use dotscope::testkit::analysis::AnalysisTestRunner;
 //!
 //! # fn main() -> dotscope::Result<()> {
 //! // `None` when this machine has no compiler and runtime: the test skips.

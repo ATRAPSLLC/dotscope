@@ -502,7 +502,7 @@ impl LoaderContext<'_> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```text
     /// use dotscope::metadata::diagnostics::DiagnosticCategory;
     ///
     /// let result = row.to_owned(strings, blob);

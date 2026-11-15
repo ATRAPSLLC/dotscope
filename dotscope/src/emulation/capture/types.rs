@@ -118,6 +118,7 @@ impl CaptureSource {
 /// # Examples
 ///
 /// ```no_run
+/// # let ctx = dotscope::emulation::CaptureContext::new();
 /// for assembly in ctx.assemblies() {
 ///     // Check if it's a valid PE/COFF file
 ///     if assembly.data.starts_with(b"MZ") {
@@ -225,7 +226,8 @@ pub enum AssemblyLoadMethod {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
+/// # let ctx = dotscope::emulation::CaptureContext::new();
 /// for string in ctx.strings() {
 ///     // Look for URLs
 ///     if string.value.starts_with("http") {
@@ -534,7 +536,10 @@ pub enum NetworkOpKind {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
+/// use dotscope::emulation::NetworkOpKind;
+/// # let ctx = dotscope::emulation::CaptureContext::new();
+///
 /// for op in ctx.network_operations() {
 ///     match op.operation {
 ///         NetworkOpKind::HttpGet | NetworkOpKind::HttpPost => {

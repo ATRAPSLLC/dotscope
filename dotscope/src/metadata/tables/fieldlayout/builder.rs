@@ -53,16 +53,23 @@ use crate::{
 ///
 /// ```no_run
 /// # use dotscope::prelude::*;
-/// # use dotscope::metadata::tables::FieldLayoutBuilder;
+/// # use dotscope::metadata::tables::{FieldBuilder, FieldLayoutBuilder};
 /// # use std::path::Path;
 /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 /// let mut assembly = CilAssembly::new(view);
 ///
 /// // Create explicit layout for a P/Invoke structure
 /// // struct Point { int x; int y; }
-/// // Assuming we created fields and got their ChangeRefs
-/// let x_field_ref = /* ... */; // ChangeRef to field
-/// let y_field_ref = /* ... */; // ChangeRef to field
+/// // `int32` fields (signature `FIELD`, `ELEMENT_TYPE_I4`)
+/// let int32_field = |name: &str, assembly: &mut CilAssembly| {
+///     FieldBuilder::new()
+///         .name(name)
+///         .flags(FieldAttributes::PUBLIC)
+///         .signature(&[0x06, 0x08])
+///         .build(assembly)
+/// };
+/// let x_field_ref = int32_field("x", &mut assembly)?;
+/// let y_field_ref = int32_field("y", &mut assembly)?;
 ///
 /// // X field at offset 0 (start of struct)
 /// let x_layout = FieldLayoutBuilder::new()
@@ -78,8 +85,8 @@ use crate::{
 ///
 /// // Create a union-like structure with overlapping fields
 /// // union Value { int intValue; float floatValue; }
-/// let int_field_ref = /* ... */;   // ChangeRef to field
-/// let float_field_ref = /* ... */; // ChangeRef to field
+/// let int_field_ref = int32_field("intValue", &mut assembly)?;
+/// let float_field_ref = int32_field("floatValue", &mut assembly)?;
 ///
 /// // Both fields start at offset 0 (overlapping)
 /// let int_layout = FieldLayoutBuilder::new()
@@ -93,8 +100,8 @@ use crate::{
 ///     .build(&mut assembly)?;
 ///
 /// // Create cache-line aligned fields for performance
-/// let cache_field1_ref = /* ... */; // ChangeRef to field
-/// let cache_field2_ref = /* ... */; // ChangeRef to field
+/// let cache_field1_ref = int32_field("hot", &mut assembly)?;
+/// let cache_field2_ref = int32_field("cold", &mut assembly)?;
 ///
 /// // First field at start
 /// let aligned_layout1 = FieldLayoutBuilder::new()

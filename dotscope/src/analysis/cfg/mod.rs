@@ -37,11 +37,13 @@
 //!
 //! ## Building a CFG from Basic Blocks
 //!
-//! ```no_run
+//! ```
 //! use dotscope::analysis::ControlFlowGraph;
 //! use dotscope::assembly::decode_blocks;
 //!
-//! let blocks = decode_blocks(data, offset, rva, Some(size))?;
+//! // `nop; ret`
+//! let il = [0x00u8, 0x2A];
+//! let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 //! let graph = ControlFlowGraph::from_basic_blocks(blocks)?;
 //!
 //! println!("CFG has {} blocks", graph.block_count());
@@ -51,29 +53,36 @@
 //!
 //! ## Traversing the CFG
 //!
-//! ```no_run
+//! ```
 //! use dotscope::analysis::ControlFlowGraph;
+//! # use dotscope::assembly::decode_blocks;
+//! # let il = [0x00u8, 0x2A];
+//! # let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 //!
 //! let graph = ControlFlowGraph::from_basic_blocks(blocks)?;
 //!
 //! // Iterate in reverse postorder (useful for data flow)
 //! for block_id in graph.reverse_postorder() {
-//!     let block = graph.block(block_id).unwrap();
-//!     println!("Block {} at RVA 0x{:x}", block_id, block.basic_block.rva);
+//!     if let Some(block) = graph.block(block_id) {
+//!         println!("Block {:?} at RVA 0x{:x}", block_id, block.rva);
+//!     }
 //! }
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Computing Dominators
 //!
-//! ```no_run
+//! ```
 //! use dotscope::analysis::ControlFlowGraph;
+//! # use dotscope::assembly::decode_blocks;
+//! # let il = [0x00u8, 0x2A];
+//! # let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 //!
 //! let graph = ControlFlowGraph::from_basic_blocks(blocks)?;
-//! let dominators = graph.dominators();
+//! let some_block = graph.exits()[0];
 //!
 //! // Check domination relationships
-//! if dominators.dominates(graph.entry(), some_block) {
+//! if graph.dominates(graph.entry(), some_block) {
 //!     println!("Entry dominates the target block");
 //! }
 //!

@@ -64,12 +64,15 @@ impl File {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
-    /// use dotscope::file::{debug::debug_type, File};
+    /// ```rust
+    /// use dotscope::File;
+    ///
+    /// // The CodeView kind, `debug_type::CODEVIEW`
+    /// const CODEVIEW: u32 = 2;
     ///
     /// let file = File::from_path("tests/samples/pdb/embedded/PdbProbe.dll")?;
     /// for entry in file.debug_directory()? {
-    ///     if entry.kind == debug_type::CODEVIEW {
+    ///     if entry.kind == CODEVIEW {
     ///         println!("CodeView entry, {} bytes at RVA 0x{:X}", entry.size, entry.rva);
     ///     }
     /// }

@@ -77,8 +77,9 @@ use crate::{emulation::HeapRef, metadata::token::Token, CilObject};
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// use dotscope::emulation::AppDomainState;
+/// use dotscope::metadata::token::Token;
 ///
 /// let mut domain = AppDomainState::new();
 ///
@@ -267,7 +268,8 @@ impl AppDomainState {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
+    /// # let domain = dotscope::emulation::AppDomainState::new();
     /// for assembly in domain.loaded_assemblies() {
     ///     println!("Loaded: {}", assembly.name);
     /// }
@@ -345,7 +347,10 @@ impl AppDomainState {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::{AppDomainState, HeapRef};
+    ///
+    /// let mut domain = AppDomainState::new();
     /// let ref1 = domain.intern_string("hello".to_string(), HeapRef::new(1));
     /// let ref2 = domain.intern_string("hello".to_string(), HeapRef::new(2));
     /// assert_eq!(ref1, ref2); // Same reference returned

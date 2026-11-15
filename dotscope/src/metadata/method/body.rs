@@ -42,11 +42,12 @@
 //! # Usage Patterns
 //!
 //! ## Basic Method Information
-//! ```no_run
+//! ```
 //! use dotscope::metadata::method::MethodBody;
 //!
-//! let method_data = /* ... method body bytes ... */;
-//! let body = MethodBody::from(method_data)?;
+//! // A tiny header (two bytes of code) and `ldc.i4.1; ret`
+//! let method_data = [0x0A, 0x17, 0x2A];
+//! let body = MethodBody::from(&method_data)?;
 //!
 //! println!("Method has {} bytes of IL code", body.size_code);
 //! println!("Header type: {}", if body.is_fat { "Fat" } else { "Tiny" });
@@ -54,7 +55,9 @@
 //! ```
 //!
 //! ## Local Variable Analysis
-//! ```no_run
+//! ```
+//! # use dotscope::metadata::method::MethodBody;
+//! # let body = MethodBody::from(&[0x0A, 0x17, 0x2A])?;
 //! if body.local_var_sig_token != 0 {
 //!     println!("Method has local variables (signature token: 0x{:08X})",
 //!              body.local_var_sig_token);
@@ -62,10 +65,13 @@
 //!         println!("Local variables are zero-initialized");
 //!     }
 //! }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Exception Handler Processing
-//! ```no_run
+//! ```
+//! # use dotscope::metadata::method::MethodBody;
+//! # let body = MethodBody::from(&[0x0A, 0x17, 0x2A])?;
 //! if body.is_exception_data {
 //!     println!("Method has {} exception handlers", body.exception_handlers.len());
 //!     for (i, handler) in body.exception_handlers.iter().enumerate() {
@@ -76,6 +82,7 @@
 //!                  handler.handler_offset + handler.handler_length);
 //!     }
 //! }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Examples
@@ -706,7 +713,7 @@ impl MethodBody {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use dotscope::metadata::method::MethodBody;
     ///
     /// # fn example() -> dotscope::Result<()> {
@@ -719,6 +726,7 @@ impl MethodBody {
     ///     is_init_local: false,
     ///     is_exception_data: false,
     ///     exception_handlers: vec![],
+    ///     exception_format: None,
     /// };
     ///
     /// let il_code = vec![0x17, 0x2A]; // ldc.i4.1, ret
@@ -728,6 +736,7 @@ impl MethodBody {
     /// assert_eq!(bytes_written, 3); // 1-byte header + 2-byte code
     /// # Ok(())
     /// # }
+    /// # example().expect("the body writes");
     /// ```
     ///
     /// # Errors

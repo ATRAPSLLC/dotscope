@@ -41,7 +41,7 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```text
 /// // Emits ldc.i4.0 (1 byte)
 /// emit_ldc_i4(&mut encoder, 0)?;
 ///
@@ -50,7 +50,6 @@ use crate::{
 ///
 /// // Emits ldc.i4 1000000 (5 bytes)
 /// emit_ldc_i4(&mut encoder, 1_000_000)?;
-/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[allow(clippy::cast_possible_truncation)] // Intentional truncation for ldc.i4.s encoding
 pub fn emit_ldc_i4(encoder: &mut InstructionEncoder, v: i32) -> Result<()> {

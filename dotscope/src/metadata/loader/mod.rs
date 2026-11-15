@@ -247,7 +247,7 @@ pub(crate) trait MetadataLoader: Send + Sync {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```text
     /// fn load(&self, context: &LoaderContext) -> Result<()> {
     ///     // Get required metadata streams
     ///     let table_stream = context.table_stream()?;
@@ -261,7 +261,6 @@ pub(crate) trait MetadataLoader: Send + Sync {
     ///
     ///     Ok(())
     /// }
-    /// # Ok::<(), dotscope::Error>(())
     /// ```
     fn load(&self, context: &LoaderContext) -> Result<()>;
 
@@ -282,7 +281,7 @@ pub(crate) trait MetadataLoader: Send + Sync {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```text
     /// use dotscope::metadata::tables::TableId;
     ///
     /// // Regular table loader
@@ -339,7 +338,7 @@ pub(crate) trait MetadataLoader: Send + Sync {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```text
     /// use dotscope::metadata::tables::TableId;
     ///
     /// // A TypeDef loader that depends on MethodDef and Field tables

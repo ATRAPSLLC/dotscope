@@ -26,18 +26,12 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
-//! # use dotscope::metadata::tables::CustomAttributeRaw;
-//! # use dotscope::metadata::streams::Blob;
-//! # fn example(raw: CustomAttributeRaw, blob: &Blob) -> dotscope::Result<()> {
+//! ```text
 //! // Convert to owned representation with resolved references
 //! let owned = raw.to_owned(|coded_index| context.get_ref(coded_index), blob, context.types)?;
 //!
 //! // Apply the custom attribute to its parent element
 //! owned.apply()?;
-//! # Ok(())
-//! # }
-//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Error Handling

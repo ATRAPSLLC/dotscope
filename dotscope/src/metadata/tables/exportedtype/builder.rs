@@ -442,7 +442,7 @@ impl ExportedTypeBuilder {
     ///     .public()
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created ExportedType with token: {}", exported_type_token);
+    /// println!("Created ExportedType with token: {:?}", exported_type_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {

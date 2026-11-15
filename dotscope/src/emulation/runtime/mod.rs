@@ -56,7 +56,8 @@
 //!
 //! ## Basic Runtime Setup
 //!
-//! ```no_run
+//! ```
+//! use dotscope::emulation::EmulationConfig;
 //! use dotscope::emulation::RuntimeState;
 //! use dotscope::emulation::RuntimeStateBuilder;
 //!
@@ -66,12 +67,14 @@
 //! // Or use the builder for custom configuration
 //! let runtime = RuntimeStateBuilder::new()
 //!     .config(EmulationConfig::minimal())
-//!     .build();
+//!     .build()?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Registering Custom Hooks
 //!
-//! ```no_run
+//! ```
+//! use dotscope::emulation::EmValue;
 //! use dotscope::emulation::RuntimeState;
 //! use dotscope::emulation::Hook;
 //! use dotscope::emulation::PreHookResult;
@@ -80,10 +83,11 @@
 //! runtime.hooks().register(
 //!     Hook::new("my-hook")
 //!         .match_name("MyNamespace", "MyType", "MyMethod")
-//!         .pre(|ctx, thread| {
+//!         .pre(|_ctx, _thread| {
 //!             PreHookResult::Bypass(Some(EmValue::I32(42)))
 //!         })
-//! );
+//! )?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Use Cases

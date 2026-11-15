@@ -52,7 +52,7 @@ pub trait TableAccess<'a, T: RowReadable> {
 /// * `$variant` - The TableData variant (e.g., TypeDef)
 ///
 /// # Example
-/// ```no_run
+/// ```text
 /// impl_table_access!(TypeDefRaw, TableId::TypeDef, TypeDef);
 /// impl_table_access!(MethodDefRaw, TableId::MethodDef, MethodDef);
 /// ```
@@ -95,7 +95,7 @@ macro_rules! impl_table_access {
 /// - On 32-bit systems, the 4GB PE limit ensures no truncation occurs
 ///
 /// # Example
-/// ```no_run
+/// ```text
 /// let table = create_table_match!(
 ///     table_type, data, t_info.rows, self.info.clone(), current_offset,
 ///     (TableId::Module, ModuleRaw, Module),

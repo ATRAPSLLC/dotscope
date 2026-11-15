@@ -44,16 +44,21 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```no_run
-/// let assembly = CilObject::open("sample.dll")?;
+/// ```
+/// use dotscope::{analysis::CallGraph, CilObject};
+///
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
 /// let call_graph = CallGraph::build(&assembly)?;
 ///
 /// // Get statistics about the call graph
 /// let stats = call_graph.stats();
 /// println!("Methods: {}, Edges: {}", stats.method_count, stats.edge_count);
 ///
-/// // Find methods called by a specific method
-/// let callees = call_graph.callees(method_token);
+/// // Find the methods an entry point calls
+/// if let Some(&method) = call_graph.entry_points().first() {
+///     let callees = call_graph.callees(method);
+///     println!("{} callees", callees.len());
+/// }
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Debug)]

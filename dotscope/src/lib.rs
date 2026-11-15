@@ -464,16 +464,22 @@ pub mod assembly;
 ///
 /// # Usage Example
 ///
-/// ```no_run
-/// use dotscope::analysis::{ControlFlowGraph, SsaConverter};
+/// ```
+/// use dotscope::analysis::{ControlFlowGraph, SsaConverter, TypeContext};
 /// use dotscope::assembly::decode_blocks;
+/// use dotscope::CilObject;
 ///
-/// // Build CFG from method body
-/// let blocks = decode_blocks(data, offset, rva, Some(size))?;
+/// // Build CFG from a method body: `ldarg.0; brtrue.s +1; nop; ret`
+/// let il = [0x02u8, 0x2D, 0x01, 0x00, 0x2A];
+/// let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 /// let cfg = ControlFlowGraph::from_basic_blocks(blocks)?;
 ///
-/// // Convert to SSA form
-/// let ssa = SsaConverter::build(&cfg, num_args, num_locals, resolver, Vec::new())?;
+/// // Convert to SSA form, typed by a method of a real assembly: one argument,
+/// // no locals
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// # let entry = assembly.methods().iter().next().expect("the sample has methods");
+/// let resolver = TypeContext::new(entry.value(), &assembly);
+/// let ssa = SsaConverter::build(&cfg, 1, 0, &resolver, Vec::new())?;
 ///
 /// // Analyze loops
 /// for loop_info in cfg.loops() {

@@ -189,8 +189,8 @@ impl ImplMapBuilder {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// # use dotscope::metadata::tables::{CodedIndex, TableId, ImplMapBuilder};
+    /// ```
+    /// # use dotscope::metadata::tables::{CodedIndex, CodedIndexType, ImplMapBuilder, TableId};
     /// let builder = ImplMapBuilder::new()
     ///     .member_forwarded(CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MemberForwarded));
     /// ```

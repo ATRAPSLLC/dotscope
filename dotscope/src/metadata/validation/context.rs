@@ -646,13 +646,19 @@ impl OwnedValidationContext<'_> {
     /// # Usage
     ///
     /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use dotscope::metadata::typesystem::CilTypeRc;
+    /// # use dotscope::metadata::validation::OwnedValidationContext;
+    /// # fn example(context: &OwnedValidationContext<'_>, some_type: CilTypeRc) {
     /// let mapping = context.method_type_mapping();
     /// let type_addr = Arc::as_ptr(&some_type) as usize;
     /// for &method_addr in mapping.get_type_methods(type_addr) {
     ///     if let Some(method) = mapping.get_method(method_addr) {
     ///         // Use method...
+    ///         println!("{}", method.name);
     ///     }
     /// }
+    /// # }
     /// ```
     pub fn method_type_mapping(&self) -> &MethodTypeMapping {
         self.cache

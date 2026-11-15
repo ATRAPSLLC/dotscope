@@ -34,9 +34,9 @@
 //!     println!("Anonymous or compiler-generated constant");
 //! }
 //!
-//! // Analyze signature data
-//! if !local_constant.signature.is_empty() {
-//!     println!("Constant has {} bytes of signature data", local_constant.signature.len());
+//! // Analyze the signature: its custom modifiers, then the type and value
+//! if !local_constant.signature.modifiers.is_empty() {
+//!     println!("Constant has {} custom modifiers", local_constant.signature.modifiers.len());
 //! }
 //! # }
 //! ```

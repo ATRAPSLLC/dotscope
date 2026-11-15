@@ -111,12 +111,15 @@ use crate::{
 /// passed to other components (e.g., the emulation controller) without needing to
 /// hold the `RuntimeState` lock. Registration and dispatch can happen concurrently:
 ///
-/// ```no_run
+/// ```
+/// use dotscope::emulation::{Hook, RuntimeState};
+///
 /// let runtime = RuntimeState::new();
 /// let hooks = runtime.hooks(); // Arc<HookManager>
 ///
 /// // Register additional hooks (thread-safe, takes &self)
-/// hooks.register(Hook::new("my-hook").match_method_name("Decrypt"));
+/// hooks.register(Hook::new("my-hook").match_method_name("Decrypt"))?;
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Method Resolution
@@ -391,8 +394,10 @@ impl Default for RuntimeState {
 ///
 /// ## Disabling Defaults
 ///
-/// ```no_run
-/// use dotscope::emulation::RuntimeStateBuilder;
+/// ```
+/// use dotscope::emulation::{Hook, RuntimeStateBuilder};
+///
+/// let my_hook = Hook::new("my-hook").match_method_name("Decrypt");
 ///
 /// // Start with no default hooks
 /// let runtime = RuntimeStateBuilder::new()
@@ -516,9 +521,10 @@ impl RuntimeStateBuilder {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// use dotscope::emulation::RuntimeStateBuilder;
+    /// ```
+    /// use dotscope::emulation::{Hook, RuntimeStateBuilder};
     ///
+    /// let my_hook = Hook::new("my-hook").match_method_name("Decrypt");
     /// let runtime = RuntimeStateBuilder::new()
     ///     .no_defaults()
     ///     .hook(my_hook)

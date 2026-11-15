@@ -962,8 +962,12 @@ impl X86Instruction {
 ///
 /// # Example
 ///
-/// ```no_run
-/// let decoded = x86_decode_single(bytes, 32, 0x1000, 0)?;
+/// ```
+/// use dotscope::analysis::x86_decode_single;
+///
+/// // push ebp; mov ebp, esp
+/// let bytes = [0x55, 0x89, 0xE5];
+/// let decoded = x86_decode_single(&bytes, 32, 0x1000, 0)?;
 /// println!("Instruction at 0x{:x}, {} bytes", decoded.offset, decoded.length);
 /// println!("Next instruction at 0x{:x}", decoded.end_offset());
 /// # Ok::<(), dotscope::Error>(())
@@ -1025,8 +1029,12 @@ pub enum X86PrologueKind {
 ///
 /// # Example
 ///
-/// ```no_run
-/// let prologue = x86_detect_prologue(bytes, 32);
+/// ```
+/// use dotscope::analysis::{x86_detect_prologue, X86PrologueKind};
+///
+/// // push ebp; mov ebp, esp; xor eax, eax; pop ebp; ret
+/// let bytes = [0x55, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3];
+/// let prologue = x86_detect_prologue(&bytes, 32);
 /// if prologue.kind == X86PrologueKind::DynCipher {
 ///     println!("DynCipher function with {} args", prologue.arg_count);
 ///     let body_start = prologue.size;

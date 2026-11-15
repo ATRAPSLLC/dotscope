@@ -777,7 +777,11 @@ impl TableInfo {
     ///
     /// ## Examples
     ///
-    /// ```no_run
+    /// ```
+    /// # use std::io::Write;
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let table_info = &assembly.tables().expect("a tables stream").info;
+    /// # let mut writer = Vec::new();
     /// let heap_sizes = table_info.heap_sizes();
     /// // Use in tables stream header serialization
     /// writer.write_all(&[heap_sizes])?;
@@ -843,15 +847,18 @@ impl TableInfo {
     ///
     /// ## Example
     ///
-    /// ```no_run
+    /// ```
     /// use std::collections::HashMap;
     /// use dotscope::metadata::tables::TableId;
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let original_info = &assembly.tables().expect("a tables stream").info;
     ///
     /// let mut new_counts = HashMap::new();
     /// new_counts.insert(TableId::TypeDef, 50);
     /// new_counts.insert(TableId::MethodDef, 100);
     ///
     /// let modified_info = original_info.with_modified_row_counts(new_counts.iter().map(|(k, v)| (*k, *v)));
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn with_modified_row_counts(

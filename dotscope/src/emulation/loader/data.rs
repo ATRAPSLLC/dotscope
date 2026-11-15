@@ -16,7 +16,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```
 //! use dotscope::emulation::AddressSpace;
 //! use dotscope::emulation::MemoryProtection;
 //! use dotscope::emulation::DataLoader;
@@ -27,7 +27,7 @@
 //! let info = DataLoader::map_readonly(
 //!     &address_space,
 //!     0x10000,
-//!     vec![0x01, 0x02, 0x03],
+//!     &[0x01, 0x02, 0x03],
 //!     "constants",
 //! )?;
 //!
@@ -35,7 +35,7 @@
 //! let info = DataLoader::map_readwrite(
 //!     &address_space,
 //!     0x20000,
-//!     vec![0u8; 0x1000],
+//!     &[0u8; 0x1000],
 //!     "buffer",
 //! )?;
 //! # Ok::<(), dotscope::Error>(())
@@ -147,7 +147,9 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     /// let info = DataLoader::map_at(
     ///     &address_space,
     ///     0x10000,
@@ -206,7 +208,9 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     /// let info = DataLoader::map(
     ///     &address_space,
     ///     &vec![0u8; 0x1000],
@@ -366,12 +370,14 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
     /// use std::path::Path;
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     ///
     /// let info = DataLoader::map_file(
     ///     &address_space,
-    ///     Path::new("/path/to/data.bin"),
+    ///     Path::new("tests/samples/crafted_2.exe"),
     ///     0x50000,
     ///     MemoryProtection::READ,
     /// )?;
@@ -419,7 +425,9 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     /// // Create a 1MB stack region
     /// let stack_info = DataLoader::map_zeroed(
     ///     &address_space,

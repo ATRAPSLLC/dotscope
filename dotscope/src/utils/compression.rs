@@ -17,7 +17,7 @@
 //!
 //! # Examples
 //!
-//! ```no_run
+//! ```
 //! use dotscope::io::{compressed_uint_size, write_compressed_uint};
 //!
 //! let mut buffer = Vec::new();
@@ -40,6 +40,7 @@
 //! write_compressed_uint(70000, &mut buffer)?;
 //! assert_eq!(buffer.len(), 4);
 //! assert_eq!(compressed_uint_size(70000), 4);
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 // ECMA-335 compressed integer encoding thresholds

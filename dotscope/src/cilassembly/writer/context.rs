@@ -15,7 +15,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```text
 //! let mut ctx = WriteContext::new(assembly, output)?;
 //!
 //! // Write all content - ctx tracks positions
@@ -26,7 +26,6 @@
 //! // Apply fixups and finalize
 //! ctx.apply_fixups()?;
 //! ctx.finalize()?;
-//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use std::collections::{HashMap, HashSet};

@@ -109,7 +109,7 @@
 //!
 //! ## Type System Exploration
 //!
-//! ```no_run
+//! ```
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -123,20 +123,20 @@
 //!              type_def.name, type_def.namespace);
 //!     
 //!     // Show type characteristics using flags
-//!     if type_def.flags_visibility.contains(TypeVisibility::PUBLIC) {
+//!     if type_def.is_public() {
 //!         println!("  - Public visibility");
 //!     }
 //!     
-//!     if type_def.flags_layout.contains(TypeLayout::ABSTRACT) {
+//!     if type_def.is_abstract() {
 //!         println!("  - Abstract type");
 //!     }
 //!     
-//!     if type_def.flags_layout.contains(TypeLayout::SEALED) {
+//!     if type_def.is_sealed() {
 //!         println!("  - Sealed type");
 //!     }
 //!     
 //!     println!("  - {} methods, {} fields",
-//!              type_def.methods.len(), type_def.fields.len());
+//!              type_def.methods.len(), type_def.fields.count());
 //! }
 //! # Ok::<(), dotscope::Error>(())
 //! ```

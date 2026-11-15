@@ -16,11 +16,17 @@
 //!
 //! ```no_run
 //! use dotscope::deobfuscation::NativeMethodConversionPass;
+//! use dotscope::metadata::token::Token;
+//! use dotscope::{CilAssembly, File};
+//!
+//! let file = File::from_path("mixed.exe")?;
+//! let mut cil_assembly = CilAssembly::from_path("mixed.exe")?;
+//! let native_method_token = Token::new(0x0600_0002);
 //!
 //! let mut converter = NativeMethodConversionPass::new();
 //! converter.register_target(native_method_token);
 //!
-//! let stats = converter.run(&mut cil_assembly, file)?;
+//! let stats = converter.run(&mut cil_assembly, &file)?;
 //! println!("Converted {} methods", stats.converted);
 //! # Ok::<(), dotscope::Error>(())
 //! ```
@@ -72,14 +78,19 @@ pub struct ConversionStats {
 ///
 /// ```no_run
 /// use dotscope::deobfuscation::NativeMethodConversionPass;
+/// use dotscope::metadata::token::Token;
+/// use dotscope::{CilAssembly, File};
+///
+/// let file = File::from_path("mixed.exe")?;
+/// let mut cil_assembly = CilAssembly::from_path("mixed.exe")?;
 ///
 /// // Create converter and register native methods to convert
 /// let mut converter = NativeMethodConversionPass::new();
-/// converter.register_target(token1);
-/// converter.register_target(token2);
+/// converter.register_target(Token::new(0x0600_0002));
+/// converter.register_target(Token::new(0x0600_0003));
 ///
 /// // Run conversion
-/// let stats = converter.run(&mut cil_assembly, file)?;
+/// let stats = converter.run(&mut cil_assembly, &file)?;
 /// println!("Converted {}/{} methods",
 ///          stats.converted,
 ///          stats.converted + stats.failed);

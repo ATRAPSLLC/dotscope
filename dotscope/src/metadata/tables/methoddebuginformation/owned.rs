@@ -74,7 +74,7 @@ use crate::metadata::{sequencepoints::SequencePoints, token::Token};
 ///
 /// // Process sequence points if available
 /// if let Some(sequence_data) = &debug_info.sequence_points {
-///     println!("Method has {} bytes of sequence point data", sequence_data.len());
+///     println!("Method has {} sequence points", sequence_data.points.len());
 /// }
 ///
 /// // Use token for cross-references

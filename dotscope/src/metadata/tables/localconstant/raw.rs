@@ -78,7 +78,8 @@ impl LocalConstantRaw {
     /// ```no_run
     /// # use dotscope::metadata::tables::LocalConstantRaw;
     /// # use dotscope::metadata::token::Token;
-    /// # fn example() -> dotscope::Result<()> {
+    /// # use dotscope::metadata::streams::{Blob, Strings};
+    /// # fn example(strings: &Strings, blobs: &Blob) -> dotscope::Result<()> {
     /// let constant_raw = LocalConstantRaw {
     ///     rid: 1,
     ///     token: Token::new(0x34000001),

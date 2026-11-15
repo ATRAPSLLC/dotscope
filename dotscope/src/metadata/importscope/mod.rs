@@ -56,32 +56,30 @@
 //!
 //! ## Basic Import Scope Parsing
 //!
-//! ```no_run
+//! ```
 //! use dotscope::metadata::importscope::{parse_imports_blob, ImportDeclaration};
 //! use dotscope::metadata::streams::Blob;
 //!
-//! # fn get_imports_blob() -> (&'static [u8], &'static Blob) {
-//! #     (b"", &Blob::new())
-//! # }
-//! let (blob_data, blobs_heap) = get_imports_blob();
+//! // A blob heap holding "System" at index 1, and an imports blob naming it:
+//! // kind 1 (ImportNamespace), then the namespace's blob index
+//! let heap = [0x00, 0x06, b'S', b'y', b's', b't', b'e', b'm'];
+//! let blobs_heap = Blob::from(&heap)?;
+//! let blob_data = [0x01, 0x01];
 //!
 //! // Parse imports blob from ImportScope table
-//! let imports = parse_imports_blob(blob_data, blobs_heap)?;
+//! let imports = parse_imports_blob(&blob_data, &blobs_heap)?;
 //!
 //! // Process import declarations by type
 //! for declaration in &imports.declarations {
 //!     match declaration {
 //!         ImportDeclaration::ImportNamespace { namespace } => {
-//!             println!("Using namespace: {}", namespace);
+//!             assert_eq!(namespace, "System");
 //!         }
 //!         ImportDeclaration::ImportType { type_ref } => {
 //!             println!("Import type: {:?}", type_ref);
 //!         }
-//!         ImportDeclaration::ImportAssemblyReference { assembly_ref } => {
-//!             println!("Reference assembly: {:?}", assembly_ref);
-//!         }
-//!         ImportDeclaration::ImportModuleReference { module_ref } => {
-//!             println!("Reference module: {:?}", module_ref);
+//!         ImportDeclaration::DefineAssemblyAlias { alias, assembly_ref } => {
+//!             println!("Alias {} for assembly {:?}", alias, assembly_ref);
 //!         }
 //!         _ => println!("Other import declaration type"),
 //!     }
@@ -91,18 +89,15 @@
 //!
 //! ## Debugging Context Resolution
 //!
-//! ```no_run
+//! ```
 //! use dotscope::metadata::importscope::{parse_imports_blob, ImportDeclaration};
-//! use dotscope::CilObject;
+//! use dotscope::metadata::streams::Blob;
 //!
-//! # fn get_assembly() -> dotscope::Result<CilObject> { todo!() }
-//! let assembly = get_assembly()?;
-//!
-//! # fn get_import_scope_data() -> (&'static [u8], &'static dotscope::metadata::streams::Blob) {
-//! #     (b"", &dotscope::metadata::streams::Blob::new())
-//! # }
-//! let (imports_blob, blob_heap) = get_import_scope_data();
-//! let import_scope = parse_imports_blob(imports_blob, blob_heap)?;
+//! // An ImportScope's imports blob, naming "System" in the blob heap
+//! let heap = [0x00, 0x06, b'S', b'y', b's', b't', b'e', b'm'];
+//! let blob_heap = Blob::from(&heap)?;
+//! let imports_blob = [0x01, 0x01];
+//! let import_scope = parse_imports_blob(&imports_blob, &blob_heap)?;
 //!
 //! // Build debugging context for symbol resolution
 //! let mut available_namespaces = Vec::new();
@@ -120,7 +115,7 @@
 //!     }
 //! }
 //!
-//! println!("Available namespaces for debugging: {:?}", available_namespaces);
+//! assert_eq!(available_namespaces, ["System"]);
 //! println!("Directly imported types: {}", imported_types.len());
 //! # Ok::<(), dotscope::Error>(())
 //! ```
@@ -142,7 +137,7 @@
 //!     match declaration {
 //!         ImportDeclaration::ImportNamespace { .. } => namespace_count += 1,
 //!         ImportDeclaration::ImportType { .. } => type_count += 1,
-//!         ImportDeclaration::ImportAssemblyReference { .. } => assembly_count += 1,
+//!         ImportDeclaration::ImportAssemblyReferenceAlias { .. } => assembly_count += 1,
 //!         _ => {}
 //!     }
 //! }

@@ -475,8 +475,8 @@ impl CodedIndex {
     ///
     /// ## Example
     ///
-    /// ```no_run
-    /// use crate::metadata::tables::{CodedIndex, CodedIndexType};
+    /// ```
+    /// use dotscope::metadata::tables::{CodedIndex, CodedIndexType};
     ///
     /// // Create a null TypeDefOrRef (no base class)
     /// let null_extends = CodedIndex::null(CodedIndexType::TypeDefOrRef);

@@ -283,8 +283,14 @@ impl FieldMarshalBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use dotscope::metadata::marshalling::NativeType;
+    /// use dotscope::metadata::marshalling::{NativeType, NATIVE_TYPE};
     /// use dotscope::metadata::tables::FieldMarshalBuilder;
+    /// # use dotscope::prelude::*;
+    /// # use std::path::Path;
+    /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
+    /// # let mut assembly = CilAssembly::new(view);
+    /// # let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+    /// # let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
     ///
     /// // Unicode string with size parameter
     /// let marshal = FieldMarshalBuilder::new()
@@ -296,7 +302,7 @@ impl FieldMarshalBuilder {
     /// let array_marshal = FieldMarshalBuilder::new()
     ///     .parent(field_ref)
     ///     .native_type_spec(NativeType::Array {
-    ///         element_type: Box::new(NativeType::I4),
+    ///         element_type: NATIVE_TYPE::I4,
     ///         num_param: Some(1),
     ///         num_element: Some(10),
     ///         flags: None,
@@ -341,6 +347,12 @@ impl FieldMarshalBuilder {
     /// ```no_run
     /// use dotscope::metadata::marshalling::{NativeType, MarshallingInfo};
     /// use dotscope::metadata::tables::FieldMarshalBuilder;
+    /// # use dotscope::prelude::*;
+    /// # use std::path::Path;
+    /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
+    /// # let mut assembly = CilAssembly::new(view);
+    /// # let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+    /// # let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
     ///
     /// let complex_info = MarshallingInfo {
     ///     primary_type: NativeType::CustomMarshaler {
@@ -353,7 +365,7 @@ impl FieldMarshalBuilder {
     ///
     /// let marshal = FieldMarshalBuilder::new()
     ///     .parent(param_ref)
-    ///     .marshalling_info(complex_info)
+    ///     .marshalling_info(&complex_info)
     ///     .build(&mut assembly)?;
     /// # Ok::<(), dotscope::Error>(())
     /// ```

@@ -21,22 +21,26 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```
 //! use dotscope::emulation::PeLoader;
 //! use dotscope::emulation::PeLoaderConfig;
 //! use dotscope::emulation::AddressSpace;
 //! use std::path::Path;
 //!
+//! let address_space = AddressSpace::new();
+//!
 //! // Load with default settings (uses PE's preferred base address)
 //! let loader = PeLoader::new();
-//! let image = loader.load_file(Path::new("target.exe"), &address_space)?;
+//! let image = loader.load_file(Path::new("tests/samples/crafted_2.exe"), &address_space)?;
 //!
-//! // Load with custom configuration
+//! // Load with custom configuration, into another address space
+//! let other_space = AddressSpace::new();
 //! let config = PeLoaderConfig::new()
 //!     .with_base_address(0x10000000)
 //!     .without_permissions();
 //! let loader = PeLoader::with_config(config);
-//! let image = loader.load_file(Path::new("target.dll"), &address_space)?;
+//! let image = loader.load_file(Path::new("tests/samples/crafted_2.exe"), &other_space)?;
+//! assert_eq!(image.base_address, 0x10000000);
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -175,7 +179,9 @@ impl PeLoaderConfig {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::PeLoaderConfig;
+    ///
     /// let config = PeLoaderConfig::new().with_base_address(0x10000000);
     /// assert_eq!(config.base_address, Some(0x10000000));
     /// ```
@@ -241,7 +247,11 @@ impl PeLoaderConfig {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
+/// # use dotscope::emulation::{AddressSpace, PeLoader};
+/// # let address_space = AddressSpace::new();
+/// # let loader = PeLoader::new();
+/// # let path = std::path::Path::new("tests/samples/crafted_2.exe");
 /// let image = loader.load_file(path, &address_space)?;
 ///
 /// println!("Image: {} loaded at 0x{:X}", image.name, image.base_address);
@@ -328,10 +338,15 @@ impl LoadedImage {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, PeLoader};
+    /// # let address_space = AddressSpace::new();
+    /// # let loader = PeLoader::new();
+    /// # let image = loader.load_file(std::path::Path::new("tests/samples/crafted_2.exe"), &address_space)?;
     /// if let Some(entry) = image.entry_point_va() {
     ///     println!("Start execution at: 0x{:X}", entry);
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn entry_point_va(&self) -> Option<u64> {
@@ -355,7 +370,12 @@ impl LoadedImage {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, PeLoader};
+    /// # let address_space = AddressSpace::new();
+    /// # let loader = PeLoader::new();
+    /// # let image = loader.load_file(std::path::Path::new("tests/samples/crafted_2.exe"), &address_space)?;
+    /// # let (import_table_rva, size) = (image.sections[0].virtual_address, 16);
     /// let import_table_va = image.rva_to_va(import_table_rva);
     /// let data = address_space.read(import_table_va, size)?;
     /// # Ok::<(), dotscope::Error>(())
@@ -399,13 +419,18 @@ impl LoadedImage {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// if let Some(section) = image.section_for_rva(0x1000) {
-    ///     println!("RVA 0x1000 is in section: {}", section.name);
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, PeLoader};
+    /// # let address_space = AddressSpace::new();
+    /// # let loader = PeLoader::new();
+    /// # let image = loader.load_file(std::path::Path::new("tests/samples/crafted_2.exe"), &address_space)?;
+    /// if let Some(section) = image.section_for_rva(0x2000) {
+    ///     println!("RVA 0x2000 is in section: {}", section.name);
     ///     if section.is_code {
     ///         println!("  This is a code section");
     ///     }
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn section_for_rva(&self, rva: u32) -> Option<&LoadedSection> {
@@ -429,11 +454,16 @@ impl LoadedImage {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, PeLoader};
+    /// # let address_space = AddressSpace::new();
+    /// # let loader = PeLoader::new();
+    /// # let image = loader.load_file(std::path::Path::new("tests/samples/crafted_2.exe"), &address_space)?;
     /// if image.is_dotnet() {
     ///     println!("{} is a .NET assembly", image.name);
     ///     println!("CLR header at RVA: 0x{:X}", image.clr_header_rva.unwrap());
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn is_dotnet(&self) -> bool {
@@ -460,7 +490,11 @@ impl LoadedImage {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
+/// # use dotscope::emulation::{AddressSpace, PeLoader};
+/// # let address_space = AddressSpace::new();
+/// # let loader = PeLoader::new();
+/// # let image = loader.load_file(std::path::Path::new("tests/samples/crafted_2.exe"), &address_space)?;
 /// for section in &image.sections {
 ///     println!("{}: RVA=0x{:X}, Size=0x{:X}",
 ///         section.name,
@@ -472,6 +506,7 @@ impl LoadedImage {
 ///         println!("  Contains executable code");
 ///     }
 /// }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct LoadedSection {
@@ -556,13 +591,14 @@ pub struct LoadedSection {
 ///
 /// # Example
 ///
-/// ```no_run
-/// use dotscope::emulation::PeLoader;
+/// ```
+/// use dotscope::emulation::{AddressSpace, PeLoader};
 /// use std::path::Path;
 ///
+/// let address_space = AddressSpace::new();
 /// let loader = PeLoader::new();
 /// let image = loader.load_file(
-///     Path::new("program.exe"),
+///     Path::new("tests/samples/crafted_2.exe"),
 ///     &address_space,
 /// )?;
 ///
@@ -586,7 +622,9 @@ impl PeLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::PeLoader;
+    ///
     /// let loader = PeLoader::new();
     /// ```
     #[must_use]
@@ -611,7 +649,9 @@ impl PeLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::{PeLoader, PeLoaderConfig};
+    ///
     /// let config = PeLoaderConfig::new()
     ///     .with_base_address(0x10000000)
     ///     .without_permissions();
@@ -649,10 +689,14 @@ impl PeLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// let pe_data = std::fs::read("program.exe")?;
-    /// let image = loader.load(&pe_data, &address_space, "program.exe")?;
-    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    /// use dotscope::emulation::{AddressSpace, PeLoader};
+    ///
+    /// let address_space = AddressSpace::new();
+    /// let loader = PeLoader::new();
+    /// let pe_data = std::fs::read("tests/samples/crafted_2.exe")?;
+    /// let image = loader.load(&pe_data, &address_space, "crafted_2.exe")?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn load(
         &self,
@@ -909,12 +953,14 @@ impl PeLoader {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::{AddressSpace, PeLoader};
     /// use std::path::Path;
     ///
+    /// let address_space = AddressSpace::new();
     /// let loader = PeLoader::new();
     /// let image = loader.load_file(
-    ///     Path::new("C:\\Windows\\System32\\kernel32.dll"),
+    ///     Path::new("tests/samples/crafted_2.exe"),
     ///     &address_space,
     /// )?;
     ///

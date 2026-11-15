@@ -39,9 +39,11 @@
 //!
 //! # Usage
 //!
-//! ```no_run
-//! use dotscope::emulation::{ProcessBuilder, CallTreeBuilder};
+//! ```
+//! use dotscope::emulation::{CallTreeBuilder, ProcessBuilder};
+//! use dotscope::CilObject;
 //!
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
 //! let tree_builder = CallTreeBuilder::new();
 //! let process = ProcessBuilder::new()
 //!     .assembly(assembly)

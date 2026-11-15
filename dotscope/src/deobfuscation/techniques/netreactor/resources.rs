@@ -37,7 +37,7 @@
 //!    `ManifestResource` rows.
 //! 3. **SSA rewrite** ([`create_pass`](Technique::create_pass)) —
 //!    [`ResourceShimRewritePass`] retargets every user-code shim
-//!    `Call(eBxqprrF8, [asm])` to a `CallVirt(GetManifestResourceNames,
+//!    `Call(eBxqprrF8, [asm])` to a `callvirt(GetManifestResourceNames,
 //!    [asm])`, and turns every `Call(lazy_init)` into `Nop`. After the
 //!    pass runs no surviving user code references the resolver type.
 //! 4. **Cleanup** — the marked resolver type, encrypted blob, and

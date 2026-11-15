@@ -83,7 +83,7 @@ impl LocalVariableRaw {
     /// ```no_run
     /// # use dotscope::metadata::tables::LocalVariableRaw;
     /// # use dotscope::metadata::token::Token;
-    /// # fn example() -> dotscope::Result<()> {
+    /// # fn example(strings: &dotscope::metadata::streams::Strings) -> dotscope::Result<()> {
     /// let variable_raw = LocalVariableRaw {
     ///     rid: 1,
     ///     token: Token::new(0x33000001),

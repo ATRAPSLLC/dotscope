@@ -73,7 +73,7 @@
 //!
 //! // Access parsed arguments
 //! match &result.fixed_args[0] {
-//!     CustomAttributeArgument::String(s) => println!("String argument: '{}'", s),
+//!     CustomAttributeArgument::String(s) => println!("String argument: {:?}", s),
 //!     _ => println!("Unexpected argument type"),
 //! }
 //!
@@ -254,7 +254,7 @@ pub fn parse_custom_attribute_blob(
 ///
 /// // Access parsed arguments
 /// match &result.fixed_args[0] {
-///     CustomAttributeArgument::String(s) => println!("String argument: '{}'", s),
+///     CustomAttributeArgument::String(s) => println!("String argument: {:?}", s),
 ///     _ => println!("Unexpected argument type"),
 /// }
 ///

@@ -83,7 +83,9 @@
 //!
 //! ```no_run
 //! use dotscope::emulation::ProcessBuilder;
+//! use dotscope::CilObject;
 //!
+//! let assembly = CilObject::from_path("sample.exe")?;
 //! let process = ProcessBuilder::new()
 //!     .assembly(assembly)
 //!     .for_analysis()

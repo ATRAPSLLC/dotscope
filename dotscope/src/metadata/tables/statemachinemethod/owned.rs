@@ -38,8 +38,11 @@ use crate::metadata::{method::MethodRc, token::Token};
 /// // - MoveNext method: <CalculateAsync>d__1.MoveNext (actual logic)
 /// //
 /// // StateMachineMethod entry links these together:
+/// use dotscope::metadata::method::MethodRc;
 /// use dotscope::metadata::tables::StateMachineMethod;
+/// use dotscope::metadata::token::Token;
 ///
+/// # fn example(move_next_ref: MethodRc, kickoff_ref: MethodRc) {
 /// let mapping = StateMachineMethod {
 ///     rid: 1,
 ///     token: Token::new(0x3600_0001),
@@ -47,6 +50,7 @@ use crate::metadata::{method::MethodRc, token::Token};
 ///     move_next_method: move_next_ref, // Strong reference to MoveNext method
 ///     kickoff_method: kickoff_ref,     // Strong reference to original method
 /// };
+/// # }
 /// ```
 ///
 /// # References

@@ -80,9 +80,34 @@
 //!
 //! ## Signature-Based Hook with Bypass
 //!
-//! ```no_run
-//! use dotscope::emulation::{Hook, HookManager, PreHookResult};
-//! use dotscope::metadata::typesystem::CilFlavor;
+//! ```
+//! use dotscope::emulation::{
+//!     EmValue, EmulationThread, Hook, HookContext, HookManager, PreHookResult,
+//! };
+//! use dotscope::metadata::typesystem::{CilFlavor, PointerSize};
+//!
+//!/// Whether the first argument is a byte array that opens as LZMA does.
+//!fn is_lzma_header(ctx: &HookContext<'_>, thread: &EmulationThread) -> bool {
+//!    let Some(EmValue::ObjectRef(array)) = ctx.args.first() else {
+//!        return false;
+//!    };
+//!    matches!(
+//!        thread.heap().get_array_as_bytes(*array, PointerSize::Bit64),
+//!        Ok(Some(bytes)) if bytes.len() >= 5 && bytes[0] == 0x5D
+//!    )
+//!}
+//!
+//!// `byte[]`, the parameter and the result the hook matches
+//!let byte_array = || CilFlavor::Array {
+//!    element_type: Box::new(CilFlavor::U1),
+//!    rank: 1,
+//!    dimensions: Vec::new(),
+//!};
+//!
+//! /// The decompressed data the hook returns in the method's place.
+//! fn decompress_lzma(_ctx: &HookContext<'_>, _thread: &mut EmulationThread) -> EmValue {
+//!     EmValue::Null
+//! }
 //!
 //! let manager = HookManager::new();
 //!
@@ -90,16 +115,17 @@
 //! manager.register(
 //!     Hook::new("confuserex-lzma")
 //!         .match_internal_method()
-//!         .match_signature(vec![CilFlavor::Array { .. }], Some(CilFlavor::Array { .. }))
+//!         .match_signature(vec![byte_array()], Some(byte_array()))
 //!         .match_runtime("lzma-header", |ctx, thread| {
 //!             // Check if input looks like LZMA data
-//!             is_confuserex_lzma_header(ctx, thread)
+//!             is_lzma_header(ctx, thread)
 //!         })
 //!         .pre(|ctx, thread| {
 //!             let decompressed = decompress_lzma(ctx, thread);
 //!             PreHookResult::Bypass(Some(decompressed))
 //!         })
-//! );
+//! )?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Use Cases

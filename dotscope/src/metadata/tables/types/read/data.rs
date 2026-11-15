@@ -15,6 +15,7 @@
 //!
 //! ```no_run
 //! use dotscope::metadata::tables::TableData;
+//! use rayon::prelude::*;
 //!
 //! fn process_table(table: &TableData) {
 //!     match table {

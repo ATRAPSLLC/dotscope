@@ -46,22 +46,50 @@
 //!
 //! # Usage Example
 //!
-//! ```no_run
-//! use dotscope::emulation::{Interpreter, EmulationLimits};
+//! ```
+//! use std::sync::{Arc, RwLock};
+//! use dotscope::assembly::decode_stream;
+//! use dotscope::emulation::{EmulationLimits, EmulationThread, Interpreter, StepResult, ThreadId};
+//! use dotscope::metadata::{token::Token, typesystem::PointerSize};
+//! use dotscope::Parser;
+//! # use dotscope::emulation::{
+//! #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+//! #     ThreadContext, VirtualFs,
+//! # };
+//! # let address_space = Arc::new(AddressSpace::new());
+//! # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+//! # let context = Arc::new(ThreadContext::new(
+//! #     Arc::clone(&address_space),
+//! #     Arc::new(RwLock::new(RuntimeState::new())),
+//! #     Arc::new(CaptureContext::new()),
+//! #     Arc::new(EmulationConfig::default()),
+//! #     None,
+//! #     fake_objects,
+//! #     Arc::new(VirtualFs::new()),
+//! # ));
 //!
-//! // Create interpreter with limits
+//! // Create interpreter with limits, and a thread running a method
 //! let limits = EmulationLimits::default();
 //! let mut interpreter = Interpreter::new(limits, address_space, PointerSize::Bit64);
+//! let mut thread = EmulationThread::new(ThreadId::MAIN, context);
+//! thread.start_method(Token::new(0x0600_0001), vec![], vec![], false);
 //!
-//! // Execute instructions
-//! loop {
-//!     match interpreter.step(&mut thread, &instruction)? {
+//! // The method body: `ldc.i4.1; ret`
+//! let il = [0x17, 0x2A];
+//! let instructions = decode_stream(&mut Parser::new(&il), 0x2050)?;
+//!
+//! // Execute instructions one at a time
+//! for instruction in &instructions {
+//!     match interpreter.step(&mut thread, instruction)? {
 //!         StepResult::Continue => continue,
-//!         StepResult::Return { value } => break,
-//!         StepResult::Branch { target } => { /* handle branch */ }
-//!         // ... handle other results
+//!         StepResult::Return { value } => {
+//!             println!("returned {:?}", value);
+//!             break;
+//!         }
+//!         _ => {}
 //!     }
 //! }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 mod callresolver;

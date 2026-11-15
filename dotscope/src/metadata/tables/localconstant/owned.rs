@@ -17,23 +17,16 @@ use crate::metadata::{pdb::LocalConstantSig, token::Token};
 ///
 /// ```no_run
 /// use dotscope::metadata::tables::LocalConstant;
-/// use dotscope::metadata::signatures::TypeSignature;
 ///
-/// // Access constant information with parsed signature
-/// println!("Constant '{}' with type: {:?}", constant.name, constant.signature.base);
-///
-/// // Check the constant's type
-/// match &constant.signature.base {
-///     TypeSignature::I4 => println!("Integer constant"),
-///     TypeSignature::String => println!("String constant"),
-///     TypeSignature::R8 => println!("Double constant"),
-///     _ => println!("Other type constant"),
-/// }
+/// # fn example(constant: &LocalConstant) {
+/// // Access constant information with its parsed signature: the type and value
+/// println!("Constant '{}' = {:?}", constant.name, constant.signature.value);
 ///
 /// // Check for custom modifiers
 /// if !constant.signature.modifiers.is_empty() {
 ///     println!("Constant has {} custom modifiers", constant.signature.modifiers.len());
 /// }
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct LocalConstant {

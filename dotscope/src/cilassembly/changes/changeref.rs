@@ -19,23 +19,26 @@
 //! ```no_run
 //! use dotscope::prelude::*;
 //!
+//! let view = CilAssemblyView::from_path("input.dll")?;
 //! let mut assembly = CilAssembly::new(view);
 //!
 //! // Add items - returns ChangeRef instead of raw offsets
 //! let string_ref = assembly.string_add("MyClass")?;
-//! let blob_ref = assembly.blob_add(&signature_bytes)?;
+//! let blob_ref = assembly.blob_add(&[0x06, 0x08])?; // FIELD, int32
 //!
-//! // Use in builders - accepts ChangeRef
-//! FieldBuilder::new()
-//!     .name(string_ref.clone())
-//!     .signature(blob_ref.clone())
+//! // Builders add their own heap entries and return the row's ChangeRef
+//! let field_ref = FieldBuilder::new()
+//!     .name("myField")
+//!     .flags(FieldAttributes::PRIVATE)
+//!     .signature(&[0x06, 0x08])
 //!     .build(&mut assembly)?;
 //!
 //! // Write assembly
-//! assembly.to_file(path)?;
+//! assembly.to_file("output.dll")?;
 //!
 //! // After write, query final locations
-//! let final_offset = string_ref.offset()?;
+//! let final_offset = string_ref.offset();
+//! println!("{:?} {:?} {:?}", final_offset, blob_ref.offset(), field_ref.placeholder_token());
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -406,14 +409,21 @@ impl ChangeRef {
     ///
     /// # Usage
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::prelude::*;
+    /// # let view = CilAssemblyView::from_path("tests/samples/crafted_2.exe")?;
+    /// # let mut assembly = CilAssembly::new(view);
     /// // For heap references (strings, blobs, guids, userstrings)
     /// let string_ref = assembly.string_add("MyClass")?;
     /// let name_field = string_ref.placeholder(); // Use in table row field
     ///
     /// // For table references (in IL tokens)
-    /// let method_ref = assembly.table_row_add(/* ... */)?;
-    /// let token = Token::from_parts(TableId::MemberRef, method_ref.placeholder());
+    /// let type_ref = TypeDefBuilder::new()
+    ///     .name("MyClass")
+    ///     .namespace("MyApp")
+    ///     .public_class()
+    ///     .build(&mut assembly)?;
+    /// let token = Token::from_parts(TableId::TypeDef, type_ref.placeholder());
     ///
     /// // For userstring tokens in IL
     /// let us_ref = assembly.userstring_add("Hello")?;
@@ -472,8 +482,19 @@ impl ChangeRef {
     ///
     /// This is a convenience method that creates a complete Token with the
     /// correct table ID and placeholder row. Equivalent to:
-    /// ```no_run
-    /// Token::from_parts(table_id, change_ref.placeholder())
+    /// ```
+    /// # use dotscope::prelude::*;
+    /// # let view = CilAssemblyView::from_path("tests/samples/crafted_2.exe")?;
+    /// # let mut assembly = CilAssembly::new(view);
+    /// # let change_ref = TypeDefBuilder::new()
+    /// #     .name("MyClass")
+    /// #     .namespace("MyApp")
+    /// #     .public_class()
+    /// #     .build(&mut assembly)?;
+    /// # let table_id = TableId::TypeDef;
+    /// let token = Token::from_parts(table_id, change_ref.placeholder());
+    /// # assert_eq!(Some(token), change_ref.placeholder_token());
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     ///
     /// Returns `None` if this is not a table row reference.
@@ -498,8 +519,16 @@ impl ChangeRef {
     ///
     /// # Usage
     ///
-    /// ```no_run
-    /// let change_ref = assembly.table_row_add(/* ... */)?;
+    /// ```
+    /// # use dotscope::prelude::*;
+    /// # let view = CilAssemblyView::from_path("tests/samples/crafted_2.exe")?;
+    /// # let mut assembly = CilAssembly::new(view);
+    /// // A TypeDef row this assembly adds
+    /// let change_ref = TypeDefBuilder::new()
+    ///     .name("MyClass")
+    ///     .namespace("MyApp")
+    ///     .public_class()
+    ///     .build(&mut assembly)?;
     /// let coded_index = CodedIndex::new(
     ///     TableId::TypeDef,
     ///     change_ref.row(),  // Returns placeholder row

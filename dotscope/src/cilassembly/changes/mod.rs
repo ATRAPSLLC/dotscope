@@ -18,13 +18,14 @@
 //! location after assembly write completes.
 //!
 //! ```no_run
-//! // Old API (problematic - offset may be invalid after write)
-//! let offset = context.string_add("MyString")?;  // u32
+//! use dotscope::{CilAssemblyView, CilAssembly};
 //!
-//! // New API (stable reference)
-//! let string_ref = context.string_add("MyString")?;  // Arc<ChangeRef>
-//! assembly.to_file(path)?;
-//! let final_offset = string_ref.offset().unwrap();  // Resolved after write
+//! let view = CilAssemblyView::from_path(std::path::Path::new("tests/samples/crafted_2.exe"))?;
+//! let mut assembly = view.to_owned();
+//! // A stable reference, not a raw offset the write would invalidate.
+//! let string_ref = assembly.string_add("MyString")?;
+//! assembly.to_file("modified.dll")?;
+//! let final_offset = string_ref.offset();  // Resolved after write
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -39,21 +40,22 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
-//! use crate::cilassembly::changes::{AssemblyChanges, HeapChanges, ChangeRef};
-//! use crate::metadata::cilassemblyview::CilAssemblyView;
-//! use std::path::Path;
+//! ```
+//! use dotscope::CilAssembly;
 //!
-//! # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
-//! // Create change tracker for an assembly
-//! let mut changes = AssemblyChanges::new(&view);
+//! // An assembly tracks its own changes
+//! let mut assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
+//! let added = assembly.userstring_add("hello")?;
 //!
 //! // Track modifications
+//! let changes = assembly.changes();
 //! if changes.has_changes() {
 //!     println!("Assembly has {} table modifications",
 //!              changes.modified_table_count());
 //! }
-//! # Ok::<(), crate::Error>(())
+//! // The reference resolves to its final location once the assembly is written
+//! println!("pending: {:?}", added.kind());
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Integration

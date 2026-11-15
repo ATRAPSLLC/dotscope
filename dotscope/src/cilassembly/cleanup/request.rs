@@ -29,18 +29,19 @@ use crate::metadata::{tables::TableId, token::Token};
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
+/// use dotscope::metadata::token::Token;
 /// use dotscope::CleanupRequest;
 ///
 /// let mut request = CleanupRequest::default();
-/// request.add_type(protection_type_token);
-/// request.add_method(decryptor_method_token);
+/// request.add_type(Token::new(0x0200_0002));
+/// request.add_type(Token::new(0x0200_0005));
+/// request.add_method(Token::new(0x0600_0001));
 /// request.exclude_section(".confuser");
 ///
 /// // Iterate in descending order for safe deletion
-/// for token in request.types() {
-///     // tokens come in descending RID order
-/// }
+/// let types: Vec<_> = request.types().copied().collect();
+/// assert_eq!(types, [Token::new(0x0200_0005), Token::new(0x0200_0002)]);
 /// ```
 #[derive(Debug, Clone)]
 pub struct CleanupRequest {

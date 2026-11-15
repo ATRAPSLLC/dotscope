@@ -43,25 +43,27 @@ use crate::{
 ///
 /// ```no_run
 /// # use dotscope::prelude::*;
-/// # use dotscope::metadata::tables::{EventBuilder, CodedIndex, TableId};
+/// # use dotscope::metadata::tables::{
+/// #     CodedIndex, CodedIndexType, EventAttributes, EventBuilder, TableId,
+/// # };
 /// # use std::path::Path;
 /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 /// let mut assembly = CilAssembly::new(view);
 ///
 /// // Create a coded index for System.EventHandler delegate type
-/// let event_handler_type = CodedIndex::new(TableId::TypeRef, 1); // TypeRef to EventHandler
+/// let event_handler_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // TypeRef to EventHandler
 ///
 /// // Create a standard event
 /// let click_event = EventBuilder::new()
 ///     .name("Click")
-///     .flags(0x0000) // No special flags
+///     .flags(EventAttributes::ZERO) // No special flags
 ///     .event_type(event_handler_type.clone())
 ///     .build(&mut assembly)?;
 ///
 /// // Create an event with special naming
 /// let special_event = EventBuilder::new()
 ///     .name("PropertyChanged")
-///     .flags(0x0200) // SpecialName
+///     .flags(EventAttributes::SPECIAL_NAME)
 ///     .event_type(event_handler_type)
 ///     .build(&mut assembly)?;
 /// # Ok::<(), dotscope::Error>(())

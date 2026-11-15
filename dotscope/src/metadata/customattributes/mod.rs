@@ -71,7 +71,7 @@
 //!     match arg {
 //!         CustomAttributeArgument::Bool(b) => println!("Boolean: {}", b),
 //!         CustomAttributeArgument::I4(i) => println!("Int32: {}", i),
-//!         CustomAttributeArgument::String(s) => println!("String: '{}'", s),
+//!         CustomAttributeArgument::String(s) => println!("String: {:?}", s),
 //!         CustomAttributeArgument::Enum(type_name, value) => println!("Enum: {} = {:?}", type_name, value),
 //!         CustomAttributeArgument::Type(t) => println!("Type: {:?}", t),
 //!         _ => println!("Other argument type: {:?}", arg),

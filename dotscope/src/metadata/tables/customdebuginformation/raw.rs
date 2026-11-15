@@ -134,7 +134,7 @@ impl CustomDebugInformationRaw {
     /// # Example
     ///
     /// ```no_run
-    /// use dotscope::metadata::tables::{CustomDebugInformationRaw, CodedIndex};
+    /// use dotscope::metadata::tables::{CodedIndex, CodedIndexType, CustomDebugInformationRaw};
     /// use dotscope::metadata::token::Token;
     /// use dotscope::metadata::typesystem::CilTypeReference;
     /// use dotscope::metadata::streams::{Guid, Blob};
@@ -149,7 +149,11 @@ impl CustomDebugInformationRaw {
     ///     rid: 1,
     ///     token: Token::new(0x37000001),
     ///     offset: 0,
-    ///     parent: CodedIndex { tag: dotscope::metadata::tables::TableId::MethodDef, row: 6, token: Token::new(0x06000006) },  // HasCustomDebugInformation coded index
+    ///     parent: CodedIndex::new(
+    ///         dotscope::metadata::tables::TableId::MethodDef,
+    ///         6,
+    ///         CodedIndexType::HasCustomDebugInformation,
+    ///     ),
     ///     kind: 1,        // GUID heap index pointing to Source Link GUID
     ///     value: 10,      // Blob heap index pointing to JSON data
     /// };

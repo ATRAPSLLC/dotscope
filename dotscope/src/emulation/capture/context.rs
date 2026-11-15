@@ -198,7 +198,9 @@ pub struct ResourceRead {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
+/// use dotscope::emulation::CaptureContext;
+///
 /// let ctx = CaptureContext::new();
 /// // ... run emulation ...
 ///
@@ -258,7 +260,9 @@ impl CaptureContext {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::CaptureContext;
+    ///
     /// let ctx = CaptureContext::new();
     /// assert!(ctx.config().assemblies);
     /// assert!(ctx.config().strings);
@@ -292,7 +296,9 @@ impl CaptureContext {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
+    /// use dotscope::emulation::{CaptureConfig, CaptureContext};
+    ///
     /// let config = CaptureConfig {
     ///     assemblies: true,
     ///     strings: false,  // Don't capture strings

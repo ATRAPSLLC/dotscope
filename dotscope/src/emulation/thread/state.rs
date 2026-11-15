@@ -34,15 +34,31 @@
 //!
 //! # Example
 //!
-//! ```no_run
-//! use dotscope::emulation::EmulationThread;
-//! use dotscope::emulation::ThreadCallFrame;
+//! ```
+//! use dotscope::emulation::{EmValue, EmulationThread, ThreadId};
+//! use dotscope::metadata::token::Token;
+//! # use std::sync::{Arc, RwLock};
+//! # use dotscope::emulation::{
+//! #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+//! #     ThreadContext, VirtualFs,
+//! # };
+//! # let address_space = Arc::new(AddressSpace::new());
+//! # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+//! # let context = Arc::new(ThreadContext::new(
+//! #     address_space,
+//! #     Arc::new(RwLock::new(RuntimeState::new())),
+//! #     Arc::new(CaptureContext::new()),
+//! #     Arc::new(EmulationConfig::default()),
+//! #     None,
+//! #     fake_objects,
+//! #     Arc::new(VirtualFs::new()),
+//! # ));
 //!
 //! // Create a thread
-//! let mut thread = EmulationThread::new(thread_id, address_space, capture, assembly);
+//! let mut thread = EmulationThread::new(ThreadId::new(1), context);
 //!
-//! // Start executing a method
-//! thread.start_method(method_token, locals, args, expects_return);
+//! // Start executing a method: no locals, no arguments, a return value
+//! thread.start_method(Token::new(0x0600_0001), vec![], vec![], true);
 //!
 //! // Push/pop values on evaluation stack
 //! thread.push(EmValue::I32(42))?;
@@ -576,17 +592,31 @@ impl ThreadCallFrame {
 ///
 /// # Example
 ///
-/// ```no_run
-/// // Create a new thread
-/// let thread = EmulationThread::new(
-///     ThreadId::new(1),
-///     address_space,
-///     capture,
-///     Some(assembly),
-/// );
+/// ```
+/// use dotscope::emulation::{EmulationThread, ThreadId};
+/// # use std::sync::{Arc, RwLock};
+/// # use dotscope::emulation::{
+/// #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+/// #     ThreadContext, VirtualFs,
+/// # };
+/// # let address_space = Arc::new(AddressSpace::new());
+/// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+/// # let context = Arc::new(ThreadContext::new(
+/// #     address_space,
+/// #     Arc::new(RwLock::new(RuntimeState::new())),
+/// #     Arc::new(CaptureContext::new()),
+/// #     Arc::new(EmulationConfig::default()),
+/// #     None,
+/// #     fake_objects,
+/// #     Arc::new(VirtualFs::new()),
+/// # ));
 ///
-/// // Or create the main thread with ID 1
-/// let main = EmulationThread::main(address_space, capture, Some(assembly));
+/// // Create a new thread
+/// let thread = EmulationThread::new(ThreadId::new(1), Arc::clone(&context));
+///
+/// // Or create the main thread, `ThreadId::MAIN`
+/// let main = EmulationThread::main(context);
+/// assert_eq!(main.id(), ThreadId::MAIN);
 /// ```
 pub struct EmulationThread {
     /// Unique identifier for this thread.
@@ -1026,7 +1056,28 @@ impl EmulationThread {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
+    /// # use dotscope::emulation::{EmValue, EmulationThread};
+    /// # use std::sync::{Arc, RwLock};
+    /// # use dotscope::emulation::{
+    /// #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+    /// #     ThreadContext, VirtualFs,
+    /// # };
+    /// # let address_space = Arc::new(AddressSpace::new());
+    /// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+    /// # let context = Arc::new(ThreadContext::new(
+    /// #     address_space,
+    /// #     Arc::new(RwLock::new(RuntimeState::new())),
+    /// #     Arc::new(CaptureContext::new()),
+    /// #     Arc::new(EmulationConfig::default()),
+    /// #     None,
+    /// #     fake_objects,
+    /// #     Arc::new(VirtualFs::new()),
+    /// # ));
+    /// # let mut thread = EmulationThread::main(context);
+    /// # for value in [1, 2, 3] {
+    /// #     thread.push(EmValue::I32(value))?;
+    /// # }
     /// // For a method call like: Foo(arg1, arg2, arg3)
     /// // Stack before (top on right): [..., arg1, arg2, arg3]
     /// let args = thread.pop_args(3)?;

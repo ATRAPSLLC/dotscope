@@ -165,7 +165,7 @@ pub struct CfgInfo<'a> {
 ///
 /// # Example: ConfuserEx
 ///
-/// ```no_run
+/// ```text
 /// impl StateMachineProvider for ConfuserExStateMachine {
 ///     fn applies_to_method(&self, method: Token) -> bool {
 ///         self.cfg_mode_methods.contains(&method)
@@ -704,7 +704,10 @@ impl StateMachineSemantics {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```text
+/// use std::sync::Arc;
+/// use dotscope::deobfuscation::{StateMachineSemantics, StateMachineState};
+///
 /// let semantics = Arc::new(StateMachineSemantics::confuserex_default());
 /// let mut state = StateMachineState::from_seed(0x12345678, semantics);
 ///
@@ -712,6 +715,7 @@ impl StateMachineSemantics {
 /// // - Updates slot 0 (flag & 0x03 = 0) with XOR
 /// // - Returns slot 1 ((flag >> 2) & 0x03 = 1)
 /// let result = state.next(0x04, 0x1111);
+/// println!("slot 1: {:#x}", result);
 /// ```
 #[derive(Debug, Clone)]
 pub struct StateMachineState {

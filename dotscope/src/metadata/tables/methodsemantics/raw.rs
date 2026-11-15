@@ -114,14 +114,13 @@ use crate::{
 ///
 /// # fn process_semantic_entry(raw_entry: &MethodSemanticsRaw) {
 /// // Check semantic type
-/// match raw_entry.semantics {
-///     MethodSemanticsAttributes::GETTER => {
-///         println!("Property getter method: {}", raw_entry.method);
-///     }
-///     MethodSemanticsAttributes::ADD_ON => {
-///         println!("Event add method: {}", raw_entry.method);
-///     }
-///     _ => println!("Other semantic type"),
+/// let semantics = MethodSemanticsAttributes::new(raw_entry.semantics);
+/// if semantics.contains(MethodSemanticsAttributes::GETTER) {
+///     println!("Property getter method: {}", raw_entry.method);
+/// } else if semantics.contains(MethodSemanticsAttributes::ADD_ON) {
+///     println!("Event add method: {}", raw_entry.method);
+/// } else {
+///     println!("Other semantic type");
 /// }
 ///
 /// // Access coded index for association

@@ -20,6 +20,7 @@
 //! # fn main() -> dotscope::Result<()> {
 //! # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 //! # let mut assembly = CilAssembly::new(view);
+//! use dotscope::metadata::tables::PropertyBuilder;
 //!
 //! // Create a type first
 //! let type_ref = TypeDefBuilder::new()
@@ -93,7 +94,11 @@ use crate::{
 /// # use std::path::Path;
 /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 /// # let mut assembly = CilAssembly::new(view);
-/// # let type_ref = assembly.placeholder();
+/// # let type_ref = TypeDefBuilder::new()
+/// #     .name("MyClass")
+/// #     .namespace("MyApp")
+/// #     .public_class()
+/// #     .build(&mut assembly)?;
 ///
 /// let property_map_ref = PropertyMapBuilder::new()
 ///     .parent(type_ref.placeholder())
@@ -236,7 +241,11 @@ impl PropertyMapBuilder {
     /// # use std::path::Path;
     /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
     /// # let mut assembly = CilAssembly::new(view);
-    /// # let type_ref = assembly.placeholder();
+    /// # let type_ref = TypeDefBuilder::new()
+    /// #     .name("MyClass")
+    /// #     .namespace("MyApp")
+    /// #     .public_class()
+    /// #     .build(&mut assembly)?;
     ///
     /// let property_map_ref = PropertyMapBuilder::new()
     ///     .parent(type_ref.placeholder())

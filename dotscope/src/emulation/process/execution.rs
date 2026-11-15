@@ -35,6 +35,8 @@
 //!
 //! ```no_run
 //! # use dotscope::metadata::token::Token;
+//! # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! # let process = dotscope::emulation::ProcessBuilder::new().assembly(assembly).build()?;
 //! # let method_token = Token::new(0x06000001);
 //! let outcome = process.execute_method(method_token, vec![])?;
 //! # Ok::<(), dotscope::Error>(())
@@ -44,10 +46,13 @@
 //!
 //! After execution, retrieve captured data:
 //!
-//! ```no_run
+//! ```
+//! # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! # let process = dotscope::emulation::ProcessBuilder::new().assembly(assembly).build()?;
 //! for asm in process.captured_assemblies() {
 //!     println!("Captured: {} bytes", asm.data.len());
 //! }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use std::{
@@ -497,9 +502,10 @@ impl EmulationProcess {
     /// # Example
     ///
     /// ```no_run
-    /// # // process is an EmulationProcess instance
-    /// for asm in process.captured_assemblies() {
-    ///     std::fs::write(format!("extracted_{}.dll", asm.id), &asm.data)?;
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let process = dotscope::emulation::ProcessBuilder::new().assembly(assembly).build()?;
+    /// for (index, asm) in process.captured_assemblies().iter().enumerate() {
+    ///     std::fs::write(format!("extracted_{index}.dll"), &asm.data)?;
     /// }
     /// # Ok::<(), dotscope::Error>(())
     /// ```
@@ -582,7 +588,8 @@ impl EmulationProcess {
     ///
     /// ```no_run
     /// # use dotscope::emulation::EmValue;
-    /// # // process is an EmulationProcess instance
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let process = dotscope::emulation::ProcessBuilder::new().assembly(assembly).build()?;
     /// if let Some(token) = process.find_method("StringDecryptor", "Decrypt") {
     ///     process.execute_method(token, vec![EmValue::I32(42)])?;
     /// }
@@ -960,11 +967,13 @@ impl EmulationProcess {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// # // process is an EmulationProcess instance
+    /// ```
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let process = dotscope::emulation::ProcessBuilder::new().assembly(assembly).build()?;
     /// let summary = process.summary();
     /// println!("Executed {} instructions", summary.instruction_count);
     /// println!("Captured {} assemblies", summary.captured_assemblies);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn summary(&self) -> ProcessSummary {
         ProcessSummary {
@@ -1002,14 +1011,16 @@ impl fmt::Debug for EmulationProcess {
 ///
 /// # Example
 ///
-/// ```no_run
-/// # // process is an EmulationProcess instance
+/// ```
+/// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// # let process = dotscope::emulation::ProcessBuilder::new().assembly(assembly).build()?;
 /// let summary = process.summary();
 /// println!("Process: {}", summary.name);
 /// println!("Instructions: {}", summary.instruction_count);
 /// println!("Captured: {} assemblies, {} strings",
 ///     summary.captured_assemblies,
 ///     summary.captured_strings);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct ProcessSummary {

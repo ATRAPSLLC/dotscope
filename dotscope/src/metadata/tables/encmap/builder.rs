@@ -45,8 +45,11 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// use dotscope::prelude::*;
+/// # use std::path::Path;
+/// # let view = CilAssemblyView::from_path(Path::new("tests/samples/crafted_2.exe"))?;
+/// # let mut assembly = CilAssembly::new(view);
 ///
 /// // Map original method token
 /// let method_map = EncMapBuilder::new()

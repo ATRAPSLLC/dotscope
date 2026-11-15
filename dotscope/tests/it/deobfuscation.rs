@@ -3761,8 +3761,8 @@ fn test_unflatten_deep_constant_propagation() -> Result<()> {
 /// - Loop condition: i <= n
 /// - Return: b
 ///
-/// Previously, copy propagation could create cross-origin PHI operand references,
-/// causing `rebuild_ssa` to incorrectly classify def sites and eliminate live code.
+/// Copy propagation keeps a phi's operands in the phi's own rename group: an operand of
+/// another group would not survive a renaming construction, and the loop body with it.
 #[test]
 fn test_fibonacci_loop_body_preserved() -> Result<()> {
     let mut asm = InstructionAssembler::new();

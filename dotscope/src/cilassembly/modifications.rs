@@ -30,23 +30,21 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
-//! use crate::cilassembly::modifications::TableModifications;
-//! use crate::cilassembly::operation::{TableOperation, Operation};
-//! use crate::metadata::tables::TableDataOwned;
+//! ```
+//! use dotscope::{metadata::tables::TableId, CilAssembly};
 //!
-//! // Create sparse modification tracker
-//! let mut modifications = TableModifications::new_sparse(1);
+//! let mut assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
 //!
-//! // Apply operations
-//! // let operation = TableOperation::new(Operation::Insert(1, row_data));
-//! // modifications.apply_operation(operation)?;
+//! // Removing a row records the operation in its table's modifications
+//! assembly.table_row_remove(TableId::TypeRef, 1)?;
 //!
 //! // Check for modifications
-//! if modifications.has_modifications() {
-//!     println!("Table has {} operations", modifications.operation_count());
+//! if let Some(modifications) = assembly.changes().get_table_modifications(TableId::TypeRef) {
+//!     if modifications.has_modifications() {
+//!         println!("Table has {} operations", modifications.operation_count());
+//!     }
 //! }
-//! # Ok::<(), crate::Error>(())
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Thread Safety
@@ -86,23 +84,23 @@ use crate::{
 ///
 /// # Usage Examples
 ///
-/// ```no_run
-/// use crate::cilassembly::modifications::TableModifications;
-/// use crate::cilassembly::operation::{TableOperation, Operation};
-/// use crate::metadata::tables::TableDataOwned;
+/// ```
+/// use dotscope::{metadata::tables::TableId, CilAssembly};
 ///
-/// // Create sparse tracker
-/// let mut modifications = TableModifications::new_sparse(5); // next RID = 5
+/// let mut assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
+/// assembly.table_row_remove(TableId::TypeRef, 1)?;
 ///
-/// // Check if RID exists
-/// if modifications.has_row(3)? {
-///     println!("Row 3 exists");
+/// if let Some(modifications) = assembly
+///     .changes_mut()
+///     .get_table_modifications_mut(TableId::TypeRef)
+/// {
+///     // The removed row no longer exists
+///     assert!(!modifications.has_row(1));
+///
+///     // Consolidate the operations recorded so far
+///     modifications.consolidate_operations();
 /// }
-///
-/// // Apply operations and consolidate
-/// // modifications.apply_operation(operation)?;
-/// modifications.consolidate_operations();
-/// # Ok::<(), crate::Error>(())
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety

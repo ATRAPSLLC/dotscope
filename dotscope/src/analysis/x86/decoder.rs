@@ -138,8 +138,12 @@ pub fn x86_decode_all_limited(
 ///
 /// # Example
 ///
-/// ```no_run
-/// let result = x86_decode_function_traversal(bytes, 32, 0x1000, 0)?;
+/// ```
+/// use dotscope::analysis::{x86_decode_traversal, X86Function};
+///
+/// // push ebp; mov ebp, esp; xor eax, eax; pop ebp; ret
+/// let bytes = [0x55, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3];
+/// let result = x86_decode_traversal(&bytes, 32, 0x1000, 0)?;
 ///
 /// if result.has_indirect_control_flow {
 ///     println!("Warning: {} unresolved targets", result.unresolved_targets.len());

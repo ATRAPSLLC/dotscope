@@ -720,13 +720,21 @@ impl TableId {
 /// # Usage Examples
 ///
 /// For table row size calculation:
-/// ```no_run
-/// use crate::metadata::tables::dispatch_table_type;
-/// dispatch_table_type!(table_id, |RawType| RawType::row_size(table_info))
+/// ```
+/// use dotscope::dispatch_table_type;
+/// use dotscope::metadata::tables::{TableId, TableRow};
+/// use dotscope::CilObject;
+///
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// let table_info = &assembly.tables().expect("a tables stream").info;
+/// let table_id = TableId::TypeDef;
+/// let row_size = dispatch_table_type!(table_id, |RawType| RawType::row_size(table_info));
+/// assert!(row_size > 0);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// For table writing operations:
-/// ```no_run
+/// ```text
 /// use crate::metadata::tables::dispatch_table_type;
 /// dispatch_table_type!(table_id, |RawType| {
 ///     if let Some(table) = self.tables_header.table::<RawType>() {
@@ -738,7 +746,7 @@ impl TableId {
 /// ```
 ///
 /// For generic table operations:
-/// ```no_run
+/// ```text
 /// use crate::metadata::tables::dispatch_table_type;
 /// dispatch_table_type!(table_id, |RawType| {
 ///     // Any operation that needs to work with the concrete Raw type

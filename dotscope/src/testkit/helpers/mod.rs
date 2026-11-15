@@ -142,6 +142,7 @@ pub fn create_cil_type(
 ///
 /// let assembly = load_test_assembly(get_testfile_mscorlib)?;
 /// // Now you can work with the assembly
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub fn load_test_assembly(testfile_fn: fn() -> PathBuf) -> Result<CilAssembly> {
     CilAssembly::from_path(testfile_fn())
@@ -163,6 +164,7 @@ pub fn load_test_assembly(testfile_fn: fn() -> PathBuf) -> Result<CilAssembly> {
 ///     // Create invalid GUID heap
 ///     Ok(())
 /// })?;
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[track_caller]
 pub fn create_test_assembly<F>(

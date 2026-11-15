@@ -210,7 +210,7 @@ impl Exports {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::exports::Exports;
     /// use dotscope::metadata::token::Token;
     ///
@@ -222,7 +222,7 @@ impl Exports {
     ///     assert_eq!(*entry.key(), token);
     /// } else {
     ///     println!("No exported type found for token {}", token);
-    /// }
+    /// };
     /// ```
     ///
     /// # Thread Safety

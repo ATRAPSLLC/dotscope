@@ -472,8 +472,8 @@ impl MarshallingInfo {
 ///
 /// # Usage Examples
 ///
-/// ```rust,no_run
-/// use dotscope::metadata::marshalling::NativeType;
+/// ```rust
+/// use dotscope::metadata::marshalling::{NativeType, NATIVE_TYPE};
 ///
 /// // Simple string marshalling
 /// let lpstr = NativeType::LPStr { size_param_index: Some(2) };
@@ -932,8 +932,8 @@ impl NativeType {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
-    /// use dotscope::metadata::marshalling::NativeType;
+    /// ```rust
+    /// use dotscope::metadata::marshalling::{NativeType, NATIVE_TYPE};
     ///
     /// // Simple types have no parameters
     /// assert!(!NativeType::I4.has_parameters());

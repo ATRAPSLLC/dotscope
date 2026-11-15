@@ -408,7 +408,7 @@ impl StackSimulator {
     /// field of the generated `LoadArg` op.
     ///
     /// This produces a def so that `LoadArg` is visible to SSA analysis,
-    /// enabling correct data flow tracking across `rebuild_ssa`.
+    /// enabling correct data flow tracking through SSA construction.
     ///
     /// # Arguments
     ///
@@ -434,7 +434,7 @@ impl StackSimulator {
     /// field of the generated `LoadLocal` op.
     ///
     /// This produces a def so that `LoadLocal` is visible to SSA analysis,
-    /// enabling correct data flow tracking across `rebuild_ssa`.
+    /// enabling correct data flow tracking through SSA construction.
     ///
     /// # Arguments
     ///

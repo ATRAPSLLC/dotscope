@@ -48,22 +48,22 @@
 //!
 //! ```rust,no_run
 //! use dotscope::metadata::customattributes::{
-//!     CustomAttributeValue, CustomAttributeArgument, CustomAttributeNamedArgument
+//!     CustomAttributeValue, CustomAttributeArgument, CustomAttributeNamedArgument, FieldOrPropType
 //! };
 //! use dotscope::metadata::typesystem::CilTypeReference;
 //!
 //! // Example: Create a custom attribute value programmatically
 //! let custom_attr = CustomAttributeValue {
 //!     fixed_args: vec![
-//!         CustomAttributeArgument::String("Hello".to_string()),
+//!         CustomAttributeArgument::String(Some("Hello".to_string())),
 //!         CustomAttributeArgument::I4(42),
 //!     ],
 //!     named_args: vec![
 //!         CustomAttributeNamedArgument {
 //!             is_field: false,  // property
 //!             name: "Name".to_string(),
-//!             arg_type: "String".to_string(),
-//!             value: CustomAttributeArgument::String("Value".to_string()),
+//!             arg_type: FieldOrPropType::String,
+//!             value: CustomAttributeArgument::String(Some("Value".to_string())),
 //!         }
 //!     ],
 //!     constructor: CilTypeReference::None,
@@ -77,16 +77,16 @@
 //! ## Working with Different Argument Types
 //!
 //! ```rust,no_run
-//! use dotscope::metadata::customattributes::CustomAttributeArgument;
+//! use dotscope::metadata::customattributes::{CustomAttributeArgument, FieldOrPropType};
 //!
 //! // Different argument types
 //! let bool_arg = CustomAttributeArgument::Bool(true);
-//! let string_arg = CustomAttributeArgument::String("Hello".to_string());
+//! let string_arg = CustomAttributeArgument::String(Some("Hello".to_string()));
 //! let int_arg = CustomAttributeArgument::I4(42);
-//! let array_arg = CustomAttributeArgument::Array(vec![
-//!     CustomAttributeArgument::I4(1),
-//!     CustomAttributeArgument::I4(2),
-//! ]);
+//! let array_arg = CustomAttributeArgument::Array(
+//!     FieldOrPropType::I4,
+//!     Some(vec![CustomAttributeArgument::I4(1), CustomAttributeArgument::I4(2)]),
+//! );
 //!
 //! // Enum with underlying value
 //! let enum_arg = CustomAttributeArgument::Enum(
@@ -96,7 +96,7 @@
 //!
 //! // Pattern matching on argument types
 //! match &string_arg {
-//!     CustomAttributeArgument::String(s) => println!("String value: {}", s),
+//!     CustomAttributeArgument::String(s) => println!("String value: {:?}", s),
 //!     CustomAttributeArgument::I4(i) => println!("Integer value: {}", i),
 //!     _ => println!("Other argument type"),
 //! }
@@ -168,7 +168,7 @@ pub type CustomAttributeValueList = RowList<CustomAttributeValueRc>;
 ///
 /// let custom_attr = CustomAttributeValue {
 ///     fixed_args: vec![
-///         CustomAttributeArgument::String("Debug".to_string()),
+///         CustomAttributeArgument::String(Some("Debug".to_string())),
 ///         CustomAttributeArgument::Bool(true),
 ///     ],
 ///     named_args: vec![], // No named arguments in this example
@@ -178,7 +178,7 @@ pub type CustomAttributeValueList = RowList<CustomAttributeValueRc>;
 ///
 /// // Access constructor arguments
 /// if let CustomAttributeArgument::String(name) = &custom_attr.fixed_args[0] {
-///     println!("Attribute name: {}", name);
+///     println!("Attribute name: {:?}", name);
 /// }
 /// # Ok::<(), dotscope::Error>(())
 /// ```

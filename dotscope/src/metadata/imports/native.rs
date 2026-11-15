@@ -563,7 +563,7 @@ impl NativeImports {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use dotscope::metadata::imports::NativeImports;
     ///
     /// let mut imports = NativeImports::new();
@@ -571,7 +571,7 @@ impl NativeImports {
     ///
     /// let descriptor = imports.get_descriptor("kernel32.dll");
     /// assert!(descriptor.is_some());
-    /// assert_eq!(descriptor.unwrap().dll_name, "kernel32.dll");
+    /// assert_eq!(&*descriptor.unwrap().dll_name, "kernel32.dll");
     ///
     /// let missing = imports.get_descriptor("missing.dll");
     /// assert!(missing.is_none());
@@ -589,7 +589,7 @@ impl NativeImports {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use dotscope::metadata::imports::NativeImports;
     ///
     /// let mut imports = NativeImports::new();
@@ -597,7 +597,7 @@ impl NativeImports {
     /// imports.add_dll("user32.dll")?;
     ///
     /// let dll_names: Vec<&str> = imports.descriptors()
-    ///     .map(|desc| desc.dll_name.as_str())
+    ///     .map(|desc| desc.dll_name.as_ref())
     ///     .collect();
     ///
     /// assert_eq!(dll_names.len(), 2);

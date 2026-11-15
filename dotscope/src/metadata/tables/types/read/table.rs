@@ -56,13 +56,18 @@ use crate::{
 /// # use dotscope::metadata::tables::MetadataTable;
 /// # use dotscope::metadata::tables::RowReadable;
 /// # use dotscope::metadata::tables::TableInfoRef;
+/// # use dotscope::metadata::tables::{TableId, TableRow};
 /// # struct MyRow { id: u32 }
-/// # impl RowReadable for MyRow {
+/// # impl TableRow for MyRow {
 /// #     fn row_size(_: &TableInfoRef) -> u32 { 4 }
+/// # }
+/// # impl RowReadable for MyRow {
+/// #     const TABLE_ID: TableId = TableId::Module;
 /// #     fn row_read(_: &[u8], offset: &mut usize, rid: u32, _: &TableInfoRef) -> dotscope::Result<Self> {
 /// #         *offset += 4; Ok(MyRow { id: rid })
 /// #     }
 /// # }
+/// # use dotscope::metadata::tables::skip_unreadable;
 /// # fn example(data: &[u8], table_info: TableInfoRef) -> dotscope::Result<()> {
 /// let table: MetadataTable<MyRow> = MetadataTable::new(data, 100, table_info)?;
 ///
@@ -86,15 +91,17 @@ use crate::{
 /// # use dotscope::metadata::tables::RowReadable;
 /// # use dotscope::metadata::tables::TableInfoRef;
 /// # use rayon::prelude::*;
+/// # use dotscope::metadata::tables::{TableId, TableRow};
 /// # struct MyRow { id: u32 }
-/// # impl RowReadable for MyRow {
+/// # impl TableRow for MyRow {
 /// #     fn row_size(_: &TableInfoRef) -> u32 { 4 }
+/// # }
+/// # impl RowReadable for MyRow {
+/// #     const TABLE_ID: TableId = TableId::Module;
 /// #     fn row_read(_: &[u8], offset: &mut usize, rid: u32, _: &TableInfoRef) -> dotscope::Result<Self> {
 /// #         *offset += 4; Ok(MyRow { id: rid })
 /// #     }
 /// # }
-/// # impl Send for MyRow {}
-/// # impl Sync for MyRow {}
 /// # fn example(data: &[u8], table_info: TableInfoRef) -> dotscope::Result<()> {
 /// let table: MetadataTable<MyRow> = MetadataTable::new(data, 100, table_info)?;
 ///
@@ -103,7 +110,7 @@ use crate::{
 ///     // A row that failed to parse is reported, not skipped.
 ///     let row = row?;
 ///     println!("Processing row: {}", row.id);
-///     Ok(())
+///     Ok::<(), dotscope::Error>(())
 /// })?;
 /// # Ok(())
 /// # }

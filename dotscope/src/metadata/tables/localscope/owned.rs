@@ -111,7 +111,7 @@ impl LocalScope {
     /// # use dotscope::metadata::tables::LocalScope;
     /// # fn example(scope: &LocalScope) {
     /// if scope.has_variables() {
-    ///     println!("Scope has {} variables", scope.variables.len());
+    ///     println!("Scope has {} variables", scope.variables.count());
     /// }
     /// # }
     /// ```
@@ -130,7 +130,7 @@ impl LocalScope {
     /// # use dotscope::metadata::tables::LocalScope;
     /// # fn example(scope: &LocalScope) {
     /// if scope.has_constants() {
-    ///     println!("Scope has {} constants", scope.constants.len());
+    ///     println!("Scope has {} constants", scope.constants.count());
     /// }
     /// # }
     /// ```

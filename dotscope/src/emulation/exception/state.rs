@@ -186,14 +186,23 @@ pub struct PendingFinally {
 ///
 /// # Example
 ///
-/// ```no_run
-/// let mut state = ThreadExceptionState::new();
+/// ```
+/// use dotscope::emulation::{ExceptionInfo, HeapRef, InstructionLocation, ThreadExceptionState};
+/// use dotscope::metadata::token::Token;
 ///
-/// // Exception thrown
+/// let mut state = ThreadExceptionState::new();
+/// let method = Token::new(0x0600_0001);
+///
+/// // Exception thrown: an object of a type (`System.Exception`'s TypeRef) at IL 0x05
+/// let exception_info = ExceptionInfo::new(
+///     HeapRef::new(1),
+///     Token::new(0x0100_0002),
+///     InstructionLocation::new(method, 0x05),
+/// );
 /// state.set_exception(exception_info);
 ///
 /// // Queue finally blocks found during search
-/// state.push_finally(method, offset, Some(leave_target));
+/// state.push_finally(method, 0x10, Some(0x20));
 ///
 /// // Execute finally blocks
 /// while let Some(finally) = state.pop_finally() {

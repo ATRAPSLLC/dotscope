@@ -88,7 +88,7 @@
 //!
 //! ## Variable Analysis
 //!
-//! ```no_run
+//! ```
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -100,20 +100,12 @@
 //!     // Analyze local variables
 //!     if !method.local_vars.is_empty() {
 //!         println!("Method '{}' has {} local variables:", method.name, method.local_vars.len());
-//!         for (i, local) in method.local_vars.iter().enumerate() {
-//!             println!("  [{}] {} (by_ref: {}, pinned: {})",
+//!         for (i, local) in method.local_vars.iter() {
+//!             println!("  [{}] {:?} (by_ref: {}, pinned: {})",
 //!                      i, local.base.name(), local.is_byref, local.is_pinned);
 //!         }
 //!     }
-//!
-//!     // Analyze varargs
-//!     if !method.varargs.is_empty() {
-//!         println!("Method '{}' has {} varargs:", method.name, method.varargs.len());
-//!         for (i, vararg) in method.varargs.iter().enumerate() {
-//!             println!("  VarArg[{}] {} (by_ref: {})",
-//!                      i, vararg.base.name(), vararg.by_ref);
-//!         }
-//!     }
+
 //! }
 //! # Ok::<(), dotscope::Error>(())
 //! ```
@@ -586,18 +578,18 @@ impl MethodAccessFlags {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::method::MethodAccessFlags;
     ///
     /// // Public method
     /// let public_flags = 0x0006;
     /// let access = MethodAccessFlags::from_method_flags(public_flags);
-    /// assert!(access.contains(MethodAccessFlags::PUBLIC));
+    /// assert_eq!(access, MethodAccessFlags::PUBLIC);
     ///
     /// // Private method with other flags
     /// let private_flags = 0x0091; // PRIVATE + other flags
     /// let access = MethodAccessFlags::from_method_flags(private_flags);
-    /// assert!(access.contains(MethodAccessFlags::PRIVATE));
+    /// assert_eq!(access, MethodAccessFlags::PRIVATE);
     /// ```
     #[must_use]
     pub fn from_method_flags(flags: u32) -> Self {
@@ -1319,7 +1311,7 @@ impl SectionFlags {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// use dotscope::CilObject;
 /// use std::path::Path;
 ///
@@ -1332,8 +1324,8 @@ impl SectionFlags {
 ///         println!("Method '{}' has {} local variables:",
 ///                  method.name, method.local_vars.len());
 ///
-///         for (i, local_var) in method.local_vars.iter().enumerate() {
-///             let var_info = format!("  [{}] Type: {}, ByRef: {}, Pinned: {}, Modifiers: {}",
+///         for (i, local_var) in method.local_vars.iter() {
+///             let var_info = format!("  [{}] Type: {:?}, ByRef: {}, Pinned: {}, Modifiers: {}",
 ///                                   i,
 ///                                   local_var.base.name(),
 ///                                   local_var.is_byref,

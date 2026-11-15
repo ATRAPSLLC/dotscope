@@ -332,14 +332,14 @@ impl RowFixups {
 ///
 /// The generator supports configuration options via [`GeneratorConfig`]:
 ///
-/// ```no_run
+/// ```text
 /// let generator = PeGenerator::new(&assembly)
 ///     .with_config(GeneratorConfig::default());
 /// ```
 ///
 /// Or using the builder pattern:
 ///
-/// ```no_run
+/// ```text
 /// let generator = PeGenerator::with_config(
 ///     &assembly,
 ///     GeneratorConfig::new()

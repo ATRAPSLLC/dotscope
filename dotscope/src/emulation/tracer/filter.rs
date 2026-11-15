@@ -20,8 +20,9 @@
 //!
 //! # Usage
 //!
-//! ```no_run
-//! use dotscope::emulation::{TraceFilter, MethodPattern};
+//! ```
+//! use dotscope::emulation::{MethodPattern, TraceFilter};
+//! use dotscope::metadata::token::Token;
 //!
 //! // Only trace a specific decryptor method
 //! let filter = TraceFilter {

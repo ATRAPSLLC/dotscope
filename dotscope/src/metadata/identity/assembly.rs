@@ -64,17 +64,20 @@
 //!
 //! ## Parsing from Metadata
 //!
-//! ```no_run
-//! use dotscope::metadata::tables::AssemblyRef;
+//! ```
 //! use dotscope::metadata::identity::AssemblyIdentity;
+//! use dotscope::CilObject;
+//!
+//! let loaded = CilObject::from_path("tests/samples/crafted_2.exe")?;
 //!
 //! // Parse from AssemblyRef table entry
-//! let assembly_ref: AssemblyRef = // ... loaded from metadata
-//! let identity = AssemblyIdentity::from_assembly_ref(&assembly_ref);
+//! let assembly_ref = loaded.refs_assembly().iter().next().expect("a reference");
+//! let identity = AssemblyIdentity::from_assembly_ref(assembly_ref.value());
 //!
 //! // Parse from Assembly table entry
-//! let assembly: Assembly = // ... loaded from metadata
-//! let identity = AssemblyIdentity::from_assembly(&assembly);
+//! let assembly = loaded.assembly().expect("an assembly manifest");
+//! let identity = AssemblyIdentity::from_assembly(assembly);
+//! println!("{}", identity.display_name());
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -432,11 +435,14 @@ impl AssemblyIdentity {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::identity::AssemblyIdentity;
+    /// use dotscope::CilObject;
     ///
-    /// let assembly_ref = // ... loaded from metadata
-    /// let identity = AssemblyIdentity::from_assembly_ref(&assembly_ref);
+    /// let loaded = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// let assembly_ref = loaded.refs_assembly().iter().next().expect("a reference");
+    /// let identity = AssemblyIdentity::from_assembly_ref(assembly_ref.value());
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn from_assembly_ref(assembly_ref: &AssemblyRef) -> Self {
         // Extract processor architecture from the AssemblyRefProcessor table data if present.
@@ -479,11 +485,14 @@ impl AssemblyIdentity {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use dotscope::metadata::identity::AssemblyIdentity;
+    /// use dotscope::CilObject;
     ///
-    /// let assembly = // ... loaded from metadata
-    /// let identity = AssemblyIdentity::from_assembly(&assembly);
+    /// let loaded = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// let assembly = loaded.assembly().expect("an assembly manifest");
+    /// let identity = AssemblyIdentity::from_assembly(assembly);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn from_assembly(assembly: &Assembly) -> Self {
         // Note: Processor architecture for the Assembly table is stored in the separate

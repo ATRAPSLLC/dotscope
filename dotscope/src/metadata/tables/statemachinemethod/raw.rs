@@ -93,6 +93,7 @@ impl StateMachineMethodRaw {
     /// ```no_run
     /// # use dotscope::metadata::tables::StateMachineMethodRaw;
     /// # use dotscope::metadata::token::Token;
+    /// # use dotscope::metadata::method::MethodMap;
     /// # fn example(method_map: &MethodMap) -> dotscope::Result<()> {
     /// let mapping_raw = StateMachineMethodRaw {
     ///     rid: 1,

@@ -58,11 +58,11 @@
 //! // Access custom debug information for a method
 //! let method_token = Token::new(0x06000001); // MethodDef token
 //!
-//! if custom_info.parent_token() == method_token {
-//!     println!("Found custom debug info kind: {:?}", custom_info.kind());
-//!     // Process the custom information blob
-//!     let data = custom_info.value();
-//!     // ... interpret based on the GUID in custom_info.kind()
+//! if custom_info.parent_token == method_token {
+//!     println!("Found custom debug info kind: {:?}", custom_info.kind);
+//!     // Process the custom information: parsed by the GUID in `kind`
+//!     let data = &custom_info.value;
+//!     println!("{:?}", data);
 //! }
 //! # Ok(())
 //! # }

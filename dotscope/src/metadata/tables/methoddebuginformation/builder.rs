@@ -238,7 +238,7 @@ impl MethodDebugInformationBuilder {
     ///     .sequence_points(vec![0x01, 0x02, 0x03])
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created MethodDebugInformation with token: {}", debug_token);
+    /// println!("Created MethodDebugInformation with token: {:?}", debug_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {

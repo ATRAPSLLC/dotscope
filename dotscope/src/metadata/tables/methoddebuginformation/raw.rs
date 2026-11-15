@@ -176,9 +176,9 @@ impl MethodDebugInformationRaw {
     /// # Examples
     /// ```no_run
     /// # use dotscope::metadata::tables::MethodDebugInformationRaw;
-    /// # use dotscope::metadata::streams::{Strings, Blob, Guid};
-    /// # fn example(raw: &MethodDebugInformationRaw, strings: &Strings, blobs: &Blob, guids: &Guid) -> dotscope::Result<()> {
-    /// let method_debug_info = raw.to_owned(strings, blobs, guids)?;
+    /// # use dotscope::metadata::streams::Blob;
+    /// # fn example(raw: &MethodDebugInformationRaw, blobs: &Blob) -> dotscope::Result<()> {
+    /// let method_debug_info = raw.to_owned(blobs)?;
     /// println!("Method debug info: {:?}", method_debug_info.document);
     /// # Ok(())
     /// # }

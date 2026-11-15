@@ -31,7 +31,10 @@ use crate::{emulation::engine::EmulationError, Result};
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
+/// use dotscope::emulation::UnmanagedMemory;
+///
+/// let mut mem = UnmanagedMemory::new(1024 * 1024);
 /// let ptr = mem.alloc(256)?;
 /// mem.write(ptr.address(), &[1, 2, 3, 4])?;
 /// # Ok::<(), dotscope::Error>(())

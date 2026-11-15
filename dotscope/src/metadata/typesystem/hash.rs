@@ -15,15 +15,19 @@
 //!
 //! # Example Usage
 //!
-//! ```no_run
+//! ```
 //! use dotscope::metadata::typesystem::TypeSignatureHash;
 //! use dotscope::metadata::typesystem::{CilFlavor, TypeSource};
+//! use dotscope::metadata::token::Token;
+//!
+//! // The generic argument: `System.String`, as the module's TypeRef names it
+//! let string_token = Token::new(0x0100_0002);
 //!
 //! let hash = TypeSignatureHash::new()
 //!     .add_flavor(&CilFlavor::GenericInstance)
 //!     .add_fullname("System.Collections.Generic", "List`1")
 //!     .add_source(&TypeSource::Primitive)
-//!     .add_component(&string_type.token)  // Generic argument
+//!     .add_component(&string_token)  // Generic argument
 //!     .finalize();
 //! ```
 

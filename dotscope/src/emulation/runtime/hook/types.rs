@@ -553,16 +553,43 @@ pub type PostHookFn = Arc<
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use dotscope::emulation::{HookManager, HookOutcome, EmValue};
+/// ```
+/// use dotscope::emulation::{HookContext, HookManager, HookOutcome};
+/// use dotscope::metadata::{token::Token, typesystem::PointerSize};
+/// # use std::sync::{Arc, RwLock};
+/// # use dotscope::emulation::{
+/// #     AddressSpace, CaptureContext, EmulationConfig, EmulationThread, RuntimeState,
+/// #     SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+/// # };
+/// # let address_space = Arc::new(AddressSpace::new());
+/// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+/// # let context = Arc::new(ThreadContext::new(
+/// #     address_space,
+/// #     Arc::new(RwLock::new(RuntimeState::new())),
+/// #     Arc::new(CaptureContext::new()),
+/// #     Arc::new(EmulationConfig::default()),
+/// #     None,
+/// #     fake_objects,
+/// #     Arc::new(VirtualFs::new()),
+/// # ));
+/// # let mut thread = EmulationThread::new(ThreadId::MAIN, context);
+/// # let manager = HookManager::new();
+/// # let context =
+/// #     HookContext::new(Token::new(0x0A00_0001), "System", "String", "Concat", PointerSize::Bit64);
 ///
-/// let outcome = manager.execute(...)?;
+/// let outcome = manager.execute(&context, &mut thread, |_thread| None)?;
 /// match outcome {
 ///     HookOutcome::NoMatch => {
 ///         // No hook matched - execute method normally
 ///     }
 ///     HookOutcome::Handled(value) => {
 ///         // Hook handled the call, use this return value
+///     }
+///     HookOutcome::ReflectionInvoke { .. } => {
+///         // Hook resolved a reflection call: redirect to the invoked method
+///     }
+///     HookOutcome::ThrewException { .. } => {
+///         // Hook threw a CLR exception: route it to the handlers
 ///     }
 /// }
 /// # Ok::<(), dotscope::Error>(())

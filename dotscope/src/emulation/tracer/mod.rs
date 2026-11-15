@@ -53,6 +53,9 @@
 //! use dotscope::emulation::{
 //!     ProcessBuilder, TracingConfig, TraceFilter, CallTreeBuilder,
 //! };
+//! use dotscope::CilObject;
+//!
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
 //!
 //! // File-based tracing with depth filter
 //! let filter = TraceFilter {

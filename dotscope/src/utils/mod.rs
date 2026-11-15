@@ -24,13 +24,14 @@
 //!
 //! ## Compressed Integer Encoding
 //!
-//! ```no_run
+//! ```
 //! use dotscope::io::write_compressed_uint;
 //! use dotscope::io::compressed_uint_size;
 //!
 //! let mut buffer = Vec::new();
 //! write_compressed_uint(300, &mut buffer)?;
 //! assert_eq!(compressed_uint_size(300), buffer.len() as u64);
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Memory Alignment

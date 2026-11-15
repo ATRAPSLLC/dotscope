@@ -441,12 +441,13 @@ impl ManifestResourceBuilder {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use dotscope::prelude::*;
     /// let builder = ManifestResourceBuilder::new()
     ///     .name("AppResources")
-    ///     .add_string_resource("AppTitle", "My Application")
-    ///     .add_string_resource("Version", "1.0.0");
+    ///     .add_string_resource("AppTitle", "My Application")?
+    ///     .add_string_resource("Version", "1.0.0")?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     ///
     /// # Errors
@@ -637,7 +638,7 @@ impl ManifestResourceBuilder {
     ///     .offset(0x1000)
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created ManifestResource with token: {}", resource_token);
+    /// println!("Created ManifestResource with token: {:?}", resource_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {

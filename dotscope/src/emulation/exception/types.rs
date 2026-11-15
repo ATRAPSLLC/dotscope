@@ -55,7 +55,13 @@ use crate::metadata::{
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
+/// use dotscope::emulation::ExceptionClause;
+/// use dotscope::metadata::token::Token;
+///
+/// // `System.Exception`, as the module's TypeRef names it
+/// let exception_type_token = Token::new(0x0100_0002);
+///
 /// // For C# code:
 /// // try { /* IL 0x00-0x10 */ }
 /// // catch (Exception) { /* IL 0x10-0x20 */ }

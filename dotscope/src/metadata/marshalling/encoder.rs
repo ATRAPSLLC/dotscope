@@ -63,8 +63,10 @@ use crate::{
 /// ```
 ///
 /// ## Complex Array Type
-/// ```rust,no_run
-/// use dotscope::metadata::marshalling::{encode_marshalling_descriptor, NativeType, MarshallingInfo};
+/// ```rust
+/// use dotscope::metadata::marshalling::{
+///     encode_marshalling_descriptor, MarshallingInfo, NativeType, NATIVE_TYPE,
+/// };
 ///
 /// // Encode array of I4 with parameter and size info
 /// let info = MarshallingInfo {

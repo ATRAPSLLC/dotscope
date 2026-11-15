@@ -360,7 +360,7 @@ impl AssemblyRefBuilder {
     ///     .version(4, 0, 0, 0)
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created AssemblyRef with token: {}", assembly_ref_token);
+    /// println!("Created AssemblyRef with token: {:?}", assembly_ref_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {

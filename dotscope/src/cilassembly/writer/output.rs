@@ -26,7 +26,7 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
+//! ```text
 //! use crate::cilassembly::writer::output::Output;
 //! use std::path::Path;
 //!
@@ -39,7 +39,6 @@
 //!
 //! // Atomically finalize the file (None = keep original size)
 //! output.finalize(None)?;
-//! # Ok::<(), crate::Error>(())
 //! ```
 //!
 //! # Thread Safety
@@ -116,17 +115,16 @@ enum OutputBacking {
 ///
 /// # Usage Patterns
 ///
-/// ```no_run
+/// ```text
 /// // File-backed output
 /// let output = Output::create("output.dll", 4096)?;
 /// // ... write data ...
-/// output.finalize(Some(actual_size))?;
+/// output.finalize(Some(256))?;
 ///
 /// // In-memory output (zero-copy)
 /// let output = Output::create_in_memory(4096)?;
 /// // ... write data ...
-/// let bytes = output.into_vec(Some(actual_size))?; // No copy!
-/// # Ok::<(), dotscope::Error>(())
+/// let bytes = output.into_vec(Some(256))?; // No copy!
 /// ```
 pub struct Output {
     /// The backing storage (file mmap or in-memory vec)
@@ -249,12 +247,11 @@ impl Output {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```text
     /// let mut output = Output::create_in_memory(4096)?;
     /// output.write_at(0, b"MZ")?;
     /// // ... more writes ...
-    /// let bytes = output.into_vec(Some(actual_size))?; // Zero-copy!
-    /// # Ok::<(), dotscope::Error>(())
+    /// let bytes = output.into_vec(Some(256))?; // Zero-copy!
     /// ```
     pub fn create_in_memory(size: u64) -> Result<Self> {
         let size_usize = usize::try_from(size).map_err(|_| {
@@ -895,12 +892,11 @@ impl Output {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```text
     /// let mut output = Output::create_in_memory(4096)?;
     /// output.write_at(0, b"MZ")?;
     /// // ... more writes ...
     /// let bytes = output.into_vec(Some(256))?; // Zero-copy, truncated to 256 bytes
-    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn into_vec(mut self, actual_size: Option<u64>) -> Result<Vec<u8>> {
         if self.finalized {
@@ -993,7 +989,7 @@ impl Drop for Output {
 /// Create an `OutputWriter` at a specific offset, then use it with any method that
 /// accepts `impl Write`:
 ///
-/// ```no_run
+/// ```text
 /// let mut output = Output::create("output.dll", 4096)?;
 /// let mut writer = output.writer_at(0x80); // Start at PE header offset
 ///
@@ -1003,7 +999,6 @@ impl Drop for Output {
 ///
 /// // Get final position after writing
 /// let end_pos = writer.position();
-/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety
@@ -1093,13 +1088,12 @@ impl Output {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```text
     /// let mut output = Output::create("output.dll", 4096)?;
     /// let mut writer = output.writer_at(0x80);
     ///
     /// // Use with write_to methods
     /// coff_header.write_to(&mut writer)?;
-    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn writer_at(&mut self, offset: u64) -> OutputWriter<'_> {
         OutputWriter::new(self, offset)

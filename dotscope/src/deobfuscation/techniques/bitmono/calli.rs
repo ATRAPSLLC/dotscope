@@ -11,14 +11,14 @@
 //! ```text
 //! ldtoken    <Module>                                 // -> SSA: LoadToken
 //! call       Type::GetTypeFromHandle                  // -> SSA: Call
-//! callvirt   Type::get_Module                         // -> SSA: CallVirt
+//! callvirt   Type::get_Module                         // -> SSA: Call (virtual)
 //! ldc.i4     0x06XXXXXX                               // -> SSA: Const(I32) <- target token
 //! call       Module::ResolveMethod                    // -> SSA: Call
-//! callvirt   MethodBase::get_MethodHandle             // -> SSA: CallVirt
+//! callvirt   MethodBase::get_MethodHandle             // -> SSA: Call (virtual)
 //! stloc      <handle_local>                           // -> SSA: StoreLocal
 //! ldloca     <handle_local>                           // -> SSA: LoadLocalAddr
 //! call       RuntimeMethodHandle::GetFunctionPointer  // -> SSA: Call
-//! calli      <StandAloneSig>                          // -> SSA: CallIndirect
+//! calli      <StandAloneSig>                          // -> SSA: Call (indirect)
 //! ```
 //!
 //! # Detection

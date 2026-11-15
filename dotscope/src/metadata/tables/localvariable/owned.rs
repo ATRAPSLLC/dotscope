@@ -17,9 +17,11 @@ use crate::metadata::token::Token;
 /// ```no_run
 /// use dotscope::metadata::tables::LocalVariable;
 ///
+/// # fn example(variable: &LocalVariable) {
 /// // Access variable information
 /// println!("Variable '{}' at index {} with attributes 0x{:X}",
 ///          variable.name, variable.index, variable.attributes);
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct LocalVariable {

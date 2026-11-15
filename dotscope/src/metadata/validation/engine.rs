@@ -154,17 +154,20 @@ fn init_owned_validators() -> Vec<Box<dyn OwnedValidator>> {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use crate::metadata::validation::engine::ValidationEngine;
+/// ```
+/// use dotscope::metadata::validation::{ValidationConfig, ValidationEngine};
+/// use dotscope::{CilAssemblyView, CilObject};
 ///
-/// let engine = ValidationEngine::new(config)?;
+/// let assembly_view = CilAssemblyView::from_path("tests/samples/crafted_2.exe")?;
+/// let object_data = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// let config = ValidationConfig::production();
+/// let engine = ValidationEngine::new(&assembly_view, config)?;
 ///
 /// // Two-stage validation
 /// let result = engine.execute_two_stage_validation(
 ///     &assembly_view,
 ///     None, // No modifications
 ///     Some(&object_data),
-///     &config,
 /// )?;
 /// # Ok::<(), dotscope::Error>(())
 /// ```

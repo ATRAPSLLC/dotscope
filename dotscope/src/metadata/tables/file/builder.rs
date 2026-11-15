@@ -32,7 +32,7 @@
 //!     .name("Resources.resources")
 //!     .contains_no_metadata()
 //!     .hash_value(&[0xAB, 0xCD, 0xEF, 0x01])
-//!     .build(&mut context)?;
+//!     .build(&mut assembly)?;
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -280,7 +280,7 @@ impl FileBuilder {
     ///     .contains_metadata()
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created File with token: {}", file_token);
+    /// println!("Created File with token: {:?}", file_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {

@@ -26,16 +26,18 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
-//! use crate::cilassembly::resolver::{LastWriteWinsResolver, ConflictResolver, Conflict};
+//! ```
+//! use dotscope::{Conflict, ConflictResolver, LastWriteWinsResolver};
 //!
 //! // Create a resolver
 //! let resolver = LastWriteWinsResolver;
 //!
 //! // Resolve conflicts (typically used by validation pipeline)
-//! // let conflicts = vec![/* conflicts */];
-//! // let resolution = resolver.resolve_conflict(&conflicts)?;
-//! # Ok::<(), crate::Error>(())
+//! // The conflicts the validation pipeline detected: none here
+//! let conflicts: Vec<Conflict> = Vec::new();
+//! let resolution = resolver.resolve_conflict(&conflicts)?;
+//! assert!(resolution.operations.is_empty());
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Thread Safety
@@ -70,21 +72,31 @@ use crate::{cilassembly::TableOperation, Error, Result};
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use crate::cilassembly::resolver::{ConflictResolver, Conflict, Resolution};
+/// ```
+/// use dotscope::{Conflict, ConflictResolver, OperationResolution, Resolution};
 ///
-/// struct LastWriteWinsResolver;
+/// /// Keeps the first operation on each row and drops the rest.
+/// struct FirstWriteWinsResolver;
 ///
-/// impl ConflictResolver for LastWriteWinsResolver {
-///     fn resolve_conflict(&self, conflicts: &[Conflict]) -> Result<Resolution> {
+/// impl ConflictResolver for FirstWriteWinsResolver {
+///     fn resolve_conflict(&self, conflicts: &[Conflict]) -> dotscope::Result<Resolution> {
 ///         let mut resolution = Resolution::default();
 ///         for conflict in conflicts {
-///             // Resolve by choosing the latest operation
-///             // Implementation details...
+///             if let Conflict::MultipleOperationsOnRid { rid, operations } = conflict {
+///                 if let Some(first) = operations.first() {
+///                     resolution
+///                         .operations
+///                         .insert(*rid, OperationResolution::UseOperation(first.clone()));
+///                 }
+///             }
 ///         }
 ///         Ok(resolution)
 ///     }
 /// }
+///
+/// let resolution = FirstWriteWinsResolver.resolve_conflict(&[])?;
+/// assert!(resolution.operations.is_empty());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub trait ConflictResolver {
     /// Resolves conflicts between operations.
@@ -109,16 +121,17 @@ pub trait ConflictResolver {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// use crate::cilassembly::resolver::{ConflictResolver, Conflict};
+    /// ```
+    /// use dotscope::{Conflict, ConflictResolver, LastWriteWinsResolver};
     ///
-    /// # let resolver = LastWriteWinsResolver;
-    /// # let conflicts = vec![]; // conflicts would be populated
+    /// let resolver = LastWriteWinsResolver;
+    /// // The conflicts the validation pipeline detected: none here
+    /// let conflicts: Vec<Conflict> = Vec::new();
     /// let resolution = resolver.resolve_conflict(&conflicts)?;
     /// for (rid, operation_resolution) in resolution.operations {
     ///     println!("RID {} resolved to: {:?}", rid, operation_resolution);
     /// }
-    /// # Ok::<(), crate::Error>(())
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     fn resolve_conflict(&self, conflicts: &[Conflict]) -> Result<Resolution>;
 }
@@ -191,15 +204,17 @@ pub enum OperationResolution {
 ///
 /// # Usage Examples
 ///
-/// ```no_run
-/// use crate::cilassembly::resolver::{LastWriteWinsResolver, ConflictResolver, Conflict};
+/// ```
+/// use dotscope::{Conflict, ConflictResolver, LastWriteWinsResolver};
 ///
 /// let resolver = LastWriteWinsResolver;
 ///
 /// // Typically used by validation pipeline
-/// // let conflicts = vec![/* detected conflicts */];
-/// // let resolution = resolver.resolve_conflict(&conflicts)?;
-/// # Ok::<(), crate::Error>(())
+/// // The conflicts the validation pipeline detected: none here
+/// let conflicts: Vec<Conflict> = Vec::new();
+/// let resolution = resolver.resolve_conflict(&conflicts)?;
+/// assert!(resolution.operations.is_empty());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety

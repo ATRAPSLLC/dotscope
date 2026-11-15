@@ -29,26 +29,36 @@
 //!
 //! # Example
 //!
-//! ```no_run
-//! use dotscope::deobfuscation::AnalysisContext;
+//! ```
+//! use dotscope::analysis::ConstValue;
+//! use dotscope::deobfuscation::DecryptorContext;
+//! use dotscope::metadata::token::Token;
+//!
+//! // The analysis context's decryptors (`ctx.decryptors`)
+//! let decryptors = DecryptorContext::new();
+//! let (call_target, caller) = (Token::new(0x0600_0010), Token::new(0x0600_0001));
 //!
 //! // During obfuscator detection:
-//! ctx.decryptors.register(decryptor_token);
+//! decryptors.register(call_target);
 //!
-//! // During SSA pass:
-//! if ctx.decryptors.is_decryptor(call_target) {
-//!     if let Some(cached) = ctx.decryptors.with_cached(call_target, &args, |v| v.clone()) {
+//! // During SSA pass: a call to the decryptor with these arguments
+//! let args = [ConstValue::I32(7)];
+//! if decryptors.is_decryptor(call_target) {
+//!     if let Some(cached) = decryptors.with_cached(call_target, &args, |v| v.clone()) {
 //!         // Use cached value
+//!         println!("cached: {:?}", cached);
 //!     } else {
 //!         // Emulate and cache
-//!         ctx.decryptors.cache_value(call_target, &args, value.clone());
-//!         ctx.decryptors.record_success(call_target, caller, location, value);
+//!         let value = ConstValue::I32(42);
+//!         decryptors.cache_value(call_target, &args, value.clone());
+//!         decryptors.record_success(call_target, caller, None, value);
 //!     }
 //! }
+//! assert!(decryptors.is_cached(call_target, &args));
 //!
-//! // During cleanup:
-//! for token in ctx.decryptors.removable_decryptors() {
-//!     assembly.mark_method_dead(token);
+//! // During cleanup: each decryptor whose every call was decrypted
+//! for token in decryptors.removable_decryptors() {
+//!     println!("dead: {}", token);
 //! }
 //! ```
 
