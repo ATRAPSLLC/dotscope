@@ -146,7 +146,9 @@
 //! - **ECMA-335 II.24.2.4**: `#Blob` heap specification
 //! - **ECMA-335 II.23.2**: Signature encoding formats stored in blobs
 
-use crate::{file::parser::Parser, Error, HeapKind, ParseFailure, Result};
+use crate::{
+    file::parser::Parser, metadata::streams::sentinel_heap, Error, HeapKind, ParseFailure, Result,
+};
 
 /// ECMA-335 binary blob heap providing indexed access to variable-length data.
 ///
@@ -338,9 +340,9 @@ impl<'a> Blob<'a> {
     /// let invalid_data = &[0x01, 0x02, 0x03];
     /// assert!(Blob::from(invalid_data).is_err());
     ///
-    /// // Empty data
-    /// let empty_data = &[];
-    /// assert!(Blob::from(empty_data).is_err());
+    /// // A stream of no bytes is a heap with no entries
+    /// let empty_heap = Blob::from(&[]).unwrap();
+    /// assert!(empty_heap.get(0).unwrap().is_empty());
     /// ```
     ///
     /// # Safety
@@ -352,14 +354,9 @@ impl<'a> Blob<'a> {
     /// - [`iter`](Self::iter): Iterate over all blobs in the heap
     /// - [ECMA-335 II.24.2.4](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Blob heap specification
     pub fn from(data: &'a [u8]) -> Result<Blob<'a>> {
-        match data.first() {
-            Some(0) => Ok(Blob { data }),
-            _ => Err(ParseFailure::HeapCorrupt {
-                heap: HeapKind::Blob,
-                reason: "first byte must be 0 (empty blob sentinel)".into(),
-            }
-            .into()),
-        }
+        Ok(Blob {
+            data: sentinel_heap(data, HeapKind::Blob)?,
+        })
     }
 
     /// Retrieves a blob from the heap by its offset.
@@ -852,6 +849,24 @@ impl<'a> Iterator for BlobIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `#Blob` stream of no bytes (Mono's `ilasm`, an assembly with no method) is a heap with
+    /// no entries: index 0 is the empty blob, any other index out of bounds.
+    #[test]
+    fn a_stream_of_no_bytes_is_a_heap_of_no_entries() {
+        let heap = Blob::from(&[]).unwrap();
+
+        assert_eq!(heap.get(0).unwrap(), &[] as &[u8]);
+        assert!(heap.get(1).is_err());
+        assert_eq!(heap.iter().count(), 0);
+    }
+
+    /// Bytes that do not begin with the sentinel stay corrupt: only the stream of no bytes
+    /// changes meaning.
+    #[test]
+    fn bytes_without_the_sentinel_are_corrupt() {
+        assert!(Blob::from(&[0x01, 0x02]).is_err());
+    }
 
     #[test]
     fn crafted() {

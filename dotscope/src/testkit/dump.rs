@@ -598,7 +598,12 @@ impl Heaps<'_> {
     /// What the heap index `value` names: a string's bytes, a blob's, or a GUID.
     fn resolve(&self, heap: HeapType, value: usize) -> String {
         match heap {
-            HeapType::String => match self.strings.and_then(|s| s.data().get(value..)) {
+            // An index names a byte of the heap, and the heap's length names none
+            HeapType::String => match self
+                .strings
+                .and_then(|s| s.data().get(value..))
+                .filter(|rest| !rest.is_empty())
+            {
                 Some(bytes) => {
                     let bytes = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
                     std::str::from_utf8(bytes).map_or_else(
@@ -1005,6 +1010,21 @@ mod tests {
         assert_eq!(cut.entries()["a"], "unreadable");
         assert_eq!(cut.entries()["b"], "undecodable");
         assert_eq!(cut.entries()["c"], "\"unreadable: text\"");
+    }
+
+    /// A `#Strings` index names a byte of the heap: the heap's length and past it name nothing.
+    #[test]
+    fn a_string_index_past_the_heap_names_nothing() {
+        let strings = Strings::from(b"\0a\0").unwrap();
+        let heaps = Heaps {
+            strings: Some(&strings),
+            blobs: None,
+            guids: None,
+        };
+        assert_eq!(heaps.resolve(HeapType::String, 1), "\"a\"");
+        assert_eq!(heaps.resolve(HeapType::String, 2), "\"\"");
+        assert_eq!(heaps.resolve(HeapType::String, 3), "str#3");
+        assert_eq!(heaps.resolve(HeapType::String, 4), "str#4");
     }
 
     /// A difference names its path and both values.

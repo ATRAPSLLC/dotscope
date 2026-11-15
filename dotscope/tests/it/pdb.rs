@@ -13,8 +13,6 @@
 
 use std::{fs, path::PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use dotscope::{
     metadata::{
         customdebuginformation::{AsyncAwait, CustomDebugInfo, CustomDebugKind},
@@ -34,6 +32,7 @@ use dotscope::{
     testkit::{fixture, fixture_bytes},
     CilAssembly, CilAssemblyView, CilObject,
 };
+use sha2::{Digest, Sha256};
 
 /// A probe source file, as written.
 fn source(project: &str, path: &str) -> String {

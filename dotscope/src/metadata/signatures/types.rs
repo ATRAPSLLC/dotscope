@@ -1342,6 +1342,20 @@ pub struct SignatureArray {
     pub dimensions: Vec<ArrayDimensions>,
 }
 
+impl SignatureArray {
+    /// Returns what the runtime writes between a general array's brackets in its name: `*`
+    /// at rank 1 (`System.Int32[*]`, which is not the vector `System.Int32[]`), else a comma
+    /// between each two dimensions (`,` at rank 2).
+    #[must_use]
+    pub fn rank_bounds(rank: u32) -> String {
+        if rank == 1 {
+            "*".to_owned()
+        } else {
+            ",".repeat((rank as usize).saturating_sub(1))
+        }
+    }
+}
+
 /// Single-dimensional array signature with custom modifiers.
 ///
 /// Represents the most common array type in .NET applications: zero-indexed,

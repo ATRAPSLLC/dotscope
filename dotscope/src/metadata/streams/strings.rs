@@ -202,7 +202,7 @@
 
 use std::{ffi::CStr, str};
 
-use crate::{Error, HeapKind, ParseFailure, Result};
+use crate::{metadata::streams::sentinel_heap, Error, HeapKind, ParseFailure, Result};
 
 /// ECMA-335 compliant `#Strings` heap providing UTF-8 identifier string access.
 ///
@@ -395,9 +395,10 @@ impl<'a> Strings<'a> {
     /// ## Validation Performed
     ///
     /// This method enforces ECMA-335 compliance by checking:
-    /// 1. **Non-empty data**: Heap must contain at least one byte
-    /// 2. **Mandatory null byte**: First byte must be 0x00 (empty string at index 0)
-    /// 3. **Format integrity**: Basic structural validation of heap data
+    /// 1. **Mandatory null byte**: First byte must be 0x00 (empty string at index 0)
+    /// 2. **Format integrity**: Basic structural validation of heap data
+    ///
+    /// A stream of no bytes is a heap with no entries: index 0 reads as the empty string.
     ///
     /// Note: Individual string UTF-8 validation is performed during access via [`Strings::get`]
     /// to optimize construction performance for large heaps.
@@ -412,7 +413,6 @@ impl<'a> Strings<'a> {
     /// # Errors
     ///
     /// Returns [`crate::Error`] in the following cases:
-    /// - **Empty heap**: Data slice is empty (violates ECMA-335 requirement)
     /// - **Missing null byte**: First byte is not 0x00 (violates mandatory empty string at index 0)
     ///
     /// # Examples
@@ -465,10 +465,6 @@ impl<'a> Strings<'a> {
     /// use dotscope::metadata::streams::Strings;
     ///
     /// # fn example() {
-    /// // Error: Empty data (no mandatory null byte)
-    /// let empty_data = [];
-    /// assert!(Strings::from(&empty_data).is_err());
-    ///
     /// // Error: Missing mandatory null byte at index 0
     /// let no_null_byte = [b'I', b'n', b'v', b'a', b'l', b'i', b'd'];
     /// assert!(Strings::from(&no_null_byte).is_err());
@@ -532,15 +528,9 @@ impl<'a> Strings<'a> {
     /// - [`Strings::iter`]: Sequential iteration over all heap strings
     /// - [ECMA-335 II.24.2.3](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Strings heap format specification
     pub fn from(data: &[u8]) -> Result<Strings<'_>> {
-        if data.first() != Some(&0) {
-            return Err(ParseFailure::HeapCorrupt {
-                heap: HeapKind::Strings,
-                reason: "first byte must be 0 (empty string sentinel)".into(),
-            }
-            .into());
-        }
-
-        Ok(Strings { data })
+        Ok(Strings {
+            data: sentinel_heap(data, HeapKind::Strings)?,
+        })
     }
 
     /// Access a UTF-8 string at the specified heap offset with comprehensive validation.
@@ -1344,6 +1334,24 @@ impl<'a> Iterator for StringEntries<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `#Strings` stream of no bytes is a heap with no entries: index 0 is the empty string,
+    /// any other index out of bounds.
+    #[test]
+    fn a_stream_of_no_bytes_is_a_heap_of_no_entries() {
+        let heap = Strings::from(&[]).unwrap();
+
+        assert_eq!(heap.get(0).unwrap(), "");
+        assert!(heap.get(1).is_err());
+        assert_eq!(heap.iter().count(), 0);
+    }
+
+    /// Bytes that do not begin with the sentinel stay corrupt: only the stream of no bytes
+    /// changes meaning.
+    #[test]
+    fn bytes_without_the_sentinel_are_corrupt() {
+        assert!(Strings::from(b"a\0").is_err());
+    }
 
     #[test]
     fn crafted() {

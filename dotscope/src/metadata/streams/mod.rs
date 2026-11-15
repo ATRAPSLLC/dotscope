@@ -318,6 +318,8 @@
 //! - **ECMA-335 II.24.2.6**: `#US` heap format and UTF-16 encoding
 //! - **ECMA-335 II.22**: Metadata table definitions and relationships
 
+use crate::{HeapKind, ParseFailure, Result};
+
 /// Stream header parsing and validation for ECMA-335 metadata directory.
 ///
 /// Provides [`crate::metadata::streams::streamheader::StreamHeader`] for parsing stream directory entries, validating
@@ -364,3 +366,31 @@ pub use blob::{Blob, BlobIterator};
 /// assembly tables its tables reference.
 mod pdb;
 pub use pdb::PdbStream;
+
+/// The empty entry a sentinel heap holds at index 0.
+static EMPTY_HEAP: [u8; 1] = [0];
+
+/// Returns the bytes a `#Strings`, `#US` or `#Blob` heap reads from.
+///
+/// ECMA-335 II.24.2.2 to II.24.2.4 place the empty entry at index 0 of a heap that has
+/// entries. A stream of no bytes has none, and a table row may still hold index 0 for an
+/// absent value (Mono's `ilasm` writes a zero-length `#US` for an assembly with no string
+/// literal and a zero-length `#Blob` for one with no method), so it reads as the sentinel
+/// alone: index 0 is the empty value, any other index is out of bounds, and every reader of
+/// the heap, its size included, sees one consistent heap.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Parse`] carrying [`ParseFailure::HeapCorrupt`] if the heap holds
+/// bytes and the first is not 0.
+fn sentinel_heap(data: &[u8], heap: HeapKind) -> Result<&[u8]> {
+    match data.first() {
+        None => Ok(&EMPTY_HEAP),
+        Some(0) => Ok(data),
+        Some(_) => Err(ParseFailure::HeapCorrupt {
+            heap,
+            reason: "first byte must be 0 (the sentinel of its empty entry)".into(),
+        }
+        .into()),
+    }
+}

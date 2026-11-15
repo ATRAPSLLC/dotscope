@@ -56,6 +56,8 @@ use crate::{
 /// collected `Vec`, `.first()`, or `.next()`:
 ///
 /// ```no_run
+/// # use dotscope::metadata::tables::{skip_unreadable, MetadataTable, ModuleRaw};
+/// # fn example(table: &MetadataTable<ModuleRaw>) {
 /// // Wrong: one unreadable row ahead of the match names a different row entirely.
 /// for (index, row) in table.iter().filter_map(skip_unreadable).enumerate() {
 ///     let rid = index as u32 + 1;
@@ -69,6 +71,7 @@ use crate::{
 /// // Right, when a specific RID is wanted: `get` derives each row's offset from its RID,
 /// // so an unreadable row cannot displace any other.
 /// let module = table.get(1).ok().flatten();
+/// # }
 /// ```
 ///
 /// Every raw row struct carries a `rid` field, and
@@ -233,9 +236,23 @@ struct TableProducer<'a, T> {
     range: std::ops::Range<u32>,
 }
 
+/// The fewest rows a split leaves one task.
+///
+/// A row parses in nanoseconds, so a task of fewer rows costs more to schedule than to
+/// run. And every split is a join, at which a worker waits for the other half and runs
+/// whatever other work it finds meanwhile, on the stack it is waiting on: another
+/// table's halves, another assembly's, each nesting the next. With every table split to
+/// single rows, the loads a test suite runs side by side nested deep enough to overflow
+/// a worker's stack. A table smaller than this is not split at all.
+const ROWS_PER_TASK: usize = 512;
+
 impl<'a, T: RowReadable + Send + Sync> rayon::iter::plumbing::Producer for TableProducer<'a, T> {
     type Item = Result<T>;
     type IntoIter = TableProducerIterator<'a, T>;
+
+    fn min_len(&self) -> usize {
+        ROWS_PER_TASK
+    }
 
     fn into_iter(self) -> Self::IntoIter {
         TableProducerIterator {

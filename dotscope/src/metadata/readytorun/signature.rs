@@ -7,7 +7,10 @@
 //! reading nor the spelling recurses and both take time linear in the
 //! signature.
 
-use crate::{Error, Result};
+use crate::{
+    metadata::signatures::{SignatureArray, MAX_ARRAY_DIMENSIONS},
+    Error, Result,
+};
 
 /// `READYTORUN_METHOD_SIG_SlotInsteadOfToken`.
 const METHOD_SIG_SLOT: u32 = 0x08;
@@ -128,12 +131,21 @@ impl SignatureType {
             if frame.types == 0 {
                 // An array's shape follows its element type.
                 if let Some(at) = frame.array {
+                    // ECMA-335 II.23.2.13: one dimension or more, at most the
+                    // runtime's largest rank, and no size or lower bound for a
+                    // dimension the rank does not have.
                     let rank = reader.unsigned()?;
-                    for _ in 0..reader.unsigned()? {
-                        reader.unsigned()?;
+                    if rank == 0 || rank > MAX_ARRAY_DIMENSIONS {
+                        return Err(reader.malformed("an array rank no array has"));
                     }
-                    for _ in 0..reader.unsigned()? {
-                        reader.unsigned()?;
+                    for _ in 0..2 {
+                        let count = reader.unsigned()?;
+                        if count > rank {
+                            return Err(reader.malformed("an array shape past its rank"));
+                        }
+                        for _ in 0..count {
+                            reader.unsigned()?;
+                        }
                     }
                     if let Some(element) = elements.get_mut(at) {
                         *element = SignatureElement::Array(rank);
@@ -338,9 +350,7 @@ impl Opened {
             SignatureElement::Pointer => "*".to_owned(),
             SignatureElement::ByRef => "&".to_owned(),
             SignatureElement::SzArray => "[]".to_owned(),
-            SignatureElement::Array(rank) => {
-                format!("[{}]", ",".repeat((rank as usize).saturating_sub(1)))
-            }
+            SignatureElement::Array(rank) => format!("[{}]", SignatureArray::rank_bounds(rank)),
             SignatureElement::FunctionPointer(0) => " *()".to_owned(),
             SignatureElement::FunctionPointer(_) => ")".to_owned(),
             _ => String::new(),
@@ -496,11 +506,26 @@ mod tests {
             spell(&[0x14, 0x12, 0x08, 0x02, 0x01, 0x04, 0x00]).as_deref(),
             Some("System.Text.StringBuilder[,]")
         );
-        // An array of arrays reads each shape after its own element.
+        // An array of arrays reads each shape after its own element; a rank-1
+        // general array is no vector.
         assert_eq!(
             spell(&[0x14, 0x14, 0x08, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00]).as_deref(),
-            Some("System.Int32[,,][]")
+            Some("System.Int32[,,][*]")
         );
+        // A rank no array has, or a size past the rank, is malformed.
+        for bytes in [
+            &[0x14, 0x08, 0x00, 0x00, 0x00][..],
+            &[0x14, 0x08, 0x21, 0x00, 0x00][..],
+            &[0x14, 0x08, 0xdf, 0xff, 0xff, 0xff, 0x00, 0x00][..],
+            &[0x14, 0x08, 0x01, 0x02, 0x04, 0x04, 0x00][..],
+            &[0x14, 0x08, 0x01, 0x00, 0x02, 0x00, 0x00][..],
+        ] {
+            let mut reader = SignatureReader { bytes, at: 0 };
+            assert!(
+                SignatureType::read(&mut reader, None).is_err(),
+                "{bytes:02x?} is refused"
+            );
+        }
         // FNPTR: default convention, two parameters (varargs after a
         // sentinel), returning void.
         assert_eq!(

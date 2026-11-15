@@ -42,7 +42,10 @@
 
 use widestring::U16String;
 
-use crate::{utils::read_compressed_int_at, Error, HeapKind, ParseFailure, Result};
+use crate::{
+    metadata::streams::sentinel_heap, utils::read_compressed_int_at, Error, HeapKind, ParseFailure,
+    Result,
+};
 
 /// The `UserStrings` object provides helper methods to access the data within the '#US' heap.
 ///
@@ -100,6 +103,7 @@ impl<'a> UserStrings<'a> {
     ///
     /// Validates that the heap data starts with the required null byte at index 0 according to
     /// ECMA-335 specification. The heap may contain multiple UTF-16 strings with length prefixes.
+    /// A stream of no bytes is a heap with no entries: index 0 reads as the empty string.
     ///
     /// # Arguments
     /// * `data` - The byte slice containing the user strings heap data
@@ -108,7 +112,7 @@ impl<'a> UserStrings<'a> {
     /// * `Ok(UserStrings)` - Valid heap accessor
     ///
     /// # Errors
-    /// * [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] - If data is empty or doesn't start with null byte
+    /// * [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] - If data doesn't start with null byte
     ///
     /// # Examples
     ///
@@ -121,15 +125,9 @@ impl<'a> UserStrings<'a> {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn from(data: &'a [u8]) -> Result<UserStrings<'a>> {
-        if data.first().copied() != Some(0) {
-            return Err(ParseFailure::HeapCorrupt {
-                heap: HeapKind::UserStrings,
-                reason: "first byte must be 0 (empty string sentinel)".into(),
-            }
-            .into());
-        }
-
-        Ok(UserStrings { data })
+        Ok(UserStrings {
+            data: sentinel_heap(data, HeapKind::UserStrings)?,
+        })
     }
 
     /// Get a view into the string contained at the provided location.
@@ -558,13 +556,19 @@ mod tests {
         assert_eq!(heap.get(3).unwrap(), u16str!("Hi"));
     }
 
+    /// A `#US` stream of no bytes (Mono's `ilasm`, an assembly with no string literal) is a
+    /// heap with no entries: index 0 is the empty string, any other index out of bounds.
+    #[test]
+    fn a_stream_of_no_bytes_is_a_heap_of_no_entries() {
+        let heap = UserStrings::from(&[]).unwrap();
+
+        assert_eq!(heap.get(0).unwrap(), u16str!(""));
+        assert!(heap.get(1).is_err());
+        assert_eq!(heap.iter().count(), 0);
+    }
+
     #[test]
     fn invalid() {
-        let data_empty = [];
-        if UserStrings::from(&data_empty).is_ok() {
-            panic!("This should not be valid!")
-        }
-
         let data_invalid_first = [
             0x22, 0x1b, 0x48, 0x00, 0x65, 0x00, 0x6c, 0x00, 0x6c, 0x00, 0x6f, 0x00, 0x2c, 0x00,
             0x20, 0x00, 0x57, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x6c, 0x00, 0x64, 0x00, 0x21, 0x00,

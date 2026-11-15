@@ -32,9 +32,6 @@ fn disagreement(fixture: &str) -> Option<Disagreement> {
     const DIRECTORY: &str = "SRM resolves a stream directory the runtime reads by another rule: \
          a repeated heap, an unknown stream, #JTD or a minimal-delta layout; \
          stream_directory.rs holds dotscope to what the CLR printed for it";
-    const REFUSED_BY_THE_RUNTIME: &str = "the runtime refuses it (factory/oracle.tsv) and \
-         dotscope's loader refuses it as its manifest entry names; read without validation, \
-         SRM takes other heaps than dotscope";
     const BITMONO_HEADERS: &str = "BitMono corrupts the PE headers the Microsoft runtimes \
          check, and neither the .NET Framework nor CoreCLR runs it (factory/oracle.tsv); \
          dotscope reads it to repair it";
@@ -48,8 +45,10 @@ fn disagreement(fixture: &str) -> Option<Disagreement> {
             | "guid_before_enc.exe"
             | "junk_after_enc.exe"
             | "junk_after_schema_after.exe"
+            | "junk_before_enc.exe"
             | "schema_after_us_after.exe"
             | "strings_after_enc.exe"
+            | "strings_before_enc.exe"
             | "us_after_enc.exe"
             | "us_after_schema_after.exe"
             | "us_after_schema_after_tables.exe"
@@ -59,13 +58,6 @@ fn disagreement(fixture: &str) -> Option<Disagreement> {
         | ("metadata/layouts", "minimal_delta_all.exe" | "minimal_delta_all_heapsizes.exe") => {
             Some(Disagreement::ReadsOtherwise(DIRECTORY))
         }
-        (
-            "metadata/streams",
-            "junk_after.exe"
-            | "junk_before_enc.exe"
-            | "strings_after.exe"
-            | "strings_before_enc.exe",
-        ) => Some(Disagreement::ReadsOtherwise(REFUSED_BY_THE_RUNTIME)),
         ("metadata/streams", "jtd_after.exe" | "jtd_before.exe") => Some(Disagreement::Refuses(
             "SRM refuses a #JTD stream beside a compressed tables stream, which the CLR reads \
              (factory/oracle.tsv, stream_directory.rs)",

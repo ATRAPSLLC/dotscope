@@ -130,12 +130,11 @@ mod constant;
 mod document;
 pub mod guids;
 
-pub use constant::{GeneralValue, LocalConstantSig, LocalConstantValue, PrimitiveConstant};
-pub use document::{document_name, split_document_name, DocumentNameBlob};
-
 use std::{collections::HashMap, fmt, io::Read, sync::OnceLock};
 
+pub use constant::{GeneralValue, LocalConstantSig, LocalConstantValue, PrimitiveConstant};
 use crossbeam_skiplist::SkipMap;
+pub use document::{document_name, split_document_name, DocumentNameBlob};
 
 use crate::{
     file::{debug::debug_type, File},

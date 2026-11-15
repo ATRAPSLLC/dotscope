@@ -254,105 +254,51 @@ fn process_strings_heap(
     // Every entry, as bytes: one that is not UTF-8 is written as it was, and does not end
     // the heap for the entries after it
     // A source that does not parse cannot have changes applied to it: dropping it would
-    // leave every reference into it dangling. Only an absent heap starts empty.
-    let source = match Strings::from(source_data) {
-        Ok(heap) => Some(heap),
-        Err(_) if source_data.is_empty() => None,
-        Err(e) => {
-            return Err(Error::LayoutFailed(format!(
-                "the #Strings heap to write does not parse ({e}), so its changes cannot be applied"
-            )))
+    // leave every reference into it dangling.
+    let strings = Strings::from(source_data).map_err(|e| {
+        Error::LayoutFailed(format!(
+            "the #Strings heap to write does not parse ({e}), so its changes cannot be applied"
+        ))
+    })?;
+    for (old_offset, original_bytes) in strings.entries() {
+        let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
+            Error::LayoutFailed(format!("String offset {old_offset} exceeds u32 range"))
+        })?;
+
+        // Calculate the original string's byte range for substring detection.
+        // This must use the ORIGINAL length, not the modified length, because
+        // other tables may reference substring offsets within the original range.
+        let original_end = old_offset_u32
+            .checked_add(to_u32(original_bytes.len())?)
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| writer_overflow("string_range"))?; // +1 for null
+
+        if changes.is_removed(old_offset_u32) {
+            // Even though this entry is removed, emit any referenced substrings
+            // as standalone entries so TypeRef/other tables can still resolve them.
+            emit_orphaned_substrings(
+                &mut output,
+                start_offset,
+                old_offset_u32,
+                original_end,
+                original_bytes,
+                referenced_offsets,
+                &mut dedup_map,
+                &mut pos,
+                &mut result,
+            )?;
+            continue;
         }
-    };
-    if let Some(strings) = source {
-        for (old_offset, original_bytes) in strings.entries() {
-            let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
-                Error::LayoutFailed(format!("String offset {old_offset} exceeds u32 range"))
-            })?;
 
-            // Calculate the original string's byte range for substring detection.
-            // This must use the ORIGINAL length, not the modified length, because
-            // other tables may reference substring offsets within the original range.
-            let original_end = old_offset_u32
-                .checked_add(to_u32(original_bytes.len())?)
-                .and_then(|v| v.checked_add(1))
-                .ok_or_else(|| writer_overflow("string_range"))?; // +1 for null
+        let modification = changes.get_modification(old_offset_u32);
+        let final_bytes = modification.map_or(original_bytes, |s| s.as_bytes());
 
-            if changes.is_removed(old_offset_u32) {
-                // Even though this entry is removed, emit any referenced substrings
-                // as standalone entries so TypeRef/other tables can still resolve them.
-                emit_orphaned_substrings(
-                    &mut output,
-                    start_offset,
-                    old_offset_u32,
-                    original_end,
-                    original_bytes,
-                    referenced_offsets,
-                    &mut dedup_map,
-                    &mut pos,
-                    &mut result,
-                )?;
-                continue;
+        if let Some(&existing_offset) = dedup_map.get(final_bytes) {
+            if old_offset_u32 != existing_offset {
+                result.remapping.insert(old_offset_u32, existing_offset);
             }
-
-            let modification = changes.get_modification(old_offset_u32);
-            let final_bytes = modification.map_or(original_bytes, |s| s.as_bytes());
-
-            if let Some(&existing_offset) = dedup_map.get(final_bytes) {
-                if old_offset_u32 != existing_offset {
-                    result.remapping.insert(old_offset_u32, existing_offset);
-                }
-                // Even when deduplicated, emit orphaned substrings if the string was modified
-                if modification.is_some() {
-                    emit_orphaned_substrings(
-                        &mut output,
-                        start_offset,
-                        old_offset_u32,
-                        original_end,
-                        original_bytes,
-                        referenced_offsets,
-                        &mut dedup_map,
-                        &mut pos,
-                        &mut result,
-                    )?;
-                }
-                continue;
-            }
-
-            let new_offset = u32::try_from(pos).map_err(|_| {
-                Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range"))
-            })?;
-            let str_bytes = final_bytes;
-            let entry_size = (str_bytes.len() as u64)
-                .checked_add(1)
-                .ok_or_else(|| writer_overflow("heap_entry_size"))?; // +1 for null terminator
-
-            // Write if in write mode
-            let write_pos = start_offset
-                .checked_add(pos)
-                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-            let null_pos = write_pos
-                .checked_add(str_bytes.len() as u64)
-                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-            if let Some(out) = output.as_mut() {
-                out.write_at(write_pos, str_bytes)?;
-                out.write_at(null_pos, &[0u8])?;
-            }
-
-            pos = pos
-                .checked_add(entry_size)
-                .ok_or_else(|| writer_overflow("heap_position"))?;
-            dedup_map.insert(final_bytes.to_vec(), new_offset);
-
-            // Add primary offset remapping if changed
-            if old_offset_u32 != new_offset {
-                result.remapping.insert(old_offset_u32, new_offset);
-            }
-
-            // Add substring remappings for any referenced offset within the ORIGINAL range.
+            // Even when deduplicated, emit orphaned substrings if the string was modified
             if modification.is_some() {
-                // Parent string was modified — substrings at the original deltas may no
-                // longer exist in the new entry. Emit them as standalone entries.
                 emit_orphaned_substrings(
                     &mut output,
                     start_offset,
@@ -364,18 +310,65 @@ fn process_strings_heap(
                     &mut pos,
                     &mut result,
                 )?;
-            } else {
-                // Unmodified: substrings are at the same delta in the new entry
-                for &ref_offset in referenced_offsets {
-                    if ref_offset > old_offset_u32 && ref_offset < original_end {
-                        let substring_delta = ref_offset
-                            .checked_sub(old_offset_u32)
-                            .ok_or_else(|| writer_overflow("substring_delta"))?;
-                        let new_substring_offset = new_offset
-                            .checked_add(substring_delta)
-                            .ok_or_else(|| writer_overflow("substring_offset"))?;
-                        result.remapping.insert(ref_offset, new_substring_offset);
-                    }
+            }
+            continue;
+        }
+
+        let new_offset = u32::try_from(pos)
+            .map_err(|_| Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range")))?;
+        let str_bytes = final_bytes;
+        let entry_size = (str_bytes.len() as u64)
+            .checked_add(1)
+            .ok_or_else(|| writer_overflow("heap_entry_size"))?; // +1 for null terminator
+
+        // Write if in write mode
+        let write_pos = start_offset
+            .checked_add(pos)
+            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+        let null_pos = write_pos
+            .checked_add(str_bytes.len() as u64)
+            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+        if let Some(out) = output.as_mut() {
+            out.write_at(write_pos, str_bytes)?;
+            out.write_at(null_pos, &[0u8])?;
+        }
+
+        pos = pos
+            .checked_add(entry_size)
+            .ok_or_else(|| writer_overflow("heap_position"))?;
+        dedup_map.insert(final_bytes.to_vec(), new_offset);
+
+        // Add primary offset remapping if changed
+        if old_offset_u32 != new_offset {
+            result.remapping.insert(old_offset_u32, new_offset);
+        }
+
+        // Add substring remappings for any referenced offset within the ORIGINAL range.
+        if modification.is_some() {
+            // Parent string was modified — substrings at the original deltas may no
+            // longer exist in the new entry. Emit them as standalone entries.
+            emit_orphaned_substrings(
+                &mut output,
+                start_offset,
+                old_offset_u32,
+                original_end,
+                original_bytes,
+                referenced_offsets,
+                &mut dedup_map,
+                &mut pos,
+                &mut result,
+            )?;
+        } else {
+            // Unmodified: substrings are at the same delta in the new entry
+            for &ref_offset in referenced_offsets {
+                if ref_offset > old_offset_u32 && ref_offset < original_end {
+                    let substring_delta = ref_offset
+                        .checked_sub(old_offset_u32)
+                        .ok_or_else(|| writer_overflow("substring_delta"))?;
+                    let new_substring_offset = new_offset
+                        .checked_add(substring_delta)
+                        .ok_or_else(|| writer_overflow("substring_offset"))?;
+                    result.remapping.insert(ref_offset, new_substring_offset);
                 }
             }
         }
@@ -622,79 +615,73 @@ fn process_blob_heap(
 
     // Process source heap
     // A source that does not parse cannot have changes applied to it: dropping it would
-    // leave every reference into it dangling. Only an absent heap starts empty.
-    let source = match Blob::from(source_data) {
-        Ok(heap) => Some(heap),
-        Err(_) if source_data.is_empty() => None,
-        Err(e) => {
-            return Err(Error::LayoutFailed(format!(
-                "the #Blob heap to write does not parse ({e}), so its changes cannot be applied"
-            )))
-        }
-    };
-    if let Some(heap) = &source {
-        let mut walked = HashSet::new();
-        for (old_offset, original_blob) in heap.iter() {
-            let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
-                Error::LayoutFailed(format!("Blob offset {old_offset} exceeds u32 range"))
-            })?;
-            walked.insert(old_offset_u32);
+    // leave every reference into it dangling.
+    let heap = Blob::from(source_data).map_err(|e| {
+        Error::LayoutFailed(format!(
+            "the #Blob heap to write does not parse ({e}), so its changes cannot be applied"
+        ))
+    })?;
+    let mut walked = HashSet::new();
+    for (old_offset, original_blob) in heap.iter() {
+        let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
+            Error::LayoutFailed(format!("Blob offset {old_offset} exceeds u32 range"))
+        })?;
+        walked.insert(old_offset_u32);
 
-            if changes.is_removed(old_offset_u32) {
-                continue;
-            }
-
-            // Get the blob content (original or modified)
-            let base_blob: &[u8] = changes
-                .get_modification(old_offset_u32)
-                .map_or(original_blob, Vec::as_slice);
-
-            if blobs.defers(old_offset_u32, None) {
-                deferred.push((old_offset_u32, None, base_blob.to_vec()));
-                continue;
-            }
-
-            // Renumber the rows a blob names
-            let remapped_blob = blobs.remap(old_offset_u32, base_blob)?;
-            let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(base_blob);
-
-            let new_offset = emit_blob(
-                &mut output,
-                start_offset,
-                &mut pos,
-                &mut dedup_map,
-                final_blob,
-            )?;
-            placed.insert(old_offset_u32);
-            if old_offset_u32 != new_offset {
-                result.remapping.insert(old_offset_u32, new_offset);
-            }
+        if changes.is_removed(old_offset_u32) {
+            continue;
         }
 
-        for offset in interior_offsets(referenced, &walked) {
-            // An offset that names no blob (past the heap: junk an obfuscator leaves in a
-            // column) has nothing at it to keep, and is written as it is
-            let Ok(blob) = heap.get(offset as usize) else {
-                nameless.push(offset);
-                continue;
-            };
-            if blobs.defers(offset, None) {
-                deferred.push((offset, None, blob.to_vec()));
-                continue;
-            }
-            let remapped_blob = blobs.remap(offset, blob)?;
-            let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(blob);
-            let new_offset = emit_blob(
-                &mut output,
-                start_offset,
-                &mut pos,
-                &mut dedup_map,
-                final_blob,
-            )?;
-            placed.insert(offset);
-            if offset != new_offset {
-                result.remapping.insert(offset, new_offset);
-            }
+        // Get the blob content (original or modified)
+        let base_blob: &[u8] = changes
+            .get_modification(old_offset_u32)
+            .map_or(original_blob, Vec::as_slice);
+
+        if blobs.defers(old_offset_u32, None) {
+            deferred.push((old_offset_u32, None, base_blob.to_vec()));
+            continue;
+        }
+
+        // Renumber the rows a blob names
+        let remapped_blob = blobs.remap(old_offset_u32, base_blob)?;
+        let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(base_blob);
+
+        let new_offset = emit_blob(
+            &mut output,
+            start_offset,
+            &mut pos,
+            &mut dedup_map,
+            final_blob,
+        )?;
+        placed.insert(old_offset_u32);
+        if old_offset_u32 != new_offset {
+            result.remapping.insert(old_offset_u32, new_offset);
+        }
+    }
+
+    for offset in interior_offsets(referenced, &walked) {
+        // An offset that names no blob (past the heap: junk an obfuscator leaves in a
+        // column) has nothing at it to keep, and is written as it is
+        let Ok(blob) = heap.get(offset as usize) else {
+            nameless.push(offset);
+            continue;
+        };
+        if blobs.defers(offset, None) {
+            deferred.push((offset, None, blob.to_vec()));
+            continue;
+        }
+        let remapped_blob = blobs.remap(offset, blob)?;
+        let final_blob: &[u8] = remapped_blob.as_deref().unwrap_or(blob);
+        let new_offset = emit_blob(
+            &mut output,
+            start_offset,
+            &mut pos,
+            &mut dedup_map,
+            final_blob,
+        )?;
+        placed.insert(offset);
+        if offset != new_offset {
+            result.remapping.insert(offset, new_offset);
         }
     }
 
@@ -760,14 +747,11 @@ fn process_blob_heap(
                     )));
                 }
                 // A blob no entry placed (inside another blob's bytes): written now
-                let named = source
-                    .as_ref()
-                    .and_then(|heap| heap.get(offset as usize).ok())
-                    .ok_or_else(|| {
-                        Error::LayoutFailed(format!(
-                            "a blob names #Blob offset {offset:#x}, which holds no blob"
-                        ))
-                    })?;
+                let named = heap.get(offset as usize).map_err(|_| {
+                    Error::LayoutFailed(format!(
+                        "a blob names #Blob offset {offset:#x}, which holds no blob"
+                    ))
+                })?;
                 skip_remapping_keys(&result, &mut pos)?;
                 emit_blob(&mut output, start_offset, &mut pos, &mut dedup_map, named)
             },
@@ -1126,54 +1110,48 @@ fn process_userstring_heap(
     }
 
     // A source that does not parse cannot have changes applied to it: dropping it would
-    // leave every reference into it dangling. Only an absent heap starts empty.
-    let source = match UserStrings::from(source_data) {
-        Ok(heap) => Some(heap),
-        Err(_) if source_data.is_empty() => None,
-        Err(e) => {
-            return Err(Error::LayoutFailed(format!(
-                "the #US heap to write does not parse ({e}), so its changes cannot be applied"
-            )))
-        }
-    };
-    if let Some(userstrings) = source {
-        let mut walked = HashSet::new();
-        for (old_offset, original) in userstrings.iter() {
-            let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
-                Error::LayoutFailed(format!("UserString offset {old_offset} exceeds u32 range"))
-            })?;
-            walked.insert(old_offset_u32);
+    // leave every reference into it dangling.
+    let userstrings = UserStrings::from(source_data).map_err(|e| {
+        Error::LayoutFailed(format!(
+            "the #US heap to write does not parse ({e}), so its changes cannot be applied"
+        ))
+    })?;
+    let mut walked = HashSet::new();
+    for (old_offset, original) in userstrings.iter() {
+        let old_offset_u32 = u32::try_from(old_offset).map_err(|_| {
+            Error::LayoutFailed(format!("UserString offset {old_offset} exceeds u32 range"))
+        })?;
+        walked.insert(old_offset_u32);
 
-            if changes.is_removed(old_offset_u32) {
-                continue;
-            }
-
-            let units = changes
-                .get_modification(old_offset_u32)
-                .map_or_else(|| original.into_vec(), |s| s.encode_utf16().collect());
-            let new_offset =
-                emit_userstring(&mut output, start_offset, &mut pos, &mut dedup_map, units)?;
-            // Only add to remapping if the offset actually changed
-            if old_offset_u32 != new_offset {
-                result.remapping.insert(old_offset_u32, new_offset);
-            }
+        if changes.is_removed(old_offset_u32) {
+            continue;
         }
 
-        for offset in interior_offsets(referenced, &walked) {
-            // An `ldstr` that names no string (in code that never runs) has nothing at it to
-            // keep, and is written as it is
-            let Ok(units) = userstrings
-                .get(offset as usize)
-                .map(|string| string.into_vec())
-            else {
-                nameless.push(offset);
-                continue;
-            };
-            let new_offset =
-                emit_userstring(&mut output, start_offset, &mut pos, &mut dedup_map, units)?;
-            if offset != new_offset {
-                result.remapping.insert(offset, new_offset);
-            }
+        let units = changes
+            .get_modification(old_offset_u32)
+            .map_or_else(|| original.into_vec(), |s| s.encode_utf16().collect());
+        let new_offset =
+            emit_userstring(&mut output, start_offset, &mut pos, &mut dedup_map, units)?;
+        // Only add to remapping if the offset actually changed
+        if old_offset_u32 != new_offset {
+            result.remapping.insert(old_offset_u32, new_offset);
+        }
+    }
+
+    for offset in interior_offsets(referenced, &walked) {
+        // An `ldstr` that names no string (in code that never runs) has nothing at it to
+        // keep, and is written as it is
+        let Ok(units) = userstrings
+            .get(offset as usize)
+            .map(|string| string.into_vec())
+        else {
+            nameless.push(offset);
+            continue;
+        };
+        let new_offset =
+            emit_userstring(&mut output, start_offset, &mut pos, &mut dedup_map, units)?;
+        if offset != new_offset {
+            result.remapping.insert(offset, new_offset);
         }
     }
 

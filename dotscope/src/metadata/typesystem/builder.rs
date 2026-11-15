@@ -108,11 +108,11 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        signatures::{SignatureMethod, SignatureMethodSpec},
+        signatures::{SignatureArray, SignatureMethod, SignatureMethodSpec},
         tables::MethodSpec,
         token::Token,
         typesystem::{
-            CilFlavor, CilModifier, CilPrimitiveKind, CilTypeRc, CilTypeReference,
+            ArrayDimensions, CilFlavor, CilModifier, CilPrimitiveKind, CilTypeRc, CilTypeReference,
             CompleteTypeSpec, TypeRegistry, TypeResolver, TypeSource,
         },
     },
@@ -718,12 +718,17 @@ impl TypeBuilder {
             let name = format!("{}[]", base_type.name);
             let namespace = base_type.namespace.clone();
 
+            // The flavor the resolver gives a vector (`SZARRAY`): one dimension, from zero.
+            // A rank-1 array stating no dimension is the general array `T[*]`.
             let array_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::Array {
                     element_type: Box::new(base_type.flavor().clone()),
                     rank: 1,
-                    dimensions: vec![],
+                    dimensions: vec![ArrayDimensions {
+                        size: None,
+                        lower_bound: None,
+                    }],
                 },
                 namespace: namespace.clone(),
                 name,
@@ -742,22 +747,21 @@ impl TypeBuilder {
         Ok(self)
     }
 
-    /// Create a multi-dimensional array of the current type
+    /// Create a general array (`ARRAY`) of the current type, named as the runtime names it:
+    /// `T[*]` at rank 1, which is not the vector [`array()`](Self::array) makes, `T[,]` at 2
     ///
     /// ## Arguments
     /// * 'rank' - The dimensions for the array
     ///
     /// # Errors
-    /// Returns an error if no current type is set or if the multi-dimensional array type cannot be created.
+    /// Returns an error if the rank is zero, if no current type is set or if the array type
+    /// cannot be created.
     pub fn multi_dimensional_array(mut self, rank: u32) -> Result<Self> {
+        if rank == 0 {
+            return Err(TypeError("an array has one dimension or more".to_string()));
+        }
         if let Some(base_type) = self.current_type.take() {
-            let dimension_part = if rank <= 1 {
-                "[]".to_string()
-            } else {
-                format!("[{}]", ",".repeat((rank as usize).saturating_sub(1)))
-            };
-
-            let name = format!("{}{}", base_type.name, dimension_part);
+            let name = format!("{}[{}]", base_type.name, SignatureArray::rank_bounds(rank));
             let namespace = base_type.namespace.clone();
 
             let array_type = self.registry.get_or_create_type(&CompleteTypeSpec {
@@ -1010,7 +1014,7 @@ mod tests {
     use crate::{
         metadata::{
             identity::AssemblyIdentity,
-            signatures::{SignatureMethod, SignatureParameter, TypeSignature},
+            signatures::{SignatureMethod, SignatureParameter, SignatureSzArray, TypeSignature},
             tables::{GenericParam, GenericParamAttributes},
             token::Token,
             typesystem::{CilFlavor, CilPrimitiveKind, TypeRegistry, TypeSource},
@@ -1094,6 +1098,42 @@ mod tests {
         } else {
             panic!("Expected Array flavor");
         };
+
+        // A rank-1 general array is not the vector: its own name and its own flavor (a token
+        // tells nothing, the registry mints one per type it creates).
+        let build = |general: bool| {
+            let builder = TypeBuilder::new(registry.clone())
+                .primitive(CilPrimitiveKind::I4)
+                .unwrap();
+            if general {
+                builder.multi_dimensional_array(1)
+            } else {
+                builder.array()
+            }
+            .unwrap()
+            .build()
+            .unwrap()
+        };
+        let (general, vector) = (build(true), build(false));
+        assert_eq!(general.name, "Int32[*]");
+        assert_eq!(vector.name, "Int32[]");
+        assert_ne!(*general.flavor(), *vector.flavor());
+
+        // The builder's vector is the resolver's: one name, one flavor.
+        let resolved = TypeResolver::new(registry.clone())
+            .resolve(&TypeSignature::SzArray(SignatureSzArray {
+                modifiers: Vec::new(),
+                base: Box::new(TypeSignature::I4),
+            }))
+            .unwrap();
+        assert_eq!(resolved.name, vector.name);
+        assert_eq!(*resolved.flavor(), *vector.flavor());
+
+        assert!(TypeBuilder::new(registry)
+            .primitive(CilPrimitiveKind::I4)
+            .unwrap()
+            .multi_dimensional_array(0)
+            .is_err());
     }
 
     #[test]

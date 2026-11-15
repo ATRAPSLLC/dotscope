@@ -31,21 +31,19 @@
 //!
 //! # Usage Examples
 //!
-//! ```no_run
-//! use crate::cilassembly::operation::{Operation, TableOperation};
-//! use crate::metadata::tables::TableDataOwned;
+//! ```text
+//! use crate::cilassembly::{Operation, TableOperation};
 //!
-//! // Create operations
-//! // let row_data = TableDataOwned::TypeDef(/* ... */);
-//! // let insert_op = Operation::Insert(1, row_data);
-//! // let delete_op = Operation::Delete(2);
+//! // Create an operation: an insert or update also carries the row's data
+//! // (a `TableDataOwned`), a delete names only the row
+//! let delete_op = Operation::Delete(2);
 //!
 //! // Wrap with timestamps for conflict resolution
-//! // let table_op = TableOperation::new(insert_op);
+//! let table_op = TableOperation::new(delete_op);
 //!
 //! // Check operation properties
-//! // let rid = table_op.get_rid();
-//! // let is_insert = table_op.is_insert();
+//! assert_eq!(table_op.get_rid(), 2);
+//! assert!(table_op.is_delete() && !table_op.is_insert());
 //! ```
 //!
 //! # Thread Safety
@@ -83,20 +81,17 @@ static OPERATION_CLOCK: AtomicU64 = AtomicU64::new(1);
 ///
 /// # Usage Examples
 ///
-/// ```no_run
-/// use crate::cilassembly::operation::Operation;
-/// use crate::metadata::tables::TableDataOwned;
+/// ```text
+/// use crate::cilassembly::Operation;
 ///
-/// // Create different operation types
-/// // let row_data = TableDataOwned::TypeDef(/* ... */);
-/// // let insert = Operation::Insert(1, row_data);
-/// // let update = Operation::Update(1, updated_data);
-/// // let delete = Operation::Delete(1);
+/// // `Operation::Insert(rid, row)` and `Operation::Update(rid, row)` carry a
+/// // `TableDataOwned` row; a delete names only the row it removes
+/// let delete = Operation::Delete(1);
 ///
 /// // Check operation properties
-/// // let rid = insert.get_rid();
-/// // let op_type = insert.operation_type();
-/// // let data = insert.get_row_data();
+/// assert_eq!(delete.get_rid(), 1);
+/// println!("{}", delete.operation_type());
+/// assert!(delete.get_row_data().is_none());
 /// ```
 ///
 /// # Thread Safety
@@ -229,18 +224,17 @@ impl Operation {
 ///
 /// # Usage Examples
 ///
-/// ```no_run
-/// use crate::cilassembly::operation::{Operation, TableOperation};
-/// use crate::metadata::tables::TableDataOwned;
+/// ```text
+/// use crate::cilassembly::{Operation, TableOperation};
 ///
-/// // Create timestamped operation
-/// // let op = Operation::Insert(1, row_data);
-/// // let table_op = TableOperation::new(op);
+/// // Create timestamped operations: each takes the next timestamp
+/// let first = TableOperation::new(Operation::Delete(1));
+/// let second = TableOperation::new(Operation::Delete(2));
 ///
 /// // Check properties
-/// // let rid = table_op.get_rid();
-/// // let timestamp = table_op.timestamp;
-/// // let is_insert = table_op.is_insert();
+/// assert_eq!(first.get_rid(), 1);
+/// assert!(second.timestamp > first.timestamp);
+/// assert!(first.is_delete());
 /// ```
 ///
 /// # Thread Safety
@@ -345,6 +339,17 @@ impl TableOperation {
 mod tests {
     use super::*;
     use crate::testkit::factories::table::cilassembly::create_test_row;
+
+    /// Each new table operation takes the next timestamp, and keeps its
+    /// operation's row and kind.
+    #[test]
+    fn a_table_operation_takes_the_next_timestamp() {
+        let first = TableOperation::new(Operation::Delete(1));
+        let second = TableOperation::new(Operation::Delete(2));
+        assert!(second.timestamp > first.timestamp);
+        assert_eq!(first.get_rid(), 1);
+        assert!(first.is_delete() && !first.is_insert() && !first.is_update());
+    }
 
     #[test]
     fn test_operation_get_rid_for_all_variants() {

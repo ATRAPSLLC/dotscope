@@ -84,11 +84,11 @@
 //!
 //! # fn example(mut resolver: TypeResolver) -> dotscope::Result<()> {
 //! // Create array signature: int[]
-//! let array_sig = TypeSignature::Array(Box::new(ArraySpecification {
-//!     base: TypeSignature::I4,
+//! let array_sig = TypeSignature::Array(SignatureArray {
+//!     base: Box::new(TypeSignature::I4),
 //!     rank: 1,
-//!     dimensions: ArrayDimensions::default(),
-//! }));
+//!     dimensions: vec![ArrayDimensions::default()],
+//! });
 //!
 //! let array_type = resolver.resolve(&array_sig)?;
 //! assert_eq!(array_type.name, "Int32[]");
@@ -144,7 +144,7 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        signatures::{SignatureMethod, SignatureMethodSpec, TypeSignature},
+        signatures::{SignatureArray, SignatureMethod, SignatureMethodSpec, TypeSignature},
         tables::MethodSpec,
         token::Token,
         typesystem::{
@@ -459,11 +459,11 @@ impl TypeResolver {
     /// let class_type = resolver.resolve(&class_sig)?;
     ///
     /// // Resolve array type
-    /// let array_sig = TypeSignature::Array(Box::new(ArraySpecification {
-    ///     base: TypeSignature::I4,
+    /// let array_sig = TypeSignature::Array(SignatureArray {
+    ///     base: Box::new(TypeSignature::I4),
     ///     rank: 1,
-    ///     dimensions: ArrayDimensions::default(),
-    /// }));
+    ///     dimensions: vec![ArrayDimensions::default()],
+    /// });
     /// let array_type = resolver.resolve(&array_sig)?;
     /// # Ok(())
     /// # }
@@ -622,14 +622,14 @@ impl TypeResolver {
                     dimensions: array.dimensions.clone(),
                 };
 
-                // Create array name: ElementName[,] for multi-dimensional arrays
+                // As the runtime names a general array: `ElementName[*]` at rank 1, which is
+                // not the vector `ElementName[]`, and `ElementName[,]` at rank 2
                 let namespace = element_type.namespace.clone();
-                let name = if array.rank == 1 {
-                    format!("{}[]", element_type.name)
-                } else {
-                    let commas = (array.rank as usize).saturating_sub(1);
-                    format!("{}[{}]", element_type.name, ",".repeat(commas))
-                };
+                let name = format!(
+                    "{}[{}]",
+                    element_type.name,
+                    SignatureArray::rank_bounds(array.rank)
+                );
 
                 let array_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                     token_init: token_init.take(),
@@ -1012,6 +1012,19 @@ mod tests {
         assert_eq!(int_2d_array.name, "Int32[,]");
 
         assert_ne!(int_array.token, int_2d_array.token);
+
+        // A rank-1 general array (`int32[1...]`) is not the vector, by name or by flavor.
+        let based_sig = TypeSignature::Array(SignatureArray {
+            rank: 1,
+            dimensions: vec![ArrayDimensions {
+                size: None,
+                lower_bound: Some(1),
+            }],
+            base: Box::new(TypeSignature::I4),
+        });
+        let based = resolver.resolve(&based_sig).unwrap();
+        assert_eq!(based.name, "Int32[*]");
+        assert_ne!(*int_array.flavor(), *based.flavor());
 
         let int_3d_array_sig = TypeSignature::Array(SignatureArray {
             rank: 3,

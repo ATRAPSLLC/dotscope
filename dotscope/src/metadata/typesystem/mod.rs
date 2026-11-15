@@ -69,6 +69,7 @@ use crate::{
         method::{MethodRc, MethodRefList},
         query::{FieldQuery, MethodQuery},
         security::Security,
+        signatures::TypeSignature,
         tables::{
             EventList, FieldAttributes, FieldList, FieldRc, GenericParamList, InterfaceEntryList,
             MethodSpec, MethodSpecList, PropertyList, TableId, TypeAttributes,
@@ -349,7 +350,7 @@ impl CilType {
     ///
     /// # fn example(cil_type: &CilType, base_type: Arc<CilType>) {
     /// let base_ref = CilTypeRef::new(&base_type);
-    /// match cil_type.set_base(base_ref) {
+    /// match cil_type.set_base(&base_ref) {
     ///     Ok(()) => println!("Base type set successfully"),
     ///     Err(_) => println!("Base type was already set"),
     /// }
@@ -1009,10 +1010,15 @@ impl CilType {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let types = assembly.types();
+    /// # let entry = types.iter().next().expect("the sample has types");
+    /// # let cil_type = entry.value();
     /// if cil_type.is_public() {
     ///     println!("Type {} is publicly accessible", cil_type.name);
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_public(&self) -> bool {
         self.flags.is_public()
@@ -1069,6 +1075,22 @@ impl CilType {
             .is_some_and(|b| &*b.fullname() == wellknown::names::ENUM)
     }
 
+    /// Returns an enum's underlying type: the type of its one instance field
+    /// (ECMA-335 II.14.3), whatever the field is named. Compilers name it
+    /// `value__`; a renaming obfuscator need not keep that.
+    ///
+    /// Read off the type as it stands, without checking that it is an enum: a
+    /// type known by a reference may not show its base, and a caller asks this
+    /// of a type it has found to be one ([`Self::is_enum`], or the registry's
+    /// view of its inheritance). `None` for a type with no instance field.
+    #[must_use]
+    pub fn enum_underlying(&self) -> Option<&TypeSignature> {
+        self.fields
+            .iter()
+            .find(|(_, field)| !field.flags.is_static())
+            .map(|(_, field)| &field.signature.base)
+    }
+
     /// Returns true if this type is a delegate (inherits from `System.Delegate` or `System.MulticastDelegate`).
     #[must_use]
     pub fn is_delegate(&self) -> bool {
@@ -1082,10 +1104,17 @@ impl CilType {
     ///
     /// This handles the weak-ref upgrade boilerplate automatically,
     /// replacing the common pattern:
-    /// ```no_run
+    /// ```
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let types = assembly.types();
+    /// # let entry = types.iter().next().expect("the sample has types");
+    /// # let type_info = entry.value();
     /// for (_, method_ref) in type_info.methods.iter() {
-    ///     if let Some(method) = method_ref.upgrade() { ... }
+    ///     if let Some(method) = method_ref.upgrade() {
+    ///         println!("{}", method.name);
+    ///     }
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn query_methods(&self) -> MethodQuery<'_> {
         MethodQuery::from_type(&self.methods)
@@ -1094,9 +1123,14 @@ impl CilType {
     /// Returns a composable query over fields defined in this type.
     ///
     /// This provides a fluent API mirroring [`query_methods()`](Self::query_methods):
-    /// ```no_run
+    /// ```
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let types = assembly.types();
+    /// # let entry = types.iter().next().expect("the sample has types");
+    /// # let type_info = entry.value();
     /// let static_fields = type_info.query_fields().static_fields().find_all();
     /// let value_field = type_info.query_fields().instance_fields().name("value__").find_first();
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn query_fields(&self) -> FieldQuery<'_> {
         FieldQuery::from_type(&self.fields)

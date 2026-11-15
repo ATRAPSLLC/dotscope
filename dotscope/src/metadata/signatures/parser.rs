@@ -200,9 +200,10 @@ const MAX_NATIVE_RECURSION_DEPTH: usize = 64;
 
 /// Maximum number of array dimensions allowed in a signature.
 ///
-/// .NET supports multi-dimensional arrays, but reasonable limits prevent memory exhaustion
-/// attacks. 32 dimensions is far beyond any practical use case.
-const MAX_ARRAY_DIMENSIONS: u32 = 32;
+/// The runtime's largest rank (CoreCLR's `MAX_RANK`): no array has more, and a signature's
+/// rank sizes what is read and spelled after it, so a larger one is refused as malformed
+/// rather than allocated against.
+pub(crate) const MAX_ARRAY_DIMENSIONS: u32 = 32;
 
 /// Maximum number of local variables in a method: locals are numbered by an unsigned 16-bit
 /// index (ECMA-335 III.3.43). The declared count is refused past it before anything is
@@ -648,12 +649,18 @@ impl<'a> SignatureParser<'a> {
     ///
     /// # Errors
     ///
-    /// When the shape is truncated, the rank exceeds [`MAX_ARRAY_DIMENSIONS`] (the runtime's
-    /// largest), or more sizes or lower bounds are given than the rank has dimensions.
+    /// When the shape is truncated, the rank is zero (II.23.2.13 states one or more) or exceeds
+    /// [`MAX_ARRAY_DIMENSIONS`] (the runtime's largest), or more sizes or lower bounds are given
+    /// than the rank has dimensions.
     fn parse_array_shape(&mut self) -> Result<(u32, Vec<ArrayDimensions>)> {
         // `rank` is bounded here and not merely stored: it bounds the size and lower-bound
         // counts below, before anything is allocated against them
         let rank = self.parser.read_compressed_uint()?;
+        if rank == 0 {
+            return Err(malformed_error!(
+                "Array signature has no dimensions: rank 0"
+            ));
+        }
         if rank > MAX_ARRAY_DIMENSIONS {
             return Err(malformed_error!(
                 "Array signature has too many dimensions: rank {} (max: {})",
@@ -662,11 +669,11 @@ impl<'a> SignatureParser<'a> {
             ));
         }
         let num_sizes = self.parser.read_compressed_uint()?;
-        if num_sizes > MAX_ARRAY_DIMENSIONS {
+        if num_sizes > rank {
             return Err(malformed_error!(
-                "Array signature has too many dimensions: {} (max: {})",
+                "Array signature has more sizes ({}) than dimensions (rank {})",
                 num_sizes,
-                MAX_ARRAY_DIMENSIONS
+                rank
             ));
         }
         let mut dimensions: Vec<ArrayDimensions> = Vec::with_capacity(num_sizes as usize);
@@ -2045,6 +2052,51 @@ mod tests {
             parser.parse_type().is_err(),
             "an array rank above MAX_ARRAY_DIMENSIONS must be rejected"
         );
+
+        // A rank of zero states no array: II.23.2.13 requires one dimension or more.
+        let mut parser = SignatureParser::new(&[
+            0x14, // ARRAY
+            0x08, // I4 (element type)
+            0x00, // rank 0
+            0x00, // num_sizes 0
+            0x00, // num_lo_bounds 0
+        ]);
+        assert!(
+            parser.parse_type().is_err(),
+            "an array of rank 0 must be rejected"
+        );
+
+        // A size for a dimension the rank does not have is refused, as a lower bound is.
+        let mut parser = SignatureParser::new(&[
+            0x14, // ARRAY
+            0x08, // I4 (element type)
+            0x01, // rank 1
+            0x02, // num_sizes 2
+            0x02, // size 2
+            0x03, // size 3
+            0x00, // num_lo_bounds 0
+        ]);
+        assert!(
+            parser.parse_type().is_err(),
+            "more sizes than the rank has dimensions must be rejected"
+        );
+
+        // A rank-1 general array counted from 1 (`int32[1...]`) is an array, not a vector.
+        let mut parser = SignatureParser::new(&[
+            0x14, // ARRAY
+            0x08, // I4 (element type)
+            0x01, // rank 1
+            0x00, // num_sizes 0
+            0x01, // num_lo_bounds 1
+            0x02, // lower bound 1, a signed compressed int
+        ]);
+        let result = parser.parse_type().unwrap();
+        let TypeSignature::Array(array) = &result else {
+            panic!("an ARRAY of rank 1 is an array: {result:?}");
+        };
+        assert_eq!(array.rank, 1);
+        assert_eq!(array.dimensions.len(), 1);
+        assert_eq!(array.dimensions[0].lower_bound, Some(1));
 
         // Multi-dimensional array int[2,3] with rank 2, with sizes
         let mut parser = SignatureParser::new(&[

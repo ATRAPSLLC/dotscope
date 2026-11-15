@@ -99,14 +99,10 @@ impl EnumUtils {
     /// (`IntPtr`, `UIntPtr`) is as wide as the target's pointers, which the type does not
     /// say, and no custom attribute can hold one (II.23.3), so it is 0 as well.
     pub fn get_enum_underlying_type_size(type_ref: &CilTypeRc) -> usize {
-        let Some((_, field)) = type_ref
-            .fields
-            .iter()
-            .find(|(_, field)| !field.flags.is_static())
-        else {
+        let Some(underlying) = type_ref.enum_underlying() else {
             return 0;
         };
-        match &field.signature.base {
+        match underlying {
             TypeSignature::I1 | TypeSignature::U1 | TypeSignature::Boolean => 1,
             TypeSignature::I2 | TypeSignature::U2 | TypeSignature::Char => 2,
             TypeSignature::I4 | TypeSignature::U4 | TypeSignature::R4 => 4,
