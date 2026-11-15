@@ -7,7 +7,7 @@
 //!
 //! # Algorithm
 //!
-//! 1. Scan the method for `Call`/`CallVirt` instructions matching the sentinel patterns
+//! 1. Scan the method for calls of methods matching the sentinel patterns
 //! 2. Check the [`SentinelCondition`] - skip the method if sentinel co-occurrence
 //!    requirements are not met
 //! 3. Run forward-only taint analysis from matched sentinel tokens
@@ -54,9 +54,12 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use analyssa::ir::function::{SsaEditOptions, SsaRollbackPolicy};
+
 use crate::{
     analysis::{
-        CilTarget, MethodRef, PhiTaintMode, SsaFunction, SsaOp, TaintConfig, TokenTaintBuilder,
+        CilTarget, MethodRef, PhiTaintMode, SsaFunction, SsaOp, SsaOpCilExt, TaintConfig,
+        TokenTaintBuilder,
     },
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     deobfuscation::utils::resolve_qualified_method_name,
@@ -170,6 +173,10 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
         ModificationScope::CfgModifying
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn should_run(&self, method: &MethodRef, _host: &CompilerContext) -> bool {
         self.target_methods.is_empty() || self.target_methods.contains(&method.0)
     }
@@ -207,9 +214,8 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
                 forward: true,
                 backward: false,
                 phi_mode: PhiTaintMode::NoPropagation,
-                max_iterations: 100,
             })
-            .analyze(ssa);
+            .analyze(ssa, &host.budget());
         if taint.tainted_instr_count() == 0 {
             return Ok(false);
         }
@@ -279,44 +285,62 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
             }
         }
 
-        // Step 4: Apply mutations.
+        // Step 4: Apply the removals in one edit session. The tainted phis go
+        // first and the terminators last: folding a branch can strand a block,
+        // whose phis then become copies at its head, which would move both the
+        // phis and the instructions the plan names by index. A fold only removes
+        // an edge, and `fold_terminator_pruning_phis` repairs that by pruning
+        // the dropped successor's operand, so the session needs no value
+        // reconstruction.
         let mut neutralized = 0usize;
-
-        for &(block_idx, instr_idx) in &removable_instrs {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(instr) = block.instruction_mut(instr_idx) {
-                    // Record metadata tokens before neutralizing
-                    match instr.op() {
-                        SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => {
-                            ctx.neutralized_tokens.insert(method.token());
-                        }
-                        _ => {}
+        let mut neutralized_tokens: Vec<Token> = Vec::new();
+        ssa.edit(
+            SsaEditOptions::new().with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                for &(block_idx, phi_idx) in removable_phis.iter().rev() {
+                    let present = editor
+                        .function()
+                        .block(block_idx)
+                        .is_some_and(|block| phi_idx < block.phi_nodes().len());
+                    if present {
+                        editor.remove_phi(block_idx, phi_idx)?;
+                        neutralized = neutralized.saturating_add(1);
                     }
-
+                }
+                let mut folds: Vec<(usize, usize)> = Vec::new();
+                for &(block_idx, instr_idx) in &removable_instrs {
+                    let Some(instr) = editor
+                        .function()
+                        .block(block_idx)
+                        .and_then(|block| block.instruction(instr_idx))
+                    else {
+                        continue;
+                    };
+                    // Record metadata tokens before neutralizing
+                    if let Some((method_token, _)) = instr.op().method_call() {
+                        neutralized_tokens.push(method_token);
+                    }
                     if instr.is_terminator() {
                         if let Some(&(_, _, target)) = branch_redirects
                             .iter()
                             .find(|&&(bi, ii, _)| bi == block_idx && ii == instr_idx)
                         {
-                            instr.set_op(SsaOp::Jump { target });
-                            neutralized = neutralized.saturating_add(1);
+                            folds.push((block_idx, target));
                         }
                     } else {
-                        instr.set_op(SsaOp::Nop);
+                        editor.nop_instruction(block_idx, instr_idx)?;
                         neutralized = neutralized.saturating_add(1);
                     }
                 }
-            }
-        }
-
-        // Step 5: Remove tainted PHI nodes (reverse order for safe removal).
-        for &(block_idx, phi_idx) in removable_phis.iter().rev() {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if phi_idx < block.phi_nodes().len() {
-                    block.phi_nodes_mut().remove(phi_idx);
+                for (block_idx, target) in folds {
+                    editor.fold_terminator_pruning_phis(block_idx, SsaOp::Jump { target })?;
                     neutralized = neutralized.saturating_add(1);
                 }
-            }
+                Ok(())
+            },
+        )?;
+        for token in neutralized_tokens {
+            ctx.neutralized_tokens.insert(token);
         }
 
         if neutralized > 0 {
@@ -335,7 +359,7 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
 
 /// Finds metadata tokens of sentinel API calls within a method's SSA.
 ///
-/// Scans all `Call`/`CallVirt` instructions and checks whether the resolved
+/// Scans all calls naming their method and checks whether the resolved
 /// method name contains any of the sentinel patterns.
 ///
 /// # Arguments
@@ -359,9 +383,8 @@ fn find_sentinel_tokens(
 
     for block in ssa.blocks() {
         for instr in block.instructions() {
-            let method_token = match instr.op() {
-                SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => method.token(),
-                _ => continue,
+            let Some((method_token, _)) = instr.op().method_call() else {
+                continue;
             };
 
             if let Some(name) = resolve_qualified_method_name(assembly, method_token) {
@@ -422,7 +445,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        analysis::{CallGraph, SsaFunctionBuilder, SsaType},
+        analysis::{CallGraph, Callee, SsaFunctionBuilder, SsaType},
         testkit::{helpers::test_assembly_arc, passes::run_verified},
     };
 
@@ -447,7 +470,7 @@ mod tests {
     /// A tainted `ret` stays, so the value it returns keeps its definition.
     #[test]
     fn a_tainted_return_keeps_the_value_it_returns() {
-        let sentinel = MethodRef::new(Token::new(0x0A00_0001));
+        let sentinel = Callee::Direct(MethodRef::new(Token::new(0x0A00_0001)));
         let mut ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
@@ -459,12 +482,12 @@ mod tests {
         run(&mut ssa);
         let instructions = ssa.block(0).unwrap().instructions();
         assert!(
-            matches!(instructions[0].op(), SsaOp::Call { .. }),
+            matches!(instructions[0].op(), SsaOp::Call(_)),
             "the returned value is still defined"
         );
         assert!(matches!(
             instructions[1].op(),
-            SsaOp::Return { value: Some(_) }
+            SsaOp::Return { value: Some(_), .. }
         ));
     }
 
@@ -472,7 +495,7 @@ mod tests {
     /// definition in it has to be kept because a phi past the branch reads it.
     #[test]
     fn a_kept_definition_does_not_make_its_arm_clean() {
-        let sentinel = MethodRef::new(Token::new(0x0A00_0001));
+        let sentinel = Callee::Direct(MethodRef::new(Token::new(0x0A00_0001)));
         let mut ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 let mut flag = None;

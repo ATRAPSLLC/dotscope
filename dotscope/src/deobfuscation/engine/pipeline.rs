@@ -14,7 +14,7 @@ use analyssa::scheduling::{run_pass_with_repair, PassEnv, SsaPass as AnalyssaSsa
 use log::{debug, info, warn};
 
 use crate::{
-    analysis::{CilTarget, MethodRef},
+    analysis::{Budget, CilTarget, MethodRef},
     cilassembly::{expand_type_tokens, CleanupRequest},
     compiler::{CompilerContext, DeadMethodEliminationPass, EventLog, PassScheduler},
     deobfuscation::{
@@ -468,7 +468,7 @@ impl<'a> PipelineRun<'a> {
     ) -> Result<()> {
         info!(
             "Running SSA fixpoint (max {} inner iterations, max {} outer iterations)",
-            self.engine.config.iterations.max_ssa_iterations,
+            self.engine.config.budget.limit(Budget::PipelineRounds),
             self.engine.config.iterations.max_outer_iterations
         );
         let mut detection_round = 0;

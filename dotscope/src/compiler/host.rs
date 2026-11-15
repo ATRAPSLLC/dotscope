@@ -13,12 +13,12 @@
 use std::sync::Arc;
 
 use analyssa::{
+    analysis::{Machine, WorkBudget},
     events::EventListener,
     host::{DirtySet, SsaStore},
     ir::function::SsaFunction,
     scheduling::SsaPassHost,
     world::World,
-    PointerSize,
 };
 
 use crate::{
@@ -149,14 +149,17 @@ impl SsaPassHost<CilTarget> for CompilerContext {
         &self.events
     }
 
-    fn ptr_size(&self) -> PointerSize {
-        // If the assembly is set, derive from its PE header. Test
-        // contexts without an assembly default to 64-bit (matches the
-        // existing dotscope default in `analysis::ssa::CilTarget::x64()`).
-        match self.assembly() {
-            Some(asm) => PointerSize::from_is_64bit(asm.file().pe().is_64bit),
-            None => PointerSize::Bit64,
-        }
+    fn budget(&self) -> WorkBudget {
+        Self::budget(self)
+    }
+
+    fn machine(&self) -> Machine {
+        // If the assembly is set, its PE header states the pointer width. Test
+        // contexts without an assembly take the 64-bit target, dotscope's
+        // default (`CilTarget::x64`).
+        self.assembly()
+            .map_or_else(CilTarget::x64, |assembly| CilTarget::of(&assembly))
+            .machine()
     }
 }
 

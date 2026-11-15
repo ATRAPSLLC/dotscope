@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use analyssa::analysis::WorkBudget;
 use crossbeam_skiplist::SkipSet;
 use dashmap::{DashMap, DashSet};
 use rayon::prelude::*;
@@ -78,7 +79,7 @@ pub struct CompilerContext {
     /// delegate's Invoke dispatch, never called directly.
     pub devirtualized_methods: DashSet<Token>,
 
-    /// Metadata tokens neutralized by SSA passes (Call/CallVirt targets that were
+    /// Metadata tokens neutralized by SSA passes (methods of calls that were
     /// NOP'd or replaced). Used by cleanup to cascade-remove orphaned MemberRef,
     /// TypeRef, and AssemblyRef entries that are no longer referenced.
     pub neutralized_tokens: DashSet<Token>,
@@ -99,6 +100,9 @@ pub struct CompilerContext {
 
     /// When analysis started.
     start_time: Instant,
+
+    /// The work budget the passes' analyses run within.
+    budget: WorkBudget,
 }
 
 impl CompilerContext {
@@ -121,7 +125,22 @@ impl CompilerContext {
             assembly_slot: RwLock::new(None),
             processing_state: ProcessingState::new(),
             start_time: Instant::now(),
+            budget: WorkBudget::DEFAULT,
         }
+    }
+
+    /// Returns this context with `budget` as the work budget its passes'
+    /// analyses run within.
+    #[must_use]
+    pub fn with_budget(mut self, budget: WorkBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Returns the work budget the passes' analyses run within.
+    #[must_use]
+    pub const fn budget(&self) -> WorkBudget {
+        self.budget
     }
 
     /// Sets the assembly under analysis. Idempotent; the pipeline calls
@@ -468,7 +487,7 @@ impl CompilerContext {
 
     /// Builds a live call graph from actual SSA instructions.
     ///
-    /// Scans all SSA functions for `Call`, `CallVirt`, `NewObj`,
+    /// Scans all SSA functions for the calls that name a method, `NewObj`,
     /// `LoadFunctionPtr`, and `LoadVirtFunctionPtr` instructions and records
     /// the caller → callee edges. This accounts for inlining and other
     /// transformations that may have removed or added calls since the
@@ -496,9 +515,12 @@ impl CompilerContext {
             for block in ssa.blocks() {
                 for instr in block.instructions() {
                     match instr.op() {
-                        SsaOp::Call { method, .. }
-                        | SsaOp::CallVirt { method, .. }
-                        | SsaOp::LoadFunctionPtr { method, .. }
+                        SsaOp::Call(call) => {
+                            if let Some(method) = call.callee.method() {
+                                callees.insert(method.token());
+                            }
+                        }
+                        SsaOp::LoadFunctionPtr { method, .. }
                         | SsaOp::LoadVirtFunctionPtr { method, .. } => {
                             callees.insert(method.token());
                         }

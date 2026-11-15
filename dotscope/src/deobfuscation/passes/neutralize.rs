@@ -35,6 +35,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use analyssa::{
+    analysis::WorkBudget,
     events::Event,
     ir::function::SsaEditOptions,
     scheduling::{FunctionPass, PassEnv},
@@ -261,17 +262,18 @@ impl<'a> NeutralizationPass<'a> {
     /// # Arguments
     ///
     /// * `ssa` - The SSA function to neutralize. Modified in place.
+    /// * `budget` - The work budget the taint propagation runs under.
     ///
     /// # Returns
     ///
     /// The number of elements neutralized (instructions + PHIs + branch conversions).
-    fn neutralize_method(&self, ssa: &mut SsaFunction) -> usize {
+    fn neutralize_method(&self, ssa: &mut SsaFunction, budget: &WorkBudget) -> usize {
         if self.removed_tokens.is_empty() {
             return 0;
         }
 
         // Run taint analysis to find all instructions dependent on removed tokens
-        let taint = find_token_dependencies(ssa, self.removed_tokens.iter().copied());
+        let taint = find_token_dependencies(ssa, self.removed_tokens.iter().copied(), budget);
         if taint.tainted_instr_count() == 0 && taint.tainted_phis().is_empty() {
             return 0;
         }
@@ -448,7 +450,7 @@ impl FunctionPass<CilTarget> for NeutralizationPass<'_> {
     }
 
     fn run(&self, ssa: &mut SsaFunction, env: &PassEnv<'_, CilTarget>) -> analyssa::Result<bool> {
-        let neutralized = self.neutralize_method(ssa);
+        let neutralized = self.neutralize_method(ssa, env.context().budget());
 
         if neutralized > 0 {
             // Pushed rather than built through the fluent recorder: an
@@ -475,7 +477,8 @@ mod tests {
 
     use crate::{
         analysis::{
-            ConstValue, MethodRef, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId,
+            CallData, Callee, ConstValue, MethodRef, SsaBlock, SsaFunction, SsaInstruction, SsaOp,
+            SsaType, SsaVarId, WorkBudget,
         },
         deobfuscation::passes::NeutralizationPass,
         metadata::token::Token,
@@ -512,12 +515,9 @@ mod tests {
         let method_ref = MethodRef::new(method_token);
 
         b0.add_instruction(
-            SsaInstruction::synthetic(SsaOp::Call {
-                dest: Some(v1),
-                method: method_ref,
-                args: vec![],
-                effects: None,
-            })
+            SsaInstruction::synthetic(
+                CallData::new(Some(v1), Callee::Direct(method_ref), vec![]).into(),
+            )
             .with_result_type(SsaType::I32),
         );
 
@@ -528,7 +528,7 @@ mod tests {
             flags: None,
         }));
 
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
 
         ssa.add_block(b0);
 
@@ -543,7 +543,7 @@ mod tests {
         removed.insert(method_token);
 
         let pass = NeutralizationPass::new(&removed);
-        let count = pass.neutralize_method(&mut ssa);
+        let count = pass.neutralize_method(&mut ssa, &WorkBudget::DEFAULT);
 
         // Should have neutralized the call and the add (which depends on call result)
         // The const and return should remain (const is independent, return is terminator)
@@ -586,19 +586,20 @@ mod tests {
             .unwrap()
             .instruction_mut(3)
             .unwrap()
-            .set_op(SsaOp::Return { value: Some(v2) });
+            .set_op(SsaOp::returns(Some(v2)));
 
         let mut removed = HashSet::new();
         removed.insert(method_token);
 
-        let count = NeutralizationPass::new(&removed).neutralize_method(&mut ssa);
+        let count =
+            NeutralizationPass::new(&removed).neutralize_method(&mut ssa, &WorkBudget::DEFAULT);
 
         assert_eq!(
             count, 0,
             "nothing may be removed while a surviving `ret` reads it"
         );
         let block = ssa.block(0).unwrap();
-        assert!(matches!(block.instructions()[1].op(), SsaOp::Call { .. }));
+        assert!(matches!(block.instructions()[1].op(), SsaOp::Call(_)));
         assert!(matches!(block.instructions()[2].op(), SsaOp::Add { .. }));
     }
 
@@ -611,7 +612,7 @@ mod tests {
         removed.insert(field_token);
 
         let pass = NeutralizationPass::new(&removed);
-        let count = pass.neutralize_method(&mut ssa);
+        let count = pass.neutralize_method(&mut ssa, &WorkBudget::DEFAULT);
 
         // Nothing should be neutralized
         assert_eq!(count, 0);

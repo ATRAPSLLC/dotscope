@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 #[cfg(feature = "smart-rename")]
 use dotscope::deobfuscation::SmartRenameConfig;
-use dotscope::deobfuscation::{
-    CleanupConfig, DeobfuscationEngine, DeobfuscationResult, EngineConfig,
+use dotscope::{
+    analysis::Budget,
+    deobfuscation::{CleanupConfig, DeobfuscationEngine, DeobfuscationResult, EngineConfig},
 };
 use log::info;
 use serde::Serialize;
@@ -231,10 +232,10 @@ fn build_config(opts: &DeobfuscateOptions) -> EngineConfig {
     };
 
     if let Some(iters) = opts.max_iterations {
-        config.iterations.max_ssa_iterations = iters;
+        config.budget = config.budget.with_limit(Budget::PipelineRounds, iters);
     }
     if let Some(instrs) = opts.max_instructions {
-        config.emulation.max_instructions = instrs;
+        config.emulation.limits.max_instructions = instrs;
     }
     if opts.no_cleanup {
         config.cleanup = CleanupConfig::disabled();

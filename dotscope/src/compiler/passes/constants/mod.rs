@@ -36,23 +36,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use analyssa::{
-    analysis::consts::{destination_width, evaluate_const_op},
-    ir::MethodDispatch,
+    analysis::{Budget, Machine, Rounds},
+    events::{Event, EventListener},
     passes::utils::resolve_chains,
+    scheduling::SsaPassHost,
     BitSet,
 };
 
 use crate::{
     analysis::{
-        simplify_op, CallResolver, CilTarget, ConstValue, ConstValueCilExt, ConstantPropagation,
-        LoopAnalyzer, MethodPurity, MethodRef, SccpResult, SimplifyResult, SsaCfg, SsaEvaluator,
-        SsaFunction, SsaOp, SsaType, SsaVarId,
+        simplify_op, CallResolver, Callee, CilTarget, ConstValue, ConstValueCilExt,
+        ConstantPropagation, LoopAnalyzer, MethodPurity, MethodRef, SccpResult, SimplifyResult,
+        SsaCfg, SsaEvaluator, SsaFunction, SsaOp, SsaType, SsaVarId,
     },
     compiler::{
         pass::{ModificationScope, SsaPass},
         CompilerContext, EventKind, EventLog,
     },
-    metadata::{tables::TableId, token::Token, typesystem::PointerSize},
+    metadata::{tables::TableId, token::Token},
     CilObject,
 };
 
@@ -134,24 +135,13 @@ enum StringFoldOp {
 /// Constant propagation and folding pass.
 ///
 /// This pass combines the SCCP analysis with additional optimizations
-/// for identity operations, absorbing elements, and type conversions.
-pub struct ConstantPropagationPass {
-    /// Maximum fixpoint iterations before stopping.
-    max_iterations: usize,
-}
+/// for identity operations, absorbing elements, and type conversions, folded
+/// as many rounds as the host's
+/// [`Budget::FoldRounds`](analyssa::analysis::Budget::FoldRounds) allows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConstantPropagationPass;
 
 impl ConstantPropagationPass {
-    /// Creates a new constant propagation pass.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_iterations` - Maximum fixpoint iterations for the internal optimization
-    ///   loop (SCCP + algebraic simplification). The default config value is 10.
-    #[must_use]
-    pub fn new(max_iterations: usize) -> Self {
-        Self { max_iterations }
-    }
-
     /// Runs the constant propagation pass on an SSA function.
     ///
     /// This uses the existing SCCP analysis and applies additional optimizations.
@@ -161,8 +151,9 @@ impl ConstantPropagationPass {
     /// * `ssa` - The SSA function to analyze and transform.
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
-    /// * `ptr_size` - Pointer size for the target architecture.
-    /// * `max_iterations` - Maximum fixpoint iterations for the optimization loop.
+    /// * `machine` - The machine the method computes on.
+    /// * `rounds` - The folding rounds the host's budget allows, which this
+    ///   takes until a round folds nothing new.
     ///
     /// # Returns
     ///
@@ -171,8 +162,8 @@ impl ConstantPropagationPass {
         ssa: &mut SsaFunction,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
-        max_iterations: usize,
+        machine: Machine,
+        rounds: &mut Rounds,
         assembly: &CilObject,
         resolver: &CallResolver,
     ) -> BTreeMap<SsaVarId, ConstValue> {
@@ -193,7 +184,7 @@ impl ConstantPropagationPass {
         // unreachable, and every value defined in one would be left Top and
         // folded as if it were a constant nobody wrote.
         let cfg = SsaCfg::from_ssa(ssa);
-        let mut sccp = ConstantPropagation::new(ptr_size);
+        let mut sccp = ConstantPropagation::new(machine);
         let mut sccp_result = sccp.analyze(ssa, &cfg);
 
         // Collect constants from SCCP result
@@ -215,12 +206,12 @@ impl ConstantPropagationPass {
             changes,
             assembly,
             resolver,
-            ptr_size,
+            machine,
         );
         if constants.len() > pre_fold_count {
             ssa.recompute_uses();
             let cfg = SsaCfg::from_ssa(ssa);
-            let mut sccp2 = ConstantPropagation::new(ptr_size);
+            let mut sccp2 = ConstantPropagation::new(machine);
             let sccp_result2 = sccp2.analyze(ssa, &cfg);
             for (var, c) in sccp_result2.constants() {
                 constants.entry(var).or_insert_with(|| c.clone());
@@ -230,7 +221,7 @@ impl ConstantPropagationPass {
         }
 
         // Apply additional optimizations iteratively
-        for _ in 0..max_iterations {
+        while rounds.next_round() {
             let prev_count = constants.len();
 
             // Run identity and absorbing element optimizations
@@ -240,20 +231,20 @@ impl ConstantPropagationPass {
             Self::simplify_involutory_ops(ssa, method_token, changes);
 
             // Run conversion folding
-            Self::fold_conversions(ssa, &mut constants, method_token, changes, ptr_size);
+            Self::fold_conversions(ssa, &mut constants, method_token, changes, machine);
 
             // Eliminate redundant conversions
             Self::eliminate_redundant_conversions(ssa, method_token, changes);
 
             // Run overflow-checked operation folding
-            Self::fold_overflow_checked_ops(ssa, &mut constants, method_token, changes, ptr_size);
+            Self::fold_overflow_checked_ops(ssa, &mut constants, method_token, changes, machine);
 
             // Run string operation folding (Concat, Substring, Replace, etc.)
             Self::fold_string_operations(ssa, &mut constants, method_token, changes, assembly);
 
             // If no new constants discovered, we're done
             if constants.len() == prev_count {
-                break;
+                rounds.settle();
             }
         }
 
@@ -267,7 +258,7 @@ impl ConstantPropagationPass {
             &sccp_result,
             method_token,
             changes,
-            ptr_size,
+            machine,
         );
 
         constants
@@ -395,7 +386,7 @@ impl ConstantPropagationPass {
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) {
         let mut new_constants: Vec<(SsaVarId, ConstValue, usize, usize)> = Vec::new();
 
@@ -411,7 +402,7 @@ impl ConstantPropagationPass {
                 } = instr.op()
                 {
                     if let Some(operand_val) = constants.get(operand) {
-                        let ptr_bytes = ptr_size.bytes() as u32;
+                        let ptr_bytes = machine.ptr_size.bytes() as u32;
                         let result = if *overflow_check {
                             operand_val.convert_to_checked(target, *unsigned, ptr_bytes)
                         } else {
@@ -767,14 +758,13 @@ impl ConstantPropagationPass {
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) {
         let mut new_constants: Vec<(SsaVarId, ConstValue, usize, usize)> = Vec::new();
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let Some((dest, value)) =
-                    Self::check_overflow_op(instr.op(), constants, ptr_size)
+                if let Some((dest, value)) = Self::check_overflow_op(instr.op(), constants, machine)
                 {
                     new_constants.push((dest, value, block_idx, instr_idx));
                 }
@@ -820,7 +810,7 @@ impl ConstantPropagationPass {
     fn check_overflow_op(
         op: &SsaOp,
         constants: &BTreeMap<SsaVarId, ConstValue>,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) -> Option<(SsaVarId, ConstValue)> {
         // No `x * 0 == 0` short-circuit for `MulOvf`: a multiply by zero cannot overflow, so
         // `mul_checked` already folds it. The short-circuit that used to sit here returned the
@@ -836,7 +826,7 @@ impl ConstantPropagationPass {
                 ..
             } => {
                 let (l, r) = (constants.get(left)?, constants.get(right)?);
-                (dest, l.add_checked(r, *unsigned, ptr_size))
+                (dest, l.add_checked(r, *unsigned, machine.ptr_size))
             }
 
             SsaOp::SubOvf {
@@ -847,7 +837,7 @@ impl ConstantPropagationPass {
                 ..
             } => {
                 let (l, r) = (constants.get(left)?, constants.get(right)?);
-                (dest, l.sub_checked(r, *unsigned, ptr_size))
+                (dest, l.sub_checked(r, *unsigned, machine.ptr_size))
             }
 
             SsaOp::MulOvf {
@@ -858,7 +848,7 @@ impl ConstantPropagationPass {
                 ..
             } => {
                 let (l, r) = (constants.get(left)?, constants.get(right)?);
-                (dest, l.mul_checked(r, *unsigned, ptr_size))
+                (dest, l.mul_checked(r, *unsigned, machine.ptr_size))
             }
 
             _ => return None,
@@ -880,23 +870,23 @@ impl ConstantPropagationPass {
         changes: &mut EventLog,
         assembly: &CilObject,
         resolver: &CallResolver,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) {
         let mut replacements: Vec<(usize, usize, SsaVarId, ConstValue)> = Vec::new();
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let Some(call) = instr.op().as_method_call() else {
+                let Some(call) = instr.op().as_named_call() else {
                     continue;
                 };
-                let Some(dest) = call.dest else {
+                let (Some(dest), Some(method)) = (call.dest, call.callee.method()) else {
                     continue;
                 };
-                let (callee_token, args) = (call.method.token(), call.args);
+                let (callee_token, args) = (method.token(), &call.args);
                 // A `callvirt` runs the body it names only where nothing in the
                 // assembly overrides that method - C# emits one for every
                 // instance call, virtual or not.
-                let is_virtual = call.dispatch == MethodDispatch::Virtual;
+                let is_virtual = !matches!(call.callee, Callee::Direct(_));
                 if is_virtual && resolver.is_polymorphic(callee_token) {
                     continue;
                 }
@@ -930,7 +920,7 @@ impl ConstantPropagationPass {
 
                 // Try to evaluate the callee
                 let Some(result) =
-                    Self::evaluate_pure_call(assembly, callee_token, &concrete_args, ptr_size)
+                    Self::evaluate_pure_call(assembly, callee_token, &concrete_args, machine)
                 else {
                     continue;
                 };
@@ -960,7 +950,7 @@ impl ConstantPropagationPass {
         // because SCCP doesn't visit exception handler blocks, so constants from
         // folded x86 calls wouldn't otherwise reach the switch variable.
         if !constants.is_empty() {
-            Self::propagate_folded_arithmetic(ssa, constants, method_token, changes, ptr_size);
+            Self::propagate_folded_arithmetic(ssa, constants, method_token, changes, machine);
         }
     }
 
@@ -968,7 +958,7 @@ impl ConstantPropagationPass {
     ///
     /// After folding pure calls, a `rem` (the `rem.un` of a flattened switch
     /// dispatch) may have both operands constant and not yet be folded. Each
-    /// is folded as SCCP folds it ([`evaluate_const_op`]), so the remainder
+    /// is folded as SCCP folds it ([`Machine::evaluate`]), so the remainder
     /// keeps its operands' width and signedness, and a divisor of zero or
     /// `MIN % -1` stays in place for the runtime to raise.
     fn propagate_folded_arithmetic(
@@ -976,7 +966,7 @@ impl ConstantPropagationPass {
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) {
         let mut new_constants: Vec<(usize, usize, SsaVarId, ConstValue)> = Vec::new();
 
@@ -996,7 +986,7 @@ impl ConstantPropagationPass {
                         .cloned()
                 };
                 if let Some(value) =
-                    evaluate_const_op(op, destination_width(ssa, op), known, ptr_size)
+                    machine.evaluate(op, op.dest().and_then(|dest| ssa.bit_width(dest)), known)
                 {
                     new_constants.push((block_idx, instr_idx, *dest, value));
                 }
@@ -1028,11 +1018,11 @@ impl ConstantPropagationPass {
         assembly: &CilObject,
         callee_token: Token,
         args: &[ConstValue],
-        ptr_size: PointerSize,
+        machine: Machine,
     ) -> Option<ConstValue> {
         let method = assembly.method(&callee_token).ok()?;
         let callee_ssa = method.ssa(assembly).ok()?;
-        Self::evaluate_pure_function(&callee_ssa, args, ptr_size)
+        Self::evaluate_pure_function(&callee_ssa, args, machine)
     }
 
     /// Evaluates `callee` over concrete arguments, when replacing a call to it
@@ -1049,7 +1039,7 @@ impl ConstantPropagationPass {
     ///
     /// * `callee` - The called method's SSA.
     /// * `args` - The call's arguments, all known.
-    /// * `ptr_size` - The target pointer width.
+    /// * `machine` - The machine the method computes on.
     ///
     /// # Returns
     ///
@@ -1058,18 +1048,18 @@ impl ConstantPropagationPass {
     fn evaluate_pure_function(
         callee_ssa: &SsaFunction,
         args: &[ConstValue],
-        ptr_size: PointerSize,
+        machine: Machine,
     ) -> Option<ConstValue> {
         // A callee that may raise is evaluated too: a run that raises does not
         // complete to a return, and is not folded.
         if !matches!(
-            callee_ssa.purity(),
+            callee_ssa.purity(|_| None),
             MethodPurity::Pure | MethodPurity::ReadOnly | MethodPurity::MayThrow
         ) {
             return None;
         }
 
-        let mut eval = SsaEvaluator::new(callee_ssa, ptr_size);
+        let mut eval = SsaEvaluator::new(callee_ssa, machine);
         for (var, value) in callee_ssa.argument_variables().zip(args) {
             eval.set_concrete(var.id(), value.clone());
         }
@@ -1085,6 +1075,7 @@ impl ConstantPropagationPass {
         for instr in last_block.instructions() {
             if let SsaOp::Return {
                 value: Some(ret_var),
+                ..
             } = instr.op()
             {
                 return eval.get_concrete(*ret_var).cloned();
@@ -1096,7 +1087,7 @@ impl ConstantPropagationPass {
 
     /// Folds string method calls with constant arguments into `DecryptedString` constants.
     ///
-    /// Scans all `Call`/`CallVirt` instructions for recognized `System.String` methods
+    /// Scans all calls naming their method for recognized `System.String` methods
     /// (Concat, Substring, Replace, ToLower, ToUpper) where every argument resolves to
     /// a known string constant. Matching calls are replaced with `SsaOp::Const` holding
     /// the folded `ConstValue::DecryptedString`.
@@ -1119,21 +1110,10 @@ impl ConstantPropagationPass {
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let folded = match instr.op() {
-                    SsaOp::Call {
-                        dest: Some(dest),
-                        method,
-                        args,
-                        ..
-                    }
-                    | SsaOp::CallVirt {
-                        dest: Some(dest),
-                        method,
-                        args,
-                        ..
-                    } => Self::try_fold_string_call(*dest, method, args, constants, assembly),
-                    _ => None,
-                };
+                let folded = instr.op().as_named_call().and_then(|call| {
+                    let (dest, method) = (call.dest?, call.callee.method()?);
+                    Self::try_fold_string_call(dest, method, &call.args, constants, assembly)
+                });
                 if let Some((dest, value)) = folded {
                     new_constants.push((dest, value, block_idx, instr_idx));
                 }
@@ -1621,15 +1601,14 @@ impl ConstantPropagationPass {
     /// * `sccp_result` - The SCCP analysis results.
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
-    /// * `ptr_size` - Pointer size for the target architecture, the width of a
-    ///   native integer a branch compares.
+    /// * `machine` - The machine the method computes on.
     fn simplify_control_flow(
         ssa: &mut SsaFunction,
         constants: &BTreeMap<SsaVarId, ConstValue>,
         sccp_result: &SccpResult,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) {
         // One dominator-tree walk answers for every block, and the answer has
         // to be taken before the first rewrite: folding a terminator changes
@@ -1706,7 +1685,11 @@ impl ConstantPropagationPass {
                                 (constants.get(left), constants.get(right))
                             {
                                 if let Some(is_true) = SsaEvaluator::evaluate_comparison(
-                                    left_val, right_val, *cmp, *unsigned, ptr_size,
+                                    left_val,
+                                    right_val,
+                                    *cmp,
+                                    *unsigned,
+                                    machine.ptr_size,
                                 ) {
                                     let target = if is_true { *true_target } else { *false_target };
                                     Some((SsaOp::Jump { target }, target))
@@ -1766,18 +1749,24 @@ impl SsaPass<CilTarget, CompilerContext> for ConstantPropagationPass {
             .ok_or_else(|| analyssa::Error::new("ConstantPropagationPass requires an assembly"))?;
         let method_token = method.0;
         let mut changes = EventLog::new();
-        let ptr_size = PointerSize::from_is_64bit(assembly.file().pe().is_64bit);
+        let machine = host.machine();
 
         // Run constant propagation and transformation
+        let mut rounds = Rounds::new(Budget::FoldRounds, host.budget().limit(Budget::FoldRounds));
         let constants = Self::run_constant_propagation(
             ssa,
             method_token,
             &mut changes,
-            ptr_size,
-            self.max_iterations,
+            machine,
+            &mut rounds,
             &assembly,
             host.call_graph.resolver(),
         );
+        // Reported to the host, not with the changes: running out of rounds is
+        // no change of the function's.
+        if let Some(exhaustion) = rounds.exhausted() {
+            host.events.push(Event::exhausted(Some(method), exhaustion));
+        }
 
         // Record what was proved, on the values it was proved about.
         //

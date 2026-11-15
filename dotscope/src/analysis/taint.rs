@@ -1,7 +1,7 @@
 //! Re-export shim — generic taint analysis lives in
 //! `analyssa::analysis::taint`. This file keeps CIL-specific glue
 //! (`TokenTaintBuilder`, `find_token_dependencies`) that uses
-//! `op.referenced_token()` and the `Token` opaque-id type — both of which
+//! `op.referenced_tokens()` and the `Token` opaque-id type, both of which
 //! analyssa intentionally doesn't see.
 
 use std::collections::HashSet;
@@ -10,6 +10,7 @@ use std::collections::HashSet;
 pub use analyssa::analysis::taint::{
     cff_taint_config, find_blocks_jumping_to, PhiTaintMode, TaintAnalysis, TaintConfig, TaintStats,
 };
+use analyssa::analysis::WorkBudget;
 
 use crate::{
     analysis::{SsaFunction, SsaOpCilExt},
@@ -51,17 +52,21 @@ impl TokenTaintBuilder {
     /// Builds and runs the taint analysis on the given SSA function.
     ///
     /// Finds all instructions that reference the target tokens (via
-    /// `SsaOpCilExt::referenced_token`), marks them as taint sources, and
-    /// propagates to fixpoint.
+    /// `SsaOpCilExt::referenced_tokens`), marks them as taint sources, and
+    /// propagates to fixpoint, or until `budget`'s
+    /// [`Budget::TaintRounds`](analyssa::analysis::Budget::TaintRounds) are
+    /// spent.
     #[must_use]
-    pub fn analyze(self, ssa: &SsaFunction) -> TaintAnalysis {
-        let mut taint = TaintAnalysis::new(self.config);
+    pub fn analyze(self, ssa: &SsaFunction, budget: &WorkBudget) -> TaintAnalysis {
+        let mut taint = TaintAnalysis::new(self.config, budget);
 
         for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
-            if let Some(token) = instr.op().referenced_token() {
-                if self.target_tokens.contains(&token) {
-                    taint.add_tainted_instr(block_idx, instr_idx, ssa);
-                }
+            if instr
+                .op()
+                .referenced_tokens()
+                .any(|token| self.target_tokens.contains(&token))
+            {
+                taint.add_tainted_instr(block_idx, instr_idx, ssa);
             }
         }
 
@@ -79,8 +84,9 @@ impl TokenTaintBuilder {
 pub fn find_token_dependencies(
     ssa: &SsaFunction,
     removed_tokens: impl IntoIterator<Item = Token>,
+    budget: &WorkBudget,
 ) -> TaintAnalysis {
-    TokenTaintBuilder::new(removed_tokens).analyze(ssa)
+    TokenTaintBuilder::new(removed_tokens).analyze(ssa, budget)
 }
 #[cfg(test)]
 mod tests {
@@ -140,7 +146,7 @@ mod tests {
             right: v0,
             flags: None,
         }));
-        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v3) }));
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v3))));
         ssa.add_block(b1);
 
         (ssa, v0, v1, v2, v3)
@@ -192,7 +198,7 @@ mod tests {
         phi.add_operand(PhiOperand::new(v0, 0));
         phi.add_operand(PhiOperand::new(v1, 1));
         b2.add_phi(phi);
-        b2.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v2) }));
+        b2.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v2))));
         ssa.add_block(b2);
 
         (ssa, v0, v1, v2)
@@ -202,7 +208,7 @@ mod tests {
     fn test_forward_propagation() {
         let (ssa, v0, v1, v2, v3) = create_simple_ssa();
 
-        let mut taint = TaintAnalysis::forward_only();
+        let mut taint = TaintAnalysis::new(TaintConfig::forward_only(), &WorkBudget::DEFAULT);
         taint.add_tainted_var(v0);
         taint.propagate(&ssa);
 
@@ -224,7 +230,7 @@ mod tests {
     fn test_backward_propagation() {
         let (ssa, v0, v1, v2, v3) = create_simple_ssa();
 
-        let mut taint = TaintAnalysis::bidirectional();
+        let mut taint = TaintAnalysis::new(TaintConfig::bidirectional(), &WorkBudget::DEFAULT);
         taint.add_tainted_var(v3);
         taint.propagate(&ssa);
 
@@ -246,10 +252,9 @@ mod tests {
             forward: true,
             backward: false,
             phi_mode: PhiTaintMode::TaintIfAnyOperand,
-            max_iterations: 100,
         };
 
-        let mut taint = TaintAnalysis::new(config);
+        let mut taint = TaintAnalysis::new(config, &WorkBudget::DEFAULT);
         taint.add_tainted_var(v0);
         taint.propagate(&ssa);
 
@@ -271,10 +276,9 @@ mod tests {
             forward: false,
             backward: true,
             phi_mode: PhiTaintMode::TaintAllOperands,
-            max_iterations: 100,
         };
 
-        let mut taint = TaintAnalysis::new(config);
+        let mut taint = TaintAnalysis::new(config, &WorkBudget::DEFAULT);
         taint.add_tainted_var(v2);
         taint.propagate(&ssa);
 
@@ -293,10 +297,9 @@ mod tests {
             forward: true,
             backward: false,
             phi_mode: PhiTaintMode::NoPropagation,
-            max_iterations: 100,
         };
 
-        let mut taint = TaintAnalysis::new(config);
+        let mut taint = TaintAnalysis::new(config, &WorkBudget::DEFAULT);
         taint.add_tainted_var(v0);
         taint.propagate(&ssa);
 
@@ -318,10 +321,9 @@ mod tests {
             forward: false,
             backward: true,
             phi_mode: PhiTaintMode::TaintFromPredecessors(preds),
-            max_iterations: 100,
         };
 
-        let mut taint = TaintAnalysis::new(config);
+        let mut taint = TaintAnalysis::new(config, &WorkBudget::DEFAULT);
         taint.add_tainted_var(v2);
         taint.propagate(&ssa);
 
@@ -337,7 +339,7 @@ mod tests {
     fn test_instruction_taint_source() {
         let (ssa, v0, v1, v2, v3) = create_simple_ssa();
 
-        let mut taint = TaintAnalysis::forward_only();
+        let mut taint = TaintAnalysis::new(TaintConfig::forward_only(), &WorkBudget::DEFAULT);
         // Mark the add instruction as a taint source
         taint.add_tainted_instr(0, 2, &ssa);
         taint.propagate(&ssa);
@@ -355,7 +357,7 @@ mod tests {
     fn test_stats() {
         let (ssa, v0, _, _, _) = create_simple_ssa();
 
-        let mut taint = TaintAnalysis::forward_only();
+        let mut taint = TaintAnalysis::new(TaintConfig::forward_only(), &WorkBudget::DEFAULT);
         taint.add_tainted_var(v0);
         taint.propagate(&ssa);
 
@@ -368,7 +370,7 @@ mod tests {
     fn test_clear() {
         let (ssa, v0, _, _, _) = create_simple_ssa();
 
-        let mut taint = TaintAnalysis::forward_only();
+        let mut taint = TaintAnalysis::new(TaintConfig::forward_only(), &WorkBudget::DEFAULT);
         taint.add_tainted_var(v0);
         taint.propagate(&ssa);
 

@@ -76,14 +76,11 @@ impl Technique for GenericFlattening {
         Detection::new_empty()
     }
 
-    fn detect_ssa(&self, ctx: &AnalysisContext, _assembly: &CilObject) -> Detection {
-        // Detection is the only consumer of these thresholds, so build them from
-        // the engine configuration here rather than defaulting and discarding
-        // what the caller asked for.
+    fn detect_ssa(&self, ctx: &AnalysisContext, assembly: &CilObject) -> Detection {
+        // The engine's configuration, on the machine the assembly computes on.
         let config = UnflattenConfig {
-            max_backedge_depth: ctx.config.unflattening.max_backedge_depth,
-            confidence_weights: ctx.config.unflattening.confidence_weights.clone(),
-            ..UnflattenConfig::default()
+            machine: CilTarget::of(assembly).machine(),
+            ..ctx.config.unflattening.clone()
         };
         let min_confidence = config.min_confidence;
         let mut dispatchers_by_method: HashMap<Token, Vec<Dispatcher>> = HashMap::new();

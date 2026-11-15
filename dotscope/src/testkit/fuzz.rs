@@ -20,7 +20,7 @@
 use std::sync::OnceLock;
 
 use crate::{
-    analysis::{SsaVerifier, VerifyLevel},
+    analysis::{Budget, SsaVerifier, VerifyLevel},
     assembly::{decode_blocks, decode_blocks_with_handlers},
     cilassembly::CilAssembly,
     deobfuscation::EngineConfig,
@@ -684,10 +684,12 @@ pub fn il_pipeline(data: &[u8]) {
 /// the default rounds with the fuzzer's instrumentation).
 pub fn deobfuscate_bounded(data: &[u8]) {
     let mut config = EngineConfig::default();
-    config.emulation.max_instructions = MAX_INSTRUCTIONS;
+    config.emulation.limits.max_instructions = MAX_INSTRUCTIONS;
     config.emulation.max_emulations = MAX_EMULATIONS;
-    config.iterations.max_ssa_iterations = 1;
-    config.iterations.max_phase_iterations = 1;
+    config.budget = config
+        .budget
+        .with_limit(Budget::PipelineRounds, 1)
+        .with_limit(Budget::PhaseRounds, 1);
     config.iterations.max_detection_rounds = 1;
     config.iterations.max_outer_iterations = 1;
     config.iterations.max_pipeline_iterations = 1;

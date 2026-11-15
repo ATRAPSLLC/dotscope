@@ -66,11 +66,18 @@
 //!
 //! Register custom method stubs for BCL methods:
 //!
-//! ```no_run
-//! # use dotscope::emulation::ProcessBuilder;
+//! ```
+//! use dotscope::emulation::{Hook, PreHookResult, ProcessBuilder};
+//! use dotscope::CilObject;
+//!
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! let my_custom_stub = Hook::new("trace-assembly-load")
+//!     .match_name("System.Reflection", "Assembly", "Load")
+//!     .pre(|_ctx, _thread| PreHookResult::Continue);
+//!
 //! let process = ProcessBuilder::new()
 //!     .assembly(assembly)
-//!     .stub(signature, my_custom_stub)
+//!     .hook(my_custom_stub)
 //!     .no_default_stubs() // Optionally disable built-in stubs
 //!     .build()?;
 //! # Ok::<(), dotscope::Error>(())
@@ -88,7 +95,9 @@ use crate::{
         filesystem::VirtualFs,
         loader::{DataLoader, PeLoader, PeLoaderConfig},
         memory::{AddressSpace, MemoryProtection, SharedHeap},
-        process::{CaptureConfig, EmulationConfig, EmulationProcess, TracingConfig},
+        process::{
+            CaptureConfig, EmulationConfig, EmulationLimits, EmulationProcess, TracingConfig,
+        },
         runtime::{Hook, RuntimeState},
         thread::ThreadContext,
         tracer::{TraceListener, TraceWriter},
@@ -658,6 +667,19 @@ impl ProcessBuilder {
     pub fn with_max_heap_bytes(mut self, max: usize) -> Self {
         self.config.limits.max_heap_bytes = max;
         self.config.memory.max_heap_size = max;
+        self
+    }
+
+    /// Sets every execution limit at once, the managed heap's size with its
+    /// ceiling as [`with_max_heap_bytes`](Self::with_max_heap_bytes) does.
+    ///
+    /// # Arguments
+    ///
+    /// * `limits` - The limits the process runs under.
+    #[must_use]
+    pub fn with_limits(mut self, limits: EmulationLimits) -> Self {
+        self.config.memory.max_heap_size = limits.max_heap_bytes;
+        self.config.limits = limits;
         self
     }
 

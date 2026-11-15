@@ -89,6 +89,8 @@ struct PipelineRun<'a> {
 ///
 /// ```no_run
 /// use dotscope::deobfuscation::{DeobfuscationEngine, EngineConfig};
+/// use dotscope::metadata::token::Token;
+/// use dotscope::CilObject;
 ///
 /// let config = EngineConfig::default();
 /// let engine = DeobfuscationEngine::new(config);
@@ -99,6 +101,7 @@ struct PipelineRun<'a> {
 ///
 /// // Or process a single method (consumes the assembly)
 /// let assembly = CilObject::from_path("obfuscated.dll")?;
+/// let method_token = Token::new(0x0600_0001);
 /// let (ssa, result) = engine.process_method(assembly, method_token)?;
 /// # Ok::<(), dotscope::Error>(())
 /// ```
@@ -160,11 +163,7 @@ impl DeobfuscationEngine {
     /// Called once per run so that each pipeline execution starts with a clean
     /// scheduler and no stale pass state.
     fn create_scheduler(&self) -> PassScheduler {
-        let mut scheduler = PassScheduler::new(
-            self.config.iterations.max_ssa_iterations,
-            self.config.iterations.stable_iterations,
-            self.config.iterations.max_phase_iterations,
-        );
+        let mut scheduler = PassScheduler::new();
 
         // Structure (layer 0) and Value (layer 1) passes are populated by
         // create_deob_passes() after AnalysisContext is built.
@@ -176,17 +175,13 @@ impl DeobfuscationEngine {
                 PassPhase::Simplify,
             );
             scheduler.add(
-                Box::new(AsSsaPass(ValueRangePropagationPass::new(
-                    self.config.passes.value_range_max_iterations,
-                ))),
+                Box::new(AsSsaPass(ValueRangePropagationPass::new())),
                 PassPhase::Simplify,
             );
         }
         if self.config.passes.control_flow_simplification {
             scheduler.add(
-                Box::new(AsSsaPass(ControlFlowSimplificationPass::new(
-                    self.config.passes.control_flow_max_iterations,
-                ))),
+                Box::new(AsSsaPass(ControlFlowSimplificationPass)),
                 PassPhase::Simplify,
             );
             scheduler.add(
@@ -212,17 +207,10 @@ impl DeobfuscationEngine {
         );
         if self.config.passes.dead_code_elimination {
             scheduler.add(
-                Box::new(AsSsaPass(DeadCodeEliminationPass::new(
-                    self.config.passes.dce_max_iterations,
-                ))),
+                Box::new(AsSsaPass(DeadCodeEliminationPass)),
                 PassPhase::Normalize,
             );
-            scheduler.add(
-                Box::new(AsSsaPass(BlockMergingPass::new(
-                    self.config.passes.block_merge_max_iterations,
-                ))),
-                PassPhase::Normalize,
-            );
+            scheduler.add(Box::new(AsSsaPass(BlockMergingPass)), PassPhase::Normalize);
             scheduler.add(Box::new(AsSsaPass(LicmPass::new())), PassPhase::Normalize);
         }
         if self.config.passes.constant_propagation {
@@ -230,24 +218,14 @@ impl DeobfuscationEngine {
                 Box::new(AsSsaPass(ReassociationPass::new())),
                 PassPhase::Normalize,
             );
-            scheduler.add(
-                Box::new(ConstantPropagationPass::new(
-                    self.config.passes.const_prop_max_iterations,
-                )),
-                PassPhase::Normalize,
-            );
+            scheduler.add(Box::new(ConstantPropagationPass), PassPhase::Normalize);
             scheduler.add(
                 Box::new(AsSsaPass(GlobalValueNumberingPass::new())),
                 PassPhase::Normalize,
             );
         }
         if self.config.passes.copy_propagation {
-            scheduler.add(
-                Box::new(CopyPropagationPass::new(
-                    self.config.passes.copy_prop_max_iterations,
-                )),
-                PassPhase::Normalize,
-            );
+            scheduler.add(Box::new(CopyPropagationPass), PassPhase::Normalize);
         }
         if self.config.passes.memory_optimization {
             // Runs after copy propagation so the address expressions Memory SSA
@@ -261,12 +239,7 @@ impl DeobfuscationEngine {
         }
         if self.config.passes.strength_reduction {
             scheduler.add(
-                // The same budget the range pass in this pipeline gets: the two
-                // read the same analysis, and a pass that asked for fewer
-                // rounds would act on a weaker answer than its neighbour.
-                Box::new(AsSsaPass(StrengthReductionPass::new(
-                    self.config.passes.value_range_max_iterations,
-                ))),
+                Box::new(AsSsaPass(StrengthReductionPass::new())),
                 PassPhase::Normalize,
             );
             scheduler.add(

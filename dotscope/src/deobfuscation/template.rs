@@ -135,14 +135,9 @@ impl EmulationTemplatePool {
             .ok_or_else(|| Error::Deobfuscation("template pool assembly already released".into()))?
             .clone();
 
-        let warmup_instruction_limit = self.config.emulation.max_instructions;
-
         let mut builder = ProcessBuilder::new()
             .assembly_arc(assembly.clone())
-            .with_max_instructions(warmup_instruction_limit)
-            .with_max_call_depth(100)
-            .with_timeout_ms(self.config.emulation.warmup_timeout.as_millis() as u64)
-            .with_max_heap_bytes(512 * 1024 * 1024)
+            .with_limits(self.config.emulation.limits.clone())
             .name("template_pool");
 
         // Add tracing configuration if provided
@@ -265,8 +260,7 @@ impl EmulationTemplatePool {
 
         match *guard {
             Some(ref template) => {
-                let limits = self.config.emulation.execution_limits(template.limits());
-                template.fork_with_limits(limits)
+                template.fork_with_limits(self.config.emulation.execution_limits())
             }
             None => Err(Error::Emulation(Box::new(EmulationError::InternalError {
                 description: "template pool not warmed up".to_string(),

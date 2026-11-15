@@ -2,12 +2,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     analysis::{
-        CallGraph, CmpKind, ConstValue, ConstValueCilExt, FieldRef, MethodRef, SsaFunction,
-        SsaFunctionBuilder, SsaOp, SsaType, SsaVarId, SsaVerifier, VerifierError, VerifyLevel,
+        AccessQualifiers, Budget, CallData, CallGraph, Callee, CilTarget, CmpKind, ConstValue,
+        ConstValueCilExt, FieldRef, MethodRef, SsaFunction, SsaFunctionBuilder, SsaOp, SsaType,
+        SsaVarId, SsaVerifier, VerifierError, VerifyLevel, WorkBudget,
     },
     compiler::{
         passes::constants::{AlgebraicResult, ConstantPropagationPass, StringFoldOp},
-        CompilerContext, EventLog, SsaPass,
+        CompilerContext, EventKind, EventLog, SsaPass,
     },
     metadata::{token::Token, typesystem::PointerSize},
     testkit::{
@@ -29,14 +30,14 @@ fn test_context() -> CompilerContext {
 
 #[test]
 fn test_pass_creation() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     assert_eq!(pass.name(), "constant-propagation");
     assert!(!pass.description().is_empty());
 }
 
 #[test]
 fn test_pass_default() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     assert_eq!(pass.name(), "constant-propagation");
 }
 
@@ -362,7 +363,8 @@ fn test_add_ovf_no_overflow() {
         flags: None,
     };
 
-    let result = ConstantPropagationPass::check_overflow_op(&op, &constants, PointerSize::Bit64);
+    let result =
+        ConstantPropagationPass::check_overflow_op(&op, &constants, CilTarget::x64().machine());
     assert!(result.is_some());
 }
 
@@ -384,13 +386,14 @@ fn test_mul_ovf_with_zero() {
     };
 
     // x * 0 = 0, even with overflow check
-    let result = ConstantPropagationPass::check_overflow_op(&op, &constants, PointerSize::Bit64);
+    let result =
+        ConstantPropagationPass::check_overflow_op(&op, &constants, CilTarget::x64().machine());
     assert_eq!(result, Some((v2, ConstValue::I32(0))));
 }
 
 #[test]
 fn test_pass_empty_function() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     let mut ssa = SsaFunctionBuilder::new(0, 0).build_with(|_f| {}).unwrap();
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
@@ -402,7 +405,7 @@ fn test_pass_empty_function() {
 
 #[test]
 fn test_pass_simple_folding() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Create a block with: v0 = 5, v1 = 3, v2 = add v0, v1
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -437,7 +440,7 @@ fn test_pass_simple_folding() {
 
 #[test]
 fn test_pass_branch_simplification() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = true, branch v0, B1, B2
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -467,7 +470,7 @@ fn test_pass_branch_simplification() {
 
 #[test]
 fn test_pass_switch_simplification() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = 1, switch v0, [B1, B2, B3], default=B4
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -500,7 +503,7 @@ fn test_pass_switch_simplification() {
 
 #[test]
 fn test_constants_cached_in_context() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     let (mut ssa, v0) = {
         let mut v0_out = SsaVarId::from_index(0);
         let ssa = SsaFunctionBuilder::new(0, 0)
@@ -670,7 +673,7 @@ fn test_identity_sub_zero() {
 
 #[test]
 fn test_chained_constant_folding() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // v0 = 2, v1 = 3, v2 = v0 + v1, v3 = 2, v4 = v2 * v3, v5 = 0, v6 = v4 + v5
     let (mut ssa, v4) = {
         let mut v4_out = SsaVarId::from_index(0);
@@ -709,7 +712,7 @@ fn test_chained_constant_folding() {
 
 #[test]
 fn test_branch_false_condition() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = false, branch v0, B1, B2
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -739,7 +742,7 @@ fn test_branch_false_condition() {
 
 #[test]
 fn test_switch_out_of_range_uses_default() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = 100 (out of range), switch v0, [B1, B2, B3], default=B4
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -1267,12 +1270,13 @@ fn test_fold_string_operations_with_decrypted_concat() {
                     dest: v1,
                     value: ConstValue::DecryptedString("tem".into()),
                 });
-                b.op(SsaOp::Call {
-                    dest: Some(v2),
-                    method: MethodRef::new(Token::new(0x0A000099)), // fake MemberRef
-                    args: vec![v0, v1],
-                    effects: None,
-                });
+                b.op(CallData::new(
+                    Some(v2),
+                    // fake MemberRef
+                    Callee::Direct(MethodRef::new(Token::new(0x0A000099))),
+                    vec![v0, v1],
+                )
+                .into());
                 b.ret();
             });
         })
@@ -1339,7 +1343,7 @@ fn folded(ssa: &SsaFunction, remainder: SsaVarId) -> Option<ConstValue> {
 fn folded_rem(left: ConstValue, right: ConstValue, unsigned: bool) -> Option<ConstValue> {
     let (mut ssa, remainder) = remainder_function(left, right, unsigned);
     run_verified(
-        &ConstantPropagationPass::new(10),
+        &ConstantPropagationPass,
         &mut ssa,
         &MethodRef::from(Token::new(0x0600_0001)),
         &test_context(),
@@ -1404,7 +1408,7 @@ fn rem_of_mixed_widths_is_rejected_and_left_unfolded() {
             .any(|finding| matches!(finding, VerifierError::InvalidOperandWidths { .. })),
         "{findings:?}"
     );
-    ConstantPropagationPass::new(10)
+    ConstantPropagationPass
         .run_on_method(
             &mut ssa,
             &MethodRef::from(Token::new(0x0600_0001)),
@@ -1516,7 +1520,7 @@ fn chained_involution_chains_resolve_to_the_innermost_value() {
         .instructions()
         .iter()
         .find_map(|instr| match instr.op() {
-            SsaOp::Return { value } => *value,
+            SsaOp::Return { value, .. } => *value,
             _ => None,
         })
         .expect("a return");
@@ -1581,6 +1585,7 @@ fn a_call_that_writes_a_static_is_not_replaced_by_its_result() {
                 b.op(SsaOp::StoreStaticField {
                     field: FieldRef::new(Token::new(0x0400_0001)),
                     value: x,
+                    access: AccessQualifiers::FLAT,
                 });
                 let one = b.const_i32(1);
                 let result = b.add(x, one);
@@ -1592,7 +1597,7 @@ fn a_call_that_writes_a_static_is_not_replaced_by_its_result() {
         ConstantPropagationPass::evaluate_pure_function(
             &writes,
             &[ConstValue::I32(4)],
-            PointerSize::Bit64
+            CilTarget::x64().machine()
         ),
         None
     );
@@ -1612,7 +1617,7 @@ fn a_call_that_writes_a_static_is_not_replaced_by_its_result() {
         ConstantPropagationPass::evaluate_pure_function(
             &pure,
             &[ConstValue::I32(4)],
-            PointerSize::Bit64
+            CilTarget::x64().machine()
         ),
         Some(ConstValue::I32(5))
     );
@@ -1663,7 +1668,7 @@ fn constant_compares_fold_at_their_own_width_and_kind() {
             })
             .unwrap();
         run_verified(
-            &ConstantPropagationPass::new(10),
+            &ConstantPropagationPass,
             &mut ssa,
             &MethodRef::from(Token::new(0x0600_0001)),
             &test_context(),
@@ -1683,4 +1688,24 @@ fn constant_compares_fold_at_their_own_width_and_kind() {
         fold(ConstValue::from(0.5_f64), ConstValue::from(0.75_f64), false),
         Some(1)
     );
+}
+
+/// **Folding out of rounds says so, to the host.** Allowed no folding round,
+/// the pass reports its budget exhausted through the host's events; allowed
+/// the default, the same function settles and reports nothing.
+#[test]
+fn folding_out_of_rounds_reports_its_budget_to_the_host() {
+    let exhausted = |budget: WorkBudget| {
+        let (mut ssa, _) = remainder_function(ConstValue::I32(7), ConstValue::I32(2), false);
+        let ctx = test_context().with_budget(budget);
+        ConstantPropagationPass
+            .run_on_method(&mut ssa, &MethodRef::from(Token::new(0x0600_0001)), &ctx)
+            .unwrap();
+        ctx.events.count_kind(EventKind::BudgetExhausted)
+    };
+    assert_eq!(
+        exhausted(WorkBudget::DEFAULT.with_limit(Budget::FoldRounds, 0)),
+        1
+    );
+    assert_eq!(exhausted(WorkBudget::DEFAULT), 0);
 }

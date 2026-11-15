@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use analyssa::passes::copying;
+use analyssa::{analysis::Budget, passes::copying};
 
 use crate::{
     analysis::{CilTarget, MethodRef, SsaFunction, SsaType, SsaVarId, VariableOrigin},
@@ -27,22 +27,11 @@ use crate::{
 ///
 /// Tracks copy operations and propagates the source to all uses of the
 /// copy. Uses an iterative fixed-point algorithm to handle cascading copies
-/// and newly exposed opportunities after each round of propagation.
-pub struct CopyPropagationPass {
-    /// Maximum fixpoint iterations before stopping.
-    max_iterations: usize,
-}
-
-impl CopyPropagationPass {
-    /// Creates a new copy propagation pass.
-    ///
-    /// `max_iterations` caps the inner fixpoint loop. Copy chains converge
-    /// in ~3 iterations; the default config value is 15.
-    #[must_use]
-    pub fn new(max_iterations: usize) -> Self {
-        Self { max_iterations }
-    }
-}
+/// and newly exposed opportunities after each round of propagation, as many
+/// rounds as the host's
+/// [`Budget::CopyRounds`](analyssa::analysis::Budget::CopyRounds) allows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CopyPropagationPass;
 
 impl SsaPass<CilTarget, CompilerContext> for CopyPropagationPass {
     fn name(&self) -> &'static str {
@@ -66,11 +55,11 @@ impl SsaPass<CilTarget, CompilerContext> for CopyPropagationPass {
         let assembly = host
             .assembly()
             .ok_or_else(|| analyssa::Error::new("CopyPropagationPass requires an assembly"))?;
-        let changed = copying::run_with_hook(
+        let changed = copying::run(
             ssa,
             method,
             &host.events,
-            self.max_iterations,
+            host.budget().limit(Budget::CopyRounds),
             |ssa, resolved| propagate_local_types(ssa, resolved, &assembly),
         );
         Ok(changed)

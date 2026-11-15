@@ -46,7 +46,7 @@ pub struct HookFactory {
 /// warmup methods, and state machine providers.
 ///
 /// All `CompilerContext` methods and fields are accessible via `Deref`:
-/// ```no_run
+/// ```text
 /// let ctx: &AnalysisContext = ...;
 /// ctx.events.record(...);           // via Deref to CompilerContext
 /// ctx.add_known_value(...);         // via Deref to CompilerContext
@@ -146,7 +146,7 @@ impl AnalysisContext {
     /// Creates a new analysis context with custom configuration.
     pub fn with_config(call_graph: Arc<CallGraph>, config: EngineConfig) -> Self {
         Self {
-            compiler: CompilerContext::new(call_graph),
+            compiler: CompilerContext::new(call_graph).with_budget(config.budget),
             decryptors: Arc::new(DecryptorContext::new()),
             dispatchers: Arc::new(DashSet::new()),
             unflattened_dispatchers: Arc::new(DashSet::new()),
@@ -207,12 +207,6 @@ impl AnalysisContext {
     #[must_use]
     pub fn has_emulation_hooks(&self) -> bool {
         !self.emulation_hooks.is_empty()
-    }
-
-    /// Returns the emulation max instructions limit from config.
-    #[must_use]
-    pub fn emulation_max_instructions(&self) -> u64 {
-        self.config.emulation.max_instructions
     }
 
     /// Registers a method to be executed during emulation template warmup.

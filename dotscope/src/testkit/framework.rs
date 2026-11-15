@@ -33,7 +33,7 @@ use crate::{
 #[must_use]
 pub fn without_wall_clock(mut config: EngineConfig) -> EngineConfig {
     config.emulation.timeout = Duration::ZERO;
-    config.emulation.warmup_timeout = Duration::ZERO;
+    config.emulation.limits.timeout_ms = 0;
     config
 }
 

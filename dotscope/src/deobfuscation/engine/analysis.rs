@@ -2,13 +2,16 @@
 
 use std::{num::NonZeroUsize, sync::Arc};
 
-use analyssa::interproc::{solve, CallGraph as SummaryGraph, SummaryStore, SummaryTransfer};
+use analyssa::{
+    analysis::Budget,
+    interproc::{solve, CallGraph as SummaryGraph, SummaryStore, SummaryTransfer},
+};
 use dashmap::DashSet;
 use log::{info, warn};
 use rayon::prelude::*;
 
 use crate::{
-    analysis::{CallGraph, ConstValue, MethodPurity, SsaFunction, SsaOp},
+    analysis::{CallGraph, ConstValue, MethodPurity, SsaFunction, SsaOp, SsaOpCilExt},
     compiler::{CallSiteInfo, MethodSummary, ParameterSummary},
     deobfuscation::{context::AnalysisContext, engine::DeobfuscationEngine},
     metadata::token::Token,
@@ -62,7 +65,7 @@ impl SummaryComputation<'_> {
     /// and return it, that this decides about.
     ///
     /// Only `Unknown` is revisited. The result is the body's own effects, its
-    /// calls taken as pure ([`SsaFunction::purity_with`]), joined with every
+    /// calls taken as pure ([`SsaFunction::purity`]), joined with every
     /// callee's: a body that also reads, takes an address or may raise keeps
     /// that whatever its callees are. A verdict is only ever raised, never
     /// lowered, so the fixpoint this runs in settles.
@@ -92,7 +95,7 @@ impl SummaryComputation<'_> {
         }
         let Some(own) = self
             .ctx
-            .with_ssa(method, |ssa| ssa.purity_with(|_| Some(MethodPurity::Pure)))
+            .with_ssa(method, |ssa| ssa.purity(|_| Some(MethodPurity::Pure)))
         else {
             return local;
         };
@@ -309,7 +312,7 @@ impl DeobfuscationEngine {
         // A cap of zero would mean "never visit anything", which is not a
         // configuration anyone wants; one round is the least that can produce
         // a summary at all.
-        let iterations = NonZeroUsize::new(self.config.passes.interproc_max_iterations)
+        let iterations = NonZeroUsize::new(self.config.budget.limit(Budget::SummaryRounds))
             .unwrap_or(NonZeroUsize::MIN);
         let mut transfer = SummaryComputation { engine: self, ctx };
         let outcome = solve(&graph, &mut transfer, iterations);
@@ -349,7 +352,7 @@ impl DeobfuscationEngine {
         let mut summary = MethodSummary::new(token);
 
         summary.return_info = ssa.return_info();
-        summary.purity = ssa.purity();
+        summary.purity = ssa.purity(|_| None);
         summary.parameters = Self::analyze_parameters(ssa);
         summary.instruction_count = ssa.instruction_count();
         summary.inline_candidate = summary.purity.can_inline()
@@ -390,9 +393,7 @@ impl DeobfuscationEngine {
                 // Determine if this op is impure once (avoid re-matching per param)
                 let is_impure = matches!(
                     op,
-                    SsaOp::Call { .. }
-                        | SsaOp::CallVirt { .. }
-                        | SsaOp::CallIndirect { .. }
+                    SsaOp::Call(_)
                         | SsaOp::NewObj { .. }
                         | SsaOp::StoreField { .. }
                         | SsaOp::StoreStaticField { .. }
@@ -430,11 +431,10 @@ impl DeobfuscationEngine {
 
                 for block in ssa.blocks() {
                     for instr in block.instructions() {
-                        let (callee_token, args) = match instr.op() {
-                            SsaOp::Call { method, args, .. }
-                            | SsaOp::CallVirt { method, args, .. } => (method.token(), args),
-                            _ => continue,
+                        let Some((callee_token, call)) = instr.op().method_call() else {
+                            continue;
                         };
+                        let args = &call.args;
 
                         // What each argument is known to hold. This is the
                         // whole point of collecting call sites: a parameter

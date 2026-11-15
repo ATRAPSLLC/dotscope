@@ -37,11 +37,21 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```no_run
-/// let mut scheduler = PassScheduler::new(5, 2, 15);
-/// scheduler.add(Box::new(value_pass), PassPhase::Value);
-/// scheduler.add(Box::new(cff_pass), PassPhase::Structure);
-/// scheduler.add(Box::new(dce_pass), PassPhase::Normalize);
+/// ```
+/// use std::sync::Arc;
+/// use dotscope::analysis::CallGraph;
+/// use dotscope::compiler::{
+///     CompilerContext, ConstantPropagationPass, DeadMethodEliminationPass, PassPhase,
+///     PassScheduler,
+/// };
+/// use dotscope::CilObject;
+///
+/// let assembly = Arc::new(CilObject::from_path("tests/samples/crafted_2.exe")?);
+/// let ctx = CompilerContext::new(Arc::new(CallGraph::build(&assembly)?));
+///
+/// let mut scheduler = PassScheduler::new();
+/// scheduler.add(Box::new(ConstantPropagationPass), PassPhase::Value);
+/// scheduler.add(Box::new(DeadMethodEliminationPass::new()), PassPhase::Normalize);
 /// scheduler.run_pipeline(&ctx, &assembly, None)?;
 /// # Ok::<(), dotscope::Error>(())
 /// ```
@@ -51,39 +61,32 @@ pub struct PassScheduler {
 
 impl Default for PassScheduler {
     fn default() -> Self {
-        Self::new(5, 2, 15)
+        Self::new()
     }
 }
 
 impl PassScheduler {
-    /// Creates a new scheduler with the specified iteration limits.
+    /// Creates a scheduler with no passes.
     ///
-    /// # Arguments
-    ///
-    /// * `max_iterations` - Maximum iterations for the entire pipeline before stopping.
-    /// * `stable_iterations` - Stop early if no changes for this many consecutive iterations.
-    /// * `max_phase_iterations` - Maximum fixpoint iterations for a single layer before
-    ///   moving to the next.
+    /// Its rounds are the context's work budget's
+    /// ([`CompilerContext::budget`]): the pipeline's
+    /// [`Budget::PipelineRounds`](analyssa::analysis::Budget::PipelineRounds),
+    /// stopping after [`Budget::StableRounds`](analyssa::analysis::Budget::StableRounds)
+    /// that change nothing, and
+    /// [`Budget::PhaseRounds`](analyssa::analysis::Budget::PhaseRounds) a layer.
     #[must_use]
-    pub fn new(
-        max_iterations: usize,
-        stable_iterations: usize,
-        max_phase_iterations: usize,
-    ) -> Self {
+    pub fn new() -> Self {
         // dotscope populates the scheduler with its own CIL passes (gated by
         // engine config), so start from an empty analyssa scheduler rather
-        // than the default built-in pipeline. Only the iteration limits, the
-        // `verify_hard` flag and the failure policy are consumed by `empty`;
-        // the remaining `PipelineConfig` fields tune analyssa's built-in
-        // passes, which we do not register here.
+        // than the default built-in pipeline. Only the `verify_hard` flag and
+        // the failure policy are consumed by `empty`; the remaining
+        // `PipelineConfig` fields choose analyssa's built-in passes, which we
+        // do not register here.
         //
         // A pass that fails on one method is rolled back for that method and
         // recorded as an event: one method no pass can handle used to fail
         // the whole assembly.
         let config = PipelineConfig {
-            max_iterations,
-            stable_iterations,
-            max_phase_iterations,
             on_method_failure: FailurePolicy::RollbackAndContinue,
             ..PipelineConfig::default()
         };

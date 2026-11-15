@@ -33,13 +33,13 @@
 
 use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 
-use analyssa::graph::NodeId;
+use analyssa::{analysis::WorkBudget, graph::NodeId};
 use dashmap::DashSet;
 
 use crate::{
     analysis::{
-        ConstValue, PhiTaintMode, SsaFunction, SsaInstruction, SsaOp, SsaVarId, TaintAnalysis,
-        TaintConfig,
+        ConstValue, PhiTaintMode, SsaFunction, SsaInstruction, SsaOp, SsaOpCilExt, SsaVarId,
+        TaintAnalysis, TaintConfig,
     },
     assembly::Operand,
     compiler::CompilerContext,
@@ -151,12 +151,16 @@ impl StateMachineProvider for ConfuserExStateMachine {
                 match instr.op() {
                     // Value type initialization uses Call to .ctor
                     // .ctor for value type: args are (&this, seed)
-                    SsaOp::Call { method, args, .. }
-                        if method.token() == init_method_token && args.len() >= 2 =>
-                    {
-                        let Some(&seed_var) = args.get(1) else {
+                    op @ SsaOp::Call(_) => {
+                        let Some((token, call)) = op.method_call() else {
                             continue;
                         };
+                        let Some(&seed_var) = call.args.get(1) else {
+                            continue;
+                        };
+                        if token != init_method_token {
+                            continue;
+                        }
                         if let Some(ConstValue::I32(seed)) =
                             self.trace_to_constant(seed_var, ssa, ctx, method_token)
                         {
@@ -195,17 +199,11 @@ impl StateMachineProvider for ConfuserExStateMachine {
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::Call {
-                    method, args, dest, ..
-                }
-                | SsaOp::CallVirt {
-                    method, args, dest, ..
-                } = instr.op()
-                {
-                    if method.token() == update_method_token {
+                if let Some((token, call)) = instr.op().method_call() {
+                    if token == update_method_token {
                         // CFGCtx.Next takes 3 args: &this, flag (byte), increment (uint)
                         if let (Some(&flag_var), Some(&increment_var), Some(dest)) =
-                            (args.get(1), args.get(2), dest.as_ref())
+                            (call.args.get(1), call.args.get(2), call.dest.as_ref())
                         {
                             updates.push(StateUpdateCall {
                                 block_idx,
@@ -241,17 +239,12 @@ impl StateMachineProvider for ConfuserExStateMachine {
         // Find decryptor calls that use XOR results
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let (call_target, args, dest) = match instr.op() {
-                    SsaOp::Call {
-                        method, args, dest, ..
-                    }
-                    | SsaOp::CallVirt {
-                        method, args, dest, ..
-                    } => (method.token(), args, *dest),
-                    _ => continue,
+                let Some((call_target, call)) = instr.op().method_call() else {
+                    continue;
                 };
-
-                let Some(dest) = dest else { continue };
+                let (args, Some(dest)) = (&call.args, call.dest) else {
+                    continue;
+                };
 
                 // Resolve MethodSpec to MethodDef for generic method calls
                 // Generic decryptors like T Get<T>(int32) are called via MethodSpec tokens
@@ -908,7 +901,11 @@ pub fn find_constants_initializer(assembly: &CilObject) -> Option<Token> {
 /// - Direct constants (Normal mode)
 /// - XOR results where one operand is a constant (CFG mode)
 /// - Values traced through PHI nodes and other operations
-pub fn find_call_sites(assembly: &CilObject, decryptor_tokens: &[Token]) -> Vec<DetectedCallSite> {
+pub fn find_call_sites(
+    assembly: &CilObject,
+    decryptor_tokens: &[Token],
+    budget: &WorkBudget,
+) -> Vec<DetectedCallSite> {
     let decryptor_set: HashSet<_> = decryptor_tokens.iter().copied().collect();
     let call_sites: boxcar::Vec<DetectedCallSite> = boxcar::Vec::new();
 
@@ -928,16 +925,11 @@ pub fn find_call_sites(assembly: &CilObject, decryptor_tokens: &[Token]) -> Vec<
         // Find call instructions to decryptors
         for (_, block) in ssa.iter_blocks() {
             for instr in block.instructions() {
-                // Look for Call/CallVirt to decryptors
-                let (call_target, args) = match instr.op() {
-                    SsaOp::Call {
-                        method: m, args, ..
-                    }
-                    | SsaOp::CallVirt {
-                        method: m, args, ..
-                    } => (m.token(), args),
-                    _ => continue,
+                // Look for calls of decryptors
+                let Some((call_target, call)) = instr.op().method_call() else {
+                    continue;
                 };
+                let args = &call.args;
 
                 // Resolve MethodSpec to MethodDef if needed (for generic method calls)
                 let resolved_target =
@@ -953,7 +945,7 @@ pub fn find_call_sites(assembly: &CilObject, decryptor_tokens: &[Token]) -> Vec<
                 };
 
                 // Use backward taint analysis to trace the argument's data flow
-                match analyze_argument_dataflow(&ssa, arg_var) {
+                match analyze_argument_dataflow(&ssa, arg_var, budget) {
                     ArgumentAnalysis::DirectConstant(_) => {
                         // Normal mode: direct constant key
                         call_sites.push(DetectedCallSite::direct(method.token));
@@ -1019,7 +1011,11 @@ enum ArgumentAnalysis {
 /// Uses proper SSA-based dataflow analysis to trace all operations
 /// contributing to the argument value. This is robust against control
 /// flow flattening and other obfuscations.
-fn analyze_argument_dataflow(ssa: &SsaFunction, arg_var: SsaVarId) -> ArgumentAnalysis {
+fn analyze_argument_dataflow(
+    ssa: &SsaFunction,
+    arg_var: SsaVarId,
+    budget: &WorkBudget,
+) -> ArgumentAnalysis {
     // Quick check: if it's already a constant, we're done
     if let Some(key) = get_i32_constant(ssa, arg_var) {
         return ArgumentAnalysis::DirectConstant(key);
@@ -1030,10 +1026,9 @@ fn analyze_argument_dataflow(ssa: &SsaFunction, arg_var: SsaVarId) -> ArgumentAn
         forward: false,
         backward: true,
         phi_mode: PhiTaintMode::TaintAllOperands,
-        max_iterations: 50,
     };
 
-    let mut taint = TaintAnalysis::new(config);
+    let mut taint = TaintAnalysis::new(config, budget);
     taint.add_tainted_var(arg_var);
     taint.propagate(ssa);
 
@@ -1059,7 +1054,7 @@ fn analyze_argument_dataflow(ssa: &SsaFunction, arg_var: SsaVarId) -> ArgumentAn
             }
 
             // Found a call - this indicates state machine or other method dependency
-            SsaOp::Call { .. } | SsaOp::CallVirt { .. } => {
+            op if op.method_call().is_some() => {
                 has_call = true;
                 // If we already found a constant in an XOR, preserve it
                 if has_xor_with_const.is_some() {
