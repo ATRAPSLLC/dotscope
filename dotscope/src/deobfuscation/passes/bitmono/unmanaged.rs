@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
 };
@@ -164,12 +164,12 @@ fn find_unmanaged_string_sites(
 
     for (i, instr) in instructions.iter().enumerate() {
         // Look for Call to a fake native method
-        let (call_dest, call_token) = match instr.op() {
-            SsaOp::Call { dest, method, .. } => {
-                let Some(d) = dest else { continue };
-                (*d, method.token())
-            }
-            _ => continue,
+        let Some((call_token, Some(call_dest))) = instr
+            .op()
+            .method_call()
+            .map(|(token, call)| (token, call.dest))
+        else {
+            continue;
         };
 
         // Check if this call targets a known fake native method
@@ -211,7 +211,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        analysis::{CallGraph, SsaFunctionBuilder, SsaType},
+        analysis::{CallGraph, Callee, SsaFunctionBuilder, SsaType},
         testkit::passes::run_verified,
     };
 
@@ -226,10 +226,14 @@ mod tests {
             let mut ssa = SsaFunctionBuilder::new(0, 0)
                 .build_with(|f| {
                     f.block(0, |b| {
-                        let pointer = b.call(MethodRef::new(native), &[], SsaType::NativeInt);
+                        let pointer = b.call(
+                            Callee::Direct(MethodRef::new(native)),
+                            &[],
+                            SsaType::NativeInt,
+                        );
                         let _ = b.newobj(ctor, &[pointer]);
                         if traced {
-                            b.call_void(trace, &[pointer]);
+                            b.call_void(Callee::Direct(trace), &[pointer]);
                         }
                         b.ret();
                     });
@@ -256,7 +260,10 @@ mod tests {
                 }
             )));
             instructions.iter().any(|instruction| {
-                matches!(instruction.op(), SsaOp::Call { method, .. } if *method == MethodRef::new(native))
+                instruction
+                    .op()
+                    .method_call()
+                    .is_some_and(|(token, _)| token == native)
             })
         };
         assert!(!native_call_kept(false), "an unread native call is removed");

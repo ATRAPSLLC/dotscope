@@ -52,7 +52,7 @@ use std::{
 };
 
 use crate::{
-    analysis::{CilTarget, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     cilassembly::CleanupRequest,
     compiler::{CompilerContext, PassPhase, SsaPass},
     deobfuscation::{
@@ -148,12 +148,13 @@ fn collect_initialization_only_methods(
         for block in entry.value().blocks() {
             for instr in block.instructions() {
                 let callee = match instr.op() {
-                    SsaOp::Call { method, .. }
-                    | SsaOp::CallVirt { method, .. }
-                    | SsaOp::LoadFunctionPtr { method, .. }
+                    SsaOp::LoadFunctionPtr { method, .. }
                     | SsaOp::LoadVirtFunctionPtr { method, .. } => method.token(),
                     SsaOp::NewObj { ctor, .. } => ctor.token(),
-                    _ => continue,
+                    op => match op.method_call() {
+                        Some((token, _)) => token,
+                        None => continue,
+                    },
                 };
                 callers.entry(callee).or_default().insert(caller);
             }
@@ -259,7 +260,7 @@ fn identify_sentinel_method(ssa: &SsaFunction) -> Option<Token> {
     // Find the Return terminator
     let terminator = block.control_terminator()?;
     let return_var = match terminator {
-        SsaOp::Return { value: Some(v) } => *v,
+        SsaOp::Return { value: Some(v), .. } => *v,
         _ => return None,
     };
 
@@ -342,8 +343,10 @@ fn collect_sentinel_info(
         }
         let has_sentinel_call = entry.value().blocks().iter().any(|block| {
             block.instructions().iter().any(|instr| {
-                matches!(instr.op(), SsaOp::Call { method, .. }
-                    if sentinel_methods.contains_key(&method.token()))
+                instr
+                    .op()
+                    .method_call()
+                    .is_some_and(|(token, _)| sentinel_methods.contains_key(&token))
             })
         });
         if has_sentinel_call {

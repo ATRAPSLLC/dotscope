@@ -104,32 +104,32 @@ pub(crate) fn build_def_map(ssa: &SsaFunction) -> HashMap<SsaVarId, &SsaOp> {
     defs
 }
 
-/// Removes the static field loads defining `values` that nothing reads any
-/// more.
+/// Returns the static field loads defining `values`, as `(block, instruction)`
+/// sites.
 ///
 /// A pass that resolves what a static field holds rewrites the instructions
 /// reading the loaded value, and the load itself is dead only once every
-/// reader is gone. Whether it is comes from the function as it stands, not from
-/// recorded use lists, which go stale as soon as an earlier pass rewrites an
-/// instruction: a load another instruction still reads is kept.
+/// reader is gone. The sites go to `remove_unread_instructions`, on the
+/// function or within an edit session, which decides that from the function as
+/// it stands rather than from recorded use lists, which go stale as soon as an
+/// earlier pass rewrites an instruction: a load another instruction still
+/// reads is kept.
 ///
 /// # Arguments
 ///
-/// * `ssa` - The SSA function to modify.
+/// * `ssa` - The SSA function to search.
 /// * `values` - Values whose `LoadStaticField` definitions may go.
 ///
 /// # Returns
 ///
-/// The number of loads removed.
-pub fn remove_unread_static_loads(ssa: &mut SsaFunction, values: &HashSet<SsaVarId>) -> usize {
-    let loads: Vec<(usize, usize)> = ssa
-        .iter_instructions()
+/// The sites of those loads, in block order.
+pub fn static_loads_of(ssa: &SsaFunction, values: &HashSet<SsaVarId>) -> Vec<(usize, usize)> {
+    ssa.iter_instructions()
         .filter(|(_, _, instr)| {
             matches!(instr.op(), SsaOp::LoadStaticField { dest, .. } if values.contains(dest))
         })
         .map(|(block_idx, instr_idx, _)| (block_idx, instr_idx))
-        .collect();
-    ssa.remove_unread_instructions(loads).len()
+        .collect()
 }
 
 /// Checks if a name contains obfuscation indicators (zero-width chars, PUA, spaces).
@@ -214,7 +214,7 @@ pub(crate) fn is_special_name(name: &str) -> bool {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```text
 /// use crate::deobfuscation::utils::build_call_site_counts;
 ///
 /// let candidates: Vec<Token> = collect_decryptor_candidates(&assembly);
@@ -724,10 +724,12 @@ pub(crate) fn is_method_named(assembly: &CilObject, token: Token, name: &str) ->
 #[cfg(test)]
 mod tests {
     use crate::{
-        analysis::{FieldRef, MethodRef, SsaFunctionBuilder, SsaOp, SsaType},
+        analysis::{
+            AccessQualifiers, Callee, FieldRef, MethodRef, SsaFunctionBuilder, SsaOp, SsaType,
+        },
         deobfuscation::utils::{
             build_call_site_counts, is_method_named, is_obfuscated_name, is_special_name,
-            remove_unread_static_loads, resolve_constructor_type,
+            resolve_constructor_type, static_loads_of,
         },
         metadata::{
             tables::{MemberRefRaw, MethodDefRaw, TableId, TypeDefRaw, TypeRefRaw},
@@ -739,7 +741,7 @@ mod tests {
     /// A static load goes once nothing reads it, and stays while an
     /// instruction the resolving pass did not rewrite still reads it.
     #[test]
-    fn test_remove_unread_static_loads_keeps_loads_still_read() {
+    fn test_static_loads_go_once_unread_and_stay_while_read() {
         let removed = |still_read: bool| {
             let field = FieldRef::new(Token::new(0x0400_0001));
             let mut loaded = None;
@@ -752,6 +754,7 @@ mod tests {
                             SsaOp::LoadStaticField {
                                 dest: object,
                                 field,
+                                access: AccessQualifiers::FLAT,
                             },
                             SsaType::Object,
                         );
@@ -759,7 +762,7 @@ mod tests {
                         let _ = b.const_i32(1);
                         if still_read {
                             let _ = b.call(
-                                MethodRef::new(Token::new(0x0A00_0001)),
+                                Callee::Direct(MethodRef::new(Token::new(0x0A00_0001))),
                                 &[object],
                                 SsaType::I32,
                             );
@@ -769,7 +772,9 @@ mod tests {
                 })
                 .unwrap();
             let values = [loaded.unwrap()].into_iter().collect();
-            let count = remove_unread_static_loads(&mut ssa, &values);
+            let loads = static_loads_of(&ssa, &values);
+            assert_eq!(loads, vec![(0, 0)], "the load defining the value");
+            let count = ssa.remove_unread_instructions(loads).len();
             let kept = matches!(
                 ssa.block(0).unwrap().instructions()[0].op(),
                 SsaOp::LoadStaticField { .. }

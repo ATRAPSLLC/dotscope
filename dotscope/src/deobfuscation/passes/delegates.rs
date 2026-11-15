@@ -3,7 +3,7 @@
 //! Resolves delegate-based call indirection by emulating delegate type
 //! `.cctor`s to extract the actual target method bound to each delegate
 //! singleton, then replacing indirect `Call(wrapper, ..., delegate)` with
-//! direct `Call`/`CallVirt` to the resolved target.
+//! a direct or virtual call of the resolved target.
 //!
 //! # Emulation Strategy
 //!
@@ -20,7 +20,7 @@
 //!    from the `HeapObject::Delegate` variant.
 //!
 //! 3. **SSA rewriting**: For each `Call(wrapper, args..., delegate)`,
-//!    replaces with `Call(target, args...)` or `CallVirt(target, args...)`.
+//!    replaces with a direct or virtual call `Call(target, args...)`.
 //!
 //! # Safety
 //!
@@ -41,11 +41,14 @@ use dashmap::{DashMap, DashSet};
 use log::debug;
 
 use crate::{
-    analysis::{CilTarget, MethodRef, MethodRef as SsaMethodRef, SsaFunction, SsaOp, SsaVarId},
+    analysis::{
+        Callee, CilTarget, MethodRef, MethodRef as SsaMethodRef, SsaFunction, SsaOp, SsaOpCilExt,
+        SsaVarId,
+    },
     assembly::{FlowType, Instruction, Operand},
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     deobfuscation::{
-        utils::{build_def_map, remove_unread_static_loads},
+        utils::{build_def_map, static_loads_of},
         EmulationTemplatePool, ProcessCell,
     },
     emulation::{tokens, DelegateEntry, EmValue, EmulationProcess, HeapObject},
@@ -67,7 +70,7 @@ pub struct DelegateTypeInfo {
 struct ResolvedTarget {
     /// The actual method token that the delegate calls.
     method_token: Token,
-    /// Whether the call should use `CallVirt` (instance method) vs `Call` (static).
+    /// Whether the call is virtual (an instance method) or direct (a static one).
     is_virtual: bool,
 }
 
@@ -535,16 +538,13 @@ impl SsaPass<CilTarget, CompilerContext> for DelegateProxyResolutionPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let SsaOp::Call {
-                    method, args, dest, ..
-                } = instr.op()
-                else {
+                let Some((wrapper, call)) = instr.op().method_call() else {
                     continue;
                 };
+                let args = &call.args;
 
                 // Check if this Call targets a known wrapper method
-                let Some(&_delegate_type_token) = self.wrapper_to_delegate.get(&method.token())
-                else {
+                let Some(&_delegate_type_token) = self.wrapper_to_delegate.get(&wrapper) else {
                     continue;
                 };
 
@@ -581,21 +581,12 @@ impl SsaPass<CilTarget, CompilerContext> for DelegateProxyResolutionPass {
                     .unwrap_or_default();
                 let target_method = SsaMethodRef::new(target_entry.method_token);
 
-                let new_op = if target_entry.is_virtual {
-                    SsaOp::CallVirt {
-                        dest: *dest,
-                        method: target_method,
-                        args: new_args,
-                        effects: None,
-                    }
+                let callee = if target_entry.is_virtual {
+                    Callee::Virtual(target_method)
                 } else {
-                    SsaOp::Call {
-                        dest: *dest,
-                        method: target_method,
-                        args: new_args,
-                        effects: None,
-                    }
+                    Callee::Direct(target_method)
                 };
+                let new_op = call.redirected(callee, new_args).into();
 
                 replacements.push((block_idx, instr_idx, new_op));
                 removed_delegate_vars.insert(delegate_var);
@@ -609,11 +600,11 @@ impl SsaPass<CilTarget, CompilerContext> for DelegateProxyResolutionPass {
         for (block_idx, instr_idx, new_op) in &replacements {
             if let Some(block) = ssa.block_mut(*block_idx) {
                 if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                    let target_desc = match new_op {
-                        SsaOp::Call { method, .. } => {
+                    let target_desc = match new_op.as_call().map(|call| &call.callee) {
+                        Some(Callee::Direct(method)) => {
                             format!("call 0x{:08X}", method.token().value())
                         }
-                        SsaOp::CallVirt { method, .. } => {
+                        Some(Callee::Virtual(method)) => {
                             format!("callvirt 0x{:08X}", method.token().value())
                         }
                         _ => "unknown".to_string(),
@@ -628,7 +619,8 @@ impl SsaPass<CilTarget, CompilerContext> for DelegateProxyResolutionPass {
         }
 
         // NOP out the delegate singleton loads nothing reads any more
-        remove_unread_static_loads(ssa, &removed_delegate_vars);
+        let loads = static_loads_of(ssa, &removed_delegate_vars);
+        ssa.remove_unread_instructions(loads);
 
         let changed = !replacements.is_empty();
         // Mark as processed to prevent redundant re-processing in subsequent

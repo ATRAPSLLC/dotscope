@@ -26,7 +26,7 @@
 //! v3 = Call(JIEJIEHelper::SMF_GetManifestResourceStream, [v1, v2])
 //!
 //! // After:
-//! v3 = CallVirt(Assembly::GetManifestResourceStream, [v1, v2])
+//! v3 = callvirt(Assembly::GetManifestResourceStream, [v1, v2])
 //! ```
 
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use log::info;
 
 use crate::{
-    analysis::{CilTarget, MethodRef, SsaFunction, SsaOp},
+    analysis::{Callee, CilTarget, MethodRef, SsaFunction, SsaOp, SsaOpCilExt},
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
 };
@@ -103,32 +103,18 @@ impl SsaPass<CilTarget, CompilerContext> for ResourceRestorationPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let (dest, method_token, args) = match instr.op() {
-                    SsaOp::Call {
-                        dest, method, args, ..
-                    } => (dest, method.token(), args),
-                    SsaOp::CallVirt {
-                        dest, method, args, ..
-                    } => (dest, method.token(), args),
-                    _ => continue,
+                let Some((method_token, call)) = instr.op().method_call() else {
+                    continue;
                 };
 
                 if let Some(target) = self.redirects.get(&method_token) {
-                    let new_op = if target.is_virtual {
-                        SsaOp::CallVirt {
-                            dest: *dest,
-                            method: MethodRef::new(target.target_token),
-                            args: args.clone(),
-                            effects: None,
-                        }
+                    let method = MethodRef::new(target.target_token);
+                    let callee = if target.is_virtual {
+                        Callee::Virtual(method)
                     } else {
-                        SsaOp::Call {
-                            dest: *dest,
-                            method: MethodRef::new(target.target_token),
-                            args: args.clone(),
-                            effects: None,
-                        }
+                        Callee::Direct(method)
                     };
+                    let new_op = call.redirected(callee, call.args.clone()).into();
                     replacements.push((block_idx, instr_idx, new_op));
                 }
             }

@@ -468,7 +468,7 @@ impl SsaPass<CilTarget, CompilerContext> for StaticFieldResolutionPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::LoadStaticField { dest, field } = instr.op() {
+                if let SsaOp::LoadStaticField { dest, field, .. } = instr.op() {
                     let field_token = field.token();
                     let value = values.get(&field_token).or_else(|| {
                         // MemberRef fallback: resolve to FieldDef and retry lookup

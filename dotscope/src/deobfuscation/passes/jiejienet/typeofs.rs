@@ -36,8 +36,8 @@ use log::debug;
 
 use crate::{
     analysis::{
-        resolve_corelib_valuetype, CilTarget, ConstValue, DefSite, MethodRef, SsaFunction,
-        SsaInstruction, SsaOp, SsaVarId, TypeRef, VariableOrigin,
+        resolve_corelib_valuetype, CallData, Callee, CilTarget, ConstValue, DefSite, MethodRef,
+        SsaFunction, SsaInstruction, SsaOp, SsaOpCilExt, SsaVarId, TypeRef, VariableOrigin,
     },
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
@@ -117,11 +117,9 @@ impl SsaPass<CilTarget, CompilerContext> for TypeOfRestorationPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::Call {
-                    dest, method, args, ..
-                } = instr.op()
-                {
-                    if method.token() != self.accessor_token {
+                if let Some((method_token, call)) = instr.op().method_call() {
+                    let (dest, args) = (&call.dest, &call.args);
+                    if method_token != self.accessor_token {
                         continue;
                     }
 
@@ -188,12 +186,14 @@ impl SsaPass<CilTarget, CompilerContext> for TypeOfRestorationPass {
 
             // Insert a Call(GetTypeFromHandle) instruction right after the LoadToken.
             // This converts RuntimeTypeHandle → System.Type, matching what GetTypeInstance did.
-            let call_instr = SsaInstruction::synthetic(SsaOp::Call {
-                dest: Some(*orig_dest),
-                method: MethodRef::new(self.get_type_from_handle_token),
-                args: vec![handle_var],
-                effects: None,
-            });
+            let call_instr = SsaInstruction::synthetic(
+                CallData::new(
+                    Some(*orig_dest),
+                    Callee::Direct(MethodRef::new(self.get_type_from_handle_token)),
+                    vec![handle_var],
+                )
+                .into(),
+            );
 
             let block = ssa.blocks_mut().get_mut(*block_idx).ok_or_else(|| {
                 Error::Deobfuscation(format!(

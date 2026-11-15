@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    analysis::{ConstValue, SsaFunction, SsaOp},
+    analysis::{ConstValue, SsaFunction, SsaOp, SsaOpCilExt},
     deobfuscation::{
         renamer::{
             context::{OpcodeProfile, PhaseInfo},
@@ -91,11 +91,15 @@ pub fn build_call_site_skeleton(ssa: &SsaFunction, assembly: &CilObject) -> Opti
 
     for (_block_idx, _instr_idx, instr) in ssa.iter_instructions() {
         match instr.op() {
-            SsaOp::Call { method, args, .. } | SsaOp::CallVirt { method, args, .. } => {
+            SsaOp::Call(call) => {
+                let Some(method) = call.callee.method() else {
+                    continue;
+                };
                 let name = assembly
                     .resolve_method_name(method.token())
                     .unwrap_or_else(|| format!("method_0x{:08X}", method.token().value()));
-                let arg_list: Vec<String> = args
+                let arg_list: Vec<String> = call
+                    .args
                     .iter()
                     .enumerate()
                     .map(|(i, _)| format!("var_{i}"))
@@ -117,6 +121,7 @@ pub fn build_call_site_skeleton(ssa: &SsaFunction, assembly: &CilObject) -> Opti
                 dest,
                 object,
                 field,
+                ..
             } => {
                 let name = assembly
                     .resolve_method_name(field.token())
@@ -131,6 +136,7 @@ pub fn build_call_site_skeleton(ssa: &SsaFunction, assembly: &CilObject) -> Opti
                 object,
                 field,
                 value,
+                ..
             } => {
                 let name = assembly
                     .resolve_method_name(field.token())
@@ -288,7 +294,9 @@ pub fn build_call_site_skeleton(ssa: &SsaFunction, assembly: &CilObject) -> Opti
             }
 
             // Comparison
-            SsaOp::Ceq { dest, left, right } => {
+            SsaOp::Ceq {
+                dest, left, right, ..
+            } => {
                 lines.push(format!(
                     "    var_{} = (var_{} == var_{});",
                     dest.index(),
@@ -431,10 +439,10 @@ pub fn build_call_site_skeleton(ssa: &SsaFunction, assembly: &CilObject) -> Opti
             }
 
             // Return with value
-            SsaOp::Return { value: Some(v) } => {
+            SsaOp::Return { value: Some(v), .. } => {
                 lines.push(format!("    return var_{};", v.index()));
             }
-            SsaOp::Return { value: None } => {
+            SsaOp::Return { value: None, .. } => {
                 lines.push("    return;".to_string());
             }
             _ => {}
@@ -492,8 +500,8 @@ fn find_phase_boundaries(ssa: &SsaFunction, assembly: &CilObject) -> (Vec<usize>
     let mut prev_namespace: Option<String> = None;
     for (block_idx, block) in blocks.iter().enumerate() {
         for instr in block.instructions() {
-            if let SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } = instr.op() {
-                if let Some(name) = assembly.resolve_method_name(method.token()) {
+            if let Some((token, _)) = instr.op().method_call() {
+                if let Some(name) = assembly.resolve_method_name(token) {
                     let ns = extract_namespace(&name);
                     if let Some(ref prev) = prev_namespace {
                         if ns != *prev {
@@ -576,8 +584,8 @@ fn build_phases_from_boundaries(
             for instr in block.instructions() {
                 classify_op_into_profile(instr.op(), &mut profile);
 
-                if let SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } = instr.op() {
-                    if let Some(name) = assembly.resolve_method_name(method.token()) {
+                if let Some((token, _)) = instr.op().method_call() {
+                    if let Some(name) = assembly.resolve_method_name(token) {
                         if !is_obfuscated_name(&name) && call_seen.insert(name.clone()) {
                             call_targets.push(name);
                         }
@@ -685,7 +693,7 @@ fn detect_transform_boundaries(ssa: &SsaFunction, boundaries: &mut HashSet<usize
 
         for instr in block.instructions() {
             match instr.op() {
-                SsaOp::Call { .. } | SsaOp::CallVirt { .. } | SsaOp::CallIndirect { .. } => {
+                SsaOp::Call(_) => {
                     has_calls = true;
                 }
                 SsaOp::And { .. }
@@ -735,7 +743,7 @@ fn detect_transform_boundaries(ssa: &SsaFunction, boundaries: &mut HashSet<usize
 /// * `profile` - The profile to update.
 fn classify_op_into_profile(op: &SsaOp, profile: &mut OpcodeProfile) {
     match op {
-        SsaOp::Call { .. } | SsaOp::CallVirt { .. } | SsaOp::CallIndirect { .. } => {
+        SsaOp::Call(_) => {
             profile.calls = profile.calls.saturating_add(1);
         }
         SsaOp::Const {

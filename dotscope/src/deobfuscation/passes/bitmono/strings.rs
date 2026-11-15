@@ -48,7 +48,7 @@ use std::{
 };
 
 use crate::{
-    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     deobfuscation::{
         techniques::BitMonoStringFindings,
@@ -326,7 +326,7 @@ fn build_ldsfld_index(ssa: &SsaFunction) -> LdsfldIndex {
     let mut index = HashMap::new();
     for (block_idx, block) in ssa.blocks().iter().enumerate() {
         for (instr_idx, instr) in block.instructions().iter().enumerate() {
-            if let SsaOp::LoadStaticField { dest, field } = instr.op() {
+            if let SsaOp::LoadStaticField { dest, field, .. } = instr.op() {
                 index.insert(*dest, (block_idx, instr_idx, field.token()));
             }
         }
@@ -353,14 +353,11 @@ fn find_decryption_sites(
 
     for (i, instr) in block.instructions().iter().enumerate() {
         // Look for Call to a decryptor method
-        let (call_dest, call_token, args) = match instr.op() {
-            SsaOp::Call {
-                dest, method, args, ..
-            } => {
-                let Some(d) = dest else { continue };
-                (*d, method.token(), args.clone())
-            }
-            _ => continue,
+        let Some((call_token, call)) = instr.op().method_call() else {
+            continue;
+        };
+        let (Some(call_dest), args) = (call.dest, call.args.clone()) else {
+            continue;
         };
 
         if !decryptor_tokens.contains(&call_token) {
@@ -515,7 +512,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        analysis::{CallGraph, FieldRef, SsaFunctionBuilder, SsaInstruction, SsaType},
+        analysis::{
+            AccessQualifiers, CallGraph, Callee, FieldRef, SsaFunctionBuilder, SsaInstruction,
+            SsaType,
+        },
         testkit::{helpers::test_assembly_arc, passes::run_verified},
     };
 
@@ -534,20 +534,26 @@ mod tests {
                             SsaOp::LoadStaticField {
                                 dest,
                                 field: field(row),
+                                access: AccessQualifiers::FLAT,
                             },
                             SsaType::Object,
                         );
                     }
-                    let _ = b.call(MethodRef::new(decryptor), &loads[..3], SsaType::String);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(decryptor)),
+                        &loads[..3],
+                        SsaType::String,
+                    );
                     b.op_typed(
                         SsaOp::LoadStaticField {
                             dest: loads[3],
                             field: field(4),
+                            access: AccessQualifiers::FLAT,
                         },
                         SsaType::Object,
                     );
                     let _ = b.call(
-                        MethodRef::new(decryptor),
+                        Callee::Direct(MethodRef::new(decryptor)),
                         &[loads[3], loads[1], loads[2]],
                         SsaType::String,
                     );
@@ -608,9 +614,7 @@ mod tests {
             "the first site's call is its string"
         );
         assert_eq!(
-            ops.iter()
-                .filter(|op| matches!(op, SsaOp::Call { .. }))
-                .count(),
+            ops.iter().filter(|op| matches!(op, SsaOp::Call(_))).count(),
             1,
             "the failed site is untouched"
         );

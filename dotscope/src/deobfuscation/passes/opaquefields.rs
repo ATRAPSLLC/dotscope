@@ -44,14 +44,15 @@ use std::{
     sync::{Arc, RwLockReadGuard},
 };
 
+use analyssa::ir::function::{SsaEditOptions, SsaRollbackPolicy};
 use dashmap::DashSet;
 use log::debug;
 
 use crate::{
-    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     compiler::{CompilerContext, EventKind, ModificationScope, PassCapability, SsaPass},
     deobfuscation::{
-        utils::{build_def_map, remove_unread_static_loads},
+        utils::{build_def_map, static_loads_of},
         EmulationTemplatePool, ProcessCell,
     },
     emulation::{EmValue, EmulationProcess, HeapRef},
@@ -410,6 +411,10 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
         ModificationScope::CfgModifying
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn provides(&self) -> &[PassCapability] {
         &[PassCapability::ResolvedStaticFields]
     }
@@ -457,8 +462,8 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
         let defs = build_def_map(ssa);
 
         // Find and resolve opaque predicates (Variant A: field chain + Variant B: sentinel)
-        // Each entry: (block_idx, jump_target, dropped_target)
-        let mut replacements: Vec<(usize, usize, usize)> = Vec::new();
+        // Each entry: (block_idx, jump_target)
+        let mut replacements: Vec<(usize, usize)> = Vec::new();
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             let Some(terminator) = block.control_terminator() else {
                 continue;
@@ -487,26 +492,18 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
                     .resolve_chain(static_token, &field_chain)?
                     .map(|v| v.to_bool_cil())
                 {
-                    let (target, dropped) = if is_truthy {
-                        (true_target, false_target)
-                    } else {
-                        (false_target, true_target)
-                    };
-                    replacements.push((block_idx, target, dropped));
+                    let target = if is_truthy { true_target } else { false_target };
+                    replacements.push((block_idx, target));
                     continue;
                 }
             }
 
             // Variant B: Call(sentinel_method) → Branch
-            if let SsaOp::Call { method, .. } = cond_def {
-                if let Some(sentinel_field) = self.sentinel_methods.get(&method.token()) {
+            if let Some((method_token, _)) = cond_def.method_call() {
+                if let Some(sentinel_field) = self.sentinel_methods.get(&method_token) {
                     if let Some(is_truthy) = resolver.resolve_sentinel(*sentinel_field)? {
-                        let (target, dropped) = if is_truthy {
-                            (true_target, false_target)
-                        } else {
-                            (false_target, true_target)
-                        };
-                        replacements.push((block_idx, target, dropped));
+                        let target = if is_truthy { true_target } else { false_target };
+                        replacements.push((block_idx, target));
                     }
                 }
             }
@@ -519,15 +516,14 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
         if !self.sentinel_methods.is_empty() {
             for (block_idx, block) in ssa.blocks().iter().enumerate() {
                 for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                    let SsaOp::Call {
-                        dest: Some(dest),
-                        method,
-                        ..
-                    } = instr.op()
+                    let Some((method_token, Some(dest))) = instr
+                        .op()
+                        .method_call()
+                        .map(|(token, call)| (token, call.dest))
                     else {
                         continue;
                     };
-                    let Some(sentinel_field) = self.sentinel_methods.get(&method.token()) else {
+                    let Some(sentinel_field) = self.sentinel_methods.get(&method_token) else {
                         continue;
                     };
                     if let Some(is_truthy) = resolver.resolve_sentinel(*sentinel_field)? {
@@ -539,7 +535,7 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
                         sentinel_call_replacements.push((
                             block_idx,
                             instr_idx,
-                            SsaOp::Const { dest: *dest, value },
+                            SsaOp::Const { dest, value },
                         ));
                     }
                 }
@@ -591,60 +587,55 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
         // Must drop the read guard before mutating ssa
         drop(guard);
 
-        // Apply replacements: Branch → Jump (Variant A + Variant B direct branches)
-        for &(block_idx, target, dropped) in &replacements {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(last) = block.instructions_mut().last_mut() {
-                    last.set_op(SsaOp::Jump { target });
-                    ctx.events
-                        .record(EventKind::OpaquePredicateRemoved)
-                        .at(method_token, block_idx)
-                        .message(format!(
-                            "removed opaque field predicate → jump to block {target}"
-                        ));
+        // Apply everything in one edit session, so the session leaves the
+        // function repaired whole. The instruction rewrites go first, at the
+        // indices they were planned at; then the folds, which can strand a
+        // block and turn its phis into copies at its head; then the loads the
+        // folds and rewrites left unread, found in the function as it then
+        // stands. A fold only removes an edge, which
+        // `fold_terminator_pruning_phis` repairs by pruning the dropped
+        // successor's operand, so no value needs reconstructing.
+        ssa.edit(
+            SsaEditOptions::new().with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                // Sentinel call replacements: Call → Const (Variant B non-branch uses)
+                // and const replacements: LoadField → Const (Variant A field injection)
+                for (block_idx, instr_idx, new_op) in
+                    sentinel_call_replacements.iter().chain(&const_replacements)
+                {
+                    editor.replace_instruction_op(*block_idx, *instr_idx, new_op.clone())?;
                 }
-            }
+                // Branch → Jump (Variant A + Variant B direct branches)
+                for &(block_idx, target) in &replacements {
+                    editor.fold_terminator_pruning_phis(block_idx, SsaOp::Jump { target })?;
+                }
+                // NOP out the LoadStaticField instructions nothing reads any more
+                let loads = static_loads_of(editor.function(), &replaced_object_vars);
+                editor.remove_unread_instructions(loads);
+                Ok(())
+            },
+        )?;
 
-            // Clean up phi operands in the dropped target that referenced our block.
-            // Without this, rebuild_ssa() may fail because phi nodes reference variables
-            // from a predecessor edge that no longer exists.
-            if dropped != target {
-                if let Some(dropped_block) = ssa.block_mut(dropped) {
-                    for phi in dropped_block.phi_nodes_mut() {
-                        phi.retain_operands(|operand| operand.predecessor() != block_idx);
-                    }
-                }
-            }
+        for &(block_idx, target) in &replacements {
+            ctx.events
+                .record(EventKind::OpaquePredicateRemoved)
+                .at(method_token, block_idx)
+                .message(format!(
+                    "removed opaque field predicate → jump to block {target}"
+                ));
         }
-
-        // Apply sentinel call replacements: Call → Const (Variant B non-branch uses)
-        for (block_idx, instr_idx, new_op) in &sentinel_call_replacements {
-            if let Some(block) = ssa.block_mut(*block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                    instr.set_op(new_op.clone());
-                    ctx.events
-                        .record(EventKind::OpaquePredicateRemoved)
-                        .at(method_token, *block_idx)
-                        .message("resolved sentinel null-check call → constant");
-                }
-            }
+        for (block_idx, _, _) in &sentinel_call_replacements {
+            ctx.events
+                .record(EventKind::OpaquePredicateRemoved)
+                .at(method_token, *block_idx)
+                .message("resolved sentinel null-check call → constant");
         }
-
-        // Apply const replacements: LoadField → Const (Variant A field injection)
-        for (block_idx, instr_idx, new_op) in &const_replacements {
-            if let Some(block) = ssa.block_mut(*block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                    instr.set_op(new_op.clone());
-                    ctx.events
-                        .record(EventKind::ConstantFolded)
-                        .at(method_token, *block_idx)
-                        .message("resolved opaque field load → constant");
-                }
-            }
+        for (block_idx, _, _) in &const_replacements {
+            ctx.events
+                .record(EventKind::ConstantFolded)
+                .at(method_token, *block_idx)
+                .message("resolved opaque field load → constant");
         }
-
-        // NOP out the LoadStaticField instructions nothing reads any more
-        remove_unread_static_loads(ssa, &replaced_object_vars);
 
         let changed = !replacements.is_empty()
             || !const_replacements.is_empty()

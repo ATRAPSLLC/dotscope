@@ -626,7 +626,8 @@ impl Technique for ConfuserExConstants {
             let semantics = detect_cfgctx_semantics(assembly);
             if let Some(semantics) = semantics {
                 // Find which methods use the state machine.
-                let call_sites = find_call_sites(assembly, &findings.decryptor_tokens);
+                let call_sites =
+                    find_call_sites(assembly, &findings.decryptor_tokens, &ctx.config.budget);
                 let cfg_mode_methods: HashSet<Token> = call_sites
                     .iter()
                     .filter(|site| site.uses_statemachine)

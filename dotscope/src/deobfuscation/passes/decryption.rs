@@ -65,18 +65,20 @@ use std::{
 };
 
 use analyssa::{
+    analysis::Machine,
     graph::{
         algorithms::{compute_dominators, DominatorTree},
         GraphBase, NodeId,
     },
     ir::value::DecryptedArrayData,
+    scheduling::SsaPassHost,
 };
 use rayon::prelude::*;
 
 use crate::{
     analysis::{
-        CilTarget, ConstValue, InstrId, MethodRef, SsaCfg, SsaFunction, SsaOp, SsaVarId, TypeRef,
-        ValueResolver,
+        CilTarget, ConstValue, InstrId, MethodRef, SsaCfg, SsaFunction, SsaOp, SsaOpCilExt,
+        SsaVarId, TypeRef, ValueResolver, ValueResolverCilExt,
     },
     compiler::{CompilerContext, EventKind, EventLog, ModificationScope, PassCapability, SsaPass},
     deobfuscation::{
@@ -595,7 +597,7 @@ impl DecryptionPass {
         ctx: &CompilerContext,
         assembly: &CilObject,
         provider: &dyn StateMachineProvider,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) -> (bool, EventLog) {
         let changes = EventLog::new();
 
@@ -669,7 +671,7 @@ impl DecryptionPass {
             );
 
             // Construct ValueResolver for this iteration (reborrow ssa as shared)
-            let mut resolver = ValueResolver::new(&*ssa, ptr_size).with_path_aware_fallback();
+            let mut resolver = ValueResolver::new(&*ssa, machine).with_path_aware_fallback();
             resolver.load_known_values();
 
             // Simulate the relevant state updates in order.
@@ -1052,7 +1054,7 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
             return Ok(false);
         }
 
-        let ptr_size = PointerSize::from_is_64bit(assembly.file().pe().is_64bit);
+        let machine = host.machine();
 
         // Track whether any mode made changes
         let mut any_changed = false;
@@ -1065,7 +1067,7 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
                 ctx,
                 assembly,
                 &*provider,
-                ptr_size,
+                machine,
             );
             if sm_changed {
                 any_changed = true;
@@ -1083,7 +1085,7 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
 
         let changes = EventLog::new();
 
-        let mut resolver = ValueResolver::new(&*ssa, ptr_size).with_path_aware_fallback();
+        let mut resolver = ValueResolver::new(&*ssa, machine).with_path_aware_fallback();
         resolver.load_known_values();
 
         // Phase 1: Collect decryption candidates (sequential)
@@ -1106,17 +1108,12 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let (call_target, args, dest) = match instr.op() {
-                    SsaOp::Call {
-                        method, args, dest, ..
-                    }
-                    | SsaOp::CallVirt {
-                        method, args, dest, ..
-                    } => (method.token(), args, *dest),
-                    _ => continue,
+                let Some((call_target, call)) = instr.op().method_call() else {
+                    continue;
                 };
-
-                let Some(dest) = dest else { continue };
+                let (args, Some(dest)) = (&call.args, call.dest) else {
+                    continue;
+                };
                 let Some(decryptor) = self.decryptors.resolve_decryptor(call_target) else {
                     continue;
                 };
@@ -1241,14 +1238,14 @@ mod tests {
     use super::*;
     use crate::{
         analysis::{
-            CallGraph, ConstValue, DefSite, MethodRef, SsaFunction, SsaFunctionBuilder, SsaOp,
-            SsaType, SsaVarId, ValueResolver, VariableOrigin,
+            CallGraph, Callee, ConstValue, DefSite, MethodRef, SsaFunction, SsaFunctionBuilder,
+            SsaOp, SsaType, SsaVarId, ValueResolver, VariableOrigin,
         },
         compiler::{EventLog, SsaPass},
         deobfuscation::{
             context::AnalysisContext, passes::DecryptionPass, DeobfuscationEngine, EngineConfig,
         },
-        metadata::{token::Token, typesystem::PointerSize},
+        metadata::token::Token,
         testkit::{
             emulation::process_builder, fixture, helpers::test_assembly_arc, passes::run_verified,
         },
@@ -1341,9 +1338,13 @@ mod tests {
                     let context = b.newobj(ctor, &[seed]);
                     let flag = b.const_i32(1);
                     let increment = b.const_i32(2);
-                    let _ = b.call(next, &[context, flag, increment], SsaType::I32);
+                    let _ = b.call(
+                        Callee::Direct(next),
+                        &[context, flag, increment],
+                        SsaType::I32,
+                    );
                     let address = b.const_i32(0);
-                    b.call_void(ctor, &[address, seed]);
+                    b.call_void(Callee::Direct(ctor), &[address, seed]);
                     b.ret();
                 });
             })
@@ -1353,7 +1354,10 @@ mod tests {
                 .and_then(|block| block.instructions().iter().position(|i| wanted(i.op())))
         };
         let newobj = position(&ssa, |op| matches!(op, SsaOp::NewObj { .. })).unwrap();
-        let ctor_call = position(&ssa, |op| matches!(op, SsaOp::Call { dest: None, .. })).unwrap();
+        let ctor_call = position(&ssa, |op| {
+            op.as_call().is_some_and(|call| call.dest.is_none())
+        })
+        .unwrap();
 
         let changes = EventLog::new();
         let mut changed = false;
@@ -1454,7 +1458,7 @@ mod tests {
             .build_with(|f| {
                 f.block(0, |b| {
                     // Call with no destination
-                    b.call_void(MethodRef::new(decryptor_token), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(decryptor_token)), &[]);
                     b.ret();
                 });
             })
@@ -1487,7 +1491,11 @@ mod tests {
                 let arg0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
                     // Call with non-constant argument
-                    let _ = b.call(MethodRef::new(decryptor_token), &[arg0], SsaType::I32);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(decryptor_token)),
+                        &[arg0],
+                        SsaType::I32,
+                    );
                     b.ret();
                 });
             })
@@ -1523,7 +1531,11 @@ mod tests {
             .build_with(|f| {
                 f.block(0, |b| {
                     // Call to a different method (not a decryptor)
-                    let _ = b.call(MethodRef::new(other_method), &[], SsaType::I32);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(other_method)),
+                        &[],
+                        SsaType::I32,
+                    );
                     b.ret();
                 });
             })
@@ -1558,7 +1570,11 @@ mod tests {
                 f.block(0, |b| {
                     let c = b.const_i32(42);
                     // Call via MethodSpec with a destination so we can attempt decryption
-                    let _ = b.call(MethodRef::new(methodspec_token), &[c], SsaType::I32);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(methodspec_token)),
+                        &[c],
+                        SsaType::I32,
+                    );
                     b.ret();
                 });
             })
@@ -1628,7 +1644,7 @@ mod tests {
         let (ssa, vars) = function_with_known(&[42, 100]);
         let (var1, var2) = (vars[0], vars[1]);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         resolver.load_known_values();
         let args = vec![var1, var2];
         let result = DecryptionPass::get_arg_constants(&args, &mut resolver);
@@ -1649,7 +1665,7 @@ mod tests {
             variable.facts_mut().clear_known_value();
         }
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         resolver.load_known_values();
         let args = vec![var1, var2];
         let result = DecryptionPass::get_arg_constants(&args, &mut resolver);
@@ -1662,7 +1678,7 @@ mod tests {
     fn test_get_arg_constants_empty() {
         let (ssa, _vars) = function_with_known(&[]);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
         resolver.load_known_values();
         let args: Vec<SsaVarId> = vec![];
         let result = DecryptionPass::get_arg_constants(&args, &mut resolver);

@@ -24,7 +24,7 @@ use std::{
 use log::debug;
 
 use crate::{
-    analysis::SsaOp,
+    analysis::SsaOpCilExt,
     cilassembly::CleanupRequest,
     compiler::PassPhase,
     deobfuscation::{
@@ -163,7 +163,7 @@ impl Technique for GenericConstants {
             return Detection::new_empty();
         }
 
-        // Phase 2: count SSA Call/CallVirt ops targeting candidates.
+        // Phase 2: count SSA calls of candidates.
         // This catches calls hidden behind delegate proxies — after
         // DelegateProxyResolutionPass resolves them, direct Call ops appear.
         let mut counts: HashMap<Token, usize> = candidates.iter().map(|&t| (t, 0)).collect();
@@ -172,11 +172,8 @@ impl Technique for GenericConstants {
         for entry in ctx.ssa_functions.iter() {
             for block in entry.value().blocks() {
                 for instr in block.instructions() {
-                    let token = match instr.op() {
-                        SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => {
-                            method.token()
-                        }
-                        _ => continue,
+                    let Some((token, _)) = instr.op().method_call() else {
+                        continue;
                     };
 
                     // Direct match

@@ -19,7 +19,9 @@
 use std::collections::HashSet;
 
 use crate::{
-    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaVarId, TypeRef},
+    analysis::{
+        CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId, TypeRef,
+    },
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
 };
@@ -73,11 +75,9 @@ impl SsaPass<CilTarget, CompilerContext> for TokenResolverPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::Call {
-                    dest, method, args, ..
-                } = instr.op()
-                {
-                    if !self.accessor_tokens.contains(&method.token()) {
+                if let Some((method_token, call)) = instr.op().method_call() {
+                    let (dest, args) = (&call.dest, &call.args);
+                    if !self.accessor_tokens.contains(&method_token) {
                         continue;
                     }
                     if args.len() != 1 {

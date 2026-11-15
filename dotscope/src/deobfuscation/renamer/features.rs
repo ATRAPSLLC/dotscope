@@ -14,7 +14,7 @@ use std::collections::HashSet;
 #[cfg(any(feature = "smart-rename", test))]
 use crate::deobfuscation::renamer::context::ApiCallInfo;
 use crate::{
-    analysis::{ConstValue, SsaFunction, SsaOp},
+    analysis::{ConstValue, SsaFunction, SsaOp, SsaOpCilExt},
     deobfuscation::{renamer::context::OpcodeProfile, utils::is_obfuscated_name},
     metadata::token::Token,
     CilObject,
@@ -22,7 +22,7 @@ use crate::{
 
 /// Collects fully-qualified call targets from a method's SSA representation.
 ///
-/// Walks all `Call` and `CallVirt` instructions, resolves the method token
+/// Walks all calls naming their method, resolves the method token
 /// to a human-readable name, and builds a "DeclaringType::MethodName" string
 /// for external methods. Deduplicates by name.
 ///
@@ -40,10 +40,11 @@ pub fn collect_call_targets(ssa: &SsaFunction, assembly: &CilObject) -> Vec<Stri
 
     for (_block_idx, _instr_idx, instr) in ssa.iter_instructions() {
         let method_token = match instr.op() {
-            SsaOp::Call { method, .. }
-            | SsaOp::CallVirt { method, .. }
-            | SsaOp::NewObj { ctor: method, .. } => method.token(),
-            _ => continue,
+            SsaOp::NewObj { ctor, .. } => ctor.token(),
+            op => match op.method_call() {
+                Some((token, _)) => token,
+                None => continue,
+            },
         };
 
         if let Some(name) = resolve_qualified_method_name(assembly, method_token) {
@@ -146,7 +147,7 @@ pub fn build_opcode_profile(ssa: &SsaFunction) -> OpcodeProfile {
     for (_block_idx, _instr_idx, instr) in ssa.iter_instructions() {
         match instr.op() {
             // Calls
-            SsaOp::Call { .. } | SsaOp::CallVirt { .. } | SsaOp::CallIndirect { .. } => {
+            SsaOp::Call(_) => {
                 profile.calls = profile.calls.saturating_add(1);
             }
 
@@ -228,7 +229,7 @@ pub fn build_opcode_profile(ssa: &SsaFunction) -> OpcodeProfile {
 
 /// Extracts anchor information from known API calls in a method.
 ///
-/// For each `Call`/`CallVirt` to an external method (resolved via MemberRef),
+/// For each call of an external method (resolved via MemberRef),
 /// maps each argument position to the call target. This provides the anchor
 /// system: if we know that argument 0 of `File.WriteAllText` is called "path",
 /// any SSA variable passed in that position can be named accordingly.
@@ -241,11 +242,10 @@ pub fn extract_anchors(ssa: &SsaFunction, assembly: &CilObject) -> Vec<ApiCallIn
     let mut anchors = Vec::new();
 
     for (_block_idx, _instr_idx, instr) in ssa.iter_instructions() {
-        let (method_token, args) = match instr.op() {
-            SsaOp::Call { method, args, .. } => (method.token(), args),
-            SsaOp::CallVirt { method, args, .. } => (method.token(), args),
-            _ => continue,
+        let Some((method_token, call)) = instr.op().method_call() else {
+            continue;
         };
+        let args = &call.args;
 
         let Some(method_name) = resolve_qualified_method_name(assembly, method_token) else {
             continue;
@@ -269,7 +269,7 @@ pub fn extract_anchors(ssa: &SsaFunction, assembly: &CilObject) -> Vec<ApiCallIn
 
 /// Extracts caller-side context for a specific call site.
 ///
-/// Scans the caller's SSA for Call/CallVirt instructions targeting `callee_token`,
+/// Scans the caller's SSA for calls of `callee_token`,
 /// then collects:
 /// - String literals within a ±3 instruction window around the call site
 /// - The method name that the call's return value is passed to (if any)
@@ -296,12 +296,11 @@ pub fn collect_call_site_context(
     let all_instrs: Vec<_> = caller_ssa.iter_instructions().collect();
 
     for (idx, (_block_idx, _instr_idx, instr)) in all_instrs.iter().enumerate() {
-        // Find Call/CallVirt targeting the callee
-        let (method_token, dest) = match instr.op() {
-            SsaOp::Call { method, dest, .. } => (method.token(), dest),
-            SsaOp::CallVirt { method, dest, .. } => (method.token(), dest),
-            _ => continue,
+        // Find calls of the callee
+        let Some((method_token, call)) = instr.op().method_call() else {
+            continue;
         };
+        let dest = &call.dest;
 
         // SSA calls may use MemberRef tokens while callee_token is a MethodDef.
         // Resolve to MethodDef for comparison.
@@ -352,12 +351,10 @@ pub fn collect_call_site_context(
         // Check if the return value feeds into another call
         if let Some(dest_var) = dest {
             for (_, _, later_instr) in all_instrs.iter().skip(idx.saturating_add(1)).take(5) {
-                let (usage_token, usage_args) = match later_instr.op() {
-                    SsaOp::Call { method, args, .. } => (method.token(), args),
-                    SsaOp::CallVirt { method, args, .. } => (method.token(), args),
-                    _ => continue,
+                let Some((usage_token, usage)) = later_instr.op().method_call() else {
+                    continue;
                 };
-                if usage_args.contains(dest_var) {
+                if usage.args.contains(dest_var) {
                     if let Some(name) = resolve_qualified_method_name(assembly, usage_token) {
                         if !has_obfuscated_component(&name) {
                             return_usage = Some(name);

@@ -307,7 +307,7 @@ fn build_member_owner_map(assembly: &CilObject) -> HashMap<Token, Token> {
 
 /// Every token that code surviving this request still names.
 ///
-/// A converted method answers for itself: [`referenced_token`] is the same
+/// A converted method answers for itself: [`referenced_tokens`] is the same
 /// question neutralization asks of each instruction, so the two agree by
 /// construction rather than by a rule written twice. A method that ships its
 /// original body - one that never converted (an encrypted body, a native one,
@@ -315,7 +315,7 @@ fn build_member_owner_map(assembly: &CilObject) -> HashMap<Token, Token> {
 /// by that body: every token its IL names, and through the static call graph
 /// what it calls.
 ///
-/// [`referenced_token`]: crate::analysis::SsaOpCilExt::referenced_token
+/// [`referenced_tokens`]: crate::analysis::SsaOpCilExt::referenced_tokens
 fn tokens_named_by_survivors(
     assembly: &CilObject,
     removed: &HashSet<Token>,
@@ -344,11 +344,9 @@ fn tokens_named_by_survivors(
             continue;
         }
         for (_, _, instr) in entry.value().iter_instructions() {
-            if let Some(token) = instr.op().referenced_token() {
-                for token in naming(token) {
-                    if removed.contains(&token) && !request.strips_call_sites(token) {
-                        named.insert(token);
-                    }
+            for token in instr.op().referenced_tokens().flat_map(naming) {
+                if removed.contains(&token) && !request.strips_call_sites(token) {
+                    named.insert(token);
                 }
             }
         }

@@ -14,7 +14,7 @@
 //! - **`GetManifestResourceNames` shim** - user code calls
 //!   `<resolver>::eBxqprrF8(Assembly) -> string[]` instead of
 //!   `Assembly::GetManifestResourceNames()`. Same arity, same return
-//!   type. We rewrite the `Call` to a `CallVirt` against the BCL
+//!   type. We rewrite the direct call to a virtual call against the BCL
 //!   MemberRef (resolved at construction time from the assembly's import
 //!   table - every NR resources sample already references that
 //!   MemberRef inside the resolver type body).
@@ -35,7 +35,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    analysis::{CilTarget, MethodRef, SsaFunction, SsaOp},
+    analysis::{Callee, CilTarget, MethodRef, SsaFunction, SsaOp, SsaOpCilExt},
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
 };
@@ -118,30 +118,25 @@ impl SsaPass<CilTarget, CompilerContext> for ResourceShimRewritePass {
                 let Some(instr) = block.instruction_mut(instr_idx) else {
                     continue;
                 };
-                let new_op = match instr.op() {
-                    SsaOp::Call {
-                        dest, method, args, ..
-                    } if self.shim_method_tokens.contains(&method.token())
-                        && self.bcl_get_manifest_resource_names.value() != 0 =>
+                let new_op = match instr.op().method_call() {
+                    Some((token, call))
+                        if self.shim_method_tokens.contains(&token)
+                            && self.bcl_get_manifest_resource_names.value() != 0 =>
                     {
                         // Same arity (Assembly arg → instance receiver),
                         // same return type (string[]). The shim's stack
                         // effect matches `callvirt
                         // Assembly::GetManifestResourceNames()`.
-                        let new = SsaOp::CallVirt {
-                            dest: *dest,
-                            method: bcl_target,
-                            args: args.clone(),
-                            effects: None,
-                        };
+                        let new = call
+                            .redirected(Callee::Virtual(bcl_target), call.args.clone())
+                            .into();
                         shim_rewrites = shim_rewrites.saturating_add(1);
                         Some(new)
                     }
-                    SsaOp::Call {
-                        dest, method, args, ..
-                    } if method.token() == self.lazy_init_token
-                        && dest.is_none()
-                        && args.is_empty() =>
+                    Some((token, call))
+                        if token == self.lazy_init_token
+                            && call.dest.is_none()
+                            && call.args.is_empty() =>
                     {
                         init_nops = init_nops.saturating_add(1);
                         Some(SsaOp::Nop)
@@ -202,7 +197,11 @@ mod tests {
             .build_with(|f| {
                 let arg0 = f.arg(0, SsaType::Object);
                 f.block(0, |b| {
-                    let _ = b.call(MethodRef::new(shim), &[arg0], SsaType::Object);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(shim)),
+                        &[arg0],
+                        SsaType::Object,
+                    );
                     b.ret();
                 });
             })
@@ -219,12 +218,12 @@ mod tests {
         .unwrap();
         assert!(changed);
         let block = ssa.block(0).unwrap();
-        match block.instructions()[0].op() {
-            SsaOp::CallVirt { method, args, .. } => {
-                assert_eq!(method.token(), bcl);
-                assert_eq!(args.len(), 1);
+        match block.instructions()[0].op().as_call() {
+            Some(call) if matches!(call.callee, Callee::Virtual(_)) => {
+                assert_eq!(call.callee.method().map(MethodRef::token), Some(bcl));
+                assert_eq!(call.args.len(), 1);
             }
-            other => panic!("expected CallVirt, got {other:?}"),
+            other => panic!("expected a virtual call, got {other:?}"),
         }
     }
 
@@ -237,7 +236,7 @@ mod tests {
         let mut ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(lazy_init), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(lazy_init)), &[]);
                     b.ret();
                 });
             })
@@ -256,7 +255,7 @@ mod tests {
         // The call is gone: the block is its return
         let block = ssa.block(0).unwrap();
         assert!(
-            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None })),
+            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None, .. })),
             "{:?}",
             block.instructions()
         );
@@ -271,7 +270,7 @@ mod tests {
         let mut ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(lazy_init), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(lazy_init)), &[]);
                     b.ret();
                 });
             })
@@ -295,7 +294,11 @@ mod tests {
             .build_with(|f| {
                 let arg0 = f.arg(0, SsaType::Object);
                 f.block(0, |b| {
-                    let _ = b.call(MethodRef::new(shim), &[arg0], SsaType::Object);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(shim)),
+                        &[arg0],
+                        SsaType::Object,
+                    );
                     b.ret();
                 });
             })

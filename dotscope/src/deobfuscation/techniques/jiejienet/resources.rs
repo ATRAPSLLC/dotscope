@@ -47,7 +47,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use log::debug;
 
 use crate::{
-    analysis::{CilTarget, ConstValue, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, ConstValue, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     assembly::{Immediate, Operand},
     cilassembly::GeneratorConfig,
     compiler::{CompilerContext, EventKind, EventLog, PassPhase, SsaPass},
@@ -640,12 +640,10 @@ fn extract_resource_entries_ssa(ssa: &SsaFunction, assembly: &CilObject) -> Vec<
         let mut resource_name: Option<String> = None;
 
         for instr in block.instructions() {
-            let (method_token, args) = match instr.op() {
-                SsaOp::CallVirt { method, args, .. } | SsaOp::Call { method, args, .. } => {
-                    (method.token(), args)
-                }
-                _ => continue,
+            let Some((method_token, call)) = instr.op().method_call() else {
+                continue;
             };
+            let args = &call.args;
 
             if !is_string_equals(assembly, method_token) {
                 continue;
@@ -669,9 +667,8 @@ fn extract_resource_entries_ssa(ssa: &SsaFunction, assembly: &CilObject) -> Vec<
             continue;
         };
         for instr in successor.instructions() {
-            let method_token = match instr.op() {
-                SsaOp::Call { method, .. } => method.token(),
-                _ => continue,
+            let Some((method_token, _)) = instr.op().method_call() else {
+                continue;
             };
 
             if let Ok(called_method) = assembly.method(&method_token) {
