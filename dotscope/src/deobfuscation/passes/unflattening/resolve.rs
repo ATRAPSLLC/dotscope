@@ -39,21 +39,21 @@
 //! routing through the dispatcher, which stays correct but flattened. Coverage
 //! degrades, never correctness.
 //!
-//! Resolution itself is a pure read of the function; [`apply_rewires`] performs
+//! Resolution itself is a pure read of the function; the rewire module performs
 //! the mutation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use analyssa::analysis::consts::{destination_width, evaluate_const_op};
+use analyssa::analysis::Machine;
 use rustc_hash::FxHashMap;
 
 use crate::{
     analysis::{
-        CmpKind, ConstValue, DefSite, PhiNode, SsaCfg, SsaFunction, SsaInstruction, SsaOp,
+        CilTarget, CmpKind, ConstValue, PhiNode, SsaCfg, SsaFunction, SsaInstruction, SsaOp,
         SsaVarId, VariableOrigin,
     },
     deobfuscation::passes::unflattening::dispatcher::Dispatcher,
-    metadata::{token::Token, typesystem::PointerSize},
+    metadata::token::Token,
 };
 
 /// Maximum definition-chain hops followed when folding a state value.
@@ -68,7 +68,7 @@ const MAX_FOLD_DEPTH: usize = 24;
 /// The chain has one link per state value that falls outside the switch table.
 /// The bound only stops a malformed or adversarial CFG from walking forever;
 /// links beyond it simply stay unresolved.
-const MAX_OVERFLOW_CHAIN: usize = 4096;
+pub const MAX_OVERFLOW_CHAIN: usize = 4096;
 
 /// Maximum nesting of state merge points followed above the dispatcher.
 ///
@@ -79,7 +79,7 @@ const MAX_MERGE_DEPTH: usize = 8;
 
 /// Maximum blocks on a state-plumbing chain between a merge point and the
 /// dispatcher.
-const MAX_CHAIN_LEN: usize = 16;
+pub const MAX_CHAIN_LEN: usize = 16;
 
 /// Maximum distinct states explored by the propagation fixed-point.
 ///
@@ -101,6 +101,21 @@ pub struct Rewire {
     pub new: usize,
     /// State value travelling along the edge.
     pub state: i64,
+    /// The last dispatch block before [`Self::new`]: the dispatcher itself
+    /// for a state its switch selects, or the overflow-check link that
+    /// matched, or that the chain fell through from. The edge bypasses every
+    /// block from [`Self::old`] to here, and [`Self::new`]'s phis read what
+    /// arrived from it.
+    pub exit: usize,
+}
+
+/// Where the dispatcher sends a state, and the last block it passes on the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dispatch {
+    /// The block control lands on.
+    pub target: usize,
+    /// The dispatch block the transfer into [`Self::target`] leaves from.
+    pub exit: usize,
 }
 
 /// Summary of one dispatcher's edge resolution, for reporting.
@@ -145,10 +160,14 @@ pub struct DispatchTable {
     switch_var: SsaVarId,
     /// The phi carrying the raw state into the dispatcher.
     state_var: SsaVarId,
-    /// Raw state value to target, recovered from the overflow-check chain.
-    overflow: BTreeMap<i64, usize>,
-    /// Block reached when nothing matches - the end of the overflow chain.
-    fallthrough: Option<usize>,
+    /// The dispatcher block, which a switch-selected transfer leaves from.
+    block: usize,
+    /// Raw state value to where it dispatches, recovered from the
+    /// overflow-check chain: the target and the link that tests the value.
+    overflow: BTreeMap<i64, Dispatch>,
+    /// Where an unmatched state ends up - the end of the overflow chain - and
+    /// the block it leaves the chain from.
+    fallthrough: Option<Dispatch>,
     /// Whether each block still holds instructions.
     ///
     /// Unflattening runs repeatedly as the pipeline iterates, and a previous
@@ -178,6 +197,7 @@ impl DispatchTable {
             cases: dispatcher.cases.clone(),
             switch_var: dispatcher.switch_var,
             state_var,
+            block: dispatcher.block,
             overflow: BTreeMap::new(),
             fallthrough: None,
             executable: ssa
@@ -208,6 +228,8 @@ impl DispatchTable {
         folder: &mut StateFolder<'_>,
     ) {
         let mut current = default;
+        // The block the transfer into `current` leaves from.
+        let mut previous = self.block;
         let mut seen: BTreeSet<usize> = BTreeSet::new();
 
         for _ in 0..MAX_OVERFLOW_CHAIN {
@@ -226,7 +248,10 @@ impl DispatchTable {
                 ..
             }) = block.control_terminator()
             else {
-                self.fallthrough = Some(current);
+                self.fallthrough = Some(Dispatch {
+                    target: current,
+                    exit: previous,
+                });
                 return;
             };
 
@@ -238,17 +263,25 @@ impl DispatchTable {
             let value = match (left_const, right_const) {
                 (Some(v), None) | (None, Some(v)) => v,
                 _ => {
-                    self.fallthrough = Some(current);
+                    self.fallthrough = Some(Dispatch {
+                        target: current,
+                        exit: previous,
+                    });
                     return;
                 }
             };
 
-            self.overflow.entry(value).or_insert(*true_target);
+            self.overflow.entry(value).or_insert(Dispatch {
+                target: *true_target,
+                exit: current,
+            });
+            previous = current;
             current = *false_target;
         }
     }
 
-    /// Returns the block the dispatcher sends `state` to.
+    /// Returns where the dispatcher sends `state`, and the dispatch block it
+    /// leaves from.
     ///
     /// The case index is obtained by evaluating the dispatcher's own switch
     /// operand with the state pinned to `state`, so however the obfuscator
@@ -256,18 +289,24 @@ impl DispatchTable {
     /// into arithmetic - the answer is the one the dispatcher would reach.
     /// Applying a separately reconstructed transform instead would silently
     /// mis-dispatch whenever detection's model of the encoding was incomplete.
-    pub fn lookup(&self, folder: &mut StateFolder<'_>, state: StateValue) -> Option<usize> {
+    pub fn lookup(&self, folder: &mut StateFolder<'_>, state: StateValue) -> Option<Dispatch> {
         // The overflow chain tests the raw state, so it is consulted first: its
         // entries are the states the switch table cannot express.
-        let target = if let Some(&target) = self.overflow.get(&state.value) {
-            target
+        let dispatch = if let Some(&dispatch) = self.overflow.get(&state.value) {
+            dispatch
         } else {
             let index = folder.fold_with(self.switch_var, self.state_var, state)?;
             let index = usize::try_from(index.value).ok()?;
-            self.cases.get(index).copied().or(self.fallthrough)?
+            self.cases
+                .get(index)
+                .map(|&target| Dispatch {
+                    target,
+                    exit: self.block,
+                })
+                .or(self.fallthrough)?
         };
 
-        self.is_executable(target).then_some(target)
+        self.is_executable(dispatch.target).then_some(dispatch)
     }
 
     /// Number of distinct states this table can dispatch.
@@ -445,11 +484,11 @@ pub struct StateFolder<'a> {
     /// A state helper calls nothing, but the bound is what stops a cycle of
     /// mutually recursive methods from folding forever.
     call_depth: usize,
-    /// The width a native integer is evaluated at.
+    /// The machine the state arithmetic is evaluated on.
     ///
     /// A state encoding computes in `int32` and `int64`; native integers are
     /// taken at 64 bits, where they are the widest they can be.
-    ptr_size: PointerSize,
+    machine: Machine,
 }
 
 /// How many nested calls a fold will follow.
@@ -473,7 +512,7 @@ impl<'a> StateFolder<'a> {
             arguments: Vec::new(),
             callees: None,
             call_depth: 0,
-            ptr_size: PointerSize::Bit64,
+            machine: CilTarget::x64().machine(),
         }
     }
 
@@ -510,7 +549,10 @@ impl<'a> StateFolder<'a> {
         // claiming a value for a method whose answer depends on which path ran.
         let mut returned = None;
         for (_, _, instr) in callee.iter_instructions() {
-            if let SsaOp::Return { value: Some(value) } = instr.op() {
+            if let SsaOp::Return {
+                value: Some(value), ..
+            } = instr.op()
+            {
                 if returned.replace(*value).is_some() {
                     return None;
                 }
@@ -525,7 +567,7 @@ impl<'a> StateFolder<'a> {
             arguments,
             callees: self.callees,
             call_depth: self.call_depth.saturating_add(1),
-            ptr_size: self.ptr_size,
+            machine: self.machine,
         };
         inner.fold_at(returned, 0)
     }
@@ -609,7 +651,12 @@ impl<'a> StateFolder<'a> {
                         .find(|(operand, _)| *operand == var)
                         .map(|(_, value)| value.clone())
                 };
-                evaluate_const_op(op, destination_width(self.ssa, op), lookup, self.ptr_size)
+                self.machine
+                    .evaluate(
+                        op,
+                        op.dest().and_then(|dest| self.ssa.bit_width(dest)),
+                        lookup,
+                    )
                     .as_ref()
                     .and_then(StateValue::from_const)
             }
@@ -698,7 +745,10 @@ impl<'a> StateFolder<'a> {
             // made of does not depend on that, and the backward search for the
             // state phi walks these arguments to find it. Folding is where the
             // body is needed, and it declines without one.
-            SsaOp::Call { method, args, .. } => Folded::Call(method.token(), args.clone()),
+            // Only a direct call certainly runs the body it names.
+            SsaOp::Call(call) => call.callee.direct().map_or(Folded::Opaque, |method| {
+                Folded::Call(method.token(), call.args.clone())
+            }),
             // In a callee evaluation, a load of an argument is that argument.
             SsaOp::LoadArg { arg_index, .. } => self
                 .arguments
@@ -970,7 +1020,7 @@ fn state_only_values(ssa: &SsaFunction, dispatcher_block: usize) -> BTreeSet<Ssa
 /// rewired, which makes the whole block dead and the question moot.
 ///
 /// Phi nodes do not count: they name a merge rather than compute anything, and
-/// `rebuild_ssa` re-derives them from the rewired graph.
+/// the rewiring hands each one the operand its edge carried.
 fn dispatcher_is_transparent(
     ssa: &SsaFunction,
     dispatcher_block: usize,
@@ -1019,7 +1069,7 @@ fn region_from(ssa: &SsaFunction, start: usize, stop: usize, budget: usize) -> B
 /// Resolves every edge feeding `dispatcher` to the block it should reach.
 ///
 /// Returns the rewires to apply and statistics for reporting. The SSA is only
-/// read; use [`apply_rewires`] to perform the change.
+/// read; the rewire module's `apply_rewires` performs the change.
 pub fn resolve_dispatch_edges(
     ssa: &SsaFunction,
     dispatcher: &Dispatcher,
@@ -1174,7 +1224,7 @@ fn propagate_states(
         if seen.len() >= MAX_PROPAGATED_STATES || !seen.insert(state.value) {
             continue;
         }
-        let Some(target) = table.lookup(folder, state) else {
+        let Some(Dispatch { target, .. }) = table.lookup(folder, state) else {
             continue;
         };
 
@@ -1223,14 +1273,15 @@ fn propagate_states(
                 else {
                     continue;
                 };
-                let Some(target) = table.lookup(folder, next) else {
+                let Some(dispatch) = table.lookup(folder, next) else {
                     continue;
                 };
                 merged.push(Rewire {
                     from: source,
                     old: inner_block,
-                    new: target,
+                    new: dispatch.target,
                     state: next.value,
+                    exit: dispatch.exit,
                 });
                 // The dispatcher edge is answered by rewiring the merge that
                 // feeds it, even though no rewire names the edge itself.
@@ -1256,15 +1307,16 @@ fn propagate_states(
             let Some(&next) = outcome.get(&(pred, state)) else {
                 continue;
             };
-            let Some(next_target) = table.lookup(folder, next) else {
+            let Some(dispatch) = table.lookup(folder, next) else {
                 continue;
             };
             covered.insert(pred);
             rewires.push(Rewire {
                 from: pred,
                 old: dispatcher.block,
-                new: next_target,
+                new: dispatch.target,
                 state: next.value,
+                exit: dispatch.exit,
             });
         }
     }
@@ -1331,13 +1383,14 @@ fn resolve_merge(
         let blame = root.unwrap_or(pred);
 
         if let Some(state) = folder.fold_bound(value, [outer, None]) {
-            if let Some(target) = table.lookup(folder, state) {
+            if let Some(dispatch) = table.lookup(folder, state) {
                 states.push(state);
                 rewires.push(Rewire {
                     from: pred,
                     old: merge_block,
-                    new: target,
+                    new: dispatch.target,
                     state: state.value,
+                    exit: dispatch.exit,
                 });
             } else {
                 unresolved.insert(blame);
@@ -1383,15 +1436,16 @@ fn resolve_merge(
             let Some(state) = folder.fold_bound(value, [outer, Some((phi_result, branch))]) else {
                 continue;
             };
-            let Some(target) = table.lookup(folder, state) else {
+            let Some(dispatch) = table.lookup(folder, state) else {
                 continue;
             };
             states.push(state);
             rewires.push(Rewire {
                 from: source,
                 old: inner_block,
-                new: target,
+                new: dispatch.target,
                 state: state.value,
+                exit: dispatch.exit,
             });
             split_any = true;
         }
@@ -1436,237 +1490,16 @@ fn drop_conflicts(rewires: Vec<Rewire>, stats: &mut ResolutionStats) -> Vec<Rewi
     chosen.into_values().collect()
 }
 
-/// Whether an instruction is state machinery rather than program behaviour.
-///
-/// State machinery is side-effect free and carries no content an analyst would
-/// look for: integer constants encoding states, the copies that move them, and
-/// the control flow that dispatches on them. A string constant fails the test
-/// even though it is pure - losing it loses evidence.
-fn is_state_machinery(instr: &SsaInstruction) -> bool {
-    if let SsaOp::Const { value, .. } = instr.op() {
-        return value.as_i64().is_some();
-    }
-    instr.is_pure()
-        || matches!(
-            instr.op(),
-            SsaOp::Jump { .. }
-                | SsaOp::Leave { .. }
-                | SsaOp::Switch { .. }
-                | SsaOp::Branch { .. }
-                | SsaOp::BranchCmp { .. }
-        )
-}
-
-/// Empties the state machinery the rewiring made unreachable.
-///
-/// Once all of a dispatcher's edges bypass it, the dispatcher and the constants
-/// that encoded the state can no longer execute. They are emptied rather than
-/// removed so block indices stay stable for the rewires already applied;
-/// `rebuild_ssa` and the dead-code passes drop the remains.
-///
-/// Only blocks that are *provably nothing but* state machinery are emptied.
-/// Unreachability here is relative to the states resolution managed to
-/// discover, and that discovery is deliberately incomplete - an edge it cannot
-/// read leaves its case block looking unreachable when it is not. Emptying such
-/// a block would turn a gap in coverage into lost program behaviour, so a block
-/// holding a call, a store, or a string constant is left alone even when
-/// nothing appears to reach it. Dead code costs a little size; deleted code
-/// costs the analysis it was kept for.
-///
-/// Handler entry blocks are roots alongside the function entry: control reaches
-/// them by a runtime exception edge, not from any terminator.
-///
-/// Returns the number of blocks emptied.
-pub fn clear_unreachable(ssa: &mut SsaFunction) -> usize {
-    let block_count = ssa.blocks().len();
-    if block_count == 0 {
-        return 0;
-    }
-
-    let mut roots: Vec<usize> = vec![0];
-    for handler in ssa.exception_handlers() {
-        roots.extend(handler.entry_blocks());
-        roots.extend(handler.protected_range.map(|range| range.start()));
-    }
-
-    let mut reachable = vec![false; block_count];
-    let mut frontier = roots;
-    while let Some(current) = frontier.pop() {
-        let Some(slot) = reachable.get_mut(current) else {
-            continue;
-        };
-        if *slot {
-            continue;
-        }
-        *slot = true;
-        if let Some(op) = ssa.block(current).and_then(|b| b.control_terminator()) {
-            frontier.extend(op.successors());
-        }
-    }
-
-    let dead: Vec<usize> = (0..block_count)
-        .filter(|&index| !reachable.get(index).copied().unwrap_or(true))
-        .filter(|&index| {
-            ssa.block(index).is_some_and(|block| {
-                (!block.instructions().is_empty() || !block.phi_nodes().is_empty())
-                    && block.instructions().iter().all(is_state_machinery)
-            })
-        })
-        .collect();
-
-    for index in &dead {
-        if let Some(block) = ssa.block_mut(*index) {
-            block.clear();
-        }
-    }
-    dead.len()
-}
-
-/// Rewires resolved edges so they bypass the dispatcher.
-///
-/// Each edge's source has its terminator's reference to the merge point
-/// replaced by the dispatch target. Predecessor lists are derived from
-/// terminators, so this is the whole of the CFG change: the stale phi operands
-/// and the now-dead constants that encoded the state are cleaned up by the
-/// caller's `rebuild_ssa` and the ordinary dead-code passes.
-///
-/// An edge whose merge point is not the dispatcher (a case's two branches meeting before
-/// the jump to it) skips the blocks from that merge to the dispatcher, and what they did
-/// has to happen on the new edge: [`carry_skipped_chain`].
-///
-/// # Arguments
-///
-/// * `ssa` - The function, its cross-block values already given slots.
-/// * `rewires` - The edges to rewire.
-/// * `dispatchers` - The dispatcher blocks, where a skipped chain ends.
-///
-/// Returns the number of edges actually rewired.
-pub fn apply_rewires(
-    ssa: &mut SsaFunction,
-    rewires: &[Rewire],
-    dispatchers: &BTreeSet<usize>,
-) -> usize {
-    let mut applied: usize = 0;
-    for rewire in rewires {
-        if !dispatchers.contains(&rewire.old) && !carry_skipped_chain(ssa, rewire, dispatchers) {
-            continue;
-        }
-        let changed = ssa
-            .block_mut(rewire.from)
-            .and_then(|block| block.instructions_mut().last_mut())
-            .is_some_and(|term| term.op_mut().redirect_target(rewire.old, rewire.new));
-        if changed {
-            applied = applied.saturating_add(1);
-        }
-    }
-    applied
-}
-
-/// Does at the end of `rewire.from` what the blocks it now skips did on its behalf.
-///
-/// The chain from `rewire.old` to the dispatcher is state plumbing (the resolver only skips
-/// such a chain) plus what giving cross-block values slots wrote at its end: the values the
-/// dispatcher's phis took on the chain's edge. After copy propagation that is where a case
-/// hands the next case a program value, as in a loop whose case computes `lower =
-/// char.ToLower(c)` and the cases after it read `lower`: skipping the chain without its
-/// writes left them reading the value `lower` had on entry.
-///
-/// Each chain instruction is written again at the end of `from`, its definitions given fresh
-/// names in their own storage groups, and each chain phi read as the operand on the edge the
-/// replica stands for. The instructions are pure, so running them on every path that skips
-/// the chain changes nothing else.
-///
-/// # Returns
-///
-/// `false`, leaving the function unchanged, when the chain does not end at a dispatcher,
-/// holds an instruction with an effect, or has a phi with no operand for the edge taken.
-fn carry_skipped_chain(
-    ssa: &mut SsaFunction,
-    rewire: &Rewire,
-    dispatchers: &BTreeSet<usize>,
-) -> bool {
-    let mut chain: Vec<usize> = Vec::new();
-    let mut current = rewire.old;
-    while !dispatchers.contains(&current) {
-        if chain.len() >= MAX_CHAIN_LEN {
-            return false;
-        }
-        let Some(SsaOp::Jump { target }) = ssa.block(current).and_then(|b| b.last_op()) else {
-            return false;
-        };
-        chain.push(current);
-        current = *target;
-    }
-
-    // The replicas, with the names they read and write remapped: a chain phi to what its
-    // edge brings, a chain definition to its replica
-    let mut renamed: BTreeMap<SsaVarId, SsaVarId> = BTreeMap::new();
-    let mut replicas: Vec<SsaInstruction> = Vec::new();
-    let mut previous = rewire.from;
-    for &block_id in &chain {
-        let Some(block) = ssa.block(block_id) else {
-            return false;
-        };
-        for phi in block.phi_nodes() {
-            let Some(operand) = phi
-                .operands()
-                .iter()
-                .find(|operand| operand.predecessor() == previous && !operand.is_exceptional())
-            else {
-                return false;
-            };
-            let value = renamed
-                .get(&operand.value())
-                .copied()
-                .unwrap_or(operand.value());
-            renamed.insert(phi.result(), value);
-        }
-        let body: Vec<SsaInstruction> = block
-            .instructions()
-            .iter()
-            .filter(|instruction| !instruction.is_terminator())
-            .cloned()
-            .collect();
-        for instruction in body {
-            if !instruction.is_pure() {
-                return false;
-            }
-            for def in instruction.op().defs() {
-                let Some(variable) = ssa.variable(def) else {
-                    return false;
-                };
-                let (origin, var_type) = (variable.origin(), variable.var_type().clone());
-                let group = ssa.rename_group(def);
-                let fresh = ssa.create_variable(origin, 0, DefSite::entry(), var_type);
-                ssa.set_rename_group(fresh, group);
-                renamed.insert(def, fresh);
-            }
-            let op = instruction
-                .op()
-                .remap_variables(|var| renamed.get(&var).copied());
-            replicas.push(SsaInstruction::synthetic(op));
-        }
-        previous = block_id;
-    }
-
-    let Some(from) = ssa.block_mut(rewire.from) else {
-        return false;
-    };
-    let instructions = from.instructions_mut();
-    let at = instructions
-        .iter()
-        .position(SsaInstruction::is_terminator)
-        .unwrap_or(instructions.len());
-    for (offset, replica) in replicas.into_iter().enumerate() {
-        instructions.insert(at.saturating_add(offset), replica);
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::{DefSite, PhiOperand, SsaBlock, SsaInstruction, SsaType, VariableOrigin};
+    use crate::{
+        analysis::{
+            AccessQualifiers, DefSite, FieldRef, PhiOperand, SsaBlock, SsaInstruction, SsaType,
+            VariableOrigin,
+        },
+        deobfuscation::passes::unflattening::rewire::apply_rewires,
+    };
 
     /// Appends an instruction to `block`, creating its destination variable with
     /// the def site the folder needs to find it again.
@@ -1732,8 +1565,8 @@ mod tests {
             }));
         }
 
-        terminate(&mut ssa, 4, SsaOp::Return { value: None });
-        terminate(&mut ssa, 1, SsaOp::Return { value: None });
+        terminate(&mut ssa, 4, SsaOp::returns(None));
+        terminate(&mut ssa, 1, SsaOp::returns(None));
 
         let dispatcher = Dispatcher::new(2, state, vec![4, 3], 1).with_state_phi(state);
         (ssa, dispatcher)
@@ -1855,7 +1688,7 @@ mod tests {
         }
         // Every target must be able to execute, or the table rejects it.
         for index in [2, 9] {
-            terminate(&mut ssa, index, SsaOp::Return { value: None });
+            terminate(&mut ssa, index, SsaOp::returns(None));
         }
 
         // Default arm: `if state == 700 goto 2` then fall through to block 3.
@@ -1876,19 +1709,31 @@ mod tests {
                 false_target: 3,
             },
         );
-        terminate(&mut ssa, 3, SsaOp::Return { value: None });
+        terminate(&mut ssa, 3, SsaOp::returns(None));
 
         let dispatcher = Dispatcher::new(1, state, vec![9], 0);
         let mut folder = StateFolder::new(&ssa);
         let table = DispatchTable::build(&ssa, &dispatcher, state, &mut folder);
 
         assert_eq!(table.overflow_len(), 1);
-        // A state outside the switch table is routed by the chain, not the table.
-        assert_eq!(table.lookup(&mut folder, StateValue::narrow(700)), Some(2));
-        // A state inside the table still uses the table.
-        assert_eq!(table.lookup(&mut folder, StateValue::narrow(0)), Some(9));
-        // Anything else lands where the chain falls through.
-        assert_eq!(table.lookup(&mut folder, StateValue::narrow(123)), Some(3));
+        // A state outside the switch table is routed by the chain, not the
+        // table, and leaves from the link that tests it.
+        assert_eq!(
+            table.lookup(&mut folder, StateValue::narrow(700)),
+            Some(Dispatch { target: 2, exit: 0 })
+        );
+        // A state inside the table still uses the table, leaving from the
+        // dispatcher.
+        assert_eq!(
+            table.lookup(&mut folder, StateValue::narrow(0)),
+            Some(Dispatch { target: 9, exit: 1 })
+        );
+        // Anything else lands where the chain falls through, leaving from its
+        // last link.
+        assert_eq!(
+            table.lookup(&mut folder, StateValue::narrow(123)),
+            Some(Dispatch { target: 3, exit: 0 })
+        );
     }
 
     #[test]
@@ -1911,23 +1756,17 @@ mod tests {
         let (rewires, _) = resolve_dispatch_edges(&ssa, &dispatcher, None);
 
         assert_eq!(
-            apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block])),
-            2
+            apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block])).ok(),
+            Some(2)
         );
         assert!(
             SsaCfg::from_ssa(&ssa).block_predecessors(2).is_empty(),
             "no edge should still reach the dispatcher"
         );
 
-        // With every edge rewired the dispatcher is unreachable, and being pure
-        // state machinery it is emptied, taking its switch with it.
-        assert_eq!(clear_unreachable(&mut ssa), 1);
+        // With every edge rewired the dispatcher is unreachable, and the
+        // session that rewired it empties it, taking its switch with it.
         assert!(ssa.block(2).is_some_and(|b| b.instructions().is_empty()));
-
-        // The default arm is unreachable too, but it returns - behaviour, not
-        // machinery - so it is left intact rather than deleted on the strength
-        // of an analysis that is allowed to be incomplete.
-        assert!(ssa.block(1).is_some_and(|b| !b.instructions().is_empty()));
     }
 
     #[test]
@@ -1951,7 +1790,7 @@ mod tests {
         // husk's own edge, whose state the emptying took with it.
         assert_eq!(stats.unresolved, 2, "those edges keep using the dispatcher");
 
-        apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block]));
+        let _ = apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block]));
 
         // The dispatcher's own switch still names the husk - that is the input
         // condition, and leaving it is what keeps the edge safe. What must not
@@ -1980,6 +1819,7 @@ mod tests {
                     old: 2,
                     new: 7,
                     state: 1,
+                    exit: 2,
                 },
                 // Same edge, different destination: unrepresentable without
                 // duplicating block 5, so neither survives.
@@ -1988,12 +1828,14 @@ mod tests {
                     old: 2,
                     new: 9,
                     state: 2,
+                    exit: 2,
                 },
                 Rewire {
                     from: 6,
                     old: 2,
                     new: 7,
                     state: 1,
+                    exit: 2,
                 },
             ],
             &mut stats,
@@ -2008,28 +1850,36 @@ mod tests {
     fn unresolved_edges_leave_the_dispatcher_in_place() {
         let (mut ssa, dispatcher) = constant_state_cff();
 
-        // Blank out the entry block's constant. The phi operand still names the
-        // variable, but its defining instruction no longer produces a value, so
-        // the edge cannot be folded.
+        // Make the entry state opaque: still defined, but by a load whose value
+        // nothing here knows, so the edge cannot be folded.
         if let Some(instr) = ssa
             .block_mut(0)
             .and_then(|block| block.instructions_mut().first_mut())
         {
-            instr.set_op(SsaOp::Nop);
+            let dest = instr
+                .op()
+                .defs()
+                .next()
+                .expect("the entry constant defines the state");
+            instr.set_op(SsaOp::LoadStaticField {
+                dest,
+                field: FieldRef::new(Token::new(0x0400_0001)),
+                access: AccessQualifiers::FLAT,
+            });
         }
 
         let (rewires, stats) = resolve_dispatch_edges(&ssa, &dispatcher, None);
         assert_eq!(stats.unresolved, 1, "the entry edge no longer folds");
 
-        apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block]));
+        let applied = apply_rewires(&mut ssa, &rewires, &BTreeSet::from([dispatcher.block]));
+        assert!(applied.is_ok(), "{applied:?}\n{ssa}");
         assert_eq!(
             SsaCfg::from_ssa(&ssa).block_predecessors(2),
             [0],
             "the unresolved edge keeps using the dispatcher"
         );
-        assert_eq!(
-            clear_unreachable(&mut ssa),
-            0,
+        assert!(
+            ssa.block(2).is_some_and(|b| !b.instructions().is_empty()),
             "a reachable dispatcher is never emptied"
         );
     }

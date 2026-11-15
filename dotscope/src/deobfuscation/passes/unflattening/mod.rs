@@ -38,7 +38,7 @@
 mod detection;
 mod dispatcher;
 mod resolve;
-mod spill;
+mod rewire;
 mod statevar;
 
 use std::{
@@ -46,6 +46,7 @@ use std::{
     sync::Arc,
 };
 
+use analyssa::analysis::Machine;
 use dashmap::DashSet;
 pub use detection::{CffDetector, CffPattern, EntryCondition, EntryPoint};
 pub use dispatcher::Dispatcher;
@@ -53,17 +54,17 @@ use rayon::prelude::*;
 
 use crate::{
     analysis::{CilTarget, MethodRef, SsaFunction},
-    compiler::{CompilerContext, PassCapability, SsaPass},
+    compiler::{CompilerContext, ModificationScope, PassCapability, SsaPass},
     deobfuscation::{config::DetectionWeights, context::AnalysisContext},
-    metadata::{token::Token, typesystem::PointerSize},
+    metadata::token::Token,
 };
 
 /// High-level API: unflatten a method by rewiring its dispatcher edges.
 ///
 /// Detects every CFF dispatcher in the method - there may be independent ones
 /// per exception handler region - resolves all of their edges against the
-/// unmodified function, and applies the whole set at once so a single
-/// `rebuild_ssa()` sees the final graph.
+/// unmodified function, and applies the whole set in one edit session, which
+/// repairs the values the rewiring disturbed.
 ///
 /// # Arguments
 ///
@@ -168,32 +169,27 @@ pub fn unflatten_with_dispatchers(
         return None;
     }
 
-    // Give every cross-block value a storage location before the CFG changes.
-    //
-    // Rewiring replaces `case -> dispatcher -> next` with `case -> next`, so a
-    // value that used to be merged by a phi at the dispatcher now arrives along
-    // an edge no phi ever described. `rebuild_ssa` can reconstruct such a value
-    // only if it has an identity independent of control flow - a local slot.
-    // Promoting first is what makes the rebuild well-defined for the rewired
-    // graph.
+    // Rewire on a copy: an edge set the session cannot repair leaves the
+    // method as it was, flattened but correct.
     let mut patched = ssa.clone();
     let dispatcher_blocks: BTreeSet<usize> = dispatchers.iter().map(|d| d.block).collect();
-    let spilled = spill::promote_cross_block_values(&mut patched, &dispatcher_blocks);
-    if spilled > 0 {
-        log::debug!("Promoted {spilled} cross-block value(s) to locals before unflattening");
-    }
-
-    let applied = resolve::apply_rewires(&mut patched, &rewires, &dispatcher_blocks);
+    let applied = match rewire::apply_rewires(&mut patched, &rewires, &dispatcher_blocks) {
+        Ok(applied) => applied,
+        Err(error) => {
+            log::warn!(
+                "CFF: the rewired form could not be repaired ({error}); leaving it flattened"
+            );
+            return None;
+        }
+    };
     if applied == 0 {
         return None;
     }
-    let cleared = resolve::clear_unreachable(&mut patched);
-    log::debug!("CFF: rewired {applied} edge(s) past the dispatcher, {cleared} block(s) now dead");
+    log::debug!("CFF: rewired {applied} edge(s) past the dispatcher");
 
     // Dispatchers whose edges did not all resolve keep their remaining
     // predecessors and stay in the graph - partial recovery, not corruption.
-    // The state constants and the dispatcher itself become unreachable once
-    // every edge is rewired, and the ordinary dead-code passes remove them.
+    // The session empties the machinery every rewired edge now bypasses.
     Some(patched)
 }
 
@@ -216,18 +212,18 @@ pub struct UnflattenConfig {
     /// Confidence scoring weights for CFF dispatcher detection.
     pub confidence_weights: DetectionWeights,
 
-    /// Target pointer size for SSA evaluation.
-    ///
-    /// Derived from the PE header. Used when detection evaluates the
-    /// dispatcher's initial state.
-    pub pointer_size: PointerSize,
+    /// The machine the method computes on, which detection evaluates the
+    /// dispatcher's initial state on: the assembly's
+    /// ([`CilTarget::of`](crate::analysis::CilTarget::of)), and the 64-bit
+    /// one by default.
+    pub machine: Machine,
 }
 
 impl Default for UnflattenConfig {
     fn default() -> Self {
         Self {
             min_confidence: 0.6,
-            pointer_size: PointerSize::Bit32,
+            machine: CilTarget::x64().machine(),
             max_backedge_depth: 10,
             confidence_weights: DetectionWeights::default(),
         }
@@ -356,6 +352,10 @@ impl SsaPass<CilTarget, CompilerContext> for CffReconstructionPass {
         "Recovers original control flow from flattened state machine patterns"
     }
 
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::CfgModifying
+    }
+
     fn repairs_ssa(&self) -> bool {
         true
     }
@@ -421,23 +421,7 @@ impl SsaPass<CilTarget, CompilerContext> for CffReconstructionPass {
         let started = std::time::Instant::now();
         let bodies = ContextBodies(ctx);
         match unflatten_with_dispatchers(ssa, dispatchers, Some(&bodies)) {
-            Some(mut patched) => {
-                // Rewiring can leave a value defined on a path the bypass no
-                // longer takes. The guards in `resolve` exist to prevent that,
-                // and `rebuild_ssa` is what proves it: it re-derives the phi
-                // graph and rejects a definition that no longer reaches its
-                // uses. Treat a rejection as "this method cannot be unflattened
-                // safely" and leave it flattened - an unrecovered method is a
-                // gap in the analysis, whereas propagating the error abandons
-                // every remaining method in the assembly as well.
-                if let Err(error) = patched.rebuild_ssa() {
-                    log::warn!(
-                        "CFF {:08x}: rewired form failed SSA validation ({error}); \
-                         leaving the method flattened",
-                        method_token.value()
-                    );
-                    return Ok(false);
-                }
+            Some(patched) => {
                 log::debug!(
                     "CFF {:08x}: {} block(s), {}ms",
                     method_token.value(),
@@ -521,7 +505,7 @@ mod tests {
 
         // B4: default/exit
         let mut b4 = SsaBlock::new(4);
-        b4.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        b4.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
         ssa.add_block(b4);
 
         let dispatcher = Dispatcher::new(1, switch_var, vec![2, 3], 4)
@@ -723,12 +707,7 @@ mod tests {
         fill(
             &mut ssa,
             2,
-            vec![
-                constant(minus_one, -1),
-                SsaOp::Return {
-                    value: Some(minus_one),
-                },
-            ],
+            vec![constant(minus_one, -1), SsaOp::returns(Some(minus_one))],
         );
         fill(
             &mut ssa,
@@ -810,20 +789,14 @@ mod tests {
                 SsaOp::Jump { target: 1 },
             ],
         );
-        fill(
-            &mut ssa,
-            7,
-            vec![SsaOp::Return {
-                value: Some(lower_merged),
-            }],
-        );
+        fill(&mut ssa, 7, vec![SsaOp::returns(Some(lower_merged))]);
         fill(
             &mut ssa,
             8,
             vec![
                 constant(hundred, 100),
                 plus(sum, lower_merged, hundred),
-                SsaOp::Return { value: Some(sum) },
+                SsaOp::returns(Some(sum)),
             ],
         );
         if let Some(block) = ssa.block_mut(1) {
@@ -839,6 +812,308 @@ mod tests {
         (ssa, dispatcher)
     }
 
+    /// `B0` enters the dispatcher with `x = a`, `y = 10`, `z = 5` and state 0; case `B3`
+    /// swaps `x` and `y` through the dispatcher's phis and moves to state 1, and case `B4`
+    /// returns `x - y + z`. `z` goes round unchanged.
+    ///
+    /// ```text
+    /// B1: x = phi(a, y), y = phi(10, x), z = phi(5, z), s = phi(0, 1)
+    ///     switch s, [B3, B4], B2
+    /// ```
+    fn swapping_cff() -> (SsaFunction, Dispatcher) {
+        let mut ssa = SsaFunction::new(1, 3);
+        for id in 0..5 {
+            ssa.add_block(SsaBlock::new(id));
+        }
+        let var = |ssa: &mut SsaFunction, origin, site| {
+            ssa.create_variable(origin, 0, site, SsaType::I32)
+        };
+        let temp = VariableOrigin::Phi;
+        let argument = var(&mut ssa, VariableOrigin::Argument(0), DefSite::entry());
+        let ten = var(&mut ssa, temp, DefSite::instruction(0, 0));
+        let five = var(&mut ssa, temp, DefSite::instruction(0, 1));
+        let zero = var(&mut ssa, temp, DefSite::instruction(0, 2));
+        let x = var(&mut ssa, VariableOrigin::Local(0), DefSite::phi(1));
+        let y = var(&mut ssa, VariableOrigin::Local(1), DefSite::phi(1));
+        let z = var(&mut ssa, VariableOrigin::Local(2), DefSite::phi(1));
+        let state = var(&mut ssa, temp, DefSite::phi(1));
+        let minus_one = var(&mut ssa, temp, DefSite::instruction(2, 0));
+        let one = var(&mut ssa, temp, DefSite::instruction(3, 0));
+        let difference = var(&mut ssa, temp, DefSite::instruction(4, 0));
+        let result = var(&mut ssa, temp, DefSite::instruction(4, 1));
+
+        let constant = |dest, value| SsaOp::Const {
+            dest,
+            value: ConstValue::I32(value),
+        };
+        let fill = |ssa: &mut SsaFunction, id: usize, ops: Vec<SsaOp>| {
+            if let Some(block) = ssa.block_mut(id) {
+                for op in ops {
+                    block.add_instruction(SsaInstruction::synthetic(op));
+                }
+            }
+        };
+        fill(
+            &mut ssa,
+            0,
+            vec![
+                constant(ten, 10),
+                constant(five, 5),
+                constant(zero, 0),
+                SsaOp::Jump { target: 1 },
+            ],
+        );
+        fill(
+            &mut ssa,
+            1,
+            vec![SsaOp::Switch {
+                value: state,
+                targets: vec![3, 4],
+                default: 2,
+            }],
+        );
+        fill(
+            &mut ssa,
+            2,
+            vec![constant(minus_one, -1), SsaOp::returns(Some(minus_one))],
+        );
+        fill(
+            &mut ssa,
+            3,
+            vec![constant(one, 1), SsaOp::Jump { target: 1 }],
+        );
+        fill(
+            &mut ssa,
+            4,
+            vec![
+                SsaOp::Sub {
+                    dest: difference,
+                    left: x,
+                    right: y,
+                    flags: None,
+                },
+                SsaOp::Add {
+                    dest: result,
+                    left: difference,
+                    right: z,
+                    flags: None,
+                },
+                SsaOp::returns(Some(result)),
+            ],
+        );
+        if let Some(block) = ssa.block_mut(1) {
+            for (result, origin, entry, round) in [
+                (x, VariableOrigin::Local(0), argument, y),
+                (y, VariableOrigin::Local(1), ten, x),
+                (z, VariableOrigin::Local(2), five, z),
+                (state, temp, zero, one),
+            ] {
+                let mut phi = PhiNode::new(result, origin);
+                phi.add_operand(PhiOperand::new(entry, 0));
+                phi.add_operand(PhiOperand::new(round, 3));
+                block.add_phi(phi);
+            }
+        }
+        ssa.recompute_uses();
+        let dispatcher = Dispatcher::new(1, state, vec![3, 4], 2).with_state_phi(state);
+        (ssa, dispatcher)
+    }
+
+    /// `B0` enters with state 0; the dispatcher decodes it as `d = s rem.un 7`,
+    /// which may throw and so cannot be run again on a new edge, and switches on
+    /// `d`. Case `B3` computes the next state from the decoded value, `d + 1`,
+    /// and case `B4` returns 42. With `slot_write`, `B3` also writes local 2,
+    /// whose address `B0` takes and which `B4` returns through `ldloc`.
+    ///
+    /// ```text
+    /// B1: s = phi(0, d + 1); d = s rem.un 7; switch d, [B3, B4], B2
+    /// ```
+    fn decoded_state_cff(slot_write: bool) -> (SsaFunction, Dispatcher) {
+        let mut ssa = SsaFunction::new(0, 3);
+        for id in 0..5 {
+            ssa.add_block(SsaBlock::new(id));
+        }
+        let var = |ssa: &mut SsaFunction, origin, site| {
+            ssa.create_variable(origin, 0, site, SsaType::I32)
+        };
+        let temp = VariableOrigin::Phi;
+        let zero = var(&mut ssa, temp, DefSite::instruction(0, 0));
+        let seven = var(&mut ssa, temp, DefSite::instruction(0, 1));
+        let address = slot_write.then(|| var(&mut ssa, temp, DefSite::instruction(0, 2)));
+        let state = var(&mut ssa, temp, DefSite::phi(1));
+        let decoded = var(&mut ssa, temp, DefSite::instruction(1, 0));
+        let minus_one = var(&mut ssa, temp, DefSite::instruction(2, 0));
+        let one = var(&mut ssa, temp, DefSite::instruction(3, 0));
+        let next = var(&mut ssa, temp, DefSite::instruction(3, 1));
+        let flag = slot_write.then(|| {
+            var(
+                &mut ssa,
+                VariableOrigin::Local(2),
+                DefSite::instruction(3, 2),
+            )
+        });
+        let answer = var(&mut ssa, temp, DefSite::instruction(4, 0));
+
+        let constant = |dest, value| SsaOp::Const {
+            dest,
+            value: ConstValue::I32(value),
+        };
+        let fill = |ssa: &mut SsaFunction, id: usize, ops: Vec<SsaOp>| {
+            if let Some(block) = ssa.block_mut(id) {
+                for op in ops {
+                    block.add_instruction(SsaInstruction::synthetic(op));
+                }
+            }
+        };
+        let mut entry = vec![constant(zero, 0), constant(seven, 7)];
+        if let Some(address) = address {
+            entry.push(SsaOp::LoadLocalAddr {
+                dest: address,
+                local_index: 2,
+            });
+        }
+        entry.push(SsaOp::Jump { target: 1 });
+        fill(&mut ssa, 0, entry);
+        fill(
+            &mut ssa,
+            1,
+            vec![
+                SsaOp::Rem {
+                    dest: decoded,
+                    left: state,
+                    right: seven,
+                    unsigned: true,
+                    flags: None,
+                },
+                SsaOp::Switch {
+                    value: decoded,
+                    targets: vec![3, 4],
+                    default: 2,
+                },
+            ],
+        );
+        fill(
+            &mut ssa,
+            2,
+            vec![constant(minus_one, -1), SsaOp::returns(Some(minus_one))],
+        );
+        let mut case = vec![
+            constant(one, 1),
+            SsaOp::Add {
+                dest: next,
+                left: decoded,
+                right: one,
+                flags: None,
+            },
+        ];
+        if let Some(flag) = flag {
+            case.push(constant(flag, 9));
+        }
+        case.push(SsaOp::Jump { target: 1 });
+        fill(&mut ssa, 3, case);
+        let last = if slot_write {
+            vec![
+                SsaOp::LoadLocal {
+                    dest: answer,
+                    local_index: 2,
+                },
+                SsaOp::returns(Some(answer)),
+            ]
+        } else {
+            vec![constant(answer, 42), SsaOp::returns(Some(answer))]
+        };
+        fill(&mut ssa, 4, last);
+        if let Some(block) = ssa.block_mut(1) {
+            let mut phi = PhiNode::new(state, temp);
+            phi.add_operand(PhiOperand::new(zero, 0));
+            phi.add_operand(PhiOperand::new(next, 3));
+            block.add_phi(phi);
+        }
+        ssa.recompute_uses();
+        let dispatcher = Dispatcher::new(1, decoded, vec![3, 4], 2).with_state_phi(state);
+        (ssa, dispatcher)
+    }
+
+    /// **A decoded state that only the next state reads is not run again.**
+    ///
+    /// The case reads the dispatcher's decoded value, but only to compute the
+    /// state it hands back, which goes nowhere once its edge is rewired. So
+    /// the decoding, which may throw and so cannot be repeated on the new
+    /// edge, is no value the edge must define, and both edges are rewired.
+    #[test]
+    fn a_decoded_state_only_the_next_state_reads_is_not_replayed() {
+        let (ssa, dispatcher) = decoded_state_cff(false);
+        let unflattened = unflatten_with_dispatchers(&ssa, vec![dispatcher], None)
+            .expect("the dispatch resolves");
+        assert!(
+            unflattened
+                .blocks()
+                .iter()
+                .all(|block| !matches!(block.last_op(), Some(SsaOp::Switch { .. }))),
+            "the dispatcher is gone:\n{unflattened}"
+        );
+        let verdict = compare(&ssa, &unflattened);
+        assert!(
+            matches!(verdict, Equivalence::Equivalent { conclusive, .. } if conclusive > 0),
+            "{verdict:?}\n{unflattened}"
+        );
+    }
+
+    /// **A case's write to a slot read as storage survives unflattening.** The
+    /// write has no SSA reader - the next case reads the slot with `ldloc` - so
+    /// as a value it is as dead as the state machinery around it, and as a
+    /// write it is not.
+    #[test]
+    fn a_cases_write_to_a_slot_read_as_storage_survives() {
+        let (ssa, dispatcher) = decoded_state_cff(true);
+        let unflattened = unflatten_with_dispatchers(&ssa, vec![dispatcher], None)
+            .expect("the dispatch resolves");
+        let writes = unflattened
+            .iter_instructions()
+            .filter(|(_, _, instr)| {
+                matches!(
+                    instr.op(),
+                    SsaOp::Const {
+                        value: ConstValue::I32(9),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(writes, 1, "the write to local 2 stays\n{unflattened}");
+        assert!(
+            unflattened
+                .blocks()
+                .iter()
+                .all(|block| !matches!(block.last_op(), Some(SsaOp::Switch { .. }))),
+            "the dispatcher is gone:\n{unflattened}"
+        );
+    }
+
+    /// **A swap through the dispatcher stays a swap.** The case hands `x` the value `y`
+    /// held and `y` the value `x` held, both read before either is written; the rewired
+    /// edge reads them the same way, so the unflattened function returns `10 - a + 5` as
+    /// the flattened one does, and `z`, passed round unchanged, keeps its value.
+    #[test]
+    fn a_swap_through_the_dispatcher_stays_a_swap() {
+        let (ssa, dispatcher) = swapping_cff();
+        let unflattened = unflatten_with_dispatchers(&ssa, vec![dispatcher], None)
+            .expect("the dispatch resolves");
+
+        assert!(
+            unflattened
+                .blocks()
+                .iter()
+                .all(|block| !matches!(block.last_op(), Some(SsaOp::Switch { .. }))),
+            "the dispatcher is gone:\n{unflattened}"
+        );
+        let verdict = compare(&ssa, &unflattened);
+        assert!(
+            matches!(verdict, Equivalence::Equivalent { conclusive, .. } if conclusive > 0),
+            "{verdict:?}\n{unflattened}"
+        );
+    }
+
     /// Unflattening rewires each branch straight to its next case, skipping the merge, and
     /// used to skip the update of `lower` with it: the next case read the value `lower` had
     /// on entry (ConfuserEx's `DemoCharOperations` counted no vowels). Both ways the update
@@ -847,9 +1122,8 @@ mod tests {
     fn a_value_updated_on_a_skipped_merge_reaches_the_next_case() {
         for merged in [false, true] {
             let (ssa, dispatcher) = skipped_merge_cff(merged);
-            let mut unflattened = unflatten_with_dispatchers(&ssa, vec![dispatcher], None)
+            let unflattened = unflatten_with_dispatchers(&ssa, vec![dispatcher], None)
                 .expect("the dispatch resolves");
-            unflattened.rebuild_ssa().unwrap();
 
             assert!(
                 unflattened
@@ -1640,7 +1914,7 @@ mod tests {
         // Now simulate what happens in the full pipeline:
         // 1. The opaque pred pass may modify branches in case blocks
         // 2. Optimizer runs (copy prop + DCE)
-        // 3. rebuild_ssa() creates fresh SSA
+        // 3. Unflattening rewires the dispatcher edges and repairs their values
         // The state variable must still be detectable with value 10.
         let mut ssa_mut = ssa;
         run_full_deobfuscation(&mut ssa_mut)?;

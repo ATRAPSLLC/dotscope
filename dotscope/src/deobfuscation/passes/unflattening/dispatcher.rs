@@ -190,7 +190,7 @@ impl Dispatcher {
         // The phi feeding the switch, found through the IR's backward tracer so
         // that an encoded dispatcher - `(state ^ key) % n` - resolves to the
         // same phi a plain one does.
-        if let Some(phi) = ssa.trace_to_phi(*value, Some(block_idx)) {
+        if let Some(phi) = ssa.trace_to_phi(*value) {
             refreshed = refreshed.with_state_phi(phi);
         }
         refreshed = refreshed

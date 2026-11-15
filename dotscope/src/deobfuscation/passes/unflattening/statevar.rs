@@ -325,7 +325,10 @@ pub fn identify_state_variable(
 
     // Look for a phi node that defines the switch variable or a variable
     // that the switch variable depends on
-    let phi_var = find_state_phi(ssa, dispatcher_block, switch_var)?;
+    // The switch may operate on a transformed value (`rem.un(xor(state_phi,
+    // key), N)` under ConfuserEx), so the definition chain is traced back to
+    // the phi that provides the state.
+    let phi_var = ssa.trace_to_phi(switch_var)?;
 
     // Build the state variable
     let mut state_var = StateVariable::from_ssa_var(phi_var);
@@ -352,24 +355,6 @@ pub fn identify_state_variable(
     state_var.confidence = compute_state_var_confidence(ssa, &state_var);
 
     Some(state_var)
-}
-
-/// Finds the phi node that provides the state value at the dispatcher.
-///
-/// The switch may operate on a transformed value (e.g., `(state ^ key) % N`),
-/// so we trace back through the definition chain to find the original phi.
-///
-/// For ConfuserEx pattern:
-/// - switch_var = rem.un(xor_result, N)
-/// - xor_result = xor(state_phi, key)
-/// - state_phi = phi at dispatcher block
-fn find_state_phi(
-    ssa: &SsaFunction,
-    dispatcher_block: usize,
-    switch_var: SsaVarId,
-) -> Option<SsaVarId> {
-    // Use the SSA module's built-in backward tracing to find the PHI
-    ssa.trace_to_phi(switch_var, Some(dispatcher_block))
 }
 
 /// Computes confidence score for a potential state variable.

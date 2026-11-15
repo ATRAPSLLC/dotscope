@@ -886,7 +886,7 @@ impl<'a> CffDetector<'a> {
         dispatcher_block: usize,
         dispatcher_var: SsaVarId,
     ) -> Option<i64> {
-        let mut evaluator = SsaEvaluator::new(self.ssa, self.config.pointer_size);
+        let mut evaluator = SsaEvaluator::new(self.ssa, self.config.machine);
         let mut current = 0usize;
         let mut visited = BitSet::new(self.ssa.block_count());
 
