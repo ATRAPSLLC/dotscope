@@ -10,11 +10,15 @@ use crate::{
     assembly::{FlowType, Immediate, Instruction, Operand},
     formatting::{
         exceptions::{BlockEvent, ExceptionBlockLayout},
-        helpers::format_type_sig,
+        helpers::{format_type_sig, ldc_r4_operand, ldc_r8_operand},
         tokens::resolve_token,
         FormatterOptions,
     },
-    metadata::{method::Method, signatures::parse_local_var_signature, tables::StandAloneSigRaw},
+    metadata::{
+        method::Method,
+        signatures::{parse_local_var_signature, SignatureLocalVariable},
+        tables::StandAloneSigRaw,
+    },
     CilObject,
 };
 
@@ -24,7 +28,7 @@ use crate::{
 /// instructions with interleaved exception handler blocks (`.try`/`catch`/
 /// `finally`/`fault`/`filter`). Instructions are indented dynamically based
 /// on exception handler nesting depth.
-pub(super) fn format_method_body(
+pub fn format_method_body(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     method: &Method,
@@ -103,7 +107,7 @@ pub(super) fn format_method_body(
 ///
 /// Skips `.maxstack`, `.locals`, and exception handler blocks. Used when
 /// the `--raw` formatter option is enabled.
-pub(super) fn format_method_body_raw(
+pub fn format_method_body_raw(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     method: &Method,
@@ -128,53 +132,56 @@ pub(super) fn format_method_body_raw(
 /// correct assembly-scoped names for nested types. Falls back to the resolved
 /// `LocalVariable` data if the raw blob is unavailable.
 fn format_locals(w: &mut dyn Write, method: &Method, asm: &CilObject) -> io::Result<()> {
-    if method.local_vars.is_empty() {
+    // The locals as the method's signature declares them, parsed from its StandAloneSig blob
+    // (which keeps the original tokens, so nested types get their assembly-scoped names).
+    // Only a blob that cannot be read falls back to the resolved locals, each rebuilt into a
+    // signature local; one that cannot be keeps its slot as `???` so the indices stay right.
+    // The block was skipped whenever the resolved locals were empty, though the signature
+    // declared locals the body's `ldloc`s still name.
+    let parsed: Option<Vec<SignatureLocalVariable>> = method.body.get().and_then(|body| {
+        let rid = body.local_var_sig_rid()?;
+        let row = asm
+            .tables()?
+            .table::<StandAloneSigRaw>()?
+            .get(rid)
+            .ok()
+            .flatten()?;
+        let data = asm.blob()?.get(row.signature as usize).ok()?;
+        parse_local_var_signature(data).ok().map(|sig| sig.locals)
+    });
+    let locals: Vec<Option<SignatureLocalVariable>> = match parsed {
+        Some(locals) => locals.into_iter().map(Some).collect(),
+        None => method
+            .local_vars
+            .iter()
+            .map(|(_, local)| local.to_signature_local())
+            .collect(),
+    };
+    if locals.is_empty() {
         return Ok(());
     }
 
     let is_init = method.body.get().is_some_and(|b| b.is_init_local);
-
     if is_init {
         writeln!(w, "    .locals init (")?;
     } else {
         writeln!(w, "    .locals (")?;
     }
 
-    // Try to format from the raw signature blob (preserves original tokens and
-    // produces correct assembly-scoped names for nested types).
-    let blob_locals = method.body.get().and_then(|body| {
-        if body.local_var_sig_token == 0 {
-            return None;
-        }
-        let rid = body.local_var_sig_token & 0x00FF_FFFF;
-        let tables = asm.tables()?;
-        let table = tables.table::<StandAloneSigRaw>()?;
-        let row = table.get(rid).ok().flatten()?;
-        let blob = asm.blob()?;
-        let sig_data = blob.get(row.signature as usize).ok()?;
-        parse_local_var_signature(sig_data).ok()
-    });
-
-    let count = method.local_vars.count();
-    for (i, local) in method.local_vars.iter() {
-        // Use raw blob TypeSignature when available (correct nested type names),
-        // fall back to reconstructed TypeSignature from resolved CilTypeRef.
-        let type_name = blob_locals
-            .as_ref()
-            .and_then(|sig| sig.locals.get(i))
-            .map(|sig_local| format_type_sig(&sig_local.base, asm))
-            .or_else(|| {
-                local
-                    .to_signature_local()
-                    .map(|sig_local| format_type_sig(&sig_local.base, asm))
-            })
-            .unwrap_or_else(|| "???".to_string());
-
-        let pinned = if local.is_pinned { " pinned" } else { "" };
-        let byref = if local.is_byref { "&" } else { "" };
-
+    let count = locals.len();
+    for (i, local) in locals.iter().enumerate() {
+        // A by-reference local's `&` belongs to its type, and `pinned` follows the type:
+        // `int32& pinned`. `pinned&` is no ILAsm.
+        let declared = local.as_ref().map_or_else(
+            || "???".to_string(),
+            |local| {
+                let byref = if local.is_byref { "&" } else { "" };
+                let pinned = if local.is_pinned { " pinned" } else { "" };
+                format!("{}{byref}{pinned}", format_type_sig(&local.base, asm))
+            },
+        );
         let comma = if i.saturating_add(1) < count { "," } else { "" };
-        writeln!(w, "      [{i}] {type_name}{pinned}{byref} V_{i}{comma}")?;
+        writeln!(w, "      [{i}] {declared} V_{i}{comma}")?;
     }
 
     writeln!(w, "    )")?;
@@ -242,6 +249,10 @@ fn format_operand(
 
     match &instruction.operand {
         Operand::None => String::new(),
+        // A float operand as ILAsm reads it: `Display` writes `inf`, `NaN` and `-0`, and a
+        // large value with hundreds of digits
+        Operand::Immediate(Immediate::Float32(value)) => ldc_r4_operand(*value),
+        Operand::Immediate(Immediate::Float64(value)) => ldc_r8_operand(*value),
         Operand::Immediate(imm) => imm.to_string(),
         Operand::Target(addr) => {
             let offset = addr.saturating_sub(code_start_rva);

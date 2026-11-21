@@ -12,7 +12,7 @@ use std::{
 use crate::{
     formatting::{
         generics,
-        helpers::{format_sig_param, quote_identifier},
+        helpers::{format_sig_param, quote_identifier, quoted_string},
     },
     metadata::{
         imports::{ImportSourceId, ImportType},
@@ -31,11 +31,7 @@ use crate::{
 /// `pinvokeimpl`, calling convention (`instance`), return type, method name with
 /// generic parameters, parameter list, and code type (`cil`/`native`/`runtime`
 /// `managed`/`unmanaged`). Does not emit the opening brace.
-pub(super) fn format_method_header(
-    w: &mut dyn Write,
-    method: &Method,
-    asm: &CilObject,
-) -> io::Result<()> {
+pub fn format_method_header(w: &mut dyn Write, method: &Method, asm: &CilObject) -> io::Result<()> {
     let access = method.flags_access.ilasm_keyword();
     write!(w, "  .method {access}")?;
 
@@ -218,13 +214,13 @@ fn format_pinvoke_spec(w: &mut dyn Write, method: &Method, asm: &CilObject) -> i
 
     // DLL name
     if let Some(ref dll) = dll_name {
-        write!(w, "\"{dll}\"")?;
+        write!(w, "{}", quoted_string(dll))?;
     }
 
     // Entry point (only if it differs from the method name)
     if let Some(ref entry) = entry_name {
         if entry != &method.name {
-            write!(w, " as \"{entry}\"")?;
+            write!(w, " as {}", quoted_string(entry))?;
         }
     }
 
@@ -274,7 +270,7 @@ fn format_pinvoke_spec(w: &mut dyn Write, method: &Method, asm: &CilObject) -> i
 /// Build the closing brace and end-of-method comment string.
 ///
 /// Returns a string like `  } // end of method Namespace.Type::MethodName`.
-pub(super) fn method_end_comment(method: &Method) -> String {
+pub fn method_end_comment(method: &Method) -> String {
     if let Some(type_name) = method.declaring_type_fullname() {
         format!("  }} // end of method {}::{}", type_name, method.name)
     } else {

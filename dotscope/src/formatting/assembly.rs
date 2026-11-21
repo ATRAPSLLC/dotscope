@@ -12,7 +12,7 @@ use crate::{
     file::sectionmap::RvaMapping,
     formatting::{
         attributes,
-        helpers::{data_label_for_rva, hex_bytes, quote_identifier},
+        helpers::{data_label_for_rva, hex_bytes, quote_identifier, quoted_name, quoted_string},
         security, FormatterOptions,
     },
     metadata::{
@@ -45,7 +45,7 @@ fn write_assembly_arch_flags(w: &mut dyn Write, flags: AssemblyFlags) -> io::Res
 /// the `.module` directive, `.corflags`, and PE header directives
 /// (`.imagebase`, `.file alignment`, `.stackreserve`, `.subsystem`)
 /// from the optional header's Windows-specific fields.
-pub(super) fn format_header(
+pub fn format_header(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     asm: &CilObject,
@@ -53,7 +53,7 @@ pub(super) fn format_header(
     if let Some(asm_meta) = asm.assembly() {
         write!(w, ".assembly")?;
         write_assembly_arch_flags(w, asm_meta.flags)?;
-        writeln!(w, " '{}' {{", asm_meta.name)?;
+        writeln!(w, " {} {{", quoted_name(&asm_meta.name))?;
 
         if asm_meta.hash_alg_id != HashAlgorithmId::NONE {
             writeln!(w, "  .hash algorithm 0x{:08X}", asm_meta.hash_alg_id.bits())?;
@@ -109,7 +109,7 @@ pub(super) fn format_header(
 /// Each external assembly reference is emitted with its name, optional
 /// `retargetable` flag, public key token or public key (when available),
 /// `.hash`, `.culture`, and version information.
-pub(super) fn format_assembly_refs(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
+pub fn format_assembly_refs(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
     for entry in asm.refs_assembly().iter() {
         let aref = entry.value();
 
@@ -119,7 +119,7 @@ pub(super) fn format_assembly_refs(w: &mut dyn Write, asm: &CilObject) -> io::Re
             write!(w, " retargetable")?;
         }
         write_assembly_arch_flags(w, aref.flags)?;
-        writeln!(w, " '{}' {{", aref.name)?;
+        writeln!(w, " {} {{", quoted_name(&aref.name))?;
 
         if let Some(ref ident) = aref.identifier {
             match ident {
@@ -146,7 +146,7 @@ pub(super) fn format_assembly_refs(w: &mut dyn Write, asm: &CilObject) -> io::Re
         // .culture
         if let Some(ref culture) = aref.culture {
             if !culture.is_empty() {
-                writeln!(w, "  .culture \"{culture}\"")?;
+                writeln!(w, "  .culture {}", quoted_string(culture))?;
             }
         }
 
@@ -164,10 +164,10 @@ pub(super) fn format_assembly_refs(w: &mut dyn Write, asm: &CilObject) -> io::Re
 ///
 /// Module references represent external unmanaged modules (native DLLs) used
 /// by P/Invoke declarations. Each is emitted as `.module extern 'ModuleName'`.
-pub(super) fn format_module_refs(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
+pub fn format_module_refs(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
     for entry in asm.refs_module().iter() {
         let mref = entry.value();
-        writeln!(w, ".module extern '{}'", mref.name)?;
+        writeln!(w, ".module extern {}", quoted_name(&mref.name))?;
     }
     Ok(())
 }
@@ -177,7 +177,7 @@ pub(super) fn format_module_refs(w: &mut dyn Write, asm: &CilObject) -> io::Resu
 /// Each file entry has flags (nometadata), name, and hash value.
 /// ILAsm syntax: `.file nometadata 'ResourceFile.dat'`
 ///               `.file 'Module2.netmodule' .hash = (XX XX ...)`
-pub(super) fn format_file_directives(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
+pub fn format_file_directives(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
     for entry in asm.refs_file().iter() {
         let file = entry.value();
 
@@ -188,7 +188,7 @@ pub(super) fn format_file_directives(w: &mut dyn Write, asm: &CilObject) -> io::
             write!(w, " nometadata")?;
         }
 
-        write!(w, " '{}'", file.name)?;
+        write!(w, " {}", quoted_name(&file.name))?;
 
         // .hash
         let hash_data = file.hash_value.data();
@@ -206,7 +206,7 @@ pub(super) fn format_file_directives(w: &mut dyn Write, asm: &CilObject) -> io::
 /// Exported types reference types in other modules of the same assembly
 /// or type forwarders to other assemblies. Each entry specifies the
 /// implementation (`.file` or `.assembly extern`) and nested type parent.
-pub(super) fn format_exported_types(
+pub fn format_exported_types(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     asm: &CilObject,
@@ -234,7 +234,7 @@ pub(super) fn format_exported_types(
         // Build full type name
         let fullname = match &exported.namespace {
             Some(ns) if !ns.is_empty() => format!("{ns}.{}", exported.name),
-            _ => exported.name.clone(),
+            _ => exported.name.to_string(),
         };
 
         if is_forwarder {
@@ -251,15 +251,15 @@ pub(super) fn format_exported_types(
         if let Some(implementation) = exported.get_implementation() {
             match implementation {
                 CilTypeReference::File(file) => {
-                    writeln!(w, "  .file '{}'", file.name)?;
+                    writeln!(w, "  .file {}", quoted_name(&file.name))?;
                 }
                 CilTypeReference::AssemblyRef(aref) => {
-                    writeln!(w, "  .assembly extern '{}'", aref.name)?;
+                    writeln!(w, "  .assembly extern {}", quoted_name(&aref.name))?;
                 }
                 CilTypeReference::ExportedType(parent) => {
                     let parent_fullname = match &parent.namespace {
                         Some(ns) if !ns.is_empty() => format!("{ns}.{}", parent.name),
-                        _ => parent.name.clone(),
+                        _ => parent.name.to_string(),
                     };
                     writeln!(w, "  .class extern {}", quote_identifier(&parent_fullname))?;
                 }
@@ -287,7 +287,7 @@ pub(super) fn format_exported_types(
 /// qualifier, fields in `.text` get `I_` prefix and `cil` qualifier, all others
 /// get `D_` prefix. Uninitialized data (RVA within virtual size but beyond raw
 /// data) is emitted as `int8[count]` instead of `bytearray(...)`.
-pub(super) fn format_data_directives(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
+pub fn format_data_directives(w: &mut dyn Write, asm: &CilObject) -> io::Result<()> {
     let file = asm.file();
     let sections = file.sections();
 

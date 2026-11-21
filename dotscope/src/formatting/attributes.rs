@@ -22,7 +22,7 @@ use crate::{
 ///
 /// Each custom attribute is emitted at the given indentation level with its
 /// constructor reference, raw blob bytes, and human-readable comment.
-pub(super) fn format_custom_attributes(
+pub fn format_custom_attributes(
     w: &mut dyn Write,
     attrs: &CustomAttributeValueList,
     indent: &str,

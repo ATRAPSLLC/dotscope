@@ -20,7 +20,7 @@ use crate::{
 /// ```text
 /// .vtfixup [Count] int32 fromunmanaged at D_XXXXXXXX
 /// ```
-pub(super) fn format_vtfixup_directives(
+pub fn format_vtfixup_directives(
     w: &mut dyn Write,
     ctx: &VtFixupContext,
     sections: &[SectionTable],
@@ -58,7 +58,7 @@ pub(super) fn format_vtfixup_directives(
 ///     .vtentry 1 : 1
 ///     .export [1] as MyFunction
 /// ```
-pub(super) fn format_method_vtentry_export(
+pub fn format_method_vtentry_export(
     w: &mut dyn Write,
     method_token: u32,
     ctx: &VtFixupContext,

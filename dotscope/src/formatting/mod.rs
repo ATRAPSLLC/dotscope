@@ -352,7 +352,7 @@ impl IlFormatter {
 ///
 /// Produces either:
 /// - Simple form: `.override TypeName::MethodName` (when declaration parent is NOT a TypeSpec)
-/// - Full method-ref form: `.override method instance void class IFoo`1<int32>::Bar(params)`
+/// - Full method-ref form: `` .override method instance void class IFoo`1<int32>::Bar(params) ``
 ///   (when declaration parent IS a TypeSpec, e.g. generic type instantiation)
 fn format_override_directive(
     w: &mut dyn Write,
@@ -418,7 +418,7 @@ mod tests {
         let cil_type = asm
             .query_types()
             .defined()
-            .filter(|t| &*t.fullname() == type_name)
+            .filter(|t| t.fullname() == type_name)
             .find_all()
             .into_iter()
             .next()
@@ -817,6 +817,23 @@ mod tests {
         assert!(
             output.contains(".custom"),
             "Missing .custom under .interfaceimpl for {type_name}: {output}"
+        );
+    }
+
+    /// A pinned by-reference local is `T& pinned`: the `&` belongs to the type and `pinned`
+    /// follows it. It was written `T pinned&`, which ILAsm does not read.
+    #[test]
+    fn a_pinned_byref_local_is_written_as_ilasm_reads_it() {
+        let asm = CilObject::from_path(fixture("WindowsBase.dll")).unwrap();
+        let formatter = IlFormatter::new(FormatterOptions::default());
+        let mut buf = Vec::new();
+        formatter.format_assembly(&mut buf, &asm).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+
+        assert!(!text.contains("pinned&"));
+        assert!(
+            text.contains("& pinned"),
+            "WindowsBase has pinned by-reference locals"
         );
     }
 }

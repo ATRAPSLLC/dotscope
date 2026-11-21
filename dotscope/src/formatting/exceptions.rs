@@ -20,7 +20,7 @@ use crate::{
 /// instruction output to emit `.try`/`catch`/`finally`/`fault`/`filter` blocks
 /// at the correct IL offsets.
 #[derive(Debug)]
-pub(crate) enum BlockEvent {
+pub enum BlockEvent {
     /// Open a `.try {` block at the beginning of a protected region.
     TryOpen,
     /// Close a try block `}` at the end of a protected region.
@@ -40,7 +40,7 @@ pub(crate) enum BlockEvent {
 
 /// The kind of exception handler for a [`BlockEvent::HandlerOpen`].
 #[derive(Debug)]
-pub(crate) enum HandlerKind {
+pub enum HandlerKind {
     /// A `catch` handler for a specific exception type.
     Catch(String),
     /// A `finally` handler that always executes on region exit.
@@ -56,7 +56,7 @@ pub(crate) enum HandlerKind {
 /// Built from a flat list of [`ExceptionHandler`] entries and produces an
 /// ordered map where close events precede open events at each offset,
 /// enabling correct nesting during instruction output.
-pub(crate) struct ExceptionBlockLayout {
+pub struct ExceptionBlockLayout {
     /// Events ordered by IL offset. At each offset, closes come before opens.
     pub events: BTreeMap<u32, Vec<BlockEvent>>,
 }

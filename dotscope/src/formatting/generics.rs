@@ -122,7 +122,7 @@ fn format_generic_params(params: &GenericParamList, asm: &CilObject) -> String {
 ///
 /// Calls [`format_generic_params`] and writes the result to `w`. Does
 /// nothing if the parameter list is empty.
-pub(super) fn write_generic_params(
+pub fn write_generic_params(
     w: &mut dyn Write,
     params: &GenericParamList,
     asm: &CilObject,
@@ -138,7 +138,7 @@ pub(super) fn write_generic_params(
 ///
 /// ILAsm syntax: `.param type T` followed by `.custom` directives.
 /// Only emits directives for generic parameters that actually have custom attributes.
-pub(super) fn format_generic_param_custom_attributes(
+pub fn format_generic_param_custom_attributes(
     w: &mut dyn Write,
     params: &GenericParamList,
     indent: &str,

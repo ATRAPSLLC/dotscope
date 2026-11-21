@@ -20,7 +20,7 @@ use crate::{
 ///
 /// Each event is emitted with its delegate type, name, accessor methods
 /// (`.addon`, `.removeon`, `.fire`, `.other`), and custom attributes.
-pub(super) fn format_events(
+pub fn format_events(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     cil_type: &CilType,

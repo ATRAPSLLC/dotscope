@@ -22,7 +22,7 @@ use crate::{
 ///
 /// Each property is emitted with its type, name, optional default value,
 /// accessor methods (`.get`, `.set`, `.other`), and custom attributes.
-pub(super) fn format_properties(
+pub fn format_properties(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     cil_type: &CilType,

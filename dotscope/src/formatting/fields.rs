@@ -23,7 +23,7 @@ use crate::{
 /// `literal`), optional `marshal(...)` info, type signature, name, optional
 /// `at D_XXXXXXXX` RVA reference, optional `= <value>` default value, and
 /// custom attributes.
-pub(super) fn format_fields(
+pub fn format_fields(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     cil_type: &CilType,

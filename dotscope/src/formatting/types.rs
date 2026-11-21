@@ -22,11 +22,7 @@ use crate::{
 /// `implements` clause. After the opening brace, emits `.pack` and `.size`
 /// directives when the type has explicit packing or class size from the
 /// `ClassLayout` table.
-pub(super) fn format_type_begin(
-    w: &mut dyn Write,
-    cil_type: &CilType,
-    asm: &CilObject,
-) -> io::Result<()> {
+pub fn format_type_begin(w: &mut dyn Write, cil_type: &CilType, asm: &CilObject) -> io::Result<()> {
     let flags = cil_type.flags;
 
     write!(w, ".class")?;
@@ -150,10 +146,10 @@ pub(super) fn format_type_begin(
 }
 
 /// Write the closing brace and end-of-class comment for a type.
-pub(super) fn format_type_end(w: &mut dyn Write, cil_type: &CilType) -> io::Result<()> {
+pub fn format_type_end(w: &mut dyn Write, cil_type: &CilType) -> io::Result<()> {
     // Use simple name for nested types (same as in the .class directive)
     let display_name = if cil_type.enclosing_type().is_some() {
-        cil_type.name.clone()
+        cil_type.name.to_string()
     } else {
         cil_type.fullname().to_string()
     };
