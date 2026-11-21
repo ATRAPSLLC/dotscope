@@ -374,7 +374,7 @@ fn try_emulate_resource_handler(
             }
             if let Some(resource_data) = hidden_resources.get_data(manifest) {
                 resources.push(ExtractedResource {
-                    name: manifest.name.clone(),
+                    name: manifest.name.to_string(),
                     flags: manifest.flags,
                     data: resource_data.to_vec(),
                 });
@@ -423,16 +423,15 @@ fn resolve_call_name(assembly: &CilObject, token: Token) -> Option<String> {
         // MethodDef
         0x06 => {
             let method = assembly.method(&token).ok()?;
-            Some(method.name.clone())
+            Some(method.name.to_string())
         }
         // MemberRef
         0x0A => {
             let member_ref = assembly.member_ref(&token)?;
-            let type_name = member_ref
-                .declaredby
-                .fullname()
-                .unwrap_or_else(|| "Unknown".to_string());
-            Some(format!("{}::{}", type_name, member_ref.name))
+            Some(match member_ref.declaredby.fullname() {
+                Some(type_name) => format!("{type_name}::{}", member_ref.name),
+                None => format!("Unknown::{}", member_ref.name),
+            })
         }
         _ => None,
     }

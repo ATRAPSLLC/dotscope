@@ -57,7 +57,7 @@ use crate::{
 /// to the #US heap and emitting proper `ldstr` instructions.
 pub struct UnmanagedStringReversalPass {
     /// Maps fake native method tokens to their decrypted string values.
-    pub(crate) native_string_map: HashMap<Token, String>,
+    pub native_string_map: HashMap<Token, String>,
 }
 
 impl SsaPass<CilTarget, CompilerContext> for UnmanagedStringReversalPass {

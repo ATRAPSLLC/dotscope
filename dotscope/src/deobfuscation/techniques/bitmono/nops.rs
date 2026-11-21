@@ -14,7 +14,7 @@
 //!
 //! # Cleanup
 //!
-//! Returns the dead nop method tokens via [`cleanup()`](SsaTechnique::cleanup)
+//! Returns the dead nop method tokens via [`cleanup()`](crate::deobfuscation::Technique::cleanup)
 //! for removal during the assembly cleanup phase.
 
 use std::any::Any;

@@ -7,9 +7,9 @@
 mod constants;
 mod debug;
 mod decompiler;
-mod delegates;
+pub mod delegates;
 mod dump;
-mod flattening;
+pub mod flattening;
 mod handlers;
 mod ildasm;
 mod metadata;

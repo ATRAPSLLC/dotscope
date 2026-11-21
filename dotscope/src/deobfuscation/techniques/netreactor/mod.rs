@@ -25,14 +25,14 @@ mod necrobit;
 mod privateimpl;
 mod resources;
 
-pub(crate) use antitamp::NetReactorAntiTamp;
-pub(crate) use antitrial::NetReactorAntiTrial;
-pub(crate) use emptyresource::NetReactorEmptyResource;
-pub(crate) use helpers::find_resources_referenced_by_methods;
-pub(crate) use licensecheck::NetReactorLicenseCheck;
-pub(crate) use necrobit::NetReactorNecroBit;
-pub(crate) use privateimpl::NetReactorPrivateImpl;
-pub(crate) use resources::NetReactorResources;
+pub use antitamp::NetReactorAntiTamp;
+pub use antitrial::NetReactorAntiTrial;
+pub use emptyresource::NetReactorEmptyResource;
+pub use helpers::find_resources_referenced_by_methods;
+pub use licensecheck::NetReactorLicenseCheck;
+pub use necrobit::NetReactorNecroBit;
+pub use privateimpl::NetReactorPrivateImpl;
+pub use resources::NetReactorResources;
 
 #[cfg(test)]
 mod tests {

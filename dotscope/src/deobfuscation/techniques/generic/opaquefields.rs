@@ -370,6 +370,10 @@ pub struct OpaquePredicateFindings {
     /// Sentinel method token → sentinel field token mapping (Variant B).
     /// The method body is `ldsfld → ldnull → ceq → ret` (always returns true if field is null).
     pub sentinel_methods: HashMap<Token, Token>,
+    /// Fields stored outside type initialization, each as the code names it and, for a
+    /// MemberRef, as the FieldDef it resolves to. A chain through one of them holds a value
+    /// the program changes at runtime, which a warmed-up value must not stand for.
+    pub runtime_stored_fields: Vec<Token>,
 }
 
 /// Detects static field chain opaque predicates via SSA def-use analysis.
@@ -526,11 +530,22 @@ impl Technique for GenericOpaquePredicates {
             )));
         }
 
+        let runtime_stored_fields: Vec<Token> = stored_fields
+            .iter()
+            .flat_map(|&token| {
+                let resolved = token
+                    .is_table(TableId::MemberRef)
+                    .then(|| assembly.resolver().resolve_field(token))
+                    .flatten();
+                std::iter::once(token).chain(resolved)
+            })
+            .collect();
         let findings = OpaquePredicateFindings {
             affected_field_tokens: affected_fields.into_iter().collect(),
             affected_methods: affected_methods.into_iter().collect(),
             owning_type_tokens: owning_types.into_iter().collect(),
             sentinel_methods,
+            runtime_stored_fields,
         };
 
         Detection::new_detected(
@@ -614,6 +629,7 @@ impl Technique for GenericOpaquePredicates {
             needed_static_fields,
             affected_methods,
             findings.sentinel_methods.clone(),
+            findings.runtime_stored_fields.iter().copied().collect(),
         ))]
     }
 

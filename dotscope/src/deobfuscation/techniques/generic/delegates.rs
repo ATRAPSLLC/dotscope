@@ -22,7 +22,7 @@
 //! `Activator.CreateInstance`, or `FieldInfo.GetValue/SetValue`.
 //!
 //! Produces [`ReflectionFindings`] consumed by the engine-owned
-//! [`ReflectionDevirtualizationPass`](crate::deobfuscation::passes::ReflectionDevirtualizationPass).
+//! [`ReflectionDevirtualizationPass`].
 //!
 //! ## Detection
 //!
@@ -77,7 +77,7 @@ pub struct ReflectionFindings {
 ///
 /// `GenericDelegateProxy::detect_ssa()` produces this because both analyses
 /// share the same SSA scanning pass. The engine extracts [`ReflectionFindings`]
-/// to create [`ReflectionDevirtualizationPass`](crate::deobfuscation::passes::ReflectionDevirtualizationPass);
+/// to create [`ReflectionDevirtualizationPass`];
 /// the technique uses [`DelegateProxyFindings`] for [`DelegateProxyResolutionPass`].
 #[derive(Debug)]
 pub struct CallIndirectionFindings {

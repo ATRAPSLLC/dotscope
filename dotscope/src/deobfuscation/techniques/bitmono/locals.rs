@@ -16,7 +16,7 @@
 //!
 //! # SSA Pass
 //!
-//! [`LocalEncodingReversalPass`](crate::deobfuscation::passes::bitmono::LocalEncodingReversalPass)
+//! [`LocalEncodingReversalPass`]
 //! carries each encoded local's values plain.
 
 use std::{any::Any, collections::HashSet, sync::Arc};

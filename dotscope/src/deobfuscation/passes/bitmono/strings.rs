@@ -478,9 +478,9 @@ fn decrypt_string(encrypted: &[u8], key: &[u8], iv: &[u8]) -> Result<String> {
     }
 
     let decrypted =
-        apply_crypto_transform("AES", key, iv, false, encrypted, 1, 2).ok_or_else(|| {
+        apply_crypto_transform("AES", key, iv, false, encrypted, 1, 2).map_err(|failure| {
             Error::Deobfuscation(format!(
-                "AES-256-CBC decryption failed for {} bytes",
+                "AES-256-CBC decryption failed for {} bytes: {failure}",
                 encrypted.len()
             ))
         })?;

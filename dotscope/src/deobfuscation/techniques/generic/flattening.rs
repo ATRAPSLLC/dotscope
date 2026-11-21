@@ -40,7 +40,7 @@ use crate::{
 /// Findings from CFF detection.
 ///
 /// Contains the pre-computed dispatcher analysis for each method where CFF
-/// was detected. The [`CffReconstructionPass`](crate::deobfuscation::passes::CffReconstructionPass)
+/// was detected. The [`CffReconstructionPass`]
 /// can consume these directly instead of re-running detection.
 #[derive(Debug)]
 pub struct FlatteningFindings {

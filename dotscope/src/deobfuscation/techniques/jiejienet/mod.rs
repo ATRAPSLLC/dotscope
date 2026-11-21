@@ -15,9 +15,9 @@
 //! | `jiejienet.resources` | Stream subclass nested in type with Dictionary<string,byte[]> | Value |
 
 // Detection techniques
-mod arrays;
+pub mod arrays;
 mod constants;
-mod resources;
+pub mod resources;
 mod strings;
 mod typeofs;
 

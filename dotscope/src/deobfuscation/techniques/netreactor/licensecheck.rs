@@ -45,7 +45,7 @@
 //!    [`find_unreferenced_types`] during `build_cleanup_request`.
 //!
 //! [`netreactor.antitrial`]: super::antitrial
-//! [`NeutralizationPass`]: crate::compiler::NeutralizationPass
+//! [`NeutralizationPass`]: crate::deobfuscation::NeutralizationPass
 //! [`find_unreferenced_types`]: crate::cilassembly::find_unreferenced_types
 
 use std::any::Any;

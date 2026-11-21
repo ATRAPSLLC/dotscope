@@ -170,6 +170,10 @@ pub enum FailureReason {
     InvalidReturnValue,
     /// Method not found in assembly.
     MethodNotFound,
+    /// No initialization of the state machine was found for the call site, so the state
+    /// its decryptor reads is unknown. Decrypting from an assumed seed answers a wrong value
+    /// that looks like a right one.
+    SeedNotFound,
 }
 
 impl FailureReason {
@@ -183,11 +187,15 @@ impl FailureReason {
     ///
     /// Retriable failures include:
     /// - `NonConstantArgs` - the arguments might become constant in later passes
+    /// - `SeedNotFound` - the seed's argument might become constant in later passes
     #[must_use]
     pub fn is_permanent(&self) -> bool {
         // Budget exhaustion is a property of the run, not of the call site: with a larger
         // budget the same site could succeed, so it must not be cached as permanent.
-        !matches!(self, Self::NonConstantArgs | Self::EmulationBudgetExhausted)
+        !matches!(
+            self,
+            Self::NonConstantArgs | Self::EmulationBudgetExhausted | Self::SeedNotFound
+        )
     }
 }
 
@@ -200,6 +208,7 @@ impl std::fmt::Display for FailureReason {
             Self::InvalidReturnValue => write!(f, "invalid return value"),
             Self::MethodNotFound => write!(f, "method not found"),
             Self::EmulationBudgetExhausted => write!(f, "run emulation budget exhausted"),
+            Self::SeedNotFound => write!(f, "no state machine seed found for the call site"),
         }
     }
 }
@@ -214,7 +223,8 @@ impl std::fmt::Display for FailureReason {
 /// (causing redundant emulation, not incorrect results).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
-    /// The decryptor method token.
+    /// The token the call names: the decryptor, or for a generic one its instantiation (a
+    /// MethodSpec), so `Get<int>(5)` and `Get<string>(5)` are cached apart.
     pub decryptor: Token,
     /// String representation of arguments for hashing.
     pub args_repr: String,
@@ -446,7 +456,8 @@ impl DecryptorContext {
     ///
     /// # Arguments
     ///
-    /// * `decryptor` - The decryptor method token.
+    /// * `decryptor` - The token the call names: the decryptor, or for a generic one its
+    ///   instantiation, whose results differ by type argument.
     /// * `args` - The constant arguments.
     /// * `f` - A closure that receives a reference to the cached value.
     ///
@@ -465,7 +476,8 @@ impl DecryptorContext {
     ///
     /// # Arguments
     ///
-    /// * `decryptor` - The decryptor method token.
+    /// * `decryptor` - The token the call names: the decryptor, or for a generic one its
+    ///   instantiation, whose results differ by type argument.
     /// * `args` - The constant arguments.
     /// * `value` - The decrypted value to cache.
     pub fn cache_value(&self, decryptor: Token, args: &[ConstValue], value: ConstValue) {

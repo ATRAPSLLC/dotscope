@@ -854,10 +854,10 @@ impl<'a> CffDetector<'a> {
                 continue;
             };
             let def_site = variable.def_site();
-            if def_site.instruction.is_some() {
+            if def_site.index().is_some() {
                 continue; // instruction-defined but not found - stale
             }
-            let Some(block) = self.ssa.block(def_site.block) else {
+            let Some(block) = self.ssa.block(def_site.block()) else {
                 continue;
             };
             for phi in block.phi_nodes() {

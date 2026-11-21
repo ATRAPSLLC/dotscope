@@ -56,7 +56,7 @@ use crate::{
         EmulationTemplatePool, ProcessCell,
     },
     emulation::{EmValue, EmulationProcess, HeapRef},
-    metadata::token::Token,
+    metadata::{tables::TableId, token::Token},
     CilObject, Result,
 };
 
@@ -92,6 +92,10 @@ pub struct OpaqueFieldPredicatePass {
     /// Sentinel method token → sentinel field token (Variant B).
     /// The method body is `ldsfld → ldnull → ceq → ret`.
     sentinel_methods: HashMap<Token, Token>,
+    /// Fields the program stores outside type initialization (as named and resolved). A
+    /// chain through one of them is never folded: its warmed-up value is not the one the
+    /// program reads at runtime.
+    runtime_stored_fields: HashSet<Token>,
 }
 
 impl OpaqueFieldPredicatePass {
@@ -108,12 +112,14 @@ impl OpaqueFieldPredicatePass {
     /// * `needed_static_fields` - Static field tokens from the SSA predicate scan.
     /// * `affected_methods` - Method tokens that contain at least one predicate.
     /// * `sentinel_methods` - Sentinel method → field mapping (Variant B).
+    /// * `runtime_stored_fields` - Fields stored outside type initialization.
     #[must_use]
     pub fn new(
         template_pool: Arc<EmulationTemplatePool>,
         needed_static_fields: HashSet<Token>,
         affected_methods: HashSet<Token>,
         sentinel_methods: HashMap<Token, Token>,
+        runtime_stored_fields: HashSet<Token>,
     ) -> Self {
         let needed = DashSet::new();
         for token in &needed_static_fields {
@@ -130,7 +136,27 @@ impl OpaqueFieldPredicatePass {
             affected_methods: affected,
             processed_methods: DashSet::new(),
             sentinel_methods,
+            runtime_stored_fields,
         }
+    }
+
+    /// Whether the chain from static field `root` through `chain` may be folded to the
+    /// value warmup gave it: the root is one detection found and proved immutable, and no
+    /// field along the chain is stored outside type initialization. Folding every chain
+    /// rooted in any static the warmup happened to set froze application state (a counter,
+    /// a cache the program fills later) to its initial value.
+    fn chain_is_foldable(&self, assembly: &CilObject, root: Token, chain: &[Token]) -> bool {
+        let stored = |token: Token| {
+            self.runtime_stored_fields.contains(&token)
+                || (token.is_table(TableId::MemberRef)
+                    && assembly
+                        .resolver()
+                        .resolve_field(token)
+                        .is_some_and(|resolved| self.runtime_stored_fields.contains(&resolved)))
+        };
+        self.needed_static_fields.contains(&root)
+            && !stored(root)
+            && !chain.iter().any(|&token| stored(token))
     }
 
     /// Finds `.cctor` tokens for types that own any of the needed static fields.
@@ -487,7 +513,9 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
             // Variant A: LoadStaticField → LoadField+ → Branch
             // Trace backward through nested LoadField chains (supports arbitrary depth).
             // PureLogs uses multi-level chains: static → instance → instance → condition.
-            if let Some((static_token, field_chain)) = trace_field_chain(cond_def, &defs) {
+            if let Some((static_token, field_chain)) = trace_field_chain(cond_def, &defs)
+                .filter(|(root, chain)| self.chain_is_foldable(assembly, *root, chain))
+            {
                 if let Some(is_truthy) = resolver
                     .resolve_chain(static_token, &field_chain)?
                     .map(|v| v.to_bool_cil())
@@ -558,6 +586,7 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
                 // preceded by any intermediate LoadField hops back to LoadStaticField.
                 let load_field_op: SsaOp = instr.op().clone();
                 let Some((static_token, field_chain)) = trace_field_chain(&load_field_op, &defs)
+                    .filter(|(root, chain)| self.chain_is_foldable(assembly, *root, chain))
                 else {
                     continue;
                 };
@@ -651,5 +680,62 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
         // Clear the emulation process to release its Arc<CilObject> reference.
         // This is needed so the assembly can be unwrapped for code generation.
         self.lazy_process.clear().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        analysis::CallGraph,
+        deobfuscation::{context::AnalysisContext, EngineConfig},
+        testkit::fixture,
+    };
+
+    /// A pass over crafted_2 whose detection found `needed` and saw `stored` written at
+    /// runtime.
+    fn pass_with(needed: &[Token], stored: &[Token]) -> (OpaqueFieldPredicatePass, CilObject) {
+        let assembly = Arc::new(CilObject::from_path(fixture("crafted_2.exe")).unwrap());
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        let pool = Arc::new(EmulationTemplatePool::new(
+            Arc::clone(&assembly),
+            assembly.file().fork_cowfile().unwrap(),
+            Arc::clone(&ctx.emulation_hooks),
+            Arc::clone(&ctx.warmup_methods),
+            EngineConfig::default(),
+        ));
+        let pass = OpaqueFieldPredicatePass::new(
+            pool,
+            needed.iter().copied().collect(),
+            HashSet::new(),
+            HashMap::new(),
+            stored.iter().copied().collect(),
+        );
+        (
+            pass,
+            CilObject::from_path(fixture("crafted_2.exe")).unwrap(),
+        )
+    }
+
+    /// A chain folds only from a static field detection found and proved immutable, through
+    /// fields the program never stores at runtime. Every chain rooted in any static the
+    /// warmup happened to set was folded, freezing application state to its initial value.
+    #[test]
+    fn only_a_chain_of_immutable_detected_fields_folds() {
+        let root = Token::new(0x0400_0001);
+        let other_root = Token::new(0x0400_0002);
+        let hop = Token::new(0x0400_0003);
+        let counter = Token::new(0x0400_0004);
+        let (pass, assembly) = pass_with(&[root], &[counter]);
+
+        assert!(pass.chain_is_foldable(&assembly, root, &[hop]));
+        assert!(
+            !pass.chain_is_foldable(&assembly, other_root, &[hop]),
+            "a static detection did not find"
+        );
+        assert!(
+            !pass.chain_is_foldable(&assembly, root, &[hop, counter]),
+            "through a field stored at runtime"
+        );
     }
 }

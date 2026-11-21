@@ -46,7 +46,7 @@
 //!
 //! # SSA Pass
 //!
-//! The removal pass lives in [`crate::deobfuscation::passes::bitmono::debug`]
+//! The removal pass is [`SentinelTaintRemovalPass`],
 //! and uses forward-only taint analysis seeded from the three sentinel API calls
 //! to automatically identify and remove all dependent obfuscation code.
 

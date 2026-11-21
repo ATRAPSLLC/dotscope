@@ -31,14 +31,14 @@ pub struct TechniqueResult {
 /// [`record()`](Self::record) deduplicates by technique ID (for detection-only
 /// entries), while [`push()`](Self::push) skips dedup (for byte-transform events
 /// that legitimately reuse the same ID).
-pub(crate) struct TechniqueResults {
+pub struct TechniqueResults {
     results: Vec<TechniqueResult>,
     recorded_ids: HashSet<String>,
 }
 
 impl TechniqueResults {
     /// Creates an empty accumulator.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             results: Vec::new(),
             recorded_ids: HashSet::new(),
@@ -48,7 +48,7 @@ impl TechniqueResults {
     /// Records a detection result, deduplicating by ID.
     ///
     /// If a result with the same `id` was already recorded, this is a no-op.
-    pub(crate) fn record(&mut self, result: TechniqueResult) {
+    pub fn record(&mut self, result: TechniqueResult) {
         if self.recorded_ids.contains(&result.id) {
             return;
         }
@@ -57,12 +57,12 @@ impl TechniqueResults {
     }
 
     /// Pushes a result without dedup (for byte-transform events).
-    pub(crate) fn push(&mut self, result: TechniqueResult) {
+    pub fn push(&mut self, result: TechniqueResult) {
         self.results.push(result);
     }
 
     /// Consumes the accumulator and returns the collected results.
-    pub(crate) fn into_vec(self) -> Vec<TechniqueResult> {
+    pub fn into_vec(self) -> Vec<TechniqueResult> {
         self.results
     }
 }

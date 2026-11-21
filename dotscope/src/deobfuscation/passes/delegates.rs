@@ -103,7 +103,7 @@ pub struct DelegateProxyResolutionPass {
 
 /// Why a delegate could not be inlined into a direct call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NotInlinable {
+pub enum NotInlinable {
     /// The invocation list is empty, so there is no target to call.
     NoTarget,
     /// More than one entry: invoking the delegate invokes all of them.
@@ -137,7 +137,7 @@ impl std::fmt::Display for NotInlinable {
 ///
 /// Supporting the closed case later means materialising the receiver and prepending it to the
 /// argument list, not dropping it.
-pub(crate) fn inlinable_entry(
+pub fn inlinable_entry(
     invocation_list: &[DelegateEntry],
 ) -> std::result::Result<&DelegateEntry, NotInlinable> {
     match invocation_list {
@@ -265,15 +265,15 @@ impl DelegateProxyResolutionPass {
             };
 
             // Read the heap object to extract the delegate binding
-            let Ok(obj) = process.address_space().heap().get(heap_ref) else {
+            let Ok(obj) = process.address_space().heap().get_shared(heap_ref) else {
                 continue;
             };
 
             if let HeapObject::Delegate {
                 invocation_list, ..
-            } = obj
+            } = &*obj
             {
-                let entry = match inlinable_entry(&invocation_list) {
+                let entry = match inlinable_entry(invocation_list) {
                     Ok(entry) => entry,
                     Err(reason) => {
                         log::debug!(

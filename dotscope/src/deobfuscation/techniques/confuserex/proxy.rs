@@ -36,7 +36,7 @@
 //!
 //! # Passes
 //!
-//! No SSA pass is needed -- the always-on [`ProxyDevirtualizationPass`] in the
+//! No SSA pass is needed -- the always-on [`ProxyDevirtualizationPass`](crate::compiler::ProxyDevirtualizationPass) in the
 //! normalize phase handles proxy devirtualization for all detected proxies.
 //! This technique only provides detection and cleanup (marking proxy methods
 //! for dead method elimination).

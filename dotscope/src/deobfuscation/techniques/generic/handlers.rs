@@ -81,9 +81,10 @@ impl Technique for GenericHandlers {
             }
 
             let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
-            if code_type.contains(MethodImplCodeType::NATIVE)
-                || code_type.contains(MethodImplCodeType::RUNTIME)
-            {
+            if matches!(
+                code_type,
+                MethodImplCodeType::NATIVE | MethodImplCodeType::RUNTIME
+            ) {
                 continue;
             }
 

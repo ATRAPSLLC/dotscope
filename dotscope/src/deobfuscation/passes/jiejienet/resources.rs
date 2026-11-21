@@ -41,11 +41,11 @@ use crate::{
 
 /// Target information for a resource interception method.
 #[derive(Debug, Clone)]
-pub(crate) struct ResourceTarget {
+pub struct ResourceTarget {
     /// Token of the original BCL method (e.g., Assembly.GetManifestResourceStream).
-    pub(crate) target_token: Token,
+    pub target_token: Token,
     /// Whether the original call is virtual.
-    pub(crate) is_virtual: bool,
+    pub is_virtual: bool,
 }
 
 /// SSA pass that replaces JIEJIE.NET resource interception calls with direct

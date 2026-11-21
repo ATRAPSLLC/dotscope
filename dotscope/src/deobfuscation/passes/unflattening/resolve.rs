@@ -710,12 +710,12 @@ impl<'a> StateFolder<'a> {
         let site = variable.def_site();
         // No instruction index means the definition is a phi or the function
         // entry; neither is a constant on its own.
-        let Some(index) = site.instruction else {
+        let Some(index) = site.index() else {
             return Folded::Opaque;
         };
         let Some(op) = self
             .ssa
-            .block(site.block)
+            .block(site.block())
             .and_then(|b| b.instructions().get(index))
             .map(|i| i.op())
         else {
@@ -881,7 +881,7 @@ fn defs_stay_within(ssa: &SsaFunction, block: usize, chain: &[usize], end: usize
                 variable
                     .uses()
                     .iter()
-                    .all(|site| site.block == end || chain.contains(&site.block))
+                    .all(|site| site.block() == end || chain.contains(&site.block()))
             })
         })
 }

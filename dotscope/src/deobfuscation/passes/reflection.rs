@@ -356,7 +356,7 @@ impl<'a> ChainTracer<'a> {
     fn def_site(&self, var: SsaVarId) -> Option<(usize, usize)> {
         let variable = self.ssa.variable(var)?;
         let ds = variable.def_site();
-        Some((ds.block, ds.instruction?))
+        Some((ds.block(), ds.index()?))
     }
 
     /// Checks whether `var` is defined as `Const(Null)`.

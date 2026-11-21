@@ -50,12 +50,12 @@
 //! Examples: `confuserex.marker` (marker attribute detection)
 
 mod assembly;
-mod bitmono;
+pub mod bitmono;
 mod confuserex;
 mod detection;
-mod generic;
-mod jiejienet;
-mod netreactor;
+pub mod generic;
+pub mod jiejienet;
+pub mod netreactor;
 mod obfuscar;
 mod registry;
 mod result;
@@ -65,11 +65,10 @@ use std::sync::Arc;
 pub use assembly::WorkingAssembly;
 // Re-export findings types needed by infrastructure passes and the engine.
 #[cfg(feature = "legacy-crypto")]
-pub(crate) use bitmono::StringFindings as BitMonoStringFindings;
+pub use bitmono::StringFindings as BitMonoStringFindings;
 pub use detection::{AttributionResult, Detection, Detections, Evidence};
 pub use registry::{ObfuscatorMatcher, ObfuscatorSignature, TechniqueRegistry};
-pub use result::TechniqueResult;
-pub(crate) use result::TechniqueResults;
+pub use result::{TechniqueResult, TechniqueResults};
 
 use crate::{
     analysis::CilTarget,
@@ -208,7 +207,9 @@ pub trait Technique: Send + Sync {
     /// Apply a byte-level transform on the raw assembly bytes.
     ///
     /// Returns `Some(Ok(events))` on success, `Some(Err(e))` on failure,
-    /// or `None` if this technique has no byte transform.
+    /// or `None` if this technique has no byte transform or nothing to transform
+    /// in the assembly as it stands. A `None` or a failure is not retried, nor
+    /// counted as pending work, until another transform changes the assembly.
     ///
     /// Byte transforms run before SSA is built and can patch raw bytes,
     /// decrypt method bodies, or unpack resources. A transform can add to its

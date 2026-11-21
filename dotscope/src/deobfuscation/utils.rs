@@ -11,7 +11,7 @@
 //!   call/callvirt targets.
 //! - **Method name resolution**: [`is_method_named()`] checks if a token resolves to a
 //!   method of a given name.
-//! - **Blob parsing**: [`read_packed_len()`] decodes the .NET SerString packed length encoding.
+//! - **Blob parsing**: [`read_packed_len()`](crate::io::read_packed_len) decodes the .NET SerString packed length encoding.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,10 +19,10 @@ use crate::{
     analysis::{SsaFunction, SsaOp, SsaVarId},
     metadata::{
         signatures::{parse_field_signature, TypeSignature},
-        streams::Strings,
+        streams::{Strings, TablesHeader},
         tables::{
-            skip_unreadable, ClassLayoutRaw, FieldRaw, MemberRefRaw, MetadataTable, MethodDefRaw,
-            TableId, TypeDefRaw, TypeRefRaw,
+            skip_unreadable, ClassLayoutRaw, FieldRaw, MemberList, MemberRefRaw, MetadataTable,
+            MethodDefRaw, MethodPtrRaw, TableId, TypeDefRaw, TypeRefRaw,
         },
         token::Token,
         typesystem::{wellknown, PointerSize},
@@ -36,7 +36,7 @@ use crate::{
 /// - **Primitive types** (e.g., `int64` for 8-byte arrays): size from `byte_size()`
 /// - **Value types** with ClassLayout (e.g., `__StaticArrayInitTypeSize=40`):
 ///   size from the ClassLayout table's `class_size` column
-pub(crate) fn get_field_data_size(assembly: &CilObject, field_rid: u32) -> Option<usize> {
+pub fn get_field_data_size(assembly: &CilObject, field_rid: u32) -> Option<usize> {
     let tables = assembly.tables()?;
     let blobs = assembly.blob()?;
 
@@ -92,7 +92,7 @@ pub(crate) fn get_field_data_size(assembly: &CilObject, field_rid: u32) -> Optio
 /// # Returns
 ///
 /// A [`HashMap`] mapping each defined [`SsaVarId`] to its defining [`SsaOp`].
-pub(crate) fn build_def_map(ssa: &SsaFunction) -> HashMap<SsaVarId, &SsaOp> {
+pub fn build_def_map(ssa: &SsaFunction) -> HashMap<SsaVarId, &SsaOp> {
     let mut defs = HashMap::new();
     for block in ssa.blocks() {
         for instr in block.instructions() {
@@ -133,7 +133,7 @@ pub fn static_loads_of(ssa: &SsaFunction, values: &HashSet<SsaVarId>) -> Vec<(us
 }
 
 /// Checks if a name contains obfuscation indicators (zero-width chars, PUA, spaces).
-pub(crate) fn is_obfuscated_name(name: &str) -> bool {
+pub fn is_obfuscated_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -162,7 +162,7 @@ pub(crate) fn is_obfuscated_name(name: &str) -> bool {
 ///
 /// Protects constructors, module types, CLR-internal angle-bracket names,
 /// and property/event accessor prefixes (get_, set_, add_, remove_).
-pub(crate) fn is_special_name(name: &str) -> bool {
+pub fn is_special_name(name: &str) -> bool {
     if name == wellknown::members::CTOR || name == wellknown::members::CCTOR {
         return true;
     }
@@ -224,7 +224,7 @@ pub(crate) fn is_special_name(name: &str) -> bool {
 ///     .filter(|t| *counts.get(t).unwrap_or(&0) >= 3)
 ///     .collect();
 /// ```
-pub(crate) fn build_call_site_counts(
+pub fn build_call_site_counts(
     assembly: &CilObject,
     target_tokens: impl IntoIterator<Item = Token>,
 ) -> HashMap<Token, usize> {
@@ -267,7 +267,7 @@ pub(crate) fn build_call_site_counts(
 /// constructor → declaring type chain. Contains all metadata that different
 /// technique implementations may need.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedType<'a> {
+pub struct ResolvedType<'a> {
     /// Type name (e.g., `"ConfusedByAttribute"`).
     pub name: &'a str,
     /// Type namespace, if present (e.g., `"System.Runtime.CompilerServices"`).
@@ -288,34 +288,27 @@ pub(crate) struct ResolvedType<'a> {
 ///
 /// * `tag` - Table identifier of the constructor (typically `MethodDef` or `MemberRef`).
 /// * `row` - Row index within the table.
-/// * `methoddef_table` - Optional reference to the MethodDef table.
-/// * `typedef_table` - Optional reference to the TypeDef table.
-/// * `typeref_table` - Optional reference to the TypeRef table.
-/// * `memberref_table` - Optional reference to the MemberRef table.
+/// * `tables` - The tables stream holding the MethodDef, TypeDef, TypeRef and MemberRef
+///   tables (and MethodPtr, in a `#-` stream).
 /// * `strings` - The `#Strings` heap for resolving name indices.
 ///
 /// # Returns
 ///
-/// [`Some(ResolvedType)`] with the declaring type's metadata, or `None` if
+/// [`Some(ResolvedType)`](ResolvedType) with the declaring type's metadata, or `None` if
 /// the constructor cannot be resolved (missing tables, invalid row, etc.).
-pub(crate) fn resolve_constructor_type<'a>(
+pub fn resolve_constructor_type<'a>(
     tag: TableId,
     row: u32,
-    methoddef_table: Option<&'a MetadataTable<'a, MethodDefRaw>>,
-    typedef_table: Option<&'a MetadataTable<'a, TypeDefRaw>>,
-    typeref_table: Option<&'a MetadataTable<'a, TypeRefRaw>>,
-    memberref_table: Option<&'a MetadataTable<'a, MemberRefRaw>>,
+    tables: &'a TablesHeader<'a>,
     strings: &'a Strings<'a>,
 ) -> Option<ResolvedType<'a>> {
     match tag {
-        TableId::MethodDef => {
-            resolve_methoddef_declaring_type(row, methoddef_table, typedef_table, strings)
-        }
+        TableId::MethodDef => resolve_methoddef_declaring_type(row, tables, strings),
         TableId::MemberRef => resolve_memberref_declaring_type(
             row,
-            memberref_table,
-            typedef_table,
-            typeref_table,
+            tables.table::<MemberRefRaw>(),
+            tables.table::<TypeDefRaw>(),
+            tables.table::<TypeRefRaw>(),
             strings,
         ),
         _ => None,
@@ -324,25 +317,39 @@ pub(crate) fn resolve_constructor_type<'a>(
 
 /// Resolves a MethodDef to its declaring TypeDef's name, namespace, and token.
 ///
-/// Walks the TypeDef table to find the type that owns the given method RID
-/// by checking `method_list` ranges.
-pub(crate) fn resolve_methoddef_declaring_type<'a>(
+/// The declaring type is the TypeDef whose normalized `MethodList` run
+/// ([`TablesHeader::member_ranges`]) contains the method: its row directly, or, in a `#-`
+/// stream with a MethodPtr table, the MethodPtr position naming it. Building the runs is one
+/// pass over the TypeDef table; the lookup is a binary search.
+pub fn resolve_methoddef_declaring_type<'a>(
     method_row: u32,
-    methoddef_table: Option<&'a MetadataTable<'a, MethodDefRaw>>,
-    typedef_table: Option<&'a MetadataTable<'a, TypeDefRaw>>,
+    tables: &'a TablesHeader<'a>,
     strings: &'a Strings<'a>,
 ) -> Option<ResolvedType<'a>> {
-    let methoddef_table = methoddef_table?;
-    let typedef_table = typedef_table?;
-    let method = methoddef_table.get(method_row).ok().flatten()?;
+    let typedef_table = tables.table::<TypeDefRaw>()?;
+    tables
+        .table::<MethodDefRaw>()?
+        .get(method_row)
+        .ok()
+        .flatten()?;
 
-    // No error channel here (the function answers `Option`), so an unreadable row is
-    // reported and skipped rather than vanishing inside the iterator.
+    let ranges = tables.member_ranges(MemberList::TypeDefMethods);
+    let position = if ranges.is_indirect() {
+        // The position whose MethodPtr entry names the method. No error channel here (the
+        // function answers `Option`), so an unreadable row is reported and skipped.
+        tables
+            .table::<MethodPtrRaw>()?
+            .iter()
+            .filter_map(skip_unreadable)
+            .find(|ptr| ptr.method == method_row)?
+            .rid
+    } else {
+        method_row
+    };
     let typedef = typedef_table
-        .iter()
-        .filter_map(skip_unreadable)
-        .filter(|t| t.method_list <= method.rid)
-        .last()?;
+        .get(ranges.owner_of(position)?)
+        .ok()
+        .flatten()?;
 
     let name = strings.get(typedef.type_name as usize).ok()?;
     let namespace = strings.get(typedef.type_namespace as usize).ok();
@@ -361,7 +368,7 @@ pub(crate) fn resolve_methoddef_declaring_type<'a>(
 /// (external reference). For TypeDef, the typedef token is included; for
 /// TypeRef, the `has_module_scope` flag indicates whether the reference
 /// resolves through the Module table.
-pub(crate) fn resolve_memberref_declaring_type<'a>(
+pub fn resolve_memberref_declaring_type<'a>(
     memberref_row: u32,
     memberref_table: Option<&'a MetadataTable<'a, MemberRefRaw>>,
     typedef_table: Option<&'a MetadataTable<'a, TypeDefRaw>>,
@@ -402,27 +409,29 @@ pub(crate) fn resolve_memberref_declaring_type<'a>(
 
 /// Resolves a qualified method name for a call target token.
 ///
-/// For MemberRef tokens (cross-assembly calls), uses [`CilTypeReference::fullname()`]
+/// For MemberRef tokens (cross-assembly calls), uses [`CilTypeReference::fullname()`](crate::metadata::typesystem::CilTypeReference::fullname)
 /// on the `declaredby` field to produce `"DeclaringType.MethodName"`
 /// (e.g., `"System.Environment.FailFast"`). For MethodDef and MethodSpec tokens,
 /// falls back to just the method name (the declaring type lookup for MethodDef
-/// requires an O(n) scan via [`TokenResolver::declaring_type()`] which is too
+/// requires an O(n) scan via [`TokenResolver::declaring_type()`](crate::metadata::resolver::TokenResolver::declaring_type) which is too
 /// expensive for batch scanning).
 ///
 /// This enables patterns like `"Environment.FailFast"` to match only the BCL method,
 /// not a user-defined method also named `FailFast`.
-pub(crate) fn resolve_qualified_method_name(assembly: &CilObject, token: Token) -> Option<String> {
+pub fn resolve_qualified_method_name(assembly: &CilObject, token: Token) -> Option<String> {
     // MemberRef: cheaply get declaring type from the declaredby field
     if token.table() == 0x0A {
         if let Some(member) = assembly.member_ref(&token) {
             if let Some(type_name) = member.declaredby.fullname() {
                 return Some(format!("{}.{}", type_name, member.name));
             }
-            return Some(member.name.clone());
+            return Some(member.name.to_string());
         }
     }
     // MethodDef / MethodSpec: fall back to unqualified name
-    assembly.resolve_method_name(token)
+    assembly
+        .resolve_method_name(token)
+        .map(|name| name.to_string())
 }
 
 /// Scans all methods for calls matching any of the given name patterns.
@@ -446,7 +455,7 @@ pub(crate) fn resolve_qualified_method_name(assembly: &CilObject, token: Token) 
 ///
 /// A [`HashMap`] from method token to the set of matched pattern indices.
 /// Only methods with at least one match are included.
-pub(crate) fn find_methods_calling_apis(
+pub fn find_methods_calling_apis(
     assembly: &CilObject,
     patterns: &[&str],
 ) -> HashMap<Token, Vec<usize>> {
@@ -491,7 +500,7 @@ pub(crate) fn find_methods_calling_apis(
 /// # Returns
 ///
 /// A [`HashSet`] of tokens meeting the threshold.
-pub(crate) fn filter_by_call_threshold(
+pub fn filter_by_call_threshold(
     candidates: Vec<Token>,
     counts: &HashMap<Token, usize>,
     min_calls: usize,
@@ -523,7 +532,7 @@ pub(crate) fn filter_by_call_threshold(
 ///
 /// A [`HashSet`] containing only candidates whose bodies do not call any other
 /// candidate. Methods whose bodies cannot be inspected are kept.
-pub(crate) fn exclude_cross_calling_candidates(
+pub fn exclude_cross_calling_candidates(
     candidates: HashSet<Token>,
     assembly: &CilObject,
 ) -> HashSet<Token> {
@@ -570,7 +579,7 @@ pub(crate) fn exclude_cross_calling_candidates(
 /// # Returns
 ///
 /// A [`HashMap`] mapping each byte-array field token to its backing field token.
-pub(crate) fn build_init_array_map(assembly: &CilObject) -> HashMap<Token, Token> {
+pub fn build_init_array_map(assembly: &CilObject) -> HashMap<Token, Token> {
     let mut map = HashMap::new();
 
     for method_entry in assembly.methods() {
@@ -646,7 +655,7 @@ pub(crate) fn build_init_array_map(assembly: &CilObject) -> HashMap<Token, Token
 /// Expected pattern: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 characters),
 /// with dashes at positions 8, 13, 18, and 23 and hex digits everywhere else.
 /// Both uppercase and lowercase hex digits are accepted.
-pub(crate) fn is_guid_name(name: &str) -> bool {
+pub fn is_guid_name(name: &str) -> bool {
     if name.len() != 36 {
         return false;
     }
@@ -680,24 +689,16 @@ pub(crate) fn is_guid_name(name: &str) -> bool {
 ///
 /// # Returns
 ///
-/// [`Some(ResolvedType)`] with the declaring type's metadata, or `None` if
+/// [`Some(ResolvedType)`](ResolvedType) with the declaring type's metadata, or `None` if
 /// the constructor cannot be resolved.
-pub(crate) fn resolve_custom_attr_type<'a>(
+pub fn resolve_custom_attr_type<'a>(
     assembly: &'a CilObject,
     attr: &crate::metadata::tables::CustomAttributeRaw,
 ) -> Option<ResolvedType<'a>> {
     let tables = assembly.tables()?;
     let strings = assembly.strings()?;
 
-    resolve_constructor_type(
-        attr.constructor.tag,
-        attr.constructor.row,
-        tables.table::<MethodDefRaw>(),
-        tables.table::<TypeDefRaw>(),
-        tables.table::<TypeRefRaw>(),
-        tables.table::<MemberRefRaw>(),
-        strings,
-    )
+    resolve_constructor_type(attr.constructor.tag, attr.constructor.row, tables, strings)
 }
 
 /// Checks whether a metadata token resolves to a method named `name`.
@@ -715,7 +716,7 @@ pub(crate) fn resolve_custom_attr_type<'a>(
 ///
 /// `true` if the token resolves to a method of that name, `false` if it does
 /// not resolve or names another method.
-pub(crate) fn is_method_named(assembly: &CilObject, token: Token, name: &str) -> bool {
+pub fn is_method_named(assembly: &CilObject, token: Token, name: &str) -> bool {
     assembly
         .resolve_method_name(token)
         .is_some_and(|n| n == name)
@@ -731,10 +732,7 @@ mod tests {
             build_call_site_counts, is_method_named, is_obfuscated_name, is_special_name,
             resolve_constructor_type, static_loads_of,
         },
-        metadata::{
-            tables::{MemberRefRaw, MethodDefRaw, TableId, TypeDefRaw, TypeRefRaw},
-            token::Token,
-        },
+        metadata::{tables::TableId, token::Token},
         testkit::helpers::{load_sample, method_token, mono_mscorlib},
     };
 
@@ -885,11 +883,6 @@ mod tests {
             .table::<crate::metadata::tables::CustomAttributeRaw>()
             .expect("CustomAttribute table should be present");
 
-        let methoddef_table = tables.table::<MethodDefRaw>();
-        let typedef_table = tables.table::<TypeDefRaw>();
-        let typeref_table = tables.table::<TypeRefRaw>();
-        let memberref_table = tables.table::<MemberRefRaw>();
-
         let mut found_marker = false;
         for attr in ca_table {
             let attr = match attr {
@@ -902,10 +895,7 @@ mod tests {
             if let Some(resolved) = resolve_constructor_type(
                 attr.constructor.tag,
                 attr.constructor.row,
-                methoddef_table,
-                typedef_table,
-                typeref_table,
-                memberref_table,
+                tables,
                 strings,
             ) {
                 if resolved.name.contains("ConfuserVersion")
@@ -929,15 +919,7 @@ mod tests {
         let tables = asm.tables().expect("tables should be present");
         let strings = asm.strings().expect("strings should be present");
 
-        let result = resolve_constructor_type(
-            TableId::Field,
-            1,
-            tables.table::<MethodDefRaw>(),
-            tables.table::<TypeDefRaw>(),
-            tables.table::<TypeRefRaw>(),
-            tables.table::<MemberRefRaw>(),
-            strings,
-        );
+        let result = resolve_constructor_type(TableId::Field, 1, tables, strings);
         assert!(result.is_none());
     }
 

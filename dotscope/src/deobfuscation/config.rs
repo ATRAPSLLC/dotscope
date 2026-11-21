@@ -9,7 +9,7 @@ use std::time::Duration;
 use analyssa::analysis::{Budget, WorkBudget};
 
 use crate::{
-    deobfuscation::{SmartRenameConfig, UnflattenConfig},
+    deobfuscation::UnflattenConfig,
     emulation::{EmulationLimits, TracingConfig},
 };
 
@@ -291,13 +291,6 @@ pub struct CleanupConfig {
     ///
     /// Enable this in aggressive mode for maximum size reduction.
     pub remove_unused_methods: bool,
-
-    /// Optional configuration for LLM-powered smart renaming.
-    ///
-    /// When `Some`, the cascade renamer uses LLM inference for semantic
-    /// identifier names. When `None`, falls back to simple sequential naming.
-    /// Requires the `smart-rename` Cargo feature for the LLM backend.
-    pub smart_rename: Option<SmartRenameConfig>,
 }
 
 impl Default for CleanupConfig {
@@ -310,7 +303,6 @@ impl Default for CleanupConfig {
             remove_artifact_sections: true,
             rename_obfuscated_names: true,
             remove_unused_methods: false, // Off by default - may break reflection/exports
-            smart_rename: None,
         }
     }
 }
@@ -333,7 +325,6 @@ impl CleanupConfig {
             remove_artifact_sections: false,
             rename_obfuscated_names: false,
             remove_unused_methods: false,
-            smart_rename: None,
         }
     }
 
@@ -354,7 +345,6 @@ impl CleanupConfig {
     pub fn aggressive() -> Self {
         Self {
             remove_unused_methods: true,
-            smart_rename: None,
             ..Self::default()
         }
     }

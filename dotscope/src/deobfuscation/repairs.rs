@@ -14,8 +14,8 @@ use crate::{
     metadata::{
         streams::{Guid, Strings, TablesHeader},
         tables::{
-            skip_unreadable, DeclSecurityRaw, FieldRaw, MethodDefRaw, ModuleRaw, NestedClassRaw,
-            TableDataOwned, TableId, TypeDefRaw,
+            skip_unreadable, DeclSecurityRaw, FieldRaw, MemberList, MethodDefRaw, ModuleRaw,
+            NestedClassRaw, TableDataOwned, TableId, TypeDefRaw,
         },
         token::Token,
         validation::ValidationConfig,
@@ -498,48 +498,32 @@ impl GlobalMemberAccess {
 
     /// The `<Module>` members with an accessibility not allowed, each made Public.
     fn repaired_members(metadata: &RawMetadata) -> GlobalMembers {
-        let Some(typedefs) = metadata.tables.table::<TypeDefRaw>() else {
-            return GlobalMembers::default();
-        };
-        // Fetched by row, not by position among the readable rows: in a damaged assembly
-        // an unreadable row would otherwise shift `<Module>` (row 1) onto another type.
-        let Some(module_type) = typedefs.get(1).ok().flatten() else {
-            return GlobalMembers::default();
-        };
-        let (field_end, method_end) = match typedefs.get(2) {
-            Ok(Some(next)) => (next.field_list, next.method_list),
-            _ => (
-                metadata
-                    .tables
-                    .table_row_count(TableId::Field)
-                    .saturating_add(1),
-                metadata
-                    .tables
-                    .table_row_count(TableId::MethodDef)
-                    .saturating_add(1),
-            ),
-        };
+        // `<Module>` is TypeDef row 1. Its runs come from the normalized ranges, fetched by
+        // row rather than by position among the readable rows (in a damaged assembly an
+        // unreadable row would otherwise shift `<Module>` onto another type), clamped to the
+        // member tables and followed through FieldPtr/MethodPtr in a `#-` stream.
+        let tables = metadata.tables;
+        let field_ranges = tables.member_ranges(MemberList::TypeDefFields);
+        let method_ranges = tables.member_ranges(MemberList::TypeDefMethods);
         let repaired = |flags: u32| {
             (!Self::ALLOWED.contains(&(flags & Self::ACCESS_MASK)))
                 .then_some((flags & !Self::ACCESS_MASK) | Self::PUBLIC)
         };
-        let fields = metadata
-            .tables
-            .table::<FieldRaw>()
-            .map_or_else(Vec::new, |fields| {
-                (module_type.field_list..field_end)
-                    .filter_map(|rid| {
-                        let field = fields.get(rid).ok().flatten()?;
-                        let flags = repaired(field.flags)?;
-                        Some(FieldRaw { flags, ..field })
-                    })
-                    .collect()
-            });
-        let methods = metadata
-            .tables
+        let fields = tables.table::<FieldRaw>().map_or_else(Vec::new, |fields| {
+            tables
+                .member_rids(&field_ranges, 1)
+                .filter_map(|rid| {
+                    let field = fields.get(rid).ok().flatten()?;
+                    let flags = repaired(field.flags)?;
+                    Some(FieldRaw { flags, ..field })
+                })
+                .collect()
+        });
+        let methods = tables
             .table::<MethodDefRaw>()
             .map_or_else(Vec::new, |methods| {
-                (module_type.method_list..method_end)
+                tables
+                    .member_rids(&method_ranges, 1)
                     .filter_map(|rid| {
                         let method = methods.get(rid).ok().flatten()?;
                         let flags = repaired(method.flags)?;
@@ -847,7 +831,7 @@ mod tests {
             .types()
             .iter()
             .filter(|entry| entry.value().namespace == "Repairs")
-            .map(|entry| entry.value().name.clone())
+            .map(|entry| entry.value().name.to_string())
             .collect();
         assert_eq!(names, ["Twin"]);
     }
@@ -906,7 +890,7 @@ mod tests {
             .types()
             .iter()
             .filter(|entry| entry.value().namespace == "Repairs")
-            .map(|entry| entry.value().name.clone())
+            .map(|entry| entry.value().name.to_string())
             .collect();
         assert_eq!(names, ["Twin"]);
     }

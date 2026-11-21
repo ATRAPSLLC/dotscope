@@ -26,7 +26,7 @@ const MAX_METHOD_BODY_SIZE: usize = 65536;
 ///
 /// These are methods where the RVA is set but the body couldn't be parsed,
 /// indicating the method body is encrypted or corrupted.
-pub(super) fn find_encrypted_methods(assembly: &CilObject) -> Vec<Token> {
+pub fn find_encrypted_methods(assembly: &CilObject) -> Vec<Token> {
     assembly
         .methods()
         .iter()
@@ -46,7 +46,7 @@ pub(super) fn find_encrypted_methods(assembly: &CilObject) -> Vec<Token> {
 /// Includes both methods with valid bodies and encrypted methods. Used when
 /// re-extracting all method bodies after anti-tamper decryption, since section
 /// layout changes may invalidate existing RVAs.
-pub(super) fn find_all_methods_with_rva(assembly: &CilObject) -> Vec<Token> {
+pub fn find_all_methods_with_rva(assembly: &CilObject) -> Vec<Token> {
     assembly
         .methods()
         .iter()
@@ -62,7 +62,7 @@ pub(super) fn find_all_methods_with_rva(assembly: &CilObject) -> Vec<Token> {
 }
 
 /// Gets the RVA for a method from the raw MethodDef table.
-pub(super) fn get_method_rva(assembly: &CilObject, token: Token) -> Option<u32> {
+pub fn get_method_rva(assembly: &CilObject, token: Token) -> Option<u32> {
     let tables = assembly.tables()?;
     let method_table = tables.table::<MethodDefRaw>()?;
     let row = token.row();
@@ -75,7 +75,7 @@ pub(super) fn get_method_rva(assembly: &CilObject, token: Token) -> Option<u32> 
 /// Reads bytes from the virtual image, parses the method body header to
 /// validate and determine size, re-encodes to canonical format, and returns
 /// the bytes ready for storage.
-pub(super) fn extract_method_body_at_rva(memory: &[u8], rva: u32) -> Option<Vec<u8>> {
+pub fn extract_method_body_at_rva(memory: &[u8], rva: u32) -> Option<Vec<u8>> {
     let rva_usize = rva as usize;
     if rva_usize >= memory.len() {
         return None;
@@ -108,7 +108,7 @@ pub(super) fn extract_method_body_at_rva(memory: &[u8], rva: u32) -> Option<Vec<
 ///
 /// Returns `(field_rid, original_rva, decrypted_data)` tuples plus a count of
 /// fields that couldn't be extracted.
-pub(super) fn extract_decrypted_field_data(
+pub fn extract_decrypted_field_data(
     assembly: &CilObject,
     virtual_image: &[u8],
 ) -> (Vec<(u32, u32, Vec<u8>)>, usize) {
@@ -167,7 +167,7 @@ pub(super) fn extract_decrypted_field_data(
 /// # Returns
 ///
 /// A [`HashSet`] of method tokens that call at least one of the target tokens.
-pub(super) fn find_methods_calling_tokens(
+pub fn find_methods_calling_tokens(
     assembly: &CilObject,
     target_tokens: &HashSet<Token>,
 ) -> HashSet<Token> {
@@ -197,7 +197,7 @@ pub(super) fn find_methods_calling_tokens(
 /// but the ImplMap table's `import_name` field always holds the real DLL export
 /// name. This function scans ImplMap to build a set of MethodDef tokens whose
 /// actual import name contains `target_name`.
-pub(super) fn resolve_pinvoke_tokens(assembly: &CilObject, target_name: &str) -> HashSet<Token> {
+pub fn resolve_pinvoke_tokens(assembly: &CilObject, target_name: &str) -> HashSet<Token> {
     let mut tokens = HashSet::new();
 
     let Some(tables) = assembly.tables() else {

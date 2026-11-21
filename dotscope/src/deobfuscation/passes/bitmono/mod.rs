@@ -16,7 +16,7 @@
 mod locals;
 #[cfg(feature = "legacy-crypto")]
 mod strings;
-mod unmanaged;
+pub mod unmanaged;
 
 #[cfg(feature = "legacy-crypto")]
 pub use self::strings::StringDecryptionPass;

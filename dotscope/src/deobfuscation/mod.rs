@@ -109,7 +109,7 @@ mod result;
 mod statemachine;
 mod techniques;
 mod template;
-pub(crate) mod utils;
+mod utils;
 mod workqueue;
 
 // Public API - used by CLI, tests, examples, and external consumers
@@ -119,25 +119,27 @@ pub use config::{
 };
 pub use context::{AnalysisContext, HookFactory};
 pub use decryptors::{CacheKey, DecryptedCall, DecryptorContext, FailedCall, FailureReason};
-pub use engine::DeobfuscationEngine;
+pub use engine::{DeobfuscationEngine, GeneratedCode};
 pub use passes::{
-    unflatten, CffDetector, CffPattern, CffReconstructionPass, DecryptionPass,
-    DelegateProxyResolutionPass, DelegateTypeInfo, Dispatcher, EntryCondition, EntryPoint,
-    NativeMethodConversionPass, NeutralizationPass, OpaqueFieldPredicatePass, UnflattenConfig,
+    unflatten, CffDetector, CffPattern, CffReconstructionPass, ConversionStats, DecryptionPass,
+    DelegateProxyResolutionPass, DelegateTypeInfo, Dispatcher, DispatcherInfo, EntryCondition,
+    EntryPoint, IndexPattern, Location, NativeMethodConversionPass, NeutralizationPass,
+    OpaqueFieldPredicatePass, StateTransform, StateVarRef, StateVariable, UnflattenConfig,
 };
 // Crate-internal re-exports (only items that are actually imported via this path)
-pub(crate) use processcell::ProcessCell;
-pub use renamer::SmartRenameConfig;
+use processcell::ProcessCell;
 pub use result::DeobfuscationResult;
-pub(crate) use statemachine::{
-    CfgInfo, StateMachineCallSite, StateMachineProvider, StateMachineSemantics, StateMachineState,
-    StateSlotOperation, StateUpdateCall,
+pub use statemachine::{
+    CfgInfo, SsaOpKind, StateMachineCallSite, StateMachineProvider, StateMachineSemantics,
+    StateMachineState, StateSlotOperation, StateUpdateCall,
 };
 pub use techniques::{
     AttributionResult, Detection, Detections, Evidence, ObfuscatorMatcher, ObfuscatorSignature,
-    Technique, TechniqueCategory, TechniqueRegistry, TechniqueResult, WorkingAssembly,
+    Technique, TechniqueCapability, TechniqueCategory, TechniqueRegistry, TechniqueResult,
+    WorkingAssembly,
 };
-pub(crate) use template::EmulationTemplatePool;
+pub use template::EmulationTemplatePool;
+pub use workqueue::{DrainedWorkItems, WorkItem, WorkQueue};
 
 #[cfg(test)]
 mod tests {

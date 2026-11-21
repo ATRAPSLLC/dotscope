@@ -1,9 +1,6 @@
 //! Technique registry for managing available deobfuscation techniques.
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Mutex,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::deobfuscation::techniques::{
     bitmono::{
@@ -57,9 +54,6 @@ pub struct ObfuscatorSignature {
 /// handled by the separate [`ObfuscatorMatcher`].
 pub struct TechniqueRegistry {
     techniques: Vec<Box<dyn Technique>>,
-    /// Cache for `sorted_techniques()`: `(detection_generation, sorted_indices)`.
-    /// Invalidated when the detection generation counter changes.
-    sorted_cache: Mutex<(u64, Vec<usize>)>,
 }
 
 impl TechniqueRegistry {
@@ -68,7 +62,6 @@ impl TechniqueRegistry {
     pub fn new() -> Self {
         Self {
             techniques: Vec::new(),
-            sorted_cache: Mutex::new((u64::MAX, Vec::new())),
         }
     }
 
@@ -204,31 +197,13 @@ impl TechniqueRegistry {
     /// An ordered vec of technique references ready for sequential execution.
     #[must_use]
     pub fn sorted_techniques(&self, detections: &Detections) -> Vec<&dyn Technique> {
-        let gen = detections.generation();
-
-        // Check cache: if the detection generation hasn't changed, reuse indices.
-        if let Ok(cache) = self.sorted_cache.lock() {
-            if cache.0 == gen {
-                return cache
-                    .1
-                    .iter()
-                    .filter_map(|&i| self.techniques.get(i).map(|t| &**t))
-                    .collect();
-            }
-        }
-
-        // Cache miss — recompute.
-        let sorted_indices = self.compute_sorted_indices(detections);
-        let result: Vec<&dyn Technique> = sorted_indices
+        // Computed per call: a few dozen techniques sort in microseconds, and a cache keyed
+        // by the detections' generation answered one run with another's order, since every
+        // run's detections count generations from zero on a registry the runs share.
+        self.compute_sorted_indices(detections)
             .iter()
             .filter_map(|&i| self.techniques.get(i).map(|t| &**t))
-            .collect();
-
-        if let Ok(mut cache) = self.sorted_cache.lock() {
-            *cache = (gen, sorted_indices);
-        }
-
-        result
+            .collect()
     }
 
     /// Computes sorted technique indices via topological sort (Kahn's algorithm).
@@ -762,6 +737,36 @@ mod tests {
         // "old" should be excluded because "new" supersedes it and is detected
         assert!(!ids.contains(&"old"));
         assert!(ids.contains(&"new"));
+    }
+
+    /// Two runs on one registry each count their detections' generations from zero: the
+    /// order one run's detections give is not the other's. A cache keyed by the generation
+    /// alone answered the second run with the first's, leaving out a technique only the first
+    /// run had superseded.
+    #[test]
+    fn runs_sharing_a_registry_get_their_own_order() {
+        let mut r = TechniqueRegistry::new();
+        r.register(Box::new(MockTechnique::new("old")));
+        r.register(Box::new(MockTechnique::with_supersedes("new", &["old"])));
+
+        // One insert each: the same generation
+        let mut first = Detections::new();
+        first.insert("new", Detection::new_detected(vec![], None));
+        let mut second = Detections::new();
+        second.insert("old", Detection::new_detected(vec![], None));
+        assert_eq!(first.generation(), second.generation());
+
+        let first_ids: Vec<&str> = r.sorted_techniques(&first).iter().map(|t| t.id()).collect();
+        let second_ids: Vec<&str> = r
+            .sorted_techniques(&second)
+            .iter()
+            .map(|t| t.id())
+            .collect();
+        assert!(!first_ids.contains(&"old"), "superseded in the first run");
+        assert!(
+            second_ids.contains(&"old"),
+            "nothing supersedes it in the second"
+        );
     }
 
     #[test]

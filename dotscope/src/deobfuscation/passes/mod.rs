@@ -48,6 +48,11 @@ mod reflection;
 mod staticfields;
 mod unflattening;
 
+pub use native::ConversionStats;
+pub use unflattening::{
+    DispatcherInfo, IndexPattern, Location, StateTransform, StateVarRef, StateVariable,
+};
+
 pub use self::{
     antidebug::{SentinelCondition, SentinelTaintRemovalPass},
     decryption::DecryptionPass,

@@ -13,7 +13,7 @@
 //!
 //! Obfuscator-specific modules should:
 //! 1. Detect what tokens need to be removed (types, methods, fields)
-//! 2. Create a [`CleanupRequest`](crate::cilassembly::CleanupRequest) with those tokens
+//! 2. Create a [`CleanupRequest`] with those tokens
 //! 3. Call [`execute_cleanup`] to perform the cleanup
 //!
 //! # Example
@@ -93,7 +93,7 @@ fn decryptors_still_called(
 /// * `detections` - The detection results from all techniques.
 /// * `assembly` - The assembly being deobfuscated.
 /// * `ssa_call_graph` - The SSA-derived call graph (caller → callees).
-pub(crate) fn build_cleanup_request(
+pub fn build_cleanup_request(
     engine: &DeobfuscationEngine,
     ctx: &AnalysisContext,
     detections: &Detections,
@@ -486,7 +486,7 @@ fn add_local_type_names(assembly: &CilObject, ctx: &AnalysisContext, names: &mut
 /// anyway, because their regenerated code was refused: their IL answers for
 /// them, as it does for a method that never converted. The engine runs this
 /// again after code generation with that set.
-pub(crate) fn retract_referenced_removals(
+pub fn retract_referenced_removals(
     assembly: &CilObject,
     request: &mut CleanupRequest,
     ssa_call_graph: &BTreeMap<Token, BTreeSet<Token>>,
@@ -544,7 +544,8 @@ pub(crate) fn retract_referenced_removals(
                     token,
                     assembly
                         .resolve_method_name(token)
-                        .unwrap_or_else(|| "non-method".to_string()),
+                        .as_deref()
+                        .unwrap_or("non-method"),
                 );
             }
         }
@@ -638,14 +639,10 @@ pub fn execute_cleanup(
     // Log individual removals before consuming the assembly
     log_cleanup_request(&request, &assembly, ctx);
 
-    // Collect rename entries while CilObject is still alive (before consumption).
-    // The smart renamer needs CilObject-level APIs (types(), resolver(), member_ref())
-    // for metadata queries - these aren't available on CilAssembly.
+    // Collect rename entries from the original metadata, before the conversion below
+    // consumes the CilObject.
     let rename_entries = if rename_obfuscated {
-        Some(renamer::renames_collect(
-            &assembly,
-            ctx.config.cleanup.smart_rename.as_ref(),
-        )?)
+        Some(renamer::renames_collect(&assembly)?)
     } else {
         None
     };
@@ -1052,7 +1049,7 @@ fn sweep_empty_module_cctor(
 ///
 /// `Some(CleanupRequest)` with settings derived from the config, or `None`
 /// if all cleanup options are disabled.
-pub(crate) fn create_cleanup_request(ctx: &AnalysisContext) -> Option<CleanupRequest> {
+pub fn create_cleanup_request(ctx: &AnalysisContext) -> Option<CleanupRequest> {
     let cleanup_config = &ctx.config.cleanup;
     if !cleanup_config.any_enabled() {
         return None;

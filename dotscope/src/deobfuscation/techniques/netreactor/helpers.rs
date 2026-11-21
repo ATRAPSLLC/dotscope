@@ -718,7 +718,7 @@ impl<'a> Iterator for ExecutedPath<'a> {
                 FlowType::UnconditionalBranch => {
                     self.enter(block.successors.first().copied());
                 }
-                FlowType::Sequential | FlowType::Call => {
+                FlowType::Sequential | FlowType::Call | FlowType::CallIndirect => {
                     if instruction.mnemonic != "nop" {
                         return Some(instruction);
                     }
@@ -782,7 +782,7 @@ fn classify_token_accessor_body(assembly: &CilObject, method_token: Token) -> Op
 /// manifest-resource token that is only reachable through the scanned
 /// methods — once those methods are cleaned up, the resource's data
 /// payload is dead weight. This is the structural signal used by
-/// [`netreactor.antitamp`] to mark the NR anti-tamper encrypted resource
+/// [`netreactor.antitamp`](crate::deobfuscation::techniques::netreactor::NetReactorAntiTamp) to mark the NR anti-tamper encrypted resource
 /// for removal.
 ///
 /// The `assembly::Operand::Token` branch is *not* checked here — NR's

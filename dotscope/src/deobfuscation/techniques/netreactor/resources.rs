@@ -31,7 +31,7 @@
 //! 2. **`byte_transform`** ([`byte_transform`](Technique::byte_transform))
 //!    — drives the dispatcher once under emulation. The reflective
 //!    `Assembly.Load(byte[])` shim is intercepted by
-//!    [`hooks::create_resources_load_shim_hook`](super::hooks::create_resources_load_shim_hook)
+//!    [`hooks::create_resources_load_shim_hook`]
 //!    so the decrypted bytes land in `CaptureContext`. The captured
 //!    PE is parsed and its embedded resources are re-injected as real
 //!    `ManifestResource` rows.
@@ -388,6 +388,16 @@ impl Technique for NetReactorResources {
             // the check fails with "<name> is tampered." and nothing is
             // decrypted. The same bypass NecroBit's emulation uses.
             .hook(hooks::create_antitamper_bypass_hook());
+        // The trial checks compare `DateTime.Now` with the protection date, and the emulator
+        // cannot know when that was: the decrypter would throw "protected by an unregistered
+        // version" before decrypting anything. The same bypass NecroBit's emulation uses.
+        let trial_checks: HashSet<Token> = helpers::find_trial_checks(&cilobject_arc)
+            .into_iter()
+            .map(|trial| trial.method_token)
+            .collect();
+        if !trial_checks.is_empty() {
+            builder = builder.hook(hooks::create_trial_bypass_hook(trial_checks));
+        }
         if !shim_set.is_empty() {
             builder = builder.hook(hooks::create_resources_load_shim_hook(
                 shim_set,
@@ -658,7 +668,7 @@ fn harvest_resources(captured: &[CapturedAssembly]) -> Vec<(String, Vec<u8>)> {
                 );
                 continue;
             }
-            out.push((res.name.clone(), bytes.to_vec()));
+            out.push((res.name.to_string(), bytes.to_vec()));
         }
     }
     out
@@ -1082,7 +1092,7 @@ fn find_bcl_member_ref(
 /// Returns `None` only when the assembly does not import
 /// `System.Reflection.Assembly` at all, which would mean the resource
 /// resolver pattern itself isn't present. Used by
-/// [`hooks::create_resources_load_shim_hook`](super::hooks::create_resources_load_shim_hook)
+/// [`hooks::create_resources_load_shim_hook`]
 /// to anchor the fake Assembly object's type to the current sample.
 pub fn find_assembly_typeref(assembly: &CilObject) -> Option<Token> {
     assembly

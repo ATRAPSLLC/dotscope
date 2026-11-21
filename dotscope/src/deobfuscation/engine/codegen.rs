@@ -17,19 +17,19 @@ use crate::{
 };
 
 /// What code generation produced, and what cleanup needs to know about it.
-pub(crate) struct GeneratedCode {
+pub struct GeneratedCode {
     /// The assembly with the regenerated bodies.
-    pub(crate) assembly: CilObject,
+    pub assembly: CilObject,
     /// How many method bodies were regenerated.
-    pub(crate) regenerated: usize,
+    pub regenerated: usize,
     /// The StandAloneSig rows of replaced local signatures, now orphaned.
-    pub(crate) old_local_signatures: Vec<Token>,
+    pub old_local_signatures: Vec<Token>,
     /// The FieldDef and TypeDef rows created for array data, which cleanup
     /// must not remove.
-    pub(crate) protected_tokens: BTreeSet<Token>,
+    pub protected_tokens: BTreeSet<Token>,
     /// The methods whose regenerated code failed, which ship their original
     /// body.
-    pub(crate) kept_original: BTreeSet<Token>,
+    pub kept_original: BTreeSet<Token>,
 }
 
 impl DeobfuscationEngine {
@@ -51,10 +51,7 @@ impl DeobfuscationEngine {
     /// # Errors
     ///
     /// Returns an error if code generation or assembly writing fails.
-    pub(crate) fn generate_code(
-        assembly: CilObject,
-        ctx: &AnalysisContext,
-    ) -> Result<GeneratedCode> {
+    pub fn generate_code(assembly: CilObject, ctx: &AnalysisContext) -> Result<GeneratedCode> {
         // Skip if no methods were processed
         if ctx.processed_methods.is_empty() {
             return Ok(GeneratedCode {

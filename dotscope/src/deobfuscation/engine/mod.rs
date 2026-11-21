@@ -9,6 +9,7 @@ mod api;
 mod codegen;
 mod detection;
 mod pipeline;
+pub use codegen::GeneratedCode;
 
 #[cfg(test)]
 mod tests;
@@ -54,11 +55,12 @@ struct PipelineRun<'a> {
     /// Byte transforms that have succeeded in this run; each one changes the
     /// assembly the next transform works on.
     transforms_applied: usize,
-    /// For each byte transform that failed, `transforms_applied` when it did.
-    /// It is not attempted again until another transform has changed the
-    /// assembly: the same input fails the same way, and some of these failures
-    /// cost a full emulation run.
-    failed_transforms: HashMap<&'static str, usize>,
+    /// For each byte transform that failed or found nothing to do,
+    /// `transforms_applied` when it did. It is not attempted again, and does not
+    /// count as pending, until another transform has changed the assembly: the
+    /// same input gives the same answer, some of these attempts cost a full
+    /// emulation run, and a pending transform makes the pipeline run again.
+    settled_transforms: HashMap<&'static str, usize>,
 }
 
 /// Main deobfuscation engine.

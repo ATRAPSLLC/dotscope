@@ -124,7 +124,7 @@ impl DeobfuscationEngine {
     ///
     /// Creates the call graph, SSA representations, and initializes the context
     /// with detection results and entry points.
-    pub(crate) fn build_context(&self, assembly: &CilObject) -> Result<AnalysisContext> {
+    pub fn build_context(&self, assembly: &CilObject) -> Result<AnalysisContext> {
         // Build call graph
         let call_graph = Arc::new(CallGraph::build(assembly)?);
         let stats = call_graph.stats();
@@ -230,7 +230,7 @@ impl DeobfuscationEngine {
     /// byte patches or work item processing).
     ///
     /// Methods are processed in parallel using rayon for faster SSA construction.
-    pub(crate) fn build_ssa_functions(
+    pub fn build_ssa_functions(
         assembly: &CilObject,
         ctx: &AnalysisContext,
         methods: Option<&DashSet<Token>>,
@@ -289,7 +289,7 @@ impl DeobfuscationEngine {
     /// propagates constant arguments to callee parameter summaries, enabling
     /// interprocedural constant propagation during SSA optimization.
     #[allow(clippy::unnecessary_wraps)] // Returns Result for API consistency with other analysis phases
-    pub(crate) fn run_interprocedural_analysis(&self, ctx: &AnalysisContext) -> Result<()> {
+    pub fn run_interprocedural_analysis(&self, ctx: &AnalysisContext) -> Result<()> {
         // Bottom-up: compute summaries callee-first, which is what makes a
         // caller's summary able to read its callees'.
         //
@@ -348,7 +348,7 @@ impl DeobfuscationEngine {
     /// Analyzes return behavior, side-effect purity, parameter usage, instruction
     /// count, inlining candidacy (pure + below threshold), and pattern detection
     /// for string decryptors and CFF dispatchers.
-    pub(crate) fn compute_method_summary(&self, ssa: &SsaFunction, token: Token) -> MethodSummary {
+    pub fn compute_method_summary(&self, ssa: &SsaFunction, token: Token) -> MethodSummary {
         let mut summary = MethodSummary::new(token);
 
         summary.return_info = ssa.return_info();
@@ -531,7 +531,7 @@ impl DeobfuscationEngine {
     /// Detects if a method looks like a string decryptor.
     ///
     /// Heuristics: small method with XOR operations or array accesses.
-    pub(crate) fn detect_string_decryptor_pattern(ssa: &SsaFunction) -> bool {
+    pub fn detect_string_decryptor_pattern(ssa: &SsaFunction) -> bool {
         if ssa.instruction_count() > 200 {
             return false;
         }
@@ -541,7 +541,7 @@ impl DeobfuscationEngine {
     /// Detects if a method looks like a dispatcher (control flow obfuscation).
     ///
     /// Heuristics: contains a switch with many cases.
-    pub(crate) fn detect_dispatcher_pattern(ssa: &SsaFunction) -> bool {
+    pub fn detect_dispatcher_pattern(ssa: &SsaFunction) -> bool {
         ssa.largest_switch_target_count()
             .is_some_and(|switch_targets| switch_targets >= 5)
     }

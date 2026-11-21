@@ -39,14 +39,14 @@ impl<'a> PipelineRun<'a> {
     /// All mutable state (detections, results, iteration count) starts empty.
     /// The assembly is not stored here - it flows through phase methods as
     /// an owned value.
-    pub(super) fn new(engine: &'a DeobfuscationEngine) -> Self {
+    pub fn new(engine: &'a DeobfuscationEngine) -> Self {
         Self {
             engine,
             detections: Detections::new(),
             results: TechniqueResults::new(),
             start: Instant::now(),
             transforms_applied: 0,
-            failed_transforms: HashMap::new(),
+            settled_transforms: HashMap::new(),
             iterations: 0,
         }
     }
@@ -59,10 +59,7 @@ impl<'a> PipelineRun<'a> {
     /// 2. [`run_ssa_pipeline`](Self::run_ssa_pipeline) - SSA construction,
     ///    fixpoint optimization, and finalization (may loop for byte-transform
     ///    re-requests)
-    pub(super) fn execute(
-        mut self,
-        assembly: CilObject,
-    ) -> Result<(CilObject, DeobfuscationResult)> {
+    pub fn execute(mut self, assembly: CilObject) -> Result<(CilObject, DeobfuscationResult)> {
         let assembly = self.detect_and_transform(assembly)?;
         self.run_ssa_pipeline(assembly)
     }
@@ -78,7 +75,7 @@ impl<'a> PipelineRun<'a> {
     /// 5. Record all detections
     ///
     /// Called once at the start of `execute`, and reused by `process_method`.
-    pub(super) fn detect_and_transform(&mut self, assembly: CilObject) -> Result<CilObject> {
+    pub fn detect_and_transform(&mut self, assembly: CilObject) -> Result<CilObject> {
         self.run_il_detection(&assembly);
         let assembly = self.run_byte_transforms(assembly)?;
         self.run_post_transform_detection(&assembly);
@@ -99,7 +96,7 @@ impl<'a> PipelineRun<'a> {
     ///    - If set: release SSA, recover assembly, re-run byte transforms
     ///
     /// Falls through to exhausted-pipeline finalization after
-    /// [`MAX_PIPELINE_ITERATIONS`].
+    /// [`IterationConfig::max_pipeline_iterations`](crate::deobfuscation::IterationConfig::max_pipeline_iterations).
     fn run_ssa_pipeline(
         mut self,
         mut assembly: CilObject,
@@ -140,11 +137,11 @@ impl<'a> PipelineRun<'a> {
         self.finalize(ctx, assembly_arc, scheduler)
     }
 
-    /// Runs IL-level [`Technique::detect`] on all enabled techniques.
+    /// Runs IL-level [`Technique::detect`](crate::deobfuscation::Technique::detect) on all enabled techniques.
     ///
     /// Results are collected into a temporary [`Detections`] and merged into
     /// `self.detections`, preserving any existing positive detections.
-    pub(super) fn run_il_detection(&mut self, assembly: &CilObject) {
+    pub fn run_il_detection(&mut self, assembly: &CilObject) {
         let mut new_detections = Detections::new();
         for tech in self.engine.registry.techniques() {
             if !tech.enabled(&self.engine.config) {
@@ -161,12 +158,12 @@ impl<'a> PipelineRun<'a> {
 
     /// Runs byte-level transforms for all detected techniques.
     ///
-    /// Iterates techniques in dependency order ([`TechniqueRegistry::sorted_techniques`]).
-    /// For each detected technique, calls [`Technique::byte_transform`]. Successful
+    /// Iterates techniques in dependency order ([`TechniqueRegistry::sorted_techniques`](crate::deobfuscation::TechniqueRegistry::sorted_techniques)).
+    /// For each detected technique, calls [`Technique::byte_transform`](crate::deobfuscation::Technique::byte_transform). Successful
     /// transforms are recorded in `self.results` (via [`TechniqueResults::push`],
     /// which skips dedup since a technique may produce multiple transform events).
     /// The assembly is regenerated after any transform that declares
-    /// [`Technique::requires_regeneration`].
+    /// [`Technique::requires_regeneration`](crate::deobfuscation::Technique::requires_regeneration).
     fn run_byte_transforms(&mut self, assembly: CilObject) -> Result<CilObject> {
         let mut working = WorkingAssembly::new(assembly);
         let sorted = self.engine.registry.sorted_techniques(&self.detections);
@@ -183,7 +180,7 @@ impl<'a> PipelineRun<'a> {
             if self.detections.is_transformed(tech.id()) {
                 continue;
             }
-            if self.failed_transforms.get(tech.id()) == Some(&self.transforms_applied) {
+            if self.settled_transforms.get(tech.id()) == Some(&self.transforms_applied) {
                 continue;
             }
             // A transform that ran before this one may have changed what this
@@ -199,6 +196,10 @@ impl<'a> PipelineRun<'a> {
             };
             let tech_start = Instant::now();
             let Some(transform_result) = tech.byte_transform(&mut working, detection) else {
+                // Nothing to transform in the assembly as it stands; the same
+                // assembly gives the same answer
+                self.settled_transforms
+                    .insert(tech.id(), self.transforms_applied);
                 continue;
             };
             let evidence = detection.evidence().to_vec();
@@ -221,7 +222,7 @@ impl<'a> PipelineRun<'a> {
                 }
                 Err(e) => {
                     warn!("[technique] {} transform failed: {}", tech.name(), e);
-                    self.failed_transforms
+                    self.settled_transforms
                         .insert(tech.id(), self.transforms_applied);
                 }
             }
@@ -231,19 +232,28 @@ impl<'a> PipelineRun<'a> {
 
     /// Whether a detected technique still has a byte transform to run.
     ///
-    /// A technique has one when it is detected, not yet transformed, declares
-    /// [`TechniqueCapability::ByteTransform`], and has not already failed on the
-    /// assembly as it stands: rerunning the pipeline for a transform that will
-    /// fail the same way rebuilds every method's SSA for nothing.
+    /// A technique has one when it is one [`run_byte_transforms`] runs (not
+    /// superseded by another detected technique), is detected, not yet
+    /// transformed, declares [`TechniqueCapability::ByteTransform`], and has not
+    /// already failed or found nothing to do on the assembly as it stands. A
+    /// pending transform makes the pipeline run again, rebuilding every method's
+    /// SSA: one that will never run, or will answer the same way, did so up to
+    /// the iteration limit.
+    ///
+    /// [`run_byte_transforms`]: Self::run_byte_transforms
     fn has_pending_byte_transforms(&self) -> bool {
-        self.engine.registry.techniques().iter().any(|tech| {
-            self.detections.is_detected(tech.id())
-                && !self.detections.is_transformed(tech.id())
-                && tech
-                    .capabilities()
-                    .contains(&TechniqueCapability::ByteTransform)
-                && self.failed_transforms.get(tech.id()) != Some(&self.transforms_applied)
-        })
+        self.engine
+            .registry
+            .sorted_techniques(&self.detections)
+            .iter()
+            .any(|tech| {
+                self.detections.is_detected(tech.id())
+                    && !self.detections.is_transformed(tech.id())
+                    && tech
+                        .capabilities()
+                        .contains(&TechniqueCapability::ByteTransform)
+                    && self.settled_transforms.get(tech.id()) != Some(&self.transforms_applied)
+            })
     }
 
     /// Re-detects techniques on the post-transform assembly.
@@ -265,12 +275,12 @@ impl<'a> PipelineRun<'a> {
         }
     }
 
-    /// Runs SSA-level detection ([`Technique::detect_ssa`]) on all enabled techniques.
+    /// Runs SSA-level detection ([`Technique::detect_ssa`](crate::deobfuscation::Technique::detect_ssa)) on all enabled techniques.
     ///
     /// Called after SSA functions are built, enabling cross-block def-use chain
     /// analysis for more precise pattern matching than IL-level detection.
     /// Techniques already SSA-detected in this pipeline iteration are skipped.
-    pub(super) fn run_ssa_detection(&mut self, ctx: &AnalysisContext, assembly: &CilObject) {
+    pub fn run_ssa_detection(&mut self, ctx: &AnalysisContext, assembly: &CilObject) {
         for tech in self.engine.registry.techniques() {
             if !tech.enabled(&self.engine.config) {
                 continue;
@@ -292,7 +302,7 @@ impl<'a> PipelineRun<'a> {
     /// For each detected technique, creates a detection-only [`TechniqueResult`]
     /// (no transform, no events) and passes it through [`TechniqueResults::record`],
     /// which skips insertion if the technique ID was already recorded.
-    pub(super) fn record_detections(&mut self) {
+    pub fn record_detections(&mut self) {
         for tech in self.engine.registry.techniques() {
             if let Some(d) = self.detections.get(tech.id()) {
                 if d.is_detected() {
@@ -313,7 +323,7 @@ impl<'a> PipelineRun<'a> {
     ///
     /// Called when the inner fixpoint made changes (`round_iterations > 0`) and
     /// the detection round budget has not been exhausted. Re-runs
-    /// [`Technique::detect_ssa`] for techniques not yet SSA-detected.
+    /// [`Technique::detect_ssa`](crate::deobfuscation::Technique::detect_ssa) for techniques not yet SSA-detected.
     ///
     /// When new techniques are found:
     /// - Initializes and creates their passes
@@ -421,7 +431,6 @@ impl<'a> PipelineRun<'a> {
                 original_pe_cow,
                 Arc::clone(&ctx.emulation_hooks),
                 Arc::clone(&ctx.warmup_methods),
-                Arc::clone(&ctx.statemachine_providers),
                 self.engine.config.clone(),
             ));
             pool.warmup()?;
@@ -805,7 +814,7 @@ impl<'a> PipelineRun<'a> {
     ///
     /// Used by [`DeobfuscationEngine::detect`] which runs detection phases
     /// but skips transforms and SSA processing.
-    pub(super) fn build_detection_result(self) -> DeobfuscationResult {
+    pub fn build_detection_result(self) -> DeobfuscationResult {
         let attribution = self.engine.matcher.compute_attribution(&self.detections);
         let attributions = self
             .engine
@@ -818,5 +827,119 @@ impl<'a> PipelineRun<'a> {
         )
         .with_attributions(attributions)
         .with_timing(self.start.elapsed(), 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        deobfuscation::{
+            config::EngineConfig,
+            techniques::{Detection, Technique, TechniqueCategory, TechniqueRegistry},
+        },
+        testkit::fixture,
+    };
+
+    /// A technique detected on every assembly. With `transform`, it declares a byte transform
+    /// that finds nothing to do; it supersedes the techniques `supersedes` names.
+    struct IdleTechnique {
+        id: &'static str,
+        transform: bool,
+        supersedes: &'static [&'static str],
+    }
+
+    impl Technique for IdleTechnique {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn name(&self) -> &'static str {
+            self.id
+        }
+
+        fn category(&self) -> TechniqueCategory {
+            TechniqueCategory::Neutralization
+        }
+
+        fn detect(&self, _assembly: &CilObject) -> Detection {
+            Detection::new_detected(vec![], None)
+        }
+
+        fn supersedes(&self) -> &[&'static str] {
+            self.supersedes
+        }
+
+        fn capabilities(&self) -> Vec<TechniqueCapability> {
+            if self.transform {
+                vec![TechniqueCapability::ByteTransform]
+            } else {
+                vec![TechniqueCapability::DetectionOnly]
+            }
+        }
+
+        fn byte_transform(
+            &self,
+            _assembly: &mut WorkingAssembly,
+            _detection: &mut Detection,
+        ) -> Option<Result<EventLog>> {
+            None
+        }
+    }
+
+    /// An engine whose registry holds only `techniques`.
+    fn engine_with(techniques: Vec<IdleTechnique>) -> DeobfuscationEngine {
+        let mut engine = DeobfuscationEngine::new(EngineConfig::default());
+        engine.registry = TechniqueRegistry::new();
+        for technique in techniques {
+            engine.register_technique(Box::new(technique));
+        }
+        engine
+    }
+
+    /// A byte transform that found nothing to do in the assembly is not pending work: it answers
+    /// the same way until another transform changes the assembly. It stayed pending, and every
+    /// pipeline round ran again for it, up to the iteration limit.
+    #[test]
+    fn a_transform_with_nothing_to_do_is_not_pending() {
+        let engine = engine_with(vec![IdleTechnique {
+            id: "idle",
+            transform: true,
+            supersedes: &[],
+        }]);
+        let mut run = PipelineRun::new(&engine);
+        run.detections
+            .insert("idle", Detection::new_detected(vec![], None));
+        assert!(run.has_pending_byte_transforms(), "not attempted yet");
+
+        let assembly = CilObject::from_path(fixture("crafted_2.exe")).unwrap();
+        run.run_byte_transforms(assembly).unwrap();
+
+        assert!(!run.has_pending_byte_transforms());
+    }
+
+    /// A byte transform superseded by another detected technique never runs, so it is not
+    /// pending work. It was counted as pending forever.
+    #[test]
+    fn a_superseded_transform_is_not_pending() {
+        let engine = engine_with(vec![
+            IdleTechnique {
+                id: "old",
+                transform: true,
+                supersedes: &[],
+            },
+            IdleTechnique {
+                id: "new",
+                transform: false,
+                supersedes: &["old"],
+            },
+        ]);
+        let mut run = PipelineRun::new(&engine);
+        run.detections
+            .insert("old", Detection::new_detected(vec![], None));
+        run.detections
+            .insert("new", Detection::new_detected(vec![], None));
+
+        assert!(!run.has_pending_byte_transforms());
     }
 }

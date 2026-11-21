@@ -49,8 +49,9 @@ use std::{
 use analyssa::analysis::Machine;
 use dashmap::DashSet;
 pub use detection::{CffDetector, CffPattern, EntryCondition, EntryPoint};
-pub use dispatcher::Dispatcher;
+pub use dispatcher::{Dispatcher, DispatcherInfo, StateTransform};
 use rayon::prelude::*;
+pub use statevar::{IndexPattern, Location, StateVarRef, StateVariable};
 
 use crate::{
     analysis::{CilTarget, MethodRef, SsaFunction},

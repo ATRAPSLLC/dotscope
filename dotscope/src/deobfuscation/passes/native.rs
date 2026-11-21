@@ -33,9 +33,12 @@
 //!
 //! # Limitations
 //!
-//! - Only supports x86/x64 code (not ARM or other architectures)
+//! - Only supports x86 code (not ARM or other architectures); 64-bit stubs decode, but
+//!   their translation is refused and they stay native
 //! - Only supports simple DynCipher-style code patterns
-//! - Methods with unsupported instructions will be skipped
+//! - Methods with an instruction the translation does not model exactly (an unsupported
+//!   instruction, a condition on a flag it cannot know, a value it cannot follow) are
+//!   skipped and keep their native code
 
 use rustc_hash::FxHashSet;
 
@@ -249,7 +252,7 @@ impl NativeMethodConversionPass {
 
         // Verify this is actually a native method
         let impl_code_type = MethodImplCodeType::from_impl_flags(method_row.impl_flags);
-        if !impl_code_type.contains(MethodImplCodeType::NATIVE) {
+        if impl_code_type != MethodImplCodeType::NATIVE {
             return Err(Error::X86Error(format!(
                 "Method 0x{:08x} is not a native method",
                 token.value()

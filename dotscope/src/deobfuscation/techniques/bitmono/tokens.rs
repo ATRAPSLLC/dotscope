@@ -572,7 +572,7 @@ mod tests {
             .declaring_type_rc()
             .map(|t| t.fullname().to_string())
             .unwrap_or_default();
-        (declaring, method.name.clone())
+        (declaring, method.name.to_string())
     }
 
     #[test]
@@ -601,7 +601,7 @@ mod tests {
                     .map(|t| t.fullname().to_string())
                     .unwrap_or_default();
                 assert_eq!(
-                    (declaring, resolved.name.clone()),
+                    (declaring, resolved.name.to_string()),
                     method_named(&original, pair.target & 0x00FF_FFFF),
                     "{version}: init {} target 0x{:08X}",
                     pair.init,
