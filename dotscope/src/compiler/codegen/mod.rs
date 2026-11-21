@@ -782,8 +782,8 @@ impl SsaCodeGenerator {
     /// beyond the original locals from the SSA function. The returned map contains
     /// (local_index -> type) pairs for these temporaries.
     ///
-    /// This should be called after `generate_with_assembly` to get the types needed
-    /// for generating a correct local variable signature.
+    /// Read it after [`generate`](Self::generate) or [`compile`](Self::compile) for the
+    /// types a correct local variable signature needs.
     #[must_use]
     pub fn local_types(&self) -> &BTreeMap<u16, SsaType> {
         &self.method.local_types
@@ -791,8 +791,8 @@ impl SsaCodeGenerator {
 
     /// Returns the mapping from original local indices to compacted indices.
     ///
-    /// This should be called after `generate_with_assembly` to get the mapping needed
-    /// for building local signatures with correct types from original SSA.
+    /// Read it after [`generate`](Self::generate) or [`compile`](Self::compile) for the
+    /// mapping that builds local signatures with the original SSA's types.
     #[must_use]
     pub fn original_local_mapping(&self) -> &BTreeMap<u16, u16> {
         &self.method.original_to_compacted
@@ -803,8 +803,8 @@ impl SsaCodeGenerator {
     /// This is used for remapping exception handler offsets. After code generation,
     /// the map contains each block's start offset in the new bytecode layout.
     ///
-    /// This should be called after `generate_with_assembly` to get the offsets for
-    /// exception handler remapping.
+    /// Read it after [`generate`](Self::generate) or [`compile`](Self::compile) for the
+    /// offsets exception handler remapping needs.
     #[must_use]
     pub fn block_offsets(&self) -> &BTreeMap<usize, u32> {
         &self.method.block_offsets

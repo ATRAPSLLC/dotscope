@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "dotscope"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "aes",
  "analyssa",
@@ -1233,71 +1233,3 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
-
-[[patch.unused]]
-name = "analysir"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "autoit-rs"
-version = "0.1.2"
-
-[[patch.unused]]
-name = "darwinscope"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "dotscope"
-version = "0.9.1"
-
-[[patch.unused]]
-name = "gobin"
-version = "0.6.1"
-
-[[patch.unused]]
-name = "innospect"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "mallabel"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "msft-typelib"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "nimrod"
-version = "0.3.1"
-
-[[patch.unused]]
-name = "nsis"
-version = "0.6.1"
-
-[[patch.unused]]
-name = "pascalscript"
-version = "0.2.1"
-
-[[patch.unused]]
-name = "securs-abi"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "securs-fleet"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "securs-spec"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "securs-wg"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "undelphi"
-version = "0.5.1"
-
-[[patch.unused]]
-name = "visualbasic"
-version = "0.6.0"

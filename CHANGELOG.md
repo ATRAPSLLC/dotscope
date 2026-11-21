@@ -5,358 +5,209 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] - 2026-11-21
+
+A correctness release built on analyssa 0.7.0. Every assembly of the test corpus loads, lifts
+to SSA the verifier accepts and writes back holding what it held; generated code is
+translation-validated; and the public API changed wherever it could not state what the
+metadata means, so this release has many breaking changes.
 
 ### Changed
 
-- **One work budget and one set of emulation limits.** `EngineConfig::budget` (an analyssa
-  `WorkBudget`) bounds every pass, the scheduler and the analyses they read, replacing the
-  per-pass and per-phase iteration counts (`with_budget` replaces `with_max_iterations`;
-  `Budget`, `Exhaustion` and `WorkBudget` are re-exported from `analysis`).
-  `EmulationConfig::limits` is the `EmulationLimits` every method's limits derive from
-  (`ProcessBuilder::with_limits`), and `EngineConfig::unflattening` is the one
-  `UnflattenConfig`.
-- **Code generation is rebuilt around the order it emits in** (#288): operations are emitted
-  in SSA order, a value moves to its use only where analyssa's `FoldForest` proves it
-  unobservable, slots are shared by analyssa's `Gathering`, and phi copies are one parallel
-  copy per edge. Every generated body is translation-validated (`compiler::validate_lift`); a
-  refused one keeps its IL (`EventKind::CodegenRefused`).
-- **Validators enforce only ECMA-335 rules and what the runtime refuses**, so validation no
-  longer fails assemblies the runtime loads.
-- **Every codec encodes back what it reads**: custom attribute values, marshalling
-  descriptors, declarative security, method bodies, signatures, sequence points and custom
-  debug information follow the ECMA-335 and Portable PDB grammars.
-- Output is deterministic, and a failing load names the first failing row in token order.
-  Every documentation example compiles, and examples run as doc tests. The docs build without
-  a broken, ambiguous or redundant link, private items included (`cargo doc
-  --document-private-items` is what CI checks).
-- **BREAKING**, assembly: `FlowType` gains `CallIndirect` (`calli`) and `MethodJump`
-  (`jmp`, which leaves the method), both `Call` before, so no consumer reads the opcode byte
-  to tell them apart (`as_str`: `"call_indirect"`, `"method_jump"`).
-  `Instruction::fall_through` and `FlowType::falls_through` state where control continues
-  when an instruction does not branch, a `switch`'s default among them.
-- **BREAKING**, loading: `CilObject::from_view` and `from_view_with_validation` return a
-  `ViewLoadError` holding the error and the view, so the raw tables of an assembly the
-  semantic load refuses stay readable without parsing it again; it converts into `Error`
-  for `?`.
-- **BREAKING**, metadata: a type's `FieldList`, `PropertyList`, `EventList` and `modifiers`
-  are `LazyList`s, allocated on first push (iterate and `get` as before; no `[i]`), and a
-  strong name's key (`Identity::PubKey`, `EcmaKey`) is an `Arc<[u8]>`. Loading the 1017
-  corpus assemblies takes 25% less time, peaks a third lower in memory and allocates 36%
-  fewer times: a method body no other method names is no longer held twice while loading,
-  decoded blocks keep no growth room and are found without a map, and a type's empty lists,
-  its source, a leaf signature type and a signature's validation allocate nothing.
-- **BREAKING**, analysis: a call is one `SsaOp::Call` holding `CallData` and its `Callee`
-  (read through `SsaOpCilExt::method_call`), CIL prefixes are stated on the operation they
-  prefix (`CilPrefix`), and evaluators take a `Machine` instead of a `PointerSize`. A float
-  constant is `ConstValue::Float(FloatBits)`, `EmValue` converts from a `ConstValue` with
-  `TryFrom`, and `SsaCodeGenerator::compile` is all or nothing (`generate_with_assembly` is
-  removed).
-- **BREAKING**, metadata: custom attribute values hold `Option` for null, a `Boxed` argument
-  and `FieldOrPropType`; `MarshallingInfo` is one native type; `SecurityAction` and
-  `SecurityPermissionFlags` take the runtime's values and permissions hold named arguments;
-  `MethodBody` keeps its `exception_format`; `CustomDebugInfo` is decoded by kind;
-  `SignatureMethod` gains `unmanaged` and its calling convention;
-  `TypeSignature::ModifiedRequired`/`ModifiedOptional` hold the type their modifiers prefix
-  (a modifier inside a type was parsed as the whole type, misreading the rest of the
-  signature); signed compressed integers
-  follow ECMA-335 and the compressed writers return `Result`. Names read from `#Strings`
-  (types, methods, parameters and the named rows, cultures, P/Invoke import names) are
-  `SharedStr`, a `Document`'s name is a `DocumentName` and its hash `SharedBytes`.
-  `CilType::fullname()` returns a `FullName` (displays and compares as the joined name).
-  The name getters return the shared values rather than copies (`CilTypeRef::name`,
-  `CilTypeReference::name`/`fullname`, `MethodRef::name`, `Method::declaring_type_fullname`,
-  `CilObject::resolve_method_name`), as do `AssemblyIdentity` (name, culture), DLL
-  dependencies, exported functions and `Import::fullname`.
-- **BREAKING**, loading and writing: a coded index whose tag names no table reads as null
-  (`TableInfo::decode_coded_index` returns `Option`); a branch operand is
-  `Operand::Target(rva)`; attached lists, `Property::fn_other`, `Event::fn_on_other` and
-  `security` among them, are `RowList`s; `Identity::Token` is in .NET's byte order;
-  `Method::varargs` is removed; `Resources` is keyed by token; the raw `to_owned` of TypeDef,
-  MethodDef, EventMap, PropertyMap and LocalScope rows take the table's `MemberRanges`. A
-  reference to a deleted row fails the write with `Error::DanglingReference` (or is null under
-  `DanglingPolicy::Null`) instead of moving to the next row.
+- **Built on analyssa 0.7.0** (**BREAKING**): a call is one `SsaOp::Call` holding `CallData`
+  and its `Callee` (read through `SsaOpCilExt::method_call`), CIL prefixes sit on the
+  operation they prefix (`CilPrefix`), evaluators take a `Machine` instead of a
+  `PointerSize`, a float constant is `ConstValue::Float(FloatBits)` and `EmValue` converts
+  from a `ConstValue` with `TryFrom`.
+- **Code generation is rebuilt** (#288): it emits in SSA order, moves a value to its use only
+  where that is unobservable, shares slots and makes one parallel copy per phi edge. Every
+  generated body is translation-validated (`compiler::validate_lift`); a refused one keeps
+  its IL (`EventKind::CodegenRefused`). `SsaCodeGenerator::compile` is all or nothing and
+  `generate_with_assembly` is removed.
+- **One work budget and one set of emulation limits**: `EngineConfig::budget` bounds every
+  pass and the scheduler (`with_budget` replaces `with_max_iterations`),
+  `EmulationConfig::limits` is the one `EmulationLimits` (`ProcessBuilder::with_limits`) and
+  `EngineConfig::unflattening` the one `UnflattenConfig`.
+- **Validators enforce only ECMA-335 rules and what the runtime refuses**, so assemblies the
+  runtime loads validate.
+- **Every codec encodes back what it reads**: custom attributes, marshalling, declarative
+  security, method bodies, signatures, sequence points and custom debug information follow
+  the ECMA-335 and Portable PDB grammars.
+- **Loading is faster and smaller**: over the 1017-assembly corpus, 25% less time, a third
+  lower peak memory and 36% fewer allocations. Names read from `#Strings` share one copy
+  (`SharedStr`; a `Document`'s name is a `DocumentName`, its hash `SharedBytes`) and are
+  returned shared, `CilType::fullname()` returns a `FullName`, and per-type lists are
+  allocated on first push.
+- Output is deterministic, a failing load names the first failing row in token order, and
+  every documentation example compiles and runs as a doc test.
+- **BREAKING** API changes besides the above:
+  - assembly: `FlowType::CallIndirect` (`calli`) and `MethodJump` (`jmp`), both `Call`
+    before; `Instruction::fall_through` and `FlowType::falls_through`; a branch operand is
+    `Operand::Target(rva)`.
+  - loading: `CilObject::from_view` and `from_view_with_validation` return a `ViewLoadError`
+    that keeps the view; a coded index whose tag names no table reads as null
+    (`TableInfo::decode_coded_index` returns `Option`).
+  - metadata: a type's `FieldList`, `PropertyList`, `EventList` and `modifiers`, `ParamList`
+    and `Method::local_vars` are `LazyList`s, and attached lists (`Property::fn_other`,
+    `Event::fn_on_other`, `security`) are `RowList`s; `Identity::PubKey`/`EcmaKey` hold an
+    `Arc<[u8]>` and `Identity::Token` is in .NET's byte order; custom attribute values hold
+    `Option` for null, a `Boxed` argument and `FieldOrPropType`; `MarshallingInfo` is one
+    native type; `SecurityAction` and `SecurityPermissionFlags` take the runtime's values;
+    `CustomDebugInfo` is decoded by kind; `SignatureMethod` gains `unmanaged`;
+    `TypeSignature::ModifiedRequired`/`ModifiedOptional` hold the type they modify; the
+    compressed integer writers return `Result`; `Resources` is keyed by token; the raw
+    `to_owned` of TypeDef, MethodDef, EventMap, PropertyMap and LocalScope rows takes the
+    table's `MemberRanges`.
+  - writing: a reference to a deleted row fails the write with `Error::DanglingReference` (or
+    is null under `DanglingPolicy::Null`) instead of moving to the next row.
+  - emulation: `ManagedHeap::iter` yields `Arc<HeapObject>`, hook results are checked
+    against the method's signature, `NewObjResolution::HookedBypass` carries the value
+    `newobj` pushes, and `MethodBuilder::build` refuses a bodyless method that is not
+    P/Invoke, internal-call or runtime-implemented.
 
 ### Added
 
-- Portable PDB: every load reads the PDB the image embeds or its own debug tables,
+- Portable PDB: every load reads the embedded PDB or the image's own debug tables,
   `CilObject::pdb()` gives every table with queries, and `with_pdb` / `with_pdb_bytes` attach
   a standalone `.pdb`.
-- `.resources` values of user types are kept (`ResourceType::Serialized`) and read as
-  MS-NRBF (`resources::nrbf`); compiled XAML reads as a BAML document (`resources::baml`).
+- `.resources` values of user types are kept (`ResourceType::Serialized`) and read as MS-NRBF
+  (`resources::nrbf`); compiled XAML reads as a BAML document (`resources::baml`).
 - Metadata queries: `Root::stream` and `unread_streams`, `Param::from_signature`,
   `type_tokens` on signatures, `TokenResolver::generic_definition`,
   `CilAssembly::find_corelib_type`, `CilObject::fields` and `custom_attributes`,
-  `CilType::enum_underlying`, and the runs of the list columns (`MemberRanges`,
-  `TablesHeader::member_ranges` and `member_rids`), `PdbStream::to_bytes`, and what
-  implements a method and where its first instruction is (`Method::code_kind`,
-  `MethodCodeKind`, `Method::code_rva`).
-- Members of public types that were crate-internal, now public: `CilObject::from_project`
-  with `project::ProjectContext`, `CilAssemblyView::load_with_validation`,
-  `assembly::decode_method` (beside `DecodedBodies`), `CustomAttributeParser`,
-  `PortablePdb::new`, `pdb::PDB_TABLES`, `TokenResolver::new`, `CilType::mark_value_type`,
-  the signatures' `for_each_type_token_mut`, and the fields of `HeapRef` and `NativeReader`.
-  Internal items take their reach from private modules, not restricted visibility. Every
-  type public API takes, returns or holds can be imported, re-exported beside the API that
-  hands it out (`LazyList`, `RowList`, `TextHash`, `AssemblyChanges`, `WorkQueue`,
-  `ExecutionStats`, ...), and `deny(unnameable_types)` keeps it so. Public docs link only
-  public items: `debug_type` (the kinds `DebugDirectoryEntry::kind` takes),
-  `resources::baml::known`, `StateMachineState` and `EmulationContext::with_call_signature`
-  are public.
+  `CilType::enum_underlying`, `MemberRanges` (`TablesHeader::member_ranges` and
+  `member_rids`), `PdbStream::to_bytes`, and `Method::code_kind` / `MethodCodeKind` /
+  `Method::code_rva`.
 - `dotscope::io` (the binary codecs), SSA forms for `arglist`, `mkrefany`, `refanyval` and
   `refanytype`, and the hidden, unstable `testkit` feature.
-- Deobfuscation: `bitmono.tokens`, `bitmono.locals`, `netreactor.emptyresource`, a metadata
+- Crate-internal members of public types are public (`CilObject::from_project`,
+  `CilAssemblyView::load_with_validation`, `assembly::decode_method`, `CustomAttributeParser`,
+  `TokenResolver::new`, ...), and every type the public API takes, returns or holds can be
+  imported (`deny(unnameable_types)` keeps it so).
+- Deobfuscation: `bitmono.tokens`, `bitmono.locals` and `netreactor.emptyresource`, a metadata
   repair registry, and exports of `repair_pe`, unflattening and the conflict resolution types.
 
 ### Removed
 
-- Configuration nothing read: `DecryptorHeuristics`, `UnflatteningThresholds`,
-  `detection_threshold`, `verify_semantics` and `resolution_strategies`.
-- `analysis::conv_op_for_target` and the `skip-expensive-tests` feature.
-- `Method::is_forwarded_pinvoke`, which tested a range bound as a flag and was always false
-  (`Method::is_forward_ref` is the `ForwardRef` test).
-- **BREAKING**, deobfuscation: the LLM renamer. The `smart-rename` feature (dotscope and
-  dotscope-cli), `SmartRenameConfig`, `CleanupConfig::smart_rename` and the CLI's
-  `--rename-ai` are gone, and with them the `mistralrs` and `tokio` dependencies. Cleanup
-  renames obfuscated identifiers to sequential names as before.
-- **BREAKING**, metadata: the table loaders (`metadata::tables::AssemblyLoader` and the
-  others), unit structs implementing a private trait, are no longer public.
+- **BREAKING**: the LLM renamer: the `smart-rename` feature (dotscope and dotscope-cli),
+  `SmartRenameConfig`, `CleanupConfig::smart_rename`, the CLI's `--rename-ai` and the
+  `mistralrs` and `tokio` dependencies. Cleanup renames to sequential names as before.
+- **BREAKING**: configuration nothing read (`DecryptorHeuristics`, `UnflatteningThresholds`,
+  `detection_threshold`, `verify_semantics`, `resolution_strategies`),
+  `analysis::conv_op_for_target`, `Method::varargs`, `Method::is_forwarded_pinvoke` (always
+  false; `Method::is_forward_ref` is the `ForwardRef` test),
+  `AssemblyChanges::referenced_string_offsets` (nothing read it), the public table loaders
+  and the `skip-expensive-tests` feature.
 
 ### Fixed
 
 #### Loading and metadata
 
 - Images load as the CLR loads them: stream directories, the `#~` ExtraData word, `#JTD`
-  tables, any metadata version text, zero-length heaps (Mono's `ilasm`) and ConfuserEx's
-  "invalid metadata" (#289). Bytes at an RVA are read through one section map as the runtimes
-  map them.
-- Signatures parse in one pass bounded by their bytes, without invented caps; array
-  signatures no longer misparse what follows them and refuse ranks no array has. Walkers see
-  through a modified type: token collection and renumbering, stack and byte sizes, flavors,
-  SSA types and emulation's generic substitution (which now also substitutes inside
-  pointers, general arrays, function pointers and varargs).
-- Custom attribute arguments are read by the constructor's signature and enums by their
-  underlying type, so 72 Mono framework assemblies load.
+  tables, any metadata version text, zero-length heaps and ConfuserEx's "invalid metadata"
+  (#289); bytes at an RVA are read through one section map.
+- Signatures parse in one pass bounded by their bytes: array and modified types no longer
+  misparse what follows them. Custom attribute arguments are read by the constructor's
+  signature and enums by their underlying type.
 - Type flavors, nested generic instances and core library types no longer depend on loader
-  timing; a project's registries list only their own types; StateMachineMethod rows,
-  sequence points and Portable PDB data load as the compilers write them.
-- Native imports and exports are walked entry by entry as the Windows loader walks them,
-  bounded by the file. DLL names are compared ignoring case, as the loader compares them:
-  `get_all_dll_names` and `get_all_dll_dependencies` list a DLL once, in a stable order.
-- A row's name shares one copy of its `#Strings` run, and a document's name and hash view one
-  copy of `#Blob`: many rows naming one long string, or a document name repeating one long
-  part, no longer cost rows times length in memory and time (`Strings::get_shared`,
-  `Blob::get_shared`, `Blob::document_name`). Full names are not joined while loading: a
-  `FullName` links to its enclosing type's and is indexed by a hash of its text, and a nested
-  type's name follows an enclosing type nested after it was first read.
-- A method's code type is compared as the two-bit enumeration it is: `is_code_il` held for
-  every method, and `is_code_native` and `is_code_opt_il` for a runtime-implemented one, so
-  `query().il()` matched every method and the native-code passes and the emulator took a
-  runtime method for native code.
-- List columns (fields, methods, parameters, events, properties and a PDB scope's locals) are
-  read once per table into runs clamped to their table and kept from overlapping, so a
-  hostile column no longer costs billions of iterations or quadratic memory; loading,
-  cleanup, renaming and repairs share them and follow the Ptr tables of `#-` streams.
+  timing, and Portable PDB data, sequence points and StateMachineMethod rows load as the
+  compilers write them.
+- Native imports and exports are walked as the Windows loader walks them, DLL names compared
+  ignoring case.
+- A method's code type is compared as the two-bit field it is (`is_code_il` held for every
+  method).
+- List columns are read once per table into runs clamped to their table, so a hostile column
+  no longer costs billions of iterations or quadratic memory.
 
 #### Project loading
 
-- A panic while loading an assembly no longer hangs `ProjectLoader::build`, and a dependency
-  that fails or panics is left out (reported in `failed_loads` with its own error) while the
-  others load without it; the primary failing fails the build. `strict_mode` fails on a
-  dependency that is missing or fails to load, and `missing_dependencies` lists
-  only names that were not found.
-- Dependency names from AssemblyRef rows must be simple file names, and a candidate must
-  resolve inside its search directory (no absolute, `..`, UNC or symlinked escape). Each
-  file is read once and each name probed once; `ProjectLoader::max_assemblies` bounds a
-  build.
-- A TypeRef binds in the assembly its AssemblyRef names, not to the first type of that name
-  in any loaded assembly. `CilProject` is updated atomically and lists and searches its
-  assemblies in identity order (`AssemblyIdentity` is `Ord`); `clear` resets the primary.
+- A panic while loading no longer hangs `ProjectLoader::build`; a dependency that fails is
+  left out and reported in `failed_loads`, `strict_mode` fails on a missing or failing one,
+  and `missing_dependencies` lists only names not found. Dependency names must be simple file
+  names resolving inside the search directory, and `max_assemblies` bounds a build.
+- A TypeRef binds in the assembly its AssemblyRef names, and `CilProject` lists its
+  assemblies in identity order.
 
 #### ILAsm output
 
-- Quoted strings and names share one escaper: string constants, P/Invoke modules and entry
-  points, cultures and assembly, module, file and resource names were written unescaped, a
-  quote ending them early, and a user string that is not valid UTF-16 goes out as
-  `bytearray (...)` instead of decoded lossily. Floats are written as the shortest decimal
-  that reads back as the same value, and an infinity, a NaN or negative zero as its bits
-  (`inf`, `NaN` and `-0` are no ILAsm, and a large value had hundreds of digits).
-- A general array is written with its bounds (`[0...,0...]`, `[1...5]`; it was `[rank]`, which
-  ILAsm reads as a single-dimensional array of that size), and `.locals` comes from the parsed
-  signature, `T& pinned` rather than `T pinned&`, even when its types do not resolve. A local
-  signature token is read only as a StandAloneSig token (`MethodBody::local_var_sig_rid`):
-  the loader, cleanup, SSA typing and the formatter masked any token to a row.
-
-#### Validation
-
-- Validators accept what the runtime loads (every Mono 4.8 and .NET 10 runtime assembly loads
-  as one project), and rules that never fired check what they name. A type implementing a
-  defined non-interface is refused by its flags, not by its name.
+- Strings and names share one escaper (several were written unescaped), a user string that
+  is not valid UTF-16 is written as `bytearray`, floats round-trip, general arrays keep their
+  bounds and `.locals` comes from the parsed signature.
 
 #### Write path and cleanup
 
-- An assembly written back unchanged holds what it held: method bodies past 8 MB, fat
-  headers, shared heap tails, user strings as read, the debug directory, PDB blob columns,
-  unassigned coded index tags, every exception clause of a rewritten body (one outside its
-  code included), and the native import and export tables, a function imported twice from
-  one DLL included.
-- A write that renumbers rows or replaces bodies regenerates the Portable PDB the image
-  embeds for the rows it now describes, and the CodeView and checksum entries name the new
-  PDB; a standalone PDB stays named only while the output still matches it (#291). Debug
-  tables an assembly holds in its own metadata follow the methods a write deletes, replaces
-  the bodies of and adds the same way.
-- Heap placeholders no longer pass for offsets (each assembly counts its own change ids), an
-  index too wide for its column is refused, the output grows past its estimate, and replaced
-  bodies' `ldstr` operands follow a moved user string heap. A write looks each placeholder
-  up in an index it builds for the write instead of scanning every change, and
-  `string_get_or_add` finds a string already appended through a content index: both scans
-  made writing quadratic in the rows and strings added (8000 new types: about 9x fewer
-  instructions). Entries added after a heap was replaced are named where the write puts them
-  (offsets and index widths came from the replaced heap). Renaming a string no longer
-  compacts the heaps, which failed the write of in-image debug tables
-  (`AssemblyChanges::referenced_string_offsets`, which it filled and nothing read, is
-  removed); cleanup's compaction keeps the blobs other blobs name. The tails tables name
-  inside a renamed string are written in offset order, its terminator stays the empty string,
-  the tails inside a duplicate string follow it to the copy it merges into, and finding them
-  is a binary search instead of a scan per entry (20000 strings: about 125x fewer
-  instructions).
-- Cleanup keeps what surviving metadata names and renumbers only signature blobs;
-  `add_cleanup` narrows earlier requests instead of resetting them; table operations are
-  ordered by a logical timestamp; builders start their lists at the next row. `MethodBuilder`
-  declares P/Invoke, internal-call and runtime-implemented methods and refuses a bodyless
-  method of any other kind, as ECMA-335 §II.22.26 does. It decides
-  which types go before deleting any member, so a requested type that surviving code still
-  names stays whole instead of as an emptied shell; deleting a type deletes what is nested
-  in it at every depth; and a protected or surviving nested type keeps its enclosing chain,
-  which empty-type removal no longer deletes.
-- `.resources` streams are written as `ResourceWriter` writes them, a public key token prints
-  in .NET's order, and `repair_pe` repairs any directory count past 16.
+- An assembly written back unchanged holds what it held: large and fat method bodies, shared
+  heap tails, user strings, the debug directory, unassigned coded index tags, every exception
+  clause, and the native import and export tables.
+- A write that renumbers rows or replaces bodies regenerates the embedded Portable PDB and
+  the debug directory entries naming it (#291); in-image debug tables follow the methods it
+  deletes, replaces and adds.
+- Heap placeholders no longer pass for offsets, an index too wide for its column is refused,
+  replaced bodies follow a moved user string heap, and renamed strings keep their tails.
+  Writes no longer scan every change per placeholder or string (adding 8000 types: about 9x
+  fewer instructions; 20000 renamed strings: about 125x).
+- Cleanup keeps what surviving metadata names, deletes nested types at every depth and keeps
+  the enclosing chain of a surviving one; `add_cleanup` narrows earlier requests instead of
+  resetting them.
+- `.resources` streams are written as `ResourceWriter` writes them, and `repair_pe` repairs
+  any directory count past 16.
 
 #### Analysis and code generation
 
-- Every corpus method lifts to SSA the verifier accepts: arithmetic is typed by ECMA-335's
-  numeric table, an enum computes as its underlying integer, every conversion is restated for
-  its operand's type, and `.locals init` locals read zero. The lift parses a method's local
-  signature and resolves the runtime handle types once per method instead of at every access
-  (3-6% fewer instructions lifting whole assemblies). Compacting a method's locals moves
-  their declared types with them; code generation had paired each local after a dropped one
-  with the type declared for the local before it. Code the runtime refuses (ECMA-335
-  III.1.7.5) no longer lifts: control falling off the end, a branch to no instruction or into
-  an operand, and a join reached at two stack depths are errors rather than SSA the verifier
-  or code generation rejects. The decoder ends a block at `jmp`, which leaves the method,
-  instead of giving it a fall-through.
+- Every corpus method lifts to SSA the verifier accepts (typed arithmetic, enums as their
+  underlying integer, `.locals init` locals read zero), and code the runtime refuses (falling
+  off the end, a branch into an operand, a join at two stack depths) is an error.
 - Constant folding respects width, kind and NaN, pure-call folding needs a pure callee, and
-  a chain of conversions is shortened only where the inner one keeps the value (an `int16`
-  through `conv.u2` does not).
-  The `z3` solver builds against analyssa's typed operations and states every operation as
-  the value it computes, leaving what the target decides unconstrained.
-- The x86 lift of native stubs is exact or refuses, so a stub it cannot follow stays native
-  instead of becoming CIL that computes something else. Conditions after every flag
-  producer follow the processor's flags (a jump after an addition compared the sum with
-  itself, and signed and unsigned conditions compared the wrong values), 8- and 16-bit
-  registers are their bits of the full register, flags survive the instructions that do not
-  touch them, MUL and DIV use EDX, MOVZX/MOVSX/CWDE extend, shifts mask their count, rotates
-  rotate, blocks fall through and each has its own zero; bit scans, BTS/BTR/BTC, CBW, CWD,
-  the one-operand IMUL, an ADC with an unknown carry, 64-bit code and SSA that does not
-  verify are refused. The linear decode no longer stops at a RET that a jump passes.
-- Exception clauses come nested first in a stable order, and generated code handles `calli`,
-  typed element access and values leaving a `try` through its `finally`. A filter's
-  `endfilter` is laid out as its last instruction, as ECMA-335 requires (377 corpus methods
-  kept their original IL because the fall-through order put filter code after it).
+  the `z3` solver states every operation as the value it computes.
+- The x86 lift of native stubs is exact or refuses (flags, partial registers, MUL/DIV,
+  extensions, shifts and rotates), so a stub it cannot follow stays native.
+- Exception clauses come nested first in a stable order, generated code handles `calli`,
+  typed element access and values leaving a `try` through its `finally`, and a filter ends
+  at its `endfilter`.
 - Call graphs and class hierarchy analysis find every override and implementation, end on
   inheritance cycles and order callees first.
-- A `callvirt` naming a BCL virtual or interface method by its MemberRef runs the receiver's
-  override (by MethodImpl, else by name and signature) before any hook: a user `ToString`,
-  `Dispose` or `Stream.Read` runs instead of the BCL method's hook.
-- The emulator charges native work to its budget, reads heap objects in place and finds a
-  field's declaring type through the field itself, as it does a method's. Heap objects and
-  static values sit behind `Arc`: the first write after a fork copies the object it writes
-  instead of every object beside it in the persistent map, and hooks read objects shared
-  (`ManagedHeap::get_shared`) instead of copying them (`Array.get_Length` copied the array).
-  An array index is an integer, as ECMA-335 states: an object is no longer searched for one
-  (a boxed integer or the first integer field stood in for the index the program lacked).
-  `ldfld` and `stfld` through a pointer to an object's field (`ldflda`) read and write the
-  struct the field holds; they went to the object holding the field.
-  A hook's result is checked against the signature of the method it stands for (a value
-  for a void method stayed on the caller's stack, a missing one let the caller pop what lay
-  below). `newobj` pushes what a constructor hook constructs, the object it initialized or
-  the value it returns (the new objects of the HMAC and `RNGCryptoServiceProvider`
-  constructors were dropped, and `ComputeHash` hashed the bare object with an empty key; it
-  now refuses an object no HMAC constructor initialized), and a `DateTime` constructed on a
-  local stores its ticks there instead of on the caller's stack; its properties read through
-  a pointer to it. `DateTime.Now` of a deterministic build (a `Repro` debug entry) is not its
-  header stamp, which is a hash, and the .NET Reactor trial checks are bypassed in every
-  emulation the pipeline runs, as they were for NecroBit (the decrypters ran into them once
-  `DateTime` values were real).
-  A delegate's `Invoke` through a MemberRef (`Action`, `Func` and every delegate type of
-  another assembly) runs the delegate's method; it was an unhooked call answered with a
-  symbolic value. A delegate bound to a target passes it as the first argument (an instance
-  method took its `this` from the caller's stack), and a multicast delegate runs each later
-  entry as its `Invoke` again at the call site, so it returns to the caller with its stack
-  and pending `leave` (it returned into the entry before it). A type's initializer no longer marks its
-  base type initialized without running the base's. An unhooked P/Invoke leaves its
-  arguments in order, and a bodyless void method returns nothing instead of a symbolic value.
-  A method of an assembly loaded with `Assembly.Load` runs in that assembly, and so do the
-  methods it calls by its own tokens; a call into it is resolved there (it was resolved again
-  in the calling assembly, and its callees ran against the main assembly's metadata). The
-  deobfuscation template maps the original PE once, under aliases for its file and module
-  names, instead of a copy per name forked with every process. It runs the 18
-  single-byte `conv.ovf.*` opcodes as ECMA-335 numbers them, which it had only as mislabelled
-  two-byte copies, and `no.` decodes, lifts and runs. Float `bge`/`ble` and their `.un`
-  forms follow ECMA-335 on NaN, and a string built from characters takes them as `char` or
-  `int32` and refuses what the runtime refuses instead of answering an empty string. `Math.Round`
-  and `MathF.Round` round a midpoint to even unless a `MidpointRounding` says otherwise.
-  Strings are measured and indexed in UTF-16 code units, as .NET does: `Length` and
-  `Chars[i]` answer in O(1) (they counted characters, so a decryption loop over a string was
-  quadratic, and miscounted any character outside the Basic Multilingual Plane), and
-  `Substring`, `ToCharArray`, `IndexOf` and padding take those indices, throwing for a range
-  outside the string or a null receiver as the runtime does; `IndexOf` answered a UTF-8 byte
-  offset and ignored its start, `ToCharArray(start, length)` its range. Hooks see the
-  parameter and return types of a framework method called through a MemberRef.
-  Symmetric transforms implement all five padding modes and throw `CryptographicException`
-  for a wrong key size, partial blocks or padding that does not check out (decrypting with
-  the wrong key) instead of handing the input back as the output; a padding decryptor holds
-  its last block back from `TransformBlock`, and a transform returns to its initial IV after
-  `TransformFinalBlock`. A `callvirt` through a base method reaches the hook of the
-  receiver's runtime type first, so a CryptoStream or DeflateStream read or written through
-  `Stream::Read`/`Write` is no longer treated as a plain stream that reads nothing and drops
-  writes. A CryptoStream closed or disposed without `FlushFinalBlock` writes its final
-  block, and a second `FlushFinalBlock` throws. Corrupt compressed data throws
-  `InvalidDataException`, a malformed RSA XML key `CryptographicException`, and transform,
-  stream, reader and writer hooks check buffer arguments as the runtime does, throwing its
-  argument exceptions instead of clamping or reading nothing.
+
+#### Emulation
+
+- A virtual call runs the receiver's override, or the hook of its runtime type, before the
+  base method's hook (a user `ToString`, a CryptoStream read through `Stream.Read`).
+- Heap objects and statics sit behind `Arc` and are copied on the first write after a fork;
+  an array index is an integer; `ldfld`/`stfld` through a field pointer reach the struct.
+- Hook results are checked against the method's signature, `newobj` pushes what a
+  constructor hook constructs, delegates dispatch through a MemberRef `Invoke`, pass their
+  target and return multicast calls to the caller, and an `Assembly.Load`ed assembly runs
+  against its own metadata.
+- The single-byte `conv.ovf.*` opcodes, `no.`, float comparisons on NaN, `Math.Round` and
+  strings (UTF-16 code units, O(1) `Length` and `Chars`) behave as in .NET; symmetric
+  crypto, CryptoStream and compression throw the runtime's exceptions instead of returning
+  their input.
 
 #### Deobfuscation
 
-- Control flow unflattening repairs each rewired edge through the values it disturbs instead
-  of spilling cross-block values to locals and rebuilding the method.
-- Passes remove only what nothing reads, and a failing pass rolls its method back
-  (`EventKind::PassFailed`). Decryptors receive values earlier decryptions produced, and
-  `process_ssa` runs with the engine's configuration. A byte transform that failed or found
-  nothing to do, or whose technique another detected one supersedes, no longer counts as
-  pending and makes the whole pipeline run again, up to the iteration limit; and runs sharing
-  an engine no longer share one run's technique order. A state-machine decryptor call with no
-  seed found is not decrypted (seed 0 stood in, giving a wrong value), the state machine stays
-  while a call site that failed still reads it, the direct mode leaves those call sites to it
-  (a second failure was recorded for each), decrypted values are cached per generic
-  instantiation (`Get<B>(42)` answered `Get<A>(42)`'s), and opaque-field folding takes only
-  chains rooted in a detected field through fields never stored at runtime (it froze any
-  static the warmup had set).
+- Control flow unflattening repairs each rewired edge instead of spilling values to locals
+  and rebuilding the method.
+- Passes remove only what nothing reads, a failing pass rolls its method back
+  (`EventKind::PassFailed`), and a byte transform that found nothing no longer reruns the
+  pipeline.
+- Decryption no longer falls back to seed 0, keeps a state machine a failed call site still
+  reads, caches values per generic instantiation, and folds opaque fields only from detected
+  fields never stored at runtime.
 - BitMono tokens resolve by signature, ConfuserEx output passes validation, and .NET Reactor
-  samples get their resources and `typeof`s back. NecroBit reads each restored body through a
-  window the size of the body instead of the rest of the image, and checks a heap array for
-  its blob from the header before copying it (both copied once per stub or array).
+  samples get their resources and `typeof`s back.
 
 #### Tests
 
-- The suite fails where it used to pass without testing: every sample is a manifest fixture,
-  every corpus assembly must load and every method lift, and no verdict depends on machine
-  load. Tests run in tiers; packer samples are checked by what they print under Mono, and the
-  System.Reflection.Metadata oracle compares every corpus assembly. Fuzzing runs locally,
-  with every failing input replayed as a regression test; benchmarks measure time and memory.
-  Every packer sample is deobfuscated twice, in pools of one and eight threads, and the
-  outputs must be byte-identical; codegen tests name the instructions they expect instead of
-  accepting any of several.
+- The suite fails instead of skipping: every sample is a manifest fixture, every corpus
+  assembly must load and every method lift, and no verdict depends on machine load. Packer
+  samples are checked by what they print under Mono and deobfuscated twice to byte-identical
+  output, the System.Reflection.Metadata oracle compares every corpus assembly, failing fuzz
+  inputs are replayed as regression tests, and benchmarks measure time and memory.
+
+### Dependencies
+
+- `analyssa` 0.6.0 → 0.7.0, `z3` 0.21.0 → 0.23.0, `iced-x86` 1.21.0 → 1.22.0, and patch
+  updates of the rest.
+- `mistralrs` and `tokio` removed; `toml` and `proptest` are optional, for `testkit`.
 
 ## [0.9.1] - 2026-09-05
 

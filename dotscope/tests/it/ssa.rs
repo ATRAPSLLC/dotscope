@@ -591,7 +591,7 @@ fn test_ssa_conversion_operations() -> Result<()> {
 
     // `conv.i8`/`conv.i4` are integer→integer conversions, which lower to
     // `IntConv`: analyssa 0.3 split the old `Conv` into a domain-typed family
-    // (see `conv_op_for_target`), so only a float or pointer target produces
+    // (see `SsaOp::conversion_between`), so only a float or pointer target produces
     // `IntToFloat`/`IntToPtr`.
     let block = ssa.block(0).unwrap();
     let conv_count = block
