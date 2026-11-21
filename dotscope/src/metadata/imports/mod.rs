@@ -72,7 +72,7 @@ pub use cil::*;
 pub use container::{
     DllDependency, DllSource, ImportEntry, NativeImportRef, UnifiedImportContainer,
 };
-pub use native::NativeImports;
+pub use native::{ImportDescriptor, NativeImports};
 
 mod builder;
 mod cil;

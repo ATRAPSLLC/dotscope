@@ -16,7 +16,7 @@
 //! # Module Components
 //!
 //! - [`crate::metadata::tables::methoddef::raw::MethodDefRaw`] - Raw table structure with unresolved indexes and heap references
-//! - [`crate::metadata::tables::methoddef::loader::MethodDefLoader`] - Internal loader for processing table entries (crate-private)
+//! - [`crate::metadata::loader::tables::MethodDefLoader`] - Internal loader for processing table entries (crate-private)
 //! - Method definition containers and concurrent access structures
 //! - Parameter resolution and signature parsing utilities
 //!
@@ -107,11 +107,9 @@
 //! - Table ID: 0x06
 //! - Purpose: Define method implementations within types
 mod builder;
-mod loader;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use raw::*;

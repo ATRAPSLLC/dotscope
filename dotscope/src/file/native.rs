@@ -34,7 +34,7 @@ const EXPORT_DIRECTORY_SIZE: u32 = 40;
 /// An import directory as read: every entry, in table order, and why the walk stopped short,
 /// when it did.
 #[derive(Debug, Default)]
-pub(crate) struct ImportTable {
+pub struct ImportTable {
     pub imports: Vec<Import>,
     /// Each DLL the table names, once, in table order.
     pub libraries: Vec<String>,
@@ -45,7 +45,7 @@ pub(crate) struct ImportTable {
 /// several names once per name), in ordinal order, and why the walk stopped short, when it
 /// did.
 #[derive(Debug, Default)]
-pub(crate) struct ExportTable {
+pub struct ExportTable {
     pub header: Option<ExportHeader>,
     pub exports: Vec<Export>,
     pub error: Option<String>,
@@ -147,7 +147,7 @@ fn at(base: u32, offset: u32) -> Result<u32, String> {
 /// The import directory `directory` names, read as the loader walks it: descriptors up to
 /// the first without a name or an import address table, each one's lookup table (its import
 /// address table when it has none) up to its zero entry.
-pub(crate) fn read_imports(
+pub fn read_imports(
     map: SectionMap<'_>,
     data: &[u8],
     directory: Option<&DataDirectory>,
@@ -226,7 +226,7 @@ fn walk_imports(
 /// The export directory `directory` names: its header, and every entry of its export address
 /// table with an address, by ordinal, with the names the name pointer table gives it. An
 /// address inside the directory is a forwarder, the name of what it forwards to.
-pub(crate) fn read_exports(
+pub fn read_exports(
     map: SectionMap<'_>,
     data: &[u8],
     directory: Option<&DataDirectory>,

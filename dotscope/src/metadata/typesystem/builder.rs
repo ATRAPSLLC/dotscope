@@ -109,6 +109,7 @@ use std::sync::Arc;
 use crate::{
     metadata::{
         signatures::{SignatureArray, SignatureMethod, SignatureMethodSpec},
+        streams::SharedStr,
         tables::MethodSpec,
         token::Token,
         typesystem::{
@@ -408,8 +409,8 @@ impl TypeBuilder {
         self.current_type = Some(self.registry.get_or_create_type(&CompleteTypeSpec {
             token_init: self.token_init.take(),
             flavor: CilFlavor::Class,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+            namespace: namespace.into(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -465,8 +466,8 @@ impl TypeBuilder {
         self.current_type = Some(self.registry.get_or_create_type(&CompleteTypeSpec {
             token_init: self.token_init.take(),
             flavor: CilFlavor::ValueType,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+            namespace: namespace.into(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -523,8 +524,8 @@ impl TypeBuilder {
         self.current_type = Some(self.registry.get_or_create_type(&CompleteTypeSpec {
             token_init: self.token_init.take(),
             flavor: CilFlavor::Interface,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+            namespace: namespace.into(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -588,7 +589,7 @@ impl TypeBuilder {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::Pointer,
                 namespace: base_type.namespace.clone(),
-                name: format!("{}*", base_type.name),
+                name: format!("{}*", base_type.name).into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: Some(base_type),
@@ -613,7 +614,7 @@ impl TypeBuilder {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::ByRef,
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -642,7 +643,7 @@ impl TypeBuilder {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::Pinned,
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -731,7 +732,7 @@ impl TypeBuilder {
                     }],
                 },
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -772,7 +773,7 @@ impl TypeBuilder {
                     dimensions: vec![],
                 },
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -803,8 +804,8 @@ impl TypeBuilder {
             flavor: CilFlavor::FnPtr {
                 signature: Box::new(signature),
             },
-            namespace: String::new(),
-            name,
+            namespace: SharedStr::default(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -1200,7 +1201,7 @@ mod tests {
             number: 0,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "T".to_string(),
+            name: "T".into(),
             constraints: Default::default(),
             rid: 0,
             offset: 0,
@@ -1370,8 +1371,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(in_attr_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Runtime.InteropServices".to_string(),
-                name: "InAttribute".to_string(),
+                namespace: "System.Runtime.InteropServices".into(),
+                name: "InAttribute".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1388,9 +1389,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(int_type.modifiers.count(), 1);
-        assert!(int_type.modifiers[0].required);
+        assert!(int_type.modifiers.get(0).unwrap().required);
         assert_eq!(
-            int_type.modifiers[0].modifier.name().unwrap(),
+            int_type.modifiers.get(0).unwrap().modifier.name().unwrap(),
             "InAttribute"
         );
 
@@ -1403,7 +1404,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(string_type.modifiers.count(), 1);
-        assert!(!string_type.modifiers[0].required);
+        assert!(!string_type.modifiers.get(0).unwrap().required);
     }
 
     #[test]
@@ -1416,8 +1417,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(base_token),
                 flavor: CilFlavor::Class,
-                namespace: "System".to_string(),
-                name: "Exception".to_string(),
+                namespace: "System".into(),
+                name: "Exception".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1501,8 +1502,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(dict_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "Dictionary`2".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "Dictionary`2".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1515,7 +1516,7 @@ mod tests {
             number: 0,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "TKey".to_string(),
+            name: "TKey".into(),
             constraints: Default::default(),
             rid: 0,
             offset: 0,
@@ -1527,7 +1528,7 @@ mod tests {
             number: 1,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "TValue".to_string(),
+            name: "TValue".into(),
             constraints: Default::default(),
             rid: 1,
             offset: 1,

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        streams::Strings,
+        streams::{SharedStr, Strings},
         tables::{LocalVariable, LocalVariableRc, TableInfoRef, TableRow},
         token::Token,
     },
@@ -100,9 +100,9 @@ impl LocalVariableRaw {
     /// ```
     pub fn to_owned(&self, strings: &Strings) -> Result<LocalVariableRc> {
         let name = if self.name == 0 {
-            String::new()
+            SharedStr::default()
         } else {
-            strings.get(self.name as usize)?.to_string()
+            strings.get_shared(self.name as usize)?
         };
 
         let variable = LocalVariable {

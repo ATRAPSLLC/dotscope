@@ -24,7 +24,7 @@
 //!
 //! ## Related Modules
 //!
-//! - [`crate::metadata::tables::types::read::traits`] - Corresponding read traits
+//! - [`RowReadable`](crate::metadata::tables::types::RowReadable) - Corresponding read trait
 //! - [`crate::metadata::tables::types::write::data`] - Owned row data enum for modification pipeline
 
 use crate::{

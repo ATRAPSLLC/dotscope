@@ -31,7 +31,7 @@
 //! This writer integrates with the metadata table infrastructure:
 //! - [`crate::metadata::tables::types::RowWritable`]: Writing trait for table rows
 //! - [`crate::metadata::tables::paramptr::ParamPtrRaw`]: Raw parameter pointer data structure
-//! - [`crate::file::io`]: Low-level binary I/O operations
+//! - [`crate::io`]: Low-level binary I/O operations
 //!
 //! # Reference
 //! - [ECMA-335 II.22.26](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - `ParamPtr` table specification

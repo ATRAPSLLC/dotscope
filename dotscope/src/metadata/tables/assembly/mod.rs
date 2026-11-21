@@ -8,7 +8,7 @@
 //!
 //! - [`crate::metadata::tables::assembly::AssemblyRaw`]: Raw table structure with unresolved heap indexes
 //! - [`crate::metadata::tables::assembly::Assembly`]: Owned variant with resolved strings/blobs and full metadata
-//! - [`crate::metadata::tables::assembly::loader::AssemblyLoader`]: Internal loader for processing Assembly table data
+//! - [`crate::metadata::loader::tables::AssemblyLoader`]: Internal loader for processing Assembly table data
 //! - Type aliases for efficient collections and reference management
 //!
 //! # Assembly Table Structure
@@ -67,14 +67,12 @@ impl fmt::Display for HashAlgorithmId {
 }
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

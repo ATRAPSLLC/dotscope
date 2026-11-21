@@ -15,7 +15,7 @@
 //! # Components
 //! - [`ImportScopeRaw`]: Raw import scope data read directly from metadata tables
 //! - [`ImportScope`]: Owned import scope data with resolved references
-//! - [`ImportScopeLoader`]: Processes and loads import scope metadata
+//! - [`ImportScopeLoader`](crate::metadata::loader::tables::ImportScopeLoader): Processes and loads import scope metadata
 //! - [`ImportScopeMap`]: Thread-safe collection of import scopes indexed by token
 //! - [`ImportScopeList`]: Vector-based collection of import scopes
 //! - [`ImportScopeRc`]: Reference-counted import scope for shared ownership
@@ -86,7 +86,6 @@
 //! See ECMA-335, Partition II, §22.35 for the complete `ImportScope` table specification.
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
@@ -96,7 +95,6 @@ use std::sync::Arc;
 
 pub use builder::*;
 use crossbeam_skiplist::SkipMap;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

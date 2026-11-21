@@ -22,7 +22,7 @@
 //!
 //! ## Parsing Infrastructure
 //! - [`crate::file::parser::Parser`] - High-level parsing interface for metadata extraction
-//! - [`crate::file::io`] - Low-level I/O utilities for reading PE structures
+//! - [`crate::io`] - Low-level I/O utilities for reading PE structures
 //!
 //! # Data Sources
 //!
@@ -124,10 +124,10 @@ pub mod parser;
 pub mod pe;
 pub mod repair;
 pub mod sectionmap;
-
 use std::{borrow::Cow, path::Path};
 
 use cowfile::CowFile;
+pub use debug::DebugDirectoryEntry;
 use goblin::pe::{
     options::{ParseMode, ParseOptions},
     PE,

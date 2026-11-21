@@ -15,7 +15,7 @@
 //! # Components
 //! - [`crate::metadata::tables::fieldrva::raw::FieldRvaRaw`]: Raw field RVA data read directly from metadata tables
 //! - [`crate::metadata::tables::fieldrva::owned::FieldRva`]: Owned field RVA data with resolved references
-//! - [`crate::metadata::tables::fieldrva::loader::FieldRvaLoader`]: Processes and loads field RVA metadata
+//! - [`crate::metadata::loader::tables::FieldRvaLoader`]: Processes and loads field RVA metadata
 //! - [`crate::metadata::tables::fieldrva::FieldRVAMap`]: Thread-safe collection of field RVAs indexed by token
 //! - [`crate::metadata::tables::fieldrva::FieldRVAList`]: Vector-based collection of field RVAs
 //! - [`crate::metadata::tables::fieldrva::FieldRVARc`]: Reference-counted field RVA for shared ownership
@@ -56,14 +56,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

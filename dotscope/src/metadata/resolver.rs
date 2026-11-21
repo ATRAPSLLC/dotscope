@@ -47,7 +47,7 @@ use crate::{
         signatures::{SignatureMethod, TypeSignature},
         tables::{MemberRefSignature, TableAccess, TableId, TypeSpecRaw},
         token::Token,
-        typesystem::{CilTypeRc, CilTypeReference},
+        typesystem::{CilTypeRc, CilTypeRef, CilTypeReference},
     },
     CilObject,
 };
@@ -159,13 +159,12 @@ pub struct TokenResolver<'a> {
 impl<'a> TokenResolver<'a> {
     /// Creates a new `TokenResolver` for the given assembly.
     ///
-    /// This is an internal constructor - users should obtain a resolver via
-    /// [`CilObject::resolver()`].
+    /// [`CilObject::resolver()`] gives the resolver of an assembly; this builds the same one.
     ///
     /// # Arguments
     ///
     /// * `assembly` - The assembly whose metadata tables will be used for resolution.
-    pub(crate) fn new(assembly: &'a CilObject) -> Self {
+    pub fn new(assembly: &'a CilObject) -> Self {
         Self { assembly }
     }
 
@@ -556,8 +555,9 @@ impl<'a> TokenResolver<'a> {
     /// Finds the declaring type of a field token.
     ///
     /// Handles both FieldDef (0x04) and MemberRef (0x0A) tokens. MemberRef resolves through
-    /// the `declaredby` field; FieldDef resolves through the type registry's memoised
-    /// `field_to_type` index.
+    /// the `declaredby` field; FieldDef through the field's `declaring_type` back-pointer,
+    /// falling back to the type registry's memoised `field_to_type` index for a field no
+    /// TypeDef claims.
     ///
     /// # Arguments
     ///
@@ -570,9 +570,9 @@ impl<'a> TokenResolver<'a> {
     ///
     /// # Performance
     ///
-    /// O(1) for MemberRef via `declaredby`. For FieldDef, the first lookup of a given token
-    /// populates the registry index and every later lookup is O(1); this is on the
-    /// `ldsfld`/`stsfld` path, so the repeat case is the one that matters.
+    /// O(1) for MemberRef via `declaredby`, and for a FieldDef its declaring TypeDef claimed
+    /// via the field's back-pointer; this is on the `ldsfld`/`stsfld` path. A field no TypeDef
+    /// claimed falls back to the registry's memoised index.
     ///
     /// # Examples
     ///
@@ -598,8 +598,23 @@ impl<'a> TokenResolver<'a> {
                 self.resolve_declaring_type(&member.declaredby)
             }
             0x04 => {
-                // FieldDef: memoised index rather than a scan over every type's field list.
-                // Reached on every `ldsfld`/`stsfld`.
+                // FieldDef: O(1) via the field's own back-pointer, which its TypeDef sets
+                // when it loads. Reached on every `ldsfld`/`stsfld`, as the method path's
+                // back-pointer is on every call.
+                if let Some(declaring) =
+                    self.assembly.fields().get(&field_token).and_then(|entry| {
+                        entry
+                            .value()
+                            .declaring_type
+                            .get()
+                            .and_then(CilTypeRef::upgrade)
+                    })
+                {
+                    return Some(declaring);
+                }
+
+                // Fallback: a field no TypeDef's run claimed has no back-pointer, and the
+                // registry's memoised index answers it.
                 let type_token = self
                     .assembly
                     .types()
@@ -900,5 +915,38 @@ mod tests {
             assert_eq!(resolver.resolve_method(member_ref.token), Some(resolved));
         }
         assert!(instantiated > 0, "the sample instantiates its own generics");
+    }
+
+    /// A FieldDef resolves to the type whose field list holds it, through the field's
+    /// back-pointer, and to the same type the registry's index finds by scanning.
+    #[test]
+    fn a_field_resolves_to_the_type_that_lists_it() {
+        let assembly = CilObject::from_path(fixture("WindowsBase.dll")).unwrap();
+        let resolver = assembly.resolver();
+        let mut checked = 0usize;
+        for entry in assembly.fields().iter() {
+            let token = *entry.key();
+            let Some(declaring) = resolver.declaring_type_of_field(token) else {
+                continue;
+            };
+            assert!(
+                declaring
+                    .fields
+                    .iter()
+                    .any(|(_, field)| field.token == token),
+                "{token:?} resolved to a type that does not list it"
+            );
+            assert_eq!(
+                assembly.types().declaring_type_token_of_field(token),
+                Some(declaring.token),
+                "{token:?}: back-pointer and registry index disagree"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            assembly.fields().len(),
+            "every field has a declaring type"
+        );
     }
 }

@@ -65,28 +65,29 @@ pub use alignment::align_to;
 pub use base64::{base64_decode, base64_encode};
 pub use compression::compressed_uint_size;
 #[cfg(all(feature = "deobfuscation", feature = "legacy-crypto"))]
-pub(crate) use crypto::derive_key_iv;
+pub use crypto::derive_key_iv;
 #[cfg(all(feature = "legacy-crypto", feature = "emulation"))]
-pub(crate) use crypto::derive_pbkdf1_key;
+pub use crypto::derive_pbkdf1_key;
 #[cfg(feature = "deobfuscation")]
-pub(crate) use crypto::CryptoParameters;
+pub use crypto::CryptoParameters;
 #[cfg(feature = "emulation")]
-pub(crate) use crypto::{
-    apply_crypto_transform, derive_pbkdf2_key, pbkdf2_work, rsa_verify_work, verify_rsa_pkcs1v15,
+pub use crypto::{
+    apply_crypto_transform, derive_pbkdf2_key, pbkdf2_work, rsa_verify_work, symmetric_block_size,
+    verify_rsa_pkcs1v15, CryptoFailure,
 };
 #[cfg(feature = "emulation")]
-pub(crate) use crypto::{compute_hmac_sha256, compute_hmac_sha512};
+pub use crypto::{compute_hmac_sha256, compute_hmac_sha512};
 #[cfg(feature = "legacy-crypto")]
-pub(crate) use crypto::{compute_md5, compute_sha1};
-pub(crate) use crypto::{compute_sha256, compute_sha384, compute_sha512};
+pub use crypto::{compute_md5, compute_sha1};
+pub use crypto::{compute_sha256, compute_sha384, compute_sha512};
 #[cfg(feature = "deobfuscation")]
 #[allow(unused_imports)]
-pub(crate) use decompress::{
+pub use decompress::{
     decompress_confuserex_lzma, decompress_confuserex_lzma_limited, is_confuserex_lzma,
 };
 #[cfg(feature = "emulation")]
 #[allow(unused_imports)]
-pub(crate) use decompress::{
+pub use decompress::{
     decompress_deflate, decompress_deflate_limited, decompress_gzip, decompress_gzip_limited,
     MAX_DECOMPRESSED_BYTES,
 };
@@ -104,20 +105,16 @@ pub use io::{
     write_compressed_uint, write_le, write_le_at, write_le_at_dyn, write_prefixed_string_utf16,
     write_prefixed_string_utf8, write_string_at, write_string_utf8, CilIO,
 };
-pub use lazylist::LazyList;
-#[allow(unused_imports)]
-pub use lazylist::LazyListIter;
+pub use lazylist::{LazyList, LazyListIter};
 #[cfg(feature = "emulation")]
-pub use lebytes::LeBytes;
+pub use lebytes::{LeBytes, LeBytesIter};
 #[cfg(feature = "emulation")]
 pub use math::to_i32_saturating;
 pub use math::to_u32;
-pub(crate) use parallel::TryForEachInOrder;
-pub use rowlist::RowList;
-#[allow(unused_imports)]
-pub use rowlist::RowListIter;
+pub use parallel::TryForEachInOrder;
+pub use rowlist::{RowList, RowListIter};
 pub use synchronization::FailFastBarrier;
-pub(crate) use text::truncate_chars;
+pub use text::truncate_chars;
 pub use visitedmap::VisitedMap;
 
 #[cfg(test)]

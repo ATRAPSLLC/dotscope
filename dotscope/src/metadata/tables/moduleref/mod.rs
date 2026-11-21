@@ -21,7 +21,7 @@
 //!
 //! - [`ModuleRefRaw`] - Raw table data with unresolved indexes for initial parsing
 //! - [`ModuleRef`] - Processed data with resolved module names
-//! - [`ModuleRefLoader`] - Handles conversion between raw and processed representations
+//! - [`ModuleRefLoader`](crate::metadata::loader::tables::ModuleRefLoader) - Handles conversion between raw and processed representations
 //! - [`ModuleRefMap`] - Thread-safe storage mapping tokens to processed entries
 //! - [`ModuleRefList`] - Thread-safe collection for sequential access
 //!
@@ -61,14 +61,12 @@ use crate::metadata::{
 };
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

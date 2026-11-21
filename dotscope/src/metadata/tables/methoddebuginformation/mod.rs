@@ -21,7 +21,7 @@
 //!
 //! - [`MethodDebugInformationRaw`] - Raw table structure with unresolved heap indices
 //! - [`MethodDebugInformation`] - Owned variant with resolved references and parsed debug data
-//! - [`MethodDebugInformationLoader`] - Internal loader for processing table data
+//! - [`MethodDebugInformationLoader`](crate::metadata::loader::tables::MethodDebugInformationLoader) - Internal loader for processing table data
 //! - [`MethodDebugInformationMap`] - Thread-safe concurrent map for caching entries
 //! - [`MethodDebugInformationList`] - Thread-safe append-only vector for collections
 //! - [`MethodDebugInformationRc`] - Reference-counted pointer for shared ownership
@@ -73,14 +73,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

@@ -122,7 +122,6 @@
 //! The resolver provides comprehensive error reporting:
 //! - **`TypeNotFound`**: Referenced types don't exist in registry
 //! - **`RecursionLimit`**: Maximum recursion depth exceeded
-//! - **`TypeMissingParent`**: Modifier types without required parent context
 //! - **`TypeError`**: General type system inconsistencies
 //!
 //! # Performance Characteristics
@@ -145,6 +144,7 @@ use std::sync::Arc;
 use crate::{
     metadata::{
         signatures::{SignatureArray, SignatureMethod, SignatureMethodSpec, TypeSignature},
+        streams::SharedStr,
         tables::MethodSpec,
         token::Token,
         typesystem::{
@@ -153,7 +153,7 @@ use crate::{
         },
     },
     utils::truncate_chars,
-    Error::{RecursionLimit, TypeError, TypeMissingParent, TypeNotFound},
+    Error::{RecursionLimit, TypeError, TypeNotFound},
     Result,
 };
 
@@ -409,7 +409,6 @@ impl TypeResolver {
     /// The method can fail with several error types:
     /// - [`TypeNotFound`] - Referenced types don't exist in the registry
     /// - [`RecursionLimit`] - Maximum recursion depth exceeded (circular references)
-    /// - [`TypeMissingParent`] - Modifier types require parent context
     /// - [`TypeError`] - General type system inconsistencies
     ///
     /// # Resolution Strategy
@@ -489,7 +488,7 @@ impl TypeResolver {
     ///
     /// # Returns
     /// A deterministic string like `FnPtr_stdcall_2_void` representing the signature.
-    pub(crate) fn format_fnptr_name(signature: &SignatureMethod) -> String {
+    pub fn format_fnptr_name(signature: &SignatureMethod) -> String {
         let calling_convention = if signature.vararg {
             "vararg"
         } else if signature.unmanaged {
@@ -589,27 +588,29 @@ impl TypeResolver {
                     Err(TypeNotFound(*token))
                 }
             }
-            TypeSignature::ModifiedRequired(modifiers)
-            | TypeSignature::ModifiedOptional(modifiers) => {
+            // A modified type is the type it modifies. The modifiers are recorded on the
+            // signature's owner (the parent) when there is one, never on the modified type: that
+            // is a shared type (`int32` itself), which every other use of it would see them on.
+            TypeSignature::ModifiedRequired(modifiers, base)
+            | TypeSignature::ModifiedOptional(modifiers, base) => {
+                let required = matches!(signature, TypeSignature::ModifiedRequired(..));
                 if let Some(parent_token) = self.token_parent {
-                    if let Some(parent_type) = self.registry.get(&parent_token) {
-                        for modifier in modifiers {
-                            if let Some(mod_type) = self.registry.get(&modifier.modifier_type) {
-                                parent_type.modifiers.push(CilModifier {
-                                    required: modifier.is_required,
-                                    modifier: mod_type.into(),
-                                });
-                            } else {
-                                return Err(TypeNotFound(modifier.modifier_type));
-                            }
-                        }
-                        Ok(parent_type)
-                    } else {
-                        Err(TypeNotFound(parent_token))
+                    let parent_type = self
+                        .registry
+                        .get(&parent_token)
+                        .ok_or(TypeNotFound(parent_token))?;
+                    for modifier in modifiers {
+                        let mod_type = self
+                            .registry
+                            .get(&modifier.modifier_type)
+                            .ok_or(TypeNotFound(modifier.modifier_type))?;
+                        parent_type.modifiers.push(CilModifier {
+                            required,
+                            modifier: mod_type.into(),
+                        });
                     }
-                } else {
-                    Err(TypeMissingParent)
                 }
+                self.resolve_with_depth(base, depth.saturating_add(1))
             }
             TypeSignature::Array(array) => {
                 let mut token_init = self.token_init.take();
@@ -635,7 +636,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: array_flavor,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -668,7 +669,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: array_flavor,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -700,7 +701,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: CilFlavor::Pointer,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -732,7 +733,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: CilFlavor::ByRef,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -750,8 +751,8 @@ impl TypeResolver {
                     flavor: CilFlavor::FnPtr {
                         signature: fn_ptr.clone(),
                     },
-                    namespace: String::new(),
-                    name,
+                    namespace: SharedStr::default(),
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -772,7 +773,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: CilFlavor::Pinned,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -870,8 +871,8 @@ impl TypeResolver {
                         index: *index,
                         method: false,
                     },
-                    namespace: String::new(),
-                    name: param_name,
+                    namespace: SharedStr::default(),
+                    name: param_name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -889,8 +890,8 @@ impl TypeResolver {
                         index: *index,
                         method: true,
                     },
-                    namespace: String::new(),
-                    name: param_name,
+                    namespace: SharedStr::default(),
+                    name: param_name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -903,8 +904,8 @@ impl TypeResolver {
                 let typed_ref_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                     token_init: self.token_init.take(),
                     flavor: CilFlavor::ValueType,
-                    namespace: "System".to_string(),
-                    name: "TypedReference".to_string(),
+                    namespace: "System".into(),
+                    name: "TypedReference".into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -1062,8 +1063,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(in_attr_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Runtime.InteropServices".to_string(),
-                name: "InAttribute".to_string(),
+                namespace: "System.Runtime.InteropServices".into(),
+                name: "InAttribute".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1201,8 +1202,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(list_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "List`1".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "List`1".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1215,7 +1216,7 @@ mod tests {
             number: 0,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "T".to_string(),
+            name: "T".into(),
             constraints: Default::default(),
             rid: 1,
             offset: 1,
@@ -1295,8 +1296,8 @@ mod tests {
                 .get_or_create_type(&CompleteTypeSpec {
                     token_init: Some(Token::new(token)),
                     flavor: CilFlavor::Class,
-                    namespace: String::new(),
-                    name: name.to_string(),
+                    namespace: Default::default(),
+                    name: name.into(),
                     source: TypeSource::Unknown,
                     generic_args: None,
                     base_type: None,
@@ -1334,8 +1335,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(class_token),
                 flavor: CilFlavor::Class,
-                namespace: "System".to_string(),
-                name: "String".to_string(),
+                namespace: "System".into(),
+                name: "String".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1347,8 +1348,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(value_token),
                 flavor: CilFlavor::ValueType,
-                namespace: "System".to_string(),
-                name: "DateTime".to_string(),
+                namespace: "System".into(),
+                name: "DateTime".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1381,8 +1382,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(modifier_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Runtime.InteropServices".to_string(),
-                name: "InAttribute".to_string(),
+                namespace: "System.Runtime.InteropServices".into(),
+                name: "InAttribute".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1396,8 +1397,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(parent_token),
                 flavor: CilFlavor::Class,
-                namespace: "System".to_string(),
-                name: "Int32".to_string(),
+                namespace: "System".into(),
+                name: "Int32".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1405,34 +1406,46 @@ mod tests {
             })
             .unwrap();
 
-        let mut resolver = TypeResolver::new(registry).with_parent(parent_token);
+        let mut resolver = TypeResolver::new(registry.clone()).with_parent(parent_token);
+        let int32 = resolver.resolve(&TypeSignature::I4).unwrap();
 
-        let req_mod_sig =
-            TypeSignature::ModifiedRequired(vec![crate::metadata::signatures::CustomModifier {
+        // A modified type resolves to the type it modifies; its modifiers go on the parent
+        let req_mod_sig = TypeSignature::ModifiedRequired(
+            vec![crate::metadata::signatures::CustomModifier {
                 is_required: true,
                 modifier_type: modifier_token,
-            }]);
+            }],
+            Box::new(TypeSignature::I4),
+        );
         let req_mod_type = resolver.resolve(&req_mod_sig).unwrap();
-
-        assert_eq!(req_mod_type.token, parent_token);
-        assert_eq!(req_mod_type.modifiers.count(), 1);
-        assert!(req_mod_type.modifiers[0].required);
+        assert_eq!(req_mod_type.token, int32.token);
         assert_eq!(
-            req_mod_type.modifiers[0].modifier.token().unwrap(),
+            int32.modifiers.count(),
+            0,
+            "the shared int32 gets no modifier"
+        );
+
+        let parent = registry.get(&parent_token).unwrap();
+        assert_eq!(parent.modifiers.count(), 1);
+        assert!(parent.modifiers.get(0).unwrap().required);
+        assert_eq!(
+            parent.modifiers.get(0).unwrap().modifier.token().unwrap(),
             modifier_token
         );
 
-        let opt_mod_sig =
-            TypeSignature::ModifiedOptional(vec![crate::metadata::signatures::CustomModifier {
+        // A run of the other kind nested inside resolves through both
+        let nested_sig = TypeSignature::ModifiedOptional(
+            vec![crate::metadata::signatures::CustomModifier {
                 is_required: false,
                 modifier_type: modifier_token,
-            }]);
-        let opt_mod_type = resolver.resolve(&opt_mod_sig).unwrap();
-
-        assert_eq!(opt_mod_type.token, parent_token);
-        assert_eq!(opt_mod_type.modifiers.count(), 2);
-        assert!(opt_mod_type.modifiers[0].required);
-        assert!(!opt_mod_type.modifiers[1].required);
+            }],
+            Box::new(req_mod_sig),
+        );
+        let nested_type = resolver.resolve(&nested_sig).unwrap();
+        assert_eq!(nested_type.token, int32.token);
+        assert_eq!(parent.modifiers.count(), 3);
+        assert!(!parent.modifiers.get(1).unwrap().required);
+        assert!(parent.modifiers.get(2).unwrap().required);
     }
 
     #[test]
@@ -1483,17 +1496,19 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::TypeNotFound(_))));
 
-        // Test TypeMissingParent error
+        // A modified type needs no parent: it is the type it modifies
         let mod_token = Token::new(0x01000001);
-        let mod_sig =
-            TypeSignature::ModifiedRequired(vec![crate::metadata::signatures::CustomModifier {
+        let mod_sig = TypeSignature::ModifiedRequired(
+            vec![crate::metadata::signatures::CustomModifier {
                 is_required: true,
                 modifier_type: mod_token,
-            }]);
-        let result = resolver.resolve(&mod_sig);
-
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::TypeMissingParent)));
+            }],
+            Box::new(TypeSignature::I4),
+        );
+        let resolved = resolver
+            .resolve(&mod_sig)
+            .expect("a modified int32 resolves");
+        assert_eq!(resolved.name, "Int32");
 
         // Test unsupported signature
 

@@ -15,7 +15,7 @@
 //!
 //! - [`crate::metadata::tables::enclog::EncLogRaw`] - Raw table structure with metadata tokens and operation codes
 //! - [`crate::metadata::tables::enclog::EncLog`] - Type alias to EncLogRaw since no heap resolution is needed
-//! - [`crate::metadata::tables::enclog::EncLogLoader`] - Internal loader for processing EncLog table data
+//! - [`crate::metadata::loader::tables::EncLogLoader`] - Internal loader for processing EncLog table data
 //! - [`crate::metadata::tables::enclog::EncLogMap`] - Thread-safe concurrent map for caching EncLog entries
 //! - [`crate::metadata::tables::enclog::EncLogList`] - Thread-safe append-only vector for EncLog collections
 //! - [`crate::metadata::tables::enclog::EncLogRc`] - Reference-counted pointer for shared ownership
@@ -75,13 +75,11 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use raw::*;
 
 /// A map that holds the mapping of [`crate::metadata::token::Token`] to parsed [`crate::metadata::tables::enclog::EncLog`]

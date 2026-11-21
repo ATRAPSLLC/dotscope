@@ -21,7 +21,7 @@
 //!
 //! - [`ModuleRaw`] - Raw table data with unresolved indexes for initial parsing
 //! - [`Module`] - Processed data with resolved strings and GUIDs
-//! - [`ModuleLoader`] - Handles conversion between raw and processed representations
+//! - [`ModuleLoader`](crate::metadata::loader::tables::ModuleLoader) - Handles conversion between raw and processed representations
 //! - [`ModuleMap`] - Thread-safe storage mapping tokens to processed entries
 //! - [`ModuleList`] - Thread-safe collection (though only one entry exists)
 //!
@@ -63,14 +63,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

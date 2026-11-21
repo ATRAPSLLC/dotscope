@@ -39,7 +39,7 @@
 //! This writer integrates with the metadata table infrastructure:
 //! - [`crate::metadata::tables::types::RowWritable`]: Writing trait for table rows
 //! - [`crate::metadata::tables::assemblyref::AssemblyRefRaw`]: Raw assembly reference data structure
-//! - [`crate::file::io`]: Low-level binary I/O operations
+//! - [`crate::io`]: Low-level binary I/O operations
 //!
 //! # Reference
 //! - [ECMA-335 II.22.5](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - `AssemblyRef` table specification

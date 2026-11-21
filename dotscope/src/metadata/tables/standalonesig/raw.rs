@@ -46,7 +46,7 @@ use crate::{
 /// - **Generic Signatures**: Generic type and method instantiation signatures
 ///
 /// ## See Also
-/// - [`StandAloneSig`](crate::metadata::tables::StandAloneSig) - Resolved owned variant
+/// - [`StandAloneSig`] - Resolved owned variant
 /// - [ECMA-335 §II.22.39](https://www.ecma-international.org/publications-and-standards/standards/ecma-335/) - `StandAloneSig` table specification
 #[derive(Clone, Debug)]
 pub struct StandAloneSigRaw {

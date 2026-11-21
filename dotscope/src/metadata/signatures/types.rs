@@ -987,9 +987,22 @@ pub enum TypeSignature {
     /// Types with different required modifiers are considered different types
     /// for assignment compatibility and method resolution.
     ///
+    /// # Encoding
+    /// A run of `ELEMENT_TYPE_CMOD_REQD` modifiers is a prefix to the type it modifies
+    /// (ECMA-335 II.23.2.7): `CMOD_REQD TypeDefOrRefOrSpecEncoded ... Type`. The variant holds
+    /// the run and that type. A run that mixes required and optional modifiers nests one
+    /// variant per same-kind run, outermost first, so `modreq(A) modopt(B) int32` is
+    /// `ModifiedRequired([A], ModifiedOptional([B], I4))`. The variant states the kind each of
+    /// its modifiers is encoded with; their `is_required` agrees with it.
+    ///
+    /// Where a signature has a modifier list of its own (a parameter, a field, a local, a
+    /// pointer or vector element, a TypeSpec's head), leading modifiers go there, and this
+    /// variant appears only nested inside a type: a generic argument, a general array's
+    /// element or a by-reference target.
+    ///
     /// # See Also
     /// - [`TypeSignature::ModifiedOptional`]: For optional modifiers
-    ModifiedRequired(Vec<CustomModifier>),
+    ModifiedRequired(Vec<CustomModifier>, Box<TypeSignature>),
 
     /// Optional custom modifier (`ELEMENT_TYPE_CMOD_OPT` = 0x20).
     ///
@@ -1014,9 +1027,13 @@ pub enum TypeSignature {
     /// Types with different optional modifiers are still considered compatible
     /// for assignment and method calls. Modifiers can be safely ignored.
     ///
+    /// # Encoding
+    /// A run of `ELEMENT_TYPE_CMOD_OPT` modifiers and the type it modifies, as for
+    /// [`TypeSignature::ModifiedRequired`].
+    ///
     /// # See Also
     /// - [`TypeSignature::ModifiedRequired`]: For required modifiers
-    ModifiedOptional(Vec<CustomModifier>),
+    ModifiedOptional(Vec<CustomModifier>, Box<TypeSignature>),
 
     /// CLI-internal type (`ELEMENT_TYPE_INTERNAL` = 0x21).
     ///
@@ -1984,7 +2001,7 @@ impl SignatureParameter {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -2489,7 +2506,7 @@ impl SignatureMethod {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -2723,7 +2740,7 @@ impl SignatureField {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -2962,7 +2979,7 @@ impl SignatureProperty {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -3103,7 +3120,7 @@ impl SignatureLocalVariables {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -3328,7 +3345,7 @@ impl SignatureLocalVariable {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -3484,7 +3501,7 @@ impl SignatureTypeSpec {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -3669,7 +3686,7 @@ impl SignatureMethodSpec {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -3721,7 +3738,10 @@ fn take_children(node: &mut TypeSignature, out: &mut Vec<TypeSignature>) {
         TypeSignature::Ptr(ptr) => out.push(take(&mut ptr.base)),
         TypeSignature::SzArray(arr) => out.push(take(&mut arr.base)),
         TypeSignature::Array(arr) => out.push(take(&mut arr.base)),
-        TypeSignature::ByRef(inner) | TypeSignature::Pinned(inner) => out.push(take(inner)),
+        TypeSignature::ByRef(inner)
+        | TypeSignature::Pinned(inner)
+        | TypeSignature::ModifiedRequired(_, inner)
+        | TypeSignature::ModifiedOptional(_, inner) => out.push(take(inner)),
         TypeSignature::GenericInst(base, args) => {
             out.push(take(base));
             out.append(args);
@@ -3731,8 +3751,7 @@ fn take_children(node: &mut TypeSignature, out: &mut Vec<TypeSignature>) {
             out.extend(method.params.drain(..).map(|p| p.base));
             out.extend(method.varargs.drain(..).map(|p| p.base));
         }
-        // Remaining variants are leaves, or hold only tokens and flags. `ModifiedRequired` and
-        // `ModifiedOptional` carry `CustomModifier`s, which are a `Token` plus a `bool`.
+        // Remaining variants are leaves, or hold only tokens and flags
         _ => {}
     }
 }
@@ -3802,8 +3821,11 @@ impl TypeSignature {
                     param.type_tokens(out);
                 }
             }
-            TypeSignature::ModifiedRequired(modifiers)
-            | TypeSignature::ModifiedOptional(modifiers) => modifier_tokens(modifiers, out),
+            TypeSignature::ModifiedRequired(modifiers, base)
+            | TypeSignature::ModifiedOptional(modifiers, base) => {
+                modifier_tokens(modifiers, out);
+                base.type_tokens(out);
+            }
             _ => {}
         }
     }
@@ -3814,7 +3836,7 @@ impl TypeSignature {
     /// # Errors
     ///
     /// The first error `visit` returns.
-    pub(crate) fn for_each_type_token_mut(
+    pub fn for_each_type_token_mut(
         &mut self,
         visit: &mut impl FnMut(&mut Token) -> Result<()>,
     ) -> Result<()> {
@@ -3843,9 +3865,10 @@ impl TypeSignature {
                 inner.for_each_type_token_mut(visit)?;
             }
             TypeSignature::FnPtr(method) => method.for_each_type_token_mut(visit)?,
-            TypeSignature::ModifiedRequired(modifiers)
-            | TypeSignature::ModifiedOptional(modifiers) => {
+            TypeSignature::ModifiedRequired(modifiers, base)
+            | TypeSignature::ModifiedOptional(modifiers, base) => {
                 modifier_tokens_mut(modifiers, visit)?;
+                base.for_each_type_token_mut(visit)?;
             }
             _ => {}
         }
@@ -3867,6 +3890,12 @@ impl TypeSignature {
     #[must_use]
     #[allow(clippy::unnested_or_patterns)] // Keep patterns separate for readability
     pub fn accepts_constant(&self, constant: &CilPrimitive) -> bool {
+        // A modifier does not change what values the type holds
+        if let TypeSignature::ModifiedRequired(_, base) | TypeSignature::ModifiedOptional(_, base) =
+            self
+        {
+            return base.accepts_constant(constant);
+        }
         match (constant.kind, self) {
             // Exact primitive matches and type conversions - all return true
             // Exact type matches
@@ -3945,6 +3974,7 @@ impl TypeSignature {
     /// - 64-bit types (I8, U8, R8) require 2 slots
     /// - All other types require 1 slot
     /// - Void requires 0 slots
+    /// - A modified type takes the slots of the type it modifies
     ///
     /// # Examples
     ///
@@ -3961,6 +3991,9 @@ impl TypeSignature {
         match self {
             TypeSignature::Void => 0,
             TypeSignature::I8 | TypeSignature::U8 | TypeSignature::R8 => 2,
+            TypeSignature::ModifiedRequired(_, base) | TypeSignature::ModifiedOptional(_, base) => {
+                base.stack_size()
+            }
             // All other types use 1 stack slot (primitives and reference types)
             _ => 1,
         }
@@ -4004,6 +4037,10 @@ impl TypeSignature {
             TypeSignature::I4 | TypeSignature::U4 | TypeSignature::R4 => Some(4),
             TypeSignature::I8 | TypeSignature::U8 | TypeSignature::R8 => Some(8),
             TypeSignature::I | TypeSignature::U => Some(ptr_size.bytes()),
+            // A modifier does not change the representation
+            TypeSignature::ModifiedRequired(_, base) | TypeSignature::ModifiedOptional(_, base) => {
+                base.byte_size(ptr_size)
+            }
             // Reference types, arrays, generics, etc. don't have fixed sizes
             _ => None,
         }
@@ -4086,21 +4123,20 @@ impl TypeSignature {
             // These directly contain tokens
             Self::Class(_) | Self::ValueType(_) => true,
 
-            // Recursively check contained types
+            // Recursively check contained types; a custom modifier names a type too
             Self::ByRef(inner) | Self::Pinned(inner) => inner.contains_type_tokens(),
-            Self::Ptr(ptr) => ptr.base.contains_type_tokens(),
-            Self::SzArray(arr) => arr.base.contains_type_tokens(),
+            Self::Ptr(ptr) => !ptr.modifiers.is_empty() || ptr.base.contains_type_tokens(),
+            Self::SzArray(arr) => !arr.modifiers.is_empty() || arr.base.contains_type_tokens(),
             Self::Array(arr) => arr.base.contains_type_tokens(),
             Self::GenericInst(base, args) => {
                 base.contains_type_tokens() || args.iter().any(TypeSignature::contains_type_tokens)
             }
-            Self::FnPtr(sig) => {
-                sig.return_type.base.contains_type_tokens()
-                    || sig.params.iter().any(|p| p.base.contains_type_tokens())
-            }
-            Self::ModifiedRequired(mods) | Self::ModifiedOptional(mods) => {
-                // Modifiers contain type tokens
-                !mods.is_empty()
+            Self::FnPtr(sig) => std::iter::once(&sig.return_type)
+                .chain(&sig.params)
+                .chain(&sig.varargs)
+                .any(|p| !p.modifiers.is_empty() || p.base.contains_type_tokens()),
+            Self::ModifiedRequired(mods, base) | Self::ModifiedOptional(mods, base) => {
+                !mods.is_empty() || base.contains_type_tokens()
             }
         }
     }
@@ -4114,7 +4150,10 @@ impl TypeSignature {
     pub fn for_each_value_type(&self, f: &mut impl FnMut(Token)) {
         match self {
             Self::ValueType(token) => f(*token),
-            Self::ByRef(inner) | Self::Pinned(inner) => inner.for_each_value_type(f),
+            Self::ByRef(inner)
+            | Self::Pinned(inner)
+            | Self::ModifiedRequired(_, inner)
+            | Self::ModifiedOptional(_, inner) => inner.for_each_value_type(f),
             Self::Ptr(ptr) => ptr.base.for_each_value_type(f),
             Self::SzArray(arr) => arr.base.for_each_value_type(f),
             Self::Array(arr) => arr.base.for_each_value_type(f),
@@ -4175,25 +4214,18 @@ impl std::fmt::Display for TypeSignature {
             TypeSignature::GenericParamType(idx) => write!(f, "!{idx}"),
             TypeSignature::GenericParamMethod(idx) => write!(f, "!!{idx}"),
             TypeSignature::FnPtr(sig) => write!(f, "fnptr({sig})"),
-            TypeSignature::ModifiedRequired(modifiers) => {
-                write!(f, "modreq[")?;
-                for (i, m) in modifiers.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{:08X}", m.modifier_type.value())?;
+            TypeSignature::ModifiedRequired(modifiers, base)
+            | TypeSignature::ModifiedOptional(modifiers, base) => {
+                let kind = if matches!(self, TypeSignature::ModifiedRequired(..)) {
+                    "modreq"
+                } else {
+                    "modopt"
+                };
+                write!(f, "{base}")?;
+                for m in modifiers {
+                    write!(f, " {kind}[{:08X}]", m.modifier_type.value())?;
                 }
-                write!(f, "]")
-            }
-            TypeSignature::ModifiedOptional(modifiers) => {
-                write!(f, "modopt[")?;
-                for (i, m) in modifiers.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{:08X}", m.modifier_type.value())?;
-                }
-                write!(f, "]")
+                Ok(())
             }
             TypeSignature::Pinned(inner) => write!(f, "pinned {inner}"),
             TypeSignature::Sentinel => write!(f, "..."),
@@ -4288,7 +4320,10 @@ mod tests {
                     )],
                     ..SignatureMethod::default()
                 })),
-                TypeSignature::ModifiedOptional(vec![modifier(0x0100_000A)]),
+                TypeSignature::ModifiedOptional(
+                    vec![modifier(0x0100_000A)],
+                    Box::new(TypeSignature::ValueType(Token::new(0x0100_000B))),
+                ),
                 TypeSignature::I4,
                 TypeSignature::GenericParamType(0),
             ],
@@ -4307,6 +4342,7 @@ mod tests {
             0x0100_0008,
             0x0100_0009,
             0x0100_000A,
+            0x0100_000B,
         ]
         .into_iter()
         .map(Token::new)
@@ -4345,5 +4381,57 @@ mod tests {
         }
         .type_tokens(&mut tokens);
         assert_eq!(tokens, expected, "local");
+    }
+
+    /// A modified type is the type it modifies for size, and every walker sees both its
+    /// modifiers and that type; `contains_type_tokens` counts what `type_tokens` reports,
+    /// pointer and vector modifiers and function pointer varargs included.
+    #[test]
+    fn walkers_see_through_a_modified_type() {
+        let modified_i8 = TypeSignature::ModifiedRequired(
+            vec![modifier(0x0100_0001)],
+            Box::new(TypeSignature::I8),
+        );
+        assert_eq!(modified_i8.stack_size(), 2);
+        assert_eq!(modified_i8.byte_size(PointerSize::Bit64), Some(8));
+
+        let modified_value = TypeSignature::ModifiedOptional(
+            vec![modifier(0x0100_0002)],
+            Box::new(TypeSignature::ValueType(Token::new(0x0200_0003))),
+        );
+        let mut seen = Vec::new();
+        modified_value.for_each_value_type(&mut |token| seen.push(token));
+        assert_eq!(seen, [Token::new(0x0200_0003)]);
+
+        let tokened = [
+            modified_i8.clone(),
+            TypeSignature::Ptr(SignaturePointer {
+                modifiers: vec![modifier(0x0100_0004)],
+                base: Box::new(TypeSignature::I4),
+            }),
+            TypeSignature::SzArray(SignatureSzArray {
+                modifiers: vec![modifier(0x0100_0005)],
+                base: Box::new(TypeSignature::I4),
+            }),
+            TypeSignature::FnPtr(Box::new(SignatureMethod {
+                varargs: vec![SignatureParameter {
+                    modifiers: Vec::new(),
+                    by_ref: false,
+                    base: TypeSignature::Class(Token::new(0x0100_0006)),
+                }],
+                ..SignatureMethod::default()
+            })),
+        ];
+        for signature in &tokened {
+            let mut tokens = Vec::new();
+            signature.type_tokens(&mut tokens);
+            assert!(!tokens.is_empty(), "{signature}");
+            assert!(signature.contains_type_tokens(), "{signature}");
+        }
+        assert!(!TypeSignature::Ptr(SignaturePointer {
+            modifiers: Vec::new(),
+            base: Box::new(TypeSignature::I4),
+        })
+        .contains_type_tokens());
     }
 }

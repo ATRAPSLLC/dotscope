@@ -18,7 +18,7 @@
 //!
 //! - [`crate::metadata::tables::eventmap::EventMapRaw`] - Raw table structure with unresolved indices  
 //! - [`crate::metadata::tables::eventmap::EventMapEntry`] - Owned variant with resolved references and event mappings
-//! - [`crate::metadata::tables::eventmap::EventMapLoader`] - Internal loader for processing EventMap table data
+//! - [`crate::metadata::loader::tables::EventMapLoader`] - Internal loader for processing EventMap table data
 //! - [`crate::metadata::tables::eventmap::EventMapEntryMap`] - Thread-safe concurrent map for caching EventMap entries
 //! - [`crate::metadata::tables::eventmap::EventMapEntryList`] - Thread-safe append-only vector for EventMap collections
 //! - [`crate::metadata::tables::eventmap::EventMapEntryRc`] - Reference-counted pointer for shared ownership
@@ -83,14 +83,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

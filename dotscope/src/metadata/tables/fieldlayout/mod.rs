@@ -14,7 +14,7 @@
 //! # Components
 //! - [`crate::metadata::tables::fieldlayout::raw::FieldLayoutRaw`]: Raw field layout data read directly from metadata tables
 //! - [`crate::metadata::tables::fieldlayout::owned::FieldLayout`]: Owned field layout data with resolved references
-//! - [`crate::metadata::tables::fieldlayout::loader::FieldLayoutLoader`]: Processes and loads field layout metadata
+//! - [`crate::metadata::loader::tables::FieldLayoutLoader`]: Processes and loads field layout metadata
 //! - [`crate::metadata::tables::fieldlayout::FieldLayoutMap`]: Thread-safe collection of field layouts indexed by token
 //! - [`crate::metadata::tables::fieldlayout::FieldLayoutList`]: Vector-based collection of field layouts
 //! - [`crate::metadata::tables::fieldlayout::FieldLayoutRc`]: Reference-counted field layout for shared ownership
@@ -39,14 +39,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

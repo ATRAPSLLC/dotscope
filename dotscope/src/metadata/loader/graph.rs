@@ -37,7 +37,7 @@ use crate::{
 /// enabling the dependency graph to handle both types appropriately while maintaining
 /// correct execution order and dependency relationships.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum LoaderKey {
+pub enum LoaderKey {
     /// Regular loader that processes a specific metadata table
     Table(TableId),
 
@@ -70,7 +70,7 @@ pub(crate) enum LoaderKey {
 /// Graph construction is single-threaded only. Generated execution plans are
 /// thread-safe for coordinating parallel loader execution.
 #[derive(Default)]
-pub(crate) struct LoaderGraph<'a> {
+pub struct LoaderGraph<'a> {
     /// Maps a `LoaderKey` to its loader
     loaders: HashMap<LoaderKey, &'a dyn MetadataLoader>,
     /// Maps a `TableId` to the set of `LoaderKeys` that depend on it (reverse dependencies)
@@ -179,7 +179,7 @@ impl<'a> LoaderGraph<'a> {
 
     /// Checks for circular dependencies using the generic graph algorithm.
     ///
-    /// Delegates to [`crate::utils::graph::IndexedGraph::find_any_cycle`] for cycle detection
+    /// Delegates to [`analyssa::graph::IndexedGraph::find_any_cycle`] for cycle detection
     /// which handles all NodeId mapping internally.
     ///
     /// # Returns

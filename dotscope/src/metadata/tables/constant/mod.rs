@@ -15,7 +15,7 @@
 //!
 //! - [`crate::metadata::tables::constant::raw::ConstantRaw`] - Raw table structure with unresolved indexes
 //! - [`crate::metadata::tables::constant::owned::Constant`] - Owned variant with resolved references
-//! - [`crate::metadata::tables::constant::loader::ConstantLoader`] - Internal loader for processing table data
+//! - [`crate::metadata::loader::tables::ConstantLoader`] - Internal loader for processing table data
 //! - [`crate::metadata::tables::constant::ConstantMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::constant::ConstantList`] - Collection type
 //! - [`crate::metadata::tables::constant::ConstantRc`] - Reference-counted pointer
@@ -57,14 +57,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

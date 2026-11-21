@@ -101,7 +101,7 @@ impl ModuleRefRaw {
             rid: self.rid,
             token: self.token,
             offset: self.offset,
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             custom_attributes: Default::default(),
         }))
     }

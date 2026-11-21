@@ -91,7 +91,7 @@
 //! - [`crate::metadata::resources::types`] - For resource type definitions and parsing compatibility
 //! - [`crate::metadata::resources::parser`] - For validation and round-trip testing
 //! - [`crate::cilassembly::CilAssembly`] - For embedding resources in assembly modification pipeline
-//! - [`crate::file::io`] - For 7-bit encoded integer encoding and binary I/O utilities
+//! - [`crate::io`] - For 7-bit encoded integer encoding and binary I/O utilities
 //!
 //! # References
 //!

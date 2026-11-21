@@ -125,7 +125,7 @@ impl ModuleRaw {
             token: self.token,
             offset: self.offset,
             generation: self.generation,
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             mvid: guids.get(self.mvid as usize)?,
             encid: if self.encid == 0 {
                 None

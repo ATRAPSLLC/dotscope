@@ -5,7 +5,11 @@
 //! This is the primary data structure for representing Portable PDB documents in a usable form,
 //! with parsed document names and resolved GUID references after the dual variant resolution phase.
 
-use crate::metadata::{pdb::guids, token::Token};
+use crate::metadata::{
+    pdb::{guids, DocumentName},
+    streams::SharedBytes,
+    token::Token,
+};
 
 /// Represents a Portable PDB document with fully resolved metadata and parsed data
 ///
@@ -48,9 +52,10 @@ pub struct Document {
     /// The document's path, typically a file path (`/_/src/Program.cs` with a SourceLink
     /// path map) or a URI. The Name column names a DocumentNameBlob, which stores the path
     /// as a separator character followed by the `#Blob` indices of its parts; the parts are
-    /// joined here by that separator, as
-    /// [`document_name`](crate::metadata::pdb::document_name) decodes them.
-    pub name: String,
+    /// joined by that separator when the name is displayed or compared: a
+    /// [`DocumentName`] keeps the blob's index and a shared copy of the heap rather than
+    /// the joined path, which a hostile name blob can make many times the heap's size.
+    pub name: DocumentName,
 
     /// Hash algorithm identifier
     ///
@@ -66,7 +71,7 @@ pub struct Document {
     /// The actual hash bytes computed from the document content using the specified
     /// hash algorithm. Used for integrity verification and change detection during debugging.
     /// An empty vector indicates no hash is available.
-    pub hash: Vec<u8>,
+    pub hash: SharedBytes,
 
     /// Source language identifier
     ///
@@ -92,18 +97,18 @@ impl Document {
         rid: u32,
         token: Token,
         offset: usize,
-        name: String,
+        name: impl Into<DocumentName>,
         hash_algorithm: Option<uguid::Guid>,
-        hash: Vec<u8>,
+        hash: impl Into<SharedBytes>,
         language: uguid::Guid,
     ) -> Self {
         Self {
             rid,
             token,
             offset,
-            name,
+            name: name.into(),
             hash_algorithm,
-            hash,
+            hash: hash.into(),
             language,
         }
     }

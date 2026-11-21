@@ -154,11 +154,11 @@ impl AssemblyRaw {
             } else {
                 Some(blobs.get(self.public_key as usize)?.to_vec())
             },
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             culture: if self.culture == 0 {
                 None
             } else {
-                Some(strings.get(self.culture as usize)?.to_string())
+                Some(strings.get_shared(self.culture as usize)?)
             },
             security: RowList::new(),
             custom_attributes: Default::default(),

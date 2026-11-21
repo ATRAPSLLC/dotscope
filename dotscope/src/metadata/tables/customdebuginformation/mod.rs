@@ -16,7 +16,7 @@
 //!
 //! - [`crate::metadata::tables::customdebuginformation::raw::CustomDebugInformationRaw`] - Raw table structure with unresolved indexes
 //! - [`crate::metadata::tables::customdebuginformation::owned::CustomDebugInformation`] - Owned variant with resolved references
-//! - [`crate::metadata::tables::customdebuginformation::loader::CustomDebugInformationLoader`] - Internal loader for processing table data
+//! - [`crate::metadata::loader::tables::CustomDebugInformationLoader`] - Internal loader for processing table data
 //! - [`crate::metadata::tables::customdebuginformation::CustomDebugInformationMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::customdebuginformation::CustomDebugInformationList`] - Collection type
 //! - [`crate::metadata::tables::customdebuginformation::CustomDebugInformationRc`] - Reference-counted pointer
@@ -88,7 +88,6 @@
 //! - [Portable PDB v1.1](https://github.com/dotnet/corefx/blob/master/src/System.Reflection.Metadata/specs/PortablePdb-Metadata.md#customdebuginformation-table-0x37) - `CustomDebugInformation` table specification
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
@@ -98,7 +97,6 @@ use std::sync::Arc;
 
 pub use builder::*;
 use crossbeam_skiplist::SkipMap;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

@@ -20,7 +20,7 @@
 //!
 //! - [`LocalScopeRaw`] - Raw table structure with unresolved indices
 //! - [`LocalScope`] - Owned variant with resolved references and scope information
-//! - [`LocalScopeLoader`] - Internal loader for processing `LocalScope` table data
+//! - [`LocalScopeLoader`](crate::metadata::loader::tables::LocalScopeLoader) - Internal loader for processing `LocalScope` table data
 //! - [`LocalScopeMap`] - Thread-safe concurrent map for caching scope entries
 //! - [`LocalScopeList`] - Thread-safe append-only vector for scope collections
 //! - [`LocalScopeRc`] - Reference-counted pointer for shared ownership
@@ -85,14 +85,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

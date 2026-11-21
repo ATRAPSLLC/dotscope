@@ -15,7 +15,7 @@
 //! # Components
 //! - [`GenericParamRaw`]: Raw generic parameter data read directly from metadata tables
 //! - [`GenericParam`]: Owned generic parameter data with resolved references
-//! - [`GenericParamLoader`]: Processes and loads generic parameter metadata
+//! - [`GenericParamLoader`](crate::metadata::loader::tables::GenericParamLoader): Processes and loads generic parameter metadata
 //! - [`GenericParamMap`]: Thread-safe collection of parameters indexed by token
 //! - [`GenericParamList`]: Vector-based collection of parameters
 //! - [`GenericParamRc`]: Reference-counted parameter for shared ownership
@@ -71,14 +71,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::{metadata::token::Token, utils::RowList};
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

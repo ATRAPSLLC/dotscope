@@ -10,7 +10,7 @@
 //! # Architecture
 //!
 //! A Portable PDB is ECMA-335 metadata of its own: a metadata root, a `#Pdb` stream
-//! ([`PdbStream`]), a tables stream holding only the debug tables (Document,
+//! ([`PdbStream`](crate::metadata::streams::PdbStream)), a tables stream holding only the debug tables (Document,
 //! MethodDebugInformation, LocalScope, LocalVariable, LocalConstant, ImportScope,
 //! StateMachineMethod and CustomDebugInformation, tables `0x30` to `0x37`) and its own
 //! `#Strings`, `#Blob` and `#GUID` heaps. Its columns that index the assembly's tables (a
@@ -28,7 +28,7 @@
 //!   write debug information into the assembly itself)
 //!
 //! Every [`CilObject`](crate::CilObject) load reads the embedded PDB, or else the image's own
-//! debug tables, as [`PortablePdb`] ([`CilObject::pdb`](crate::CilObject::pdb)). A standalone
+//! debug tables, as [`PortablePdb`](crate::metadata::pdb::PortablePdb) ([`CilObject::pdb`](crate::CilObject::pdb)). A standalone
 //! PDB is never looked for on disk: [`CilObject::with_pdb`](crate::CilObject::with_pdb)
 //! attaches one. The loaders that read the debug tables resolve the methods and types they
 //! name in the assembly that was loaded, so a sequence point's method is the assembly's
@@ -36,16 +36,16 @@
 //!
 //! # Key Components
 //!
-//! - [`PortablePdb`] - an assembly's PDB, with every table decoded and queries by method,
+//! - [`PortablePdb`](crate::metadata::pdb::PortablePdb) - an assembly's PDB, with every table decoded and queries by method,
 //!   document and parent
-//! - [`PdbOrigin`] - where the PDB was read from
-//! - [`PdbMetadata`] - a PDB's metadata read from its bytes: root, `#Pdb` stream, tables and
+//! - [`PdbOrigin`](crate::metadata::pdb::PdbOrigin) - where the PDB was read from
+//! - [`PdbMetadata`](crate::metadata::pdb::PdbMetadata) - a PDB's metadata read from its bytes: root, `#Pdb` stream, tables and
 //!   heaps
-//! - [`embedded_portable_pdb`] - the PDB an image embeds, inflated no further than its size
-//! - [`codeview_pdb_id`] - the identity of the PDB an image was built with
-//! - [`LocalConstantSig`] - a constant local's type and value
-//! - [`document_name`] - a Document's path from its DocumentNameBlob
-//! - [`guids`] - the custom debug information kind, hash algorithm and language GUIDs
+//! - [`embedded_portable_pdb`](crate::metadata::pdb::embedded_portable_pdb) - the PDB an image embeds, inflated no further than its size
+//! - [`codeview_pdb_id`](crate::metadata::pdb::codeview_pdb_id) - the identity of the PDB an image was built with
+//! - [`LocalConstantSig`](crate::metadata::pdb::LocalConstantSig) - a constant local's type and value
+//! - [`document_name`](crate::metadata::pdb::document_name) - a Document's path from its DocumentNameBlob
+//! - [`guids`](crate::metadata::pdb::guids) - the custom debug information kind, hash algorithm and language GUIDs
 //!
 //! # Usage Examples
 //!
@@ -116,7 +116,7 @@
 //!
 //! # Thread Safety
 //!
-//! [`PortablePdb`] is [`Send`] and [`Sync`]: its maps are lock-free skip lists filled once
+//! [`PortablePdb`](crate::metadata::pdb::PortablePdb) is [`Send`] and [`Sync`]: its maps are lock-free skip lists filled once
 //! while the assembly loads and only read afterwards.
 //!
 //! # References
@@ -134,7 +134,7 @@ use std::{collections::HashMap, fmt, io::Read, sync::OnceLock};
 
 pub use constant::{GeneralValue, LocalConstantSig, LocalConstantValue, PrimitiveConstant};
 use crossbeam_skiplist::SkipMap;
-pub use document::{document_name, split_document_name, DocumentNameBlob};
+pub use document::{document_name, split_document_name, DocumentName, DocumentNameBlob};
 
 use crate::{
     file::{debug::debug_type, File},
@@ -161,10 +161,10 @@ const EMBEDDED_PDB_SIGNATURE: u32 = 0x4244_504D;
 const CODEVIEW_SIGNATURE: u32 = 0x5344_5352;
 
 /// The minor version of a CodeView debug directory entry that names a Portable PDB (`PM`).
-const PORTABLE_CODEVIEW_MINOR_VERSION: u16 = 0x504D;
+pub const PORTABLE_CODEVIEW_MINOR_VERSION: u16 = 0x504D;
 
 /// The Portable PDB's tables, in table order.
-pub(crate) const PDB_TABLES: [TableId; 8] = [
+pub const PDB_TABLES: [TableId; 8] = [
     TableId::Document,
     TableId::MethodDebugInformation,
     TableId::LocalScope,
@@ -232,16 +232,16 @@ impl fmt::Display for PdbOrigin {
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct PortablePdb {
-    pub(crate) origin: PdbOrigin,
-    pub(crate) pdb_stream: Option<PdbStream>,
-    pub(crate) documents: DocumentMap,
-    pub(crate) method_debug_information: MethodDebugInformationMap,
-    pub(crate) local_scopes: LocalScopeMap,
-    pub(crate) local_variables: LocalVariableMap,
-    pub(crate) local_constants: LocalConstantMap,
-    pub(crate) import_scopes: ImportScopeMap,
-    pub(crate) state_machine_methods: StateMachineMethodMap,
-    pub(crate) custom_debug_information: CustomDebugInformationMap,
+    origin: PdbOrigin,
+    pdb_stream: Option<PdbStream>,
+    documents: DocumentMap,
+    method_debug_information: MethodDebugInformationMap,
+    local_scopes: LocalScopeMap,
+    local_variables: LocalVariableMap,
+    local_constants: LocalConstantMap,
+    import_scopes: ImportScopeMap,
+    state_machine_methods: StateMachineMethodMap,
+    custom_debug_information: CustomDebugInformationMap,
     /// Each method's local scopes, in table order, built on the first query
     scopes_by_method: OnceLock<HashMap<Token, Vec<LocalScopeRc>>>,
     /// The custom debug information attached to each parent, in table order, built on the
@@ -251,7 +251,7 @@ pub struct PortablePdb {
 
 impl PortablePdb {
     /// An empty PDB of `origin`, its `#Pdb` stream `pdb_stream`, for the loaders to fill.
-    pub(crate) fn new(origin: PdbOrigin, pdb_stream: Option<PdbStream>) -> Self {
+    pub fn new(origin: PdbOrigin, pdb_stream: Option<PdbStream>) -> Self {
         PortablePdb {
             origin,
             pdb_stream,
@@ -563,7 +563,7 @@ impl<'a> PdbMetadata<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Malformed`] naming the first table whose count differs.
+    /// Returns [`crate::Error::Parse`] naming the first table whose count differs.
     pub fn check_rows(&self, image: Option<&TablesHeader<'_>>) -> Result<()> {
         for (index, &rows) in self.pdb_stream.type_system_rows.iter().enumerate() {
             if self.pdb_stream.referenced_tables & (1u64 << index) == 0 {

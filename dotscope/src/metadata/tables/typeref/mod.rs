@@ -12,17 +12,15 @@
 //!
 //! ## Module Contents
 //! - [`crate::metadata::tables::typeref::raw::TypeRefRaw`] - Raw table entry representation
-//! - [`crate::metadata::tables::typeref::loader::TypeRefLoader`] - Table loading and processing functionality
+//! - [`crate::metadata::loader::tables::TypeRefLoader`] - Table loading and processing functionality
 //!
 //! ## ECMA-335 Reference
 //! See ECMA-335, Partition II, Section 22.38 for the complete `TypeRef` table specification.
 
 mod builder;
-mod loader;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use raw::*;

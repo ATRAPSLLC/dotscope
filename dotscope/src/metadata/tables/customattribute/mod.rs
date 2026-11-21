@@ -16,7 +16,7 @@
 //!
 //! - [`crate::metadata::tables::customattribute::raw::CustomAttributeRaw`] - Raw table structure with unresolved indexes
 //! - [`crate::metadata::tables::customattribute::owned::CustomAttribute`] - Owned variant with resolved references
-//! - [`crate::metadata::tables::customattribute::loader::CustomAttributeLoader`] - Internal loader for processing table data
+//! - [`crate::metadata::loader::tables::CustomAttributeLoader`] - Internal loader for processing table data
 //! - [`crate::metadata::tables::customattribute::CustomAttributeMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::customattribute::CustomAttributeList`] - Collection type
 //! - [`crate::metadata::tables::customattribute::CustomAttributeRc`] - Reference-counted pointer
@@ -76,14 +76,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

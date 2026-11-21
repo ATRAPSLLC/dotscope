@@ -22,7 +22,7 @@
 //! - [`crate::metadata::validation::validators::raw::constraints::layout::RawLayoutConstraintValidator`] - Main validator implementation providing comprehensive layout validation
 //! - [`crate::metadata::validation::validators::raw::constraints::layout::RawLayoutConstraintValidator::validate_field_layouts`] - Field layout position validation with overlap detection
 //! - [`crate::metadata::validation::validators::raw::constraints::layout::RawLayoutConstraintValidator::validate_class_layouts`] - Class layout constraint validation with packing size verification
-//! - [`crate::metadata::validation::validators::raw::constraints::layout::RawLayoutConstraintValidator::validate_layout_consistency`] - Cross-table layout validation with inheritance checking
+//! - [`crate::metadata::validation::validators::raw::constraints::layout::RawLayoutConstraintValidator::validate_value_type_layouts`] - Value type explicit size limit (ECMA-335 II.22.8)
 //!
 //! # Usage Examples
 //!

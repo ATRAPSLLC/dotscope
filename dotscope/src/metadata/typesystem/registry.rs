@@ -66,7 +66,7 @@
 //! ```rust,no_run
 //! use dotscope::metadata::typesystem::{TypeRegistry, CilType, TypeSource};
 //! use dotscope::metadata::method::MethodRefList;
-//! use dotscope::metadata::tables::TypeAttributes;
+//! use dotscope::metadata::tables::{FieldList, TypeAttributes};
 //! use dotscope::metadata::identity::AssemblyIdentity;
 //! use dotscope::metadata::token::Token;
 //! use std::sync::Arc;
@@ -83,7 +83,7 @@
 //!     None, // No external reference
 //!     None, // No base type yet
 //!     TypeAttributes::new(0x00100001), // Public class
-//!     Arc::new(boxcar::Vec::new()), // Empty fields
+//!     FieldList::new(), // Empty fields, allocated on first push
 //!     MethodRefList::new(), // Empty methods, allocated on first push
 //!     None, // Flavor will be computed
 //! );
@@ -122,14 +122,16 @@ use crate::{
     metadata::{
         identity::AssemblyIdentity,
         signatures::{SignatureMethodSpec, TypeSignature},
+        streams::SharedStr,
         tables::{
             AssemblyRc, AssemblyRefRc, FileRc, MethodSpec, ModuleRc, ModuleRefRc, TableId,
             TypeAttributes,
         },
+        texthash::TextHash,
         token::Token,
         typesystem::{
             wellknown::names, CilFlavor, CilPrimitive, CilPrimitiveKind, CilType, CilTypeRc,
-            CilTypeRef, CilTypeReference, PointerSize, TypeSignatureHash,
+            CilTypeRef, CilTypeReference, FullName, PointerSize, TypeSignatureHash,
         },
     },
     utils::LazyList,
@@ -149,9 +151,9 @@ pub struct CompleteTypeSpec {
     /// The CIL flavor/kind of the type
     pub flavor: CilFlavor,
     /// Type namespace
-    pub namespace: String,
+    pub namespace: SharedStr,
     /// Type name
-    pub name: String,
+    pub name: SharedStr,
     /// Source context (assembly, module, etc.)
     pub source: TypeSource,
     /// Generic arguments for generic instances
@@ -412,6 +414,19 @@ impl SourceRegistry {
         }
     }
 
+    /// Calls `f` with the source of `reference`, borrowed from the cache when it is an
+    /// assembly's: an assembly's identity holds its public key, and every type of the
+    /// assembly names it, so a copy per type cost a copy of the key per type.
+    fn with_source<R>(&self, reference: &CilTypeReference, f: impl FnOnce(&TypeSource) -> R) -> R {
+        if let CilTypeReference::Assembly(assembly) = reference {
+            let key = Arc::as_ptr(assembly) as usize;
+            if let Some(cached) = self.assembly_sources.get(&key) {
+                return f(&cached.value().1);
+            }
+        }
+        f(&self.register_source(reference))
+    }
+
     /// Register an external type reference source.
     ///
     /// Stores the external reference and returns a corresponding `TypeSource`
@@ -586,6 +601,8 @@ pub struct TypeRegistry {
     sources: SourceRegistry,
     /// Identity of the assembly this registry represents
     current_assembly: AssemblyIdentity,
+    /// The source of the types this registry's assembly defines (`current_assembly`'s)
+    current_source: TypeSource,
     /// Secondary index: types grouped by their origin source
     ///
     /// The four indices below hold `BTreeSet`s rather than `Vec`s because the TypeRef
@@ -595,22 +612,24 @@ pub struct TypeRegistry {
     /// duplicated name resolves to - stays deterministic across runs.
     types_by_source: DashMap<TypeSource, BTreeSet<Token>>,
     /// Secondary index: types indexed by full name (namespace.name)
-    types_by_fullname: DashMap<Arc<str>, BTreeSet<Token>>,
+    types_by_fullname: DashMap<TextHash, BTreeSet<Token>>,
     /// Secondary index: types indexed by simple name (may have duplicates)
-    types_by_name: DashMap<String, BTreeSet<Token>>,
+    types_by_name: DashMap<SharedStr, BTreeSet<Token>>,
     /// Secondary index: types grouped by namespace
-    types_by_namespace: DashMap<String, BTreeSet<Token>>,
+    types_by_namespace: DashMap<SharedStr, BTreeSet<Token>>,
     /// Secondary index: nested types keyed by the last component of their fullname.
     ///
     /// A TypeRef may name a nested type by its inner name alone (`Enumerator`2`) while the
     /// TypeDef carries the full path (`NS.Partitioner/Enumerator`2`). Resolving that without
     /// an index means an `ends_with` scan of every registered fullname on *every* exact-name
     /// miss, and the custom-attribute parser drives two such misses per fixed argument.
-    types_by_nested_suffix: DashMap<Arc<str>, BTreeSet<Token>>,
+    types_by_nested_suffix: DashMap<TextHash, BTreeSet<Token>>,
     /// Registered external TypeRegistries for cross-assembly type resolution, by assembly.
     /// The links are weak: registries of a project link to one another, and strong links
-    /// made every project's registries keep each other alive forever.
-    external_registries: DashMap<AssemblyIdentity, Weak<TypeRegistry>>,
+    /// made every project's registries keep each other alive forever. The map is ordered by
+    /// identity, so a search across the linked registries visits them in the same order on
+    /// every run, whatever order the assemblies finished loading in.
+    external_registries: SkipMap<AssemblyIdentity, Weak<TypeRegistry>>,
     /// Secondary index: MethodDef token to the token of its declaring type.
     ///
     /// Without this, `TypeResolver::declaring_type` answers the MethodDef case by scanning
@@ -674,13 +693,14 @@ impl TypeRegistry {
             types: SkipMap::new(),
             next_token: AtomicU32::new(0xF000_0020), // Start after reserved primitives
             sources: SourceRegistry::new(),
+            current_source: TypeSource::Assembly(assembly_identity.clone()),
             current_assembly: assembly_identity,
             types_by_source: DashMap::new(),
             types_by_fullname: DashMap::new(),
             types_by_name: DashMap::new(),
             types_by_namespace: DashMap::new(),
             types_by_nested_suffix: DashMap::new(),
-            external_registries: DashMap::new(),
+            external_registries: SkipMap::new(),
             method_to_type: DashMap::new(),
             field_to_type: DashMap::new(),
         };
@@ -696,7 +716,7 @@ impl TypeRegistry {
 
     /// Get the TypeSource for the current assembly.
     pub fn current_assembly_source(&self) -> TypeSource {
-        TypeSource::Assembly(self.current_assembly.clone())
+        self.current_source.clone()
     }
 
     /// Get the next available token and increment the counter
@@ -750,12 +770,12 @@ impl TypeRegistry {
                 None,
                 None,
                 TypeAttributes::ZERO,
-                Arc::new(boxcar::Vec::new()),
+                LazyList::new(),
                 LazyList::new(),
                 Some(flavor),
             ));
 
-            self.register_type_internal(&new_type, TypeSource::Primitive);
+            self.register_type_internal(&new_type, &TypeSource::Primitive);
         }
 
         // Set up base type relationships
@@ -826,7 +846,7 @@ impl TypeRegistry {
     /// ## Arguments
     /// * `type_rc`     - The type instance
     /// * `source`      - The the source of the type
-    fn register_type_internal(&self, type_rc: &CilTypeRc, source: TypeSource) {
+    fn register_type_internal(&self, type_rc: &CilTypeRc, source: &TypeSource) {
         let token = type_rc.token;
         if self.types.contains_key(&token) {
             return;
@@ -834,10 +854,15 @@ impl TypeRegistry {
 
         self.types.insert(token, type_rc.clone());
 
-        self.types_by_source
-            .entry(source)
-            .or_default()
-            .insert(type_rc.token);
+        // The source is copied only for its first type: most share their assembly's
+        if let Some(mut tokens) = self.types_by_source.get_mut(source) {
+            tokens.insert(type_rc.token);
+        } else {
+            self.types_by_source
+                .entry(source.clone())
+                .or_default()
+                .insert(type_rc.token);
+        }
 
         if !type_rc.namespace.is_empty() {
             self.types_by_namespace
@@ -854,7 +879,7 @@ impl TypeRegistry {
         let fullname = type_rc.fullname();
         self.index_nested_suffix(&fullname, type_rc.token);
         self.types_by_fullname
-            .entry(fullname)
+            .entry(fullname.text_hash())
             .or_default()
             .insert(type_rc.token);
     }
@@ -863,14 +888,12 @@ impl TypeRegistry {
     ///
     /// Non-nested names are skipped: they are already answered exactly by
     /// `types_by_fullname`, and indexing them would make the suffix map a second copy of it.
-    fn index_nested_suffix(&self, fullname: &str, token: Token) {
-        if let Some(last) = fullname.rsplit('/').next() {
-            if last.len() != fullname.len() {
-                self.types_by_nested_suffix
-                    .entry(Arc::from(last))
-                    .or_default()
-                    .insert(token);
-            }
+    fn index_nested_suffix(&self, fullname: &FullName, token: Token) {
+        if let Some(last) = fullname.last_component_hash() {
+            self.types_by_nested_suffix
+                .entry(last)
+                .or_default()
+                .insert(token);
         }
     }
 
@@ -879,12 +902,12 @@ impl TypeRegistry {
     /// ## Arguments
     /// * '`new_type`' - The type to register
     pub fn insert(&self, new_type: &CilTypeRc) {
-        let source = match new_type.external() {
-            Some(external_source) => self.register_source(external_source),
-            None => TypeSource::Assembly(self.current_assembly.clone()),
-        };
-
-        self.register_type_internal(new_type, source);
+        match new_type.external() {
+            Some(external_source) => self.sources.with_source(external_source, |source| {
+                self.register_type_internal(new_type, source);
+            }),
+            None => self.register_type_internal(new_type, &self.current_source),
+        }
     }
 
     /// Create a new empty type with the next available token
@@ -901,7 +924,7 @@ impl TypeRegistry {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             None,
         ));
@@ -927,7 +950,7 @@ impl TypeRegistry {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(flavor),
         ));
@@ -1073,9 +1096,11 @@ impl TypeRegistry {
         name: &str,
     ) -> Option<CilTypeRc> {
         let fullname = if namespace.is_empty() {
-            name.to_string()
+            TextHash::of(name.as_bytes())
         } else {
-            format!("{namespace}.{name}")
+            TextHash::of(namespace.as_bytes())
+                .then(TextHash::of(b"."))
+                .then(TextHash::of(name.as_bytes()))
         };
 
         if let Some(tokens) = self.types_by_source.get(source) {
@@ -1088,7 +1113,7 @@ impl TypeRegistry {
             }
         }
 
-        if let Some(tokens) = self.types_by_fullname.get(fullname.as_str()) {
+        if let Some(tokens) = self.types_by_fullname.get(&fullname) {
             if let Some(&token) = tokens.first() {
                 return self.types.get(&token).map(|res| res.value().clone());
             }
@@ -1217,7 +1242,18 @@ impl TypeRegistry {
     /// # }
     /// ```
     pub fn get_by_fullname(&self, fullname: &str, external: bool) -> Option<CilTypeRc> {
-        if let Some(tokens) = self.types_by_fullname.get(fullname) {
+        self.get_by_key(&NameKey::of_str(fullname), external)
+    }
+
+    /// [`Self::get_by_fullname`] for a type's [`FullName`], found without joining its text.
+    pub fn get_by_full_name(&self, name: &FullName, external: bool) -> Option<CilTypeRc> {
+        self.get_by_key(&NameKey::of_full_name(name), external)
+    }
+
+    /// [`Self::get_by_fullname`] for a full name given by its [`NameKey`], which a type's
+    /// [`FullName`] gives without joining its text.
+    fn get_by_key(&self, key: &NameKey, external: bool) -> Option<CilTypeRc> {
+        if let Some(tokens) = self.types_by_fullname.get(&key.hash) {
             for token in tokens.value() {
                 if let Some(entry) = self.types.get(token) {
                     let type_rc = entry.value().clone();
@@ -1240,8 +1276,7 @@ impl TypeRegistry {
             // suffix, so a multi-component request still matches exactly as before. Only
             // matches that cut a component in half - `Bar` against `A/FooBar` - are no
             // longer accepted, and those were never nested-type resolutions.
-            let requested_suffix = fullname.rsplit('/').next().unwrap_or(fullname);
-            if let Some(tokens) = self.types_by_nested_suffix.get(requested_suffix) {
+            if let Some(tokens) = self.types_by_nested_suffix.get(&key.last_component) {
                 for token in tokens.value() {
                     let Some(entry) = self.types.get(token) else {
                         continue;
@@ -1253,8 +1288,7 @@ impl TypeRegistry {
                         continue;
                     }
 
-                    let candidate = type_rc.fullname();
-                    if candidate.ends_with(fullname) && &*candidate != fullname {
+                    if type_rc.fullname().ends_with_proper(key.hash) {
                         return Some(type_rc);
                     }
                 }
@@ -1262,11 +1296,11 @@ impl TypeRegistry {
         }
 
         if external {
-            for external_registry_entry in &self.external_registries {
+            for external_registry_entry in self.external_registries.iter() {
                 let Some(external_registry) = external_registry_entry.value().upgrade() else {
                     continue;
                 };
-                if let Some(external_type) = external_registry.get_by_fullname(fullname, false) {
+                if let Some(external_type) = external_registry.get_by_key(key, false) {
                     return Some(external_type);
                 }
             }
@@ -1304,7 +1338,7 @@ impl TypeRegistry {
     pub fn resolve(&self, token: &Token) -> Option<CilTypeRc> {
         let entry = self.get(token)?;
         if token.is_table(TableId::TypeRef) {
-            self.get_by_fullname(&entry.fullname(), false)
+            self.get_by_key(&NameKey::of_full_name(&entry.fullname()), false)
                 .or(Some(entry))
         } else {
             Some(entry)
@@ -1322,7 +1356,10 @@ impl TypeRegistry {
     pub fn get_by_fullname_list(&self, fullname: &str, include_external: bool) -> Vec<CilTypeRc> {
         let mut typedef_matches = Vec::new();
 
-        if let Some(tokens) = self.types_by_fullname.get(fullname) {
+        if let Some(tokens) = self
+            .types_by_fullname
+            .get(&TextHash::of(fullname.as_bytes()))
+        {
             for token in tokens.value() {
                 if let Some(entry) = self.types.get(token) {
                     let type_rc = entry.value().clone();
@@ -1336,7 +1373,7 @@ impl TypeRegistry {
         }
 
         if include_external {
-            for external_registry_entry in &self.external_registries {
+            for external_registry_entry in self.external_registries.iter() {
                 let Some(external_registry) = external_registry_entry.value().upgrade() else {
                     continue;
                 };
@@ -1383,7 +1420,7 @@ impl TypeRegistry {
     /// Returns the TypeRefs named `fullname`, lowest row first.
     fn typerefs_named(&self, fullname: &str) -> Vec<CilTypeRc> {
         self.types_by_fullname
-            .get(fullname)
+            .get(&TextHash::of(fullname.as_bytes()))
             .map(|tokens| {
                 tokens
                     .value()
@@ -1587,14 +1624,14 @@ impl TypeRegistry {
             self.get_source_reference(&spec.source),
             None,
             flags,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(spec.flavor.clone()),
         ));
 
         Self::configure_type_from_spec(&new_type, spec)?;
 
-        self.register_type_internal(&new_type, spec.source.clone());
+        self.register_type_internal(&new_type, &spec.source);
 
         Ok(new_type)
     }
@@ -1841,7 +1878,7 @@ impl TypeRegistry {
     ) -> Option<Arc<TypeRegistry>> {
         self.external_registries
             .remove(assembly_identity)
-            .and_then(|(_, registry)| registry.upgrade())
+            .and_then(|entry| entry.value().upgrade())
     }
 
     /// Get a type by fully qualified name across all registries.
@@ -1869,6 +1906,88 @@ impl TypeRegistry {
     /// ```
     pub fn resolve_type_global(&self, fullname: &str) -> Option<CilTypeRc> {
         self.get_by_fullname(fullname, true)
+    }
+
+    /// Binds a TypeRef to the definition it names in a linked assembly, by its resolution
+    /// scope.
+    ///
+    /// ECMA-335 II.22.38: a TypeRef's ResolutionScope names where the type lives. A TypeRef
+    /// scoped to an AssemblyRef (directly, or through the enclosing TypeRefs of a nested
+    /// type) is looked up first in the linked assembly that reference names: an assembly
+    /// whose identity satisfies it, else the one with its name (the project loader loads one
+    /// assembly per name, a version mismatch included). Only when that assembly does not
+    /// define the type, as when it forwards it through an ExportedType row, are the other
+    /// linked assemblies searched, in identity order. Such a TypeRef never binds to a type of
+    /// the referencing assembly itself, unless its AssemblyRef names that assembly.
+    ///
+    /// A TypeRef scoped to a module of its own assembly (a ModuleRef, the Module row or a
+    /// null scope) has no other assembly to name and keeps the plain global search
+    /// ([`Self::resolve_type_global`]).
+    ///
+    /// # Arguments
+    /// * `type_ref` - A TypeRef entry of this registry
+    ///
+    /// # Returns
+    /// The TypeDef the reference binds to, or `None` when no linked assembly defines it.
+    #[must_use]
+    pub fn resolve_typeref_scoped(&self, type_ref: &CilTypeRc) -> Option<CilTypeRc> {
+        let key = NameKey::of_full_name(&type_ref.fullname());
+
+        // The AssemblyRef at the root of the scope chain; enclosing TypeRefs of a nested
+        // type are followed outwards, with a bound so a cyclic chain ends.
+        let mut scope = type_ref.external().cloned();
+        let mut assembly_ref = None;
+        for _ in 0..64 {
+            match scope {
+                Some(CilTypeReference::AssemblyRef(reference)) => {
+                    assembly_ref = Some(reference);
+                    break;
+                }
+                Some(CilTypeReference::TypeRef(parent)) => {
+                    scope = parent.upgrade().and_then(|p| p.external().cloned());
+                }
+                _ => break,
+            }
+        }
+        let Some(assembly_ref) = assembly_ref else {
+            return self.get_by_key(&key, true);
+        };
+
+        let required = AssemblyIdentity::from_assembly_ref(&assembly_ref);
+        if self.current_assembly.satisfies(&required) {
+            return self.get_by_key(&key, false);
+        }
+
+        let linked: Vec<(AssemblyIdentity, Arc<TypeRegistry>)> = self
+            .external_registries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .upgrade()
+                    .map(|registry| (entry.key().clone(), registry))
+            })
+            .collect();
+        let named = linked
+            .iter()
+            .position(|(identity, _)| identity.satisfies(&required))
+            .or_else(|| {
+                linked
+                    .iter()
+                    .position(|(identity, _)| identity.name.eq_ignore_ascii_case(&required.name))
+            });
+
+        if let Some(found) = named
+            .and_then(|index| linked.get(index))
+            .and_then(|(_, registry)| registry.get_by_key(&key, false))
+        {
+            return Some(found);
+        }
+        linked
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != named)
+            .find_map(|(_, (_, registry))| registry.get_by_key(&key, false))
     }
 
     /// Get all registered external assembly identities.
@@ -1947,21 +2066,25 @@ impl TypeRegistry {
         }
 
         if !original_typeref.namespace.is_empty() {
-            if let Some(mut list) = self.types_by_namespace.get_mut(&original_typeref.namespace) {
+            if let Some(mut list) = self
+                .types_by_namespace
+                .get_mut(original_typeref.namespace.as_str())
+            {
                 list.remove(&typeref_token);
             }
         }
 
-        if let Some(mut list) = self.types_by_name.get_mut(&original_typeref.name) {
+        if let Some(mut list) = self.types_by_name.get_mut(original_typeref.name.as_str()) {
             list.remove(&typeref_token);
         }
 
         let old_fullname = original_typeref.fullname();
-        let old_suffix = old_fullname.rsplit('/').next().unwrap_or(&old_fullname);
-        if let Some(mut list) = self.types_by_nested_suffix.get_mut(old_suffix) {
-            list.remove(&typeref_token);
+        if let Some(old_suffix) = old_fullname.last_component_hash() {
+            if let Some(mut list) = self.types_by_nested_suffix.get_mut(&old_suffix) {
+                list.remove(&typeref_token);
+            }
         }
-        if let Some(mut list) = self.types_by_fullname.get_mut(&*old_fullname) {
+        if let Some(mut list) = self.types_by_fullname.get_mut(&old_fullname.text_hash()) {
             list.remove(&typeref_token);
         }
 
@@ -1989,7 +2112,7 @@ impl TypeRegistry {
         let new_fullname = resolved_typedef.fullname();
         self.index_nested_suffix(&new_fullname, typeref_token);
         self.types_by_fullname
-            .entry(new_fullname)
+            .entry(new_fullname.text_hash())
             .or_default()
             .insert(typeref_token);
 
@@ -2019,9 +2142,39 @@ impl TypeRegistry {
 
             self.index_nested_suffix(&current_fullname, type_rc.token);
             self.types_by_fullname
-                .entry(current_fullname)
+                .entry(current_fullname.text_hash())
                 .or_default()
                 .insert(type_rc.token);
+        }
+    }
+}
+
+/// A full name to look up in a registry: the hash of its text and of its last `/`
+/// component, the key of the nested-name fallback.
+struct NameKey {
+    /// The [`TextHash`] of the whole name
+    hash: TextHash,
+    /// The [`TextHash`] of the part after its last `/`, the whole name when it has none
+    last_component: TextHash,
+}
+
+impl NameKey {
+    /// The key of a name given as text, hashed once.
+    fn of_str(fullname: &str) -> Self {
+        let last = fullname.rsplit('/').next().unwrap_or(fullname);
+        NameKey {
+            hash: TextHash::of(fullname.as_bytes()),
+            last_component: TextHash::of(last.as_bytes()),
+        }
+    }
+
+    /// The key of a type's [`FullName`], without joining its text.
+    fn of_full_name(fullname: &FullName) -> Self {
+        NameKey {
+            hash: fullname.text_hash(),
+            last_component: fullname
+                .last_component_hash()
+                .unwrap_or_else(|| fullname.text_hash()),
         }
     }
 }
@@ -2046,7 +2199,10 @@ mod tests {
         },
         testkit::{
             fixture,
-            helpers::{runtime_type_handle_rows, TWO_CORELIB_FIXTURES},
+            helpers::{
+                create_assembly_ref, create_cil_type, runtime_type_handle_rows,
+                TWO_CORELIB_FIXTURES,
+            },
         },
         CilObject,
     };
@@ -2061,7 +2217,7 @@ mod tests {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             None,
         ))
@@ -2119,7 +2275,7 @@ mod tests {
 
         let tokens = registry
             .types_by_fullname
-            .get("NS.Outer/Inner")
+            .get(&TextHash::of(b"NS.Outer/Inner"))
             .expect("fullname must be indexed");
         assert_eq!(tokens.value().len(), 1);
     }
@@ -2196,8 +2352,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "List`1".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "List`1".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2242,8 +2398,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::ValueType,
-                namespace: "System.Drawing".to_string(),
-                name: "Point".to_string(),
+                namespace: "System.Drawing".into(),
+                name: "Point".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2255,8 +2411,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::ValueType,
-                namespace: "System.Windows".to_string(),
-                name: "Point".to_string(),
+                namespace: "System.Windows".into(),
+                name: "Point".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2315,7 +2471,7 @@ mod tests {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(CilFlavor::Class),
         ));
@@ -2339,7 +2495,7 @@ mod tests {
 
         let module = Arc::new(Module {
             token: Token::new(0x00000001),
-            name: "MainModule".to_string(),
+            name: "MainModule".into(),
             mvid: guid!("01234567-89ab-cdef-0123-456789abcdef"),
             encid: None,
             rid: 1,
@@ -2352,7 +2508,7 @@ mod tests {
 
         let module_ref = Arc::new(ModuleRef {
             token: Token::new(0x1A000001),
-            name: "ReferenceModule".to_string(),
+            name: "ReferenceModule".into(),
             rid: 0,
             offset: 0,
             custom_attributes: Default::default(),
@@ -2361,8 +2517,8 @@ mod tests {
         let assembly_ref = Arc::new(AssemblyRef {
             token: Token::new(0x23000001),
             flags: AssemblyFlags::ZERO,
-            name: "ReferenceAssembly".to_string(),
-            culture: Some("".to_string()),
+            name: "ReferenceAssembly".into(),
+            culture: Some("".into()),
             rid: 0,
             offset: 0,
             major_version: 1,
@@ -2381,7 +2537,7 @@ mod tests {
         let file = Arc::new(File {
             token: Token::new(0x26000001),
             flags: FileAttributes::ZERO,
-            name: "ExternalFile.dll".to_string(),
+            name: "ExternalFile.dll".into(),
             rid: 0,
             offset: 0,
             hash_value: AssemblyRefHash::new(&[0xCC, 0xCC]).unwrap(),
@@ -2444,8 +2600,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections".to_string(),
-                name: "ArrayList".to_string(),
+                namespace: "System.Collections".into(),
+                name: "ArrayList".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2457,8 +2613,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections".to_string(),
-                name: "ArrayList".to_string(),
+                namespace: "System.Collections".into(),
+                name: "ArrayList".into(),
                 source: module_ref_source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -2470,8 +2626,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections".to_string(),
-                name: "ArrayList".to_string(),
+                namespace: "System.Collections".into(),
+                name: "ArrayList".into(),
                 source: assembly_ref_source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -2503,8 +2659,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "MyNamespace".to_string(),
-                name: "MyClass1".to_string(),
+                namespace: "MyNamespace".into(),
+                name: "MyClass1".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2516,8 +2672,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "MyNamespace".to_string(),
-                name: "MyClass2".to_string(),
+                namespace: "MyNamespace".into(),
+                name: "MyClass2".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2556,8 +2712,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections".to_string(),
-                name: "ArrayList".to_string(),
+                namespace: "System.Collections".into(),
+                name: "ArrayList".into(),
                 source: source1,
                 generic_args: None,
                 base_type: None,
@@ -2569,8 +2725,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections".to_string(),
-                name: "ArrayList".to_string(),
+                namespace: "System.Collections".into(),
+                name: "ArrayList".into(),
                 source: source2,
                 generic_args: None,
                 base_type: None,
@@ -2618,8 +2774,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::GenericInstance,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "List`1".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "List`1".into(),
                 source: TypeSource::Unknown,
                 generic_args: Some(vec![string_type.clone()]),
                 base_type: None,
@@ -2631,8 +2787,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::GenericInstance,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "List`1".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "List`1".into(),
                 source: TypeSource::Unknown,
                 generic_args: Some(vec![string_type.clone()]),
                 base_type: None,
@@ -2644,8 +2800,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::GenericInstance,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "List`1".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "List`1".into(),
                 source: TypeSource::Unknown,
                 generic_args: Some(vec![int_type.clone()]),
                 base_type: None,
@@ -2741,8 +2897,8 @@ mod tests {
                 .get_or_create_type(&CompleteTypeSpec {
                     token_init: None,
                     flavor: CilFlavor::Class,
-                    namespace: namespace.to_string(),
-                    name: name.to_string(),
+                    namespace: (*namespace).into(),
+                    name: (*name).into(),
                     source: source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -2770,8 +2926,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "System".to_string(),
-                name: "String".to_string(),
+                namespace: "System".into(),
+                name: "String".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2795,8 +2951,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Class,
-                namespace: "MyNamespace".to_string(),
-                name: "MyType".to_string(),
+                namespace: "MyNamespace".into(),
+                name: "MyType".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2808,8 +2964,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::Interface,
-                namespace: "MyNamespace".to_string(),
-                name: "MyType".to_string(),
+                namespace: "MyNamespace".into(),
+                name: "MyType".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2821,8 +2977,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: None,
                 flavor: CilFlavor::ValueType,
-                namespace: "MyNamespace".to_string(),
-                name: "MyType".to_string(),
+                namespace: "MyNamespace".into(),
+                name: "MyType".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -2859,8 +3015,8 @@ mod tests {
                 .get_or_create_type(&CompleteTypeSpec {
                     token_init: None,
                     flavor: CilFlavor::Class,
-                    namespace: "TestNamespace".to_string(),
-                    name: type_name.to_string(),
+                    namespace: "TestNamespace".into(),
+                    name: (*type_name).into(),
                     source: TypeSource::Unknown,
                     generic_args: None,
                     base_type: None,
@@ -3020,5 +3176,63 @@ mod tests {
         assert!(weak_b.upgrade().is_none());
         assert!(a.get_external_registry(&identity_b).is_none());
         assert!(a.resolve_type_global("Missing.Type").is_none());
+    }
+
+    /// A TypeRef scoped to an AssemblyRef binds to the type of the assembly that reference
+    /// names, even when the referencing assembly and another linked assembly, earlier in
+    /// identity order, define a type of the same name. A forwarded type, one the named
+    /// assembly does not define, is found in the other linked assemblies; never in the
+    /// referencing assembly itself.
+    #[test]
+    fn a_typeref_binds_in_the_assembly_its_scope_names() {
+        let identity = |name: &str| AssemblyIdentity::parse(&format!("{name}, Version=1.0.0.0"));
+        let (id_p, id_a, id_b) = (
+            identity("P").unwrap(),
+            identity("A").unwrap(),
+            identity("B").unwrap(),
+        );
+        let p = Arc::new(TypeRegistry::new(id_p).unwrap());
+        let a = Arc::new(TypeRegistry::new(id_a.clone()).unwrap());
+        let b = Arc::new(TypeRegistry::new(id_b.clone()).unwrap());
+
+        let typedef = Token::new(0x0200_0001);
+        let local_t = create_cil_type(typedef, "Ns", "T", None);
+        let a_t = create_cil_type(typedef, "Ns", "T", None);
+        let b_t = create_cil_type(typedef, "Ns", "T", None);
+        let a_forwarded = create_cil_type(Token::new(0x0200_0002), "Ns", "Moved", None);
+        p.insert(&local_t);
+        a.insert(&a_t);
+        a.insert(&a_forwarded);
+        b.insert(&b_t);
+        p.registry_link(id_a, &a);
+        p.registry_link(id_b, &b);
+
+        let scoped_to_b = |rid: u32, name: &str| {
+            let typeref = create_cil_type(
+                Token::new(0x0100_0000 | rid),
+                "Ns",
+                name,
+                Some(CilTypeReference::AssemblyRef(create_assembly_ref(1, "B"))),
+            );
+            p.insert(&typeref);
+            typeref
+        };
+
+        let bound = p.resolve_typeref_scoped(&scoped_to_b(1, "T")).unwrap();
+        assert!(Arc::ptr_eq(&bound, &b_t), "[B]Ns.T binds to B's Ns.T");
+
+        let forwarded = p.resolve_typeref_scoped(&scoped_to_b(2, "Moved")).unwrap();
+        assert!(
+            Arc::ptr_eq(&forwarded, &a_forwarded),
+            "a type B does not define is found in the other linked assembly"
+        );
+
+        let local_only = create_cil_type(Token::new(0x0200_0003), "Ns", "LocalOnly", None);
+        p.insert(&local_only);
+        assert!(
+            p.resolve_typeref_scoped(&scoped_to_b(3, "LocalOnly"))
+                .is_none(),
+            "an AssemblyRef-scoped TypeRef never binds to the referencing assembly's own type"
+        );
     }
 }

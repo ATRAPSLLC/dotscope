@@ -10,11 +10,11 @@
 //! `MethodDefEntryPoints` section, a NativeFormat array, pairs each compiled
 //! method, by its `MethodDef` row, with the record of its entry. The
 //! `ImportSections` section lists the cells the runtime fills for the code
-//! (see [`ImportCell`]).
+//! (see [`ImportCell`](crate::metadata::readytorun::ImportCell)).
 //!
 //! A ReadyToRun image built for another OS states its machine XOR that OS's
 //! override (the runtime's `MachineOSOverride`), so an ARM64 image for macOS
-//! states `0xEC20`; [`ReadyToRun::machine`] is the machine read through it.
+//! states `0xEC20`; [`ReadyToRun::machine`](crate::metadata::readytorun::ReadyToRun::machine) is the machine read through it.
 //!
 //! # Usage Examples
 //!
@@ -44,6 +44,8 @@ mod imports;
 mod names;
 mod native;
 mod signature;
+
+pub use signature::SignatureReader;
 
 pub use crate::metadata::readytorun::{
     imports::{helper_name, Fixup, FixupSubject, ImportCell},

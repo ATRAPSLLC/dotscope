@@ -16,7 +16,7 @@
 //!
 //! - [`crate::metadata::tables::DeclSecurityRaw`] - Raw table structure with unresolved coded indexes
 //! - [`crate::metadata::tables::DeclSecurity`] - Owned variant with resolved references and parsed permission sets
-//! - [`crate::metadata::tables::DeclSecurityLoader`] - Internal loader for processing `DeclSecurity` table data
+//! - [`crate::metadata::loader::tables::DeclSecurityLoader`] - Internal loader for processing `DeclSecurity` table data
 //! - [`crate::metadata::tables::DeclSecurityMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::DeclSecurityList`] - Collection type
 //! - [`crate::metadata::tables::DeclSecurityRc`] - Reference-counted pointer
@@ -94,14 +94,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

@@ -15,7 +15,7 @@
 //! # Components
 //! - [`GenericParamConstraintRaw`]: Raw constraint data read directly from metadata tables
 //! - [`GenericParamConstraint`]: Owned constraint data with resolved references
-//! - [`GenericParamConstraintLoader`]: Processes and loads constraint metadata
+//! - [`GenericParamConstraintLoader`](crate::metadata::loader::tables::GenericParamConstraintLoader): Processes and loads constraint metadata
 //! - [`GenericParamConstraintMap`]: Thread-safe collection of constraints indexed by token
 //! - [`GenericParamConstraintList`]: Vector-based collection of constraints
 //! - [`GenericParamConstraintRc`]: Reference-counted constraint for shared ownership
@@ -71,14 +71,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

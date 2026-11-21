@@ -52,7 +52,6 @@
 //! - [ECMA-335 State Machine Attributes](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf)
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
@@ -62,7 +61,6 @@ use std::sync::Arc;
 
 pub use builder::*;
 use crossbeam_skiplist::SkipMap;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

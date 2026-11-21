@@ -127,6 +127,7 @@ use crate::{
         },
         streams::Blob,
         tables::ParamList,
+        texthash::TextHash,
         typesystem::{CilFlavor, CilTypeRef, CilTypeReference, TypeRegistry},
     },
     utils::EnumUtils,
@@ -363,7 +364,7 @@ pub struct CustomAttributeParser<'a> {
     /// Current native-recursion depth, for stack-overflow prevention.
     depth: usize,
     /// The underlying type sizes of the enums a constructor parameter resolved, by name.
-    known_enum_sizes: HashMap<String, usize>,
+    known_enum_sizes: HashMap<TextHash, usize>,
     /// The underlying type sizes the current decoding assumes for enums no loaded assembly
     /// defines, by name.
     enum_sizes: HashMap<String, usize>,
@@ -609,27 +610,30 @@ impl<'a> CustomAttributeParser<'a> {
             }
             CilFlavor::Class | CilFlavor::ValueType => {
                 let name = type_ref.fullname();
-                match &*name {
-                    "System.Type" => FieldOrPropType::Type,
-                    "System.String" => FieldOrPropType::String,
-                    "System.Object" => FieldOrPropType::Boxed,
-                    _ => {
+                if name == "System.Type" {
+                    FieldOrPropType::Type
+                } else if name == "System.String" {
+                    FieldOrPropType::String
+                } else if name == "System.Object" {
+                    FieldOrPropType::Boxed
+                } else {
+                    {
                         // The only other types an argument can have are enums (II.23.3). One
                         // defined here, or in an assembly the registry has, is sized by its
                         // definition; an imported one the blob sizes.
                         let defined = self
                             .type_registry
                             .as_ref()
-                            .and_then(|registry| registry.resolve_type_global(&name))
+                            .and_then(|registry| registry.get_by_full_name(&name, true))
                             .filter(|resolved| {
                                 EnumUtils::is_enum_type(resolved, self.type_registry.as_ref())
                             });
                         if let Some(resolved) = defined {
                             let size = EnumUtils::get_enum_underlying_type_size(&resolved);
-                            self.known_enum_sizes.insert(name.to_string(), size);
+                            self.known_enum_sizes.insert(name.text_hash(), size);
                         } else if EnumUtils::is_enum_type(&type_ref, None) {
                             let size = EnumUtils::get_enum_underlying_type_size(&type_ref);
-                            self.known_enum_sizes.insert(name.to_string(), size);
+                            self.known_enum_sizes.insert(name.text_hash(), size);
                         } else if type_ref.token.table() != 0x01 && !type_ref.is_typeref() {
                             return Err(malformed_error!(
                                 "Constructor parameter type '{}' is neither an enum nor a type a custom attribute argument can have",
@@ -772,7 +776,10 @@ impl<'a> CustomAttributeParser<'a> {
     /// The size of the named enum's underlying type: the constructor parameter's or the
     /// registry's when either defines the enum, otherwise [`Self::assumed_enum_size`].
     fn enum_underlying_size(&mut self, type_name: &str) -> usize {
-        if let Some(&size) = self.known_enum_sizes.get(type_name) {
+        if let Some(&size) = self
+            .known_enum_sizes
+            .get(&TextHash::of(type_name.as_bytes()))
+        {
             return size;
         }
         if let Some(registry) = &self.type_registry {
@@ -1251,7 +1258,7 @@ mod tests {
             offset: 0,
             flags: ParamAttributes::ZERO,
             sequence: 1,
-            name: Some("arrayParam".to_string()),
+            name: Some("arrayParam".into()),
             default: OnceLock::new(),
             marshal: OnceLock::new(),
             modifiers: Arc::new(boxcar::Vec::new()),

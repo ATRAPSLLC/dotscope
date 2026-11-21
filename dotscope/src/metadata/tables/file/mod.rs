@@ -15,7 +15,7 @@
 //! # Components
 //! - [`FileRaw`]: Raw file data read directly from metadata tables
 //! - [`File`]: Owned file data with resolved references and complete metadata
-//! - [`FileLoader`]: Processes and loads file metadata
+//! - [`FileLoader`](crate::metadata::loader::tables::FileLoader): Processes and loads file metadata
 //! - [`FileMap`]: Thread-safe collection of files indexed by token
 //! - [`FileList`]: Vector-based collection of files
 //! - [`FileRc`]: Reference-counted file for shared ownership
@@ -72,14 +72,12 @@ use crate::metadata::{
 };
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

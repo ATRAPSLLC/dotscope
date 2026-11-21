@@ -116,9 +116,13 @@ use std::io::Write;
 use log::debug;
 
 use crate::{
-    metadata::method::{
-        encode_exception_handlers, ExceptionHandler, ExceptionHandlerFlags, ExceptionSectionFormat,
-        MethodBodyFlags, SectionFlags,
+    metadata::{
+        method::{
+            encode_exception_handlers, ExceptionHandler, ExceptionHandlerFlags,
+            ExceptionSectionFormat, MethodBodyFlags, SectionFlags,
+        },
+        tables::TableId,
+        token::Token,
     },
     utils::{read_le, read_le_at},
     Result,
@@ -283,6 +287,18 @@ pub struct MethodBody {
 }
 
 impl MethodBody {
+    /// The StandAloneSig row holding the local variable signature, or `None` when the body
+    /// has no locals (a zero token) or its token names another table.
+    ///
+    /// ECMA-335 §II.25.4.3 makes the token a StandAloneSig token. Every reader masked it to a
+    /// row and read StandAloneSig there whatever table it named, so a token for another table
+    /// read an unrelated signature as the locals.
+    #[must_use]
+    pub fn local_var_sig_rid(&self) -> Option<u32> {
+        let token = Token::new(self.local_var_sig_token);
+        (token.is_table(TableId::StandAloneSig) && token.row() != 0).then_some(token.row())
+    }
+
     /// Create a `MethodBody` object from a sequence of bytes.
     ///
     /// Parses a complete .NET method body including header, CIL instructions, and optional
@@ -833,6 +849,22 @@ impl MethodBody {
 
 #[cfg(test)]
 mod tests {
+
+    /// The local signature is a StandAloneSig row: a zero token is no locals, and a token
+    /// naming another table names no local signature, though every reader read StandAloneSig
+    /// at its row.
+    #[test]
+    fn a_local_signature_token_names_a_standalonesig_row() {
+        let body_with = |token| MethodBody {
+            local_var_sig_token: token,
+            ..MethodBody::from(&[0x06, 0x2A]).unwrap()
+        };
+        assert_eq!(body_with(0x1100_0003).local_var_sig_rid(), Some(3));
+        assert_eq!(body_with(0).local_var_sig_rid(), None);
+        assert_eq!(body_with(0x1100_0000).local_var_sig_rid(), None);
+        assert_eq!(body_with(0x0200_0003).local_var_sig_rid(), None);
+    }
+
     use proptest::{prop_assert, prop_assert_eq, test_runner::TestCaseError};
 
     use super::*;
@@ -934,9 +966,10 @@ mod tests {
         assert_eq!(method_header.size(), 60); // 44 (aligned base) + 16 (small exception section)
         assert_eq!(method_header.local_var_sig_token, 0x11000003);
         assert_eq!(method_header.exception_handlers.len(), 1);
-        assert!(method_header.exception_handlers[0]
-            .flags
-            .contains(ExceptionHandlerFlags::EXCEPTION));
+        assert_eq!(
+            method_header.exception_handlers[0].flags,
+            ExceptionHandlerFlags::EXCEPTION
+        );
         assert_eq!(method_header.exception_handlers[0].try_offset, 0);
         assert_eq!(method_header.exception_handlers[0].try_length, 0xF);
         assert_eq!(method_header.exception_handlers[0].handler_offset, 0xF);
@@ -1115,9 +1148,10 @@ mod tests {
         assert_eq!(method_header.exception_handlers[0].handler_length, 10);
         assert_eq!(method_header.exception_handlers[0].filter_offset, 0);
 
-        assert!(method_header.exception_handlers[1]
-            .flags
-            .contains(ExceptionHandlerFlags::EXCEPTION));
+        assert_eq!(
+            method_header.exception_handlers[1].flags,
+            ExceptionHandlerFlags::EXCEPTION
+        );
         assert_eq!(method_header.exception_handlers[1].try_offset, 0);
         assert_eq!(method_header.exception_handlers[1].try_length, 77);
         assert_eq!(method_header.exception_handlers[1].handler_offset, 77);

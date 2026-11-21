@@ -33,8 +33,8 @@
 //! # Integration
 //!
 //! This module integrates with:
-//! - [`crate::assembly::decoder`] - Uses visited maps to coordinate parallel disassembly
-//! - [`crate::assembly::block`] - Tracks which instruction regions have been processed
+//! - [`crate::assembly::decode_blocks`] - Uses visited maps to coordinate parallel disassembly
+//! - [`crate::assembly::BasicBlock`] - Tracks which instruction regions have been processed
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

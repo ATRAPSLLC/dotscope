@@ -164,7 +164,7 @@
 //! caching and lazy loading use appropriate synchronization primitives to ensure
 //! correctness in multi-threaded scenarios. All public APIs are [`std::marker::Send`] and [`std::marker::Sync`].
 //!
-use std::{path::Path, sync::Arc};
+use std::{fmt, path::Path, sync::Arc};
 
 use log::debug;
 
@@ -186,19 +186,60 @@ use crate::{
         resolver::TokenResolver,
         resources::Resources,
         root::Root,
-        streams::{Blob, Guid, Strings, TablesHeader, UserStrings},
+        streams::{Blob, Guid, SharedStr, Strings, TablesHeader, UserStrings},
         tables::{
             member_ref_name_by_token, method_spec_name_by_token, AssemblyOsRc, AssemblyProcessorRc,
             AssemblyRc, AssemblyRefMap, CustomAttributeMap, DeclSecurityMap, FieldMap, FileMap,
             MemberRefMap, MemberRefRc, MethodSpecMap, MethodSpecRc, ModuleRc, ModuleRefMap,
         },
         token::Token,
-        typesystem::{CilTypeReference, TypeRegistry},
+        typesystem::{CilTypeReference, FullName, TypeRegistry},
         validation::{ValidationConfig, ValidationEngine},
     },
     project::ProjectContext,
     Error, MethodLookupError, Result,
 };
+
+/// A load of a [`CilObject`] from a [`CilAssemblyView`] that failed, with the view it was
+/// given: the headers, streams, heaps and raw tables stay readable after the semantic load
+/// refused the assembly (a packed, obfuscated or truncated image), without parsing it again.
+///
+/// It converts into the [`Error`] it holds, so `?` in a function returning
+/// [`crate::Result`] works as it does for any other load.
+pub struct ViewLoadError {
+    /// Why the load failed
+    pub error: Error,
+    /// The view the load was given, unchanged (boxed: a view is several hundred bytes, and
+    /// the error travels by value)
+    pub view: Box<CilAssemblyView>,
+}
+
+impl From<ViewLoadError> for Error {
+    fn from(failure: ViewLoadError) -> Self {
+        failure.error
+    }
+}
+
+impl fmt::Debug for ViewLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ViewLoadError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for ViewLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for ViewLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 /// A fully parsed and loaded .NET assembly representation.
 ///
@@ -359,7 +400,11 @@ impl CilObject {
         debug!("Loading assembly: {}", path.as_ref().display());
         let assembly_view =
             CilAssemblyView::from_path_with_validation(path, ValidationConfig::disabled())?;
-        Self::load_validated(assembly_view, validation_config, None)
+        Ok(Self::load_validated(
+            assembly_view,
+            validation_config,
+            None,
+        )?)
     }
 
     /// Creates a new `CilObject` by parsing a .NET assembly from a memory buffer.
@@ -447,7 +492,11 @@ impl CilObject {
         debug!("Loading assembly from memory buffer ({} bytes)", data.len());
         let assembly_view =
             CilAssemblyView::from_mem_with_validation(data, ValidationConfig::disabled())?;
-        Self::load_validated(assembly_view, validation_config, None)
+        Ok(Self::load_validated(
+            assembly_view,
+            validation_config,
+            None,
+        )?)
     }
 
     /// Creates a CilObject from a dotscope::file::File.
@@ -517,7 +566,11 @@ impl CilObject {
             file,
             ValidationConfig::disabled(),
         )?;
-        Self::load_validated(assembly_view, validation_config, None)
+        Ok(Self::load_validated(
+            assembly_view,
+            validation_config,
+            None,
+        )?)
     }
 
     /// Creates a CilObject from an opened std::fs::File.
@@ -673,8 +726,9 @@ impl CilObject {
     ///
     /// # Errors
     ///
-    /// Returns an error if the assembly cannot be processed or validated.
-    pub fn from_view(assembly_view: CilAssemblyView) -> Result<Self> {
+    /// Returns a [`ViewLoadError`] if the assembly cannot be processed or validated: its
+    /// error, and `assembly_view` back to keep reading the raw tables from.
+    pub fn from_view(assembly_view: CilAssemblyView) -> std::result::Result<Self, ViewLoadError> {
         Self::from_view_with_validation(assembly_view, ValidationConfig::production())
     }
 
@@ -697,7 +751,8 @@ impl CilObject {
     ///
     /// # Errors
     ///
-    /// Returns an error if the assembly cannot be processed or if validation checks fail.
+    /// Returns a [`ViewLoadError`] if the assembly cannot be processed or if validation
+    /// checks fail: its error, and `assembly_view` back to keep reading the raw tables from.
     ///
     /// # Thread Safety
     ///
@@ -705,7 +760,7 @@ impl CilObject {
     pub fn from_view_with_validation(
         assembly_view: CilAssemblyView,
         validation_config: ValidationConfig,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, ViewLoadError> {
         Self::load_validated(assembly_view, validation_config, None)
     }
 
@@ -713,31 +768,55 @@ impl CilObject {
     /// reference scan: the raw stage before the owned data is built, so a raw failure ends
     /// the load before it, and the owned stage after. `standalone_pdb` is a Portable PDB to
     /// read the debug information from instead of the image's own.
+    ///
+    /// A failure hands `assembly_view` back with its error ([`ViewLoadError`]).
     fn load_validated(
         assembly_view: CilAssemblyView,
         validation_config: ValidationConfig,
         standalone_pdb: Option<&[u8]>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, ViewLoadError> {
         let engine = if validation_config == ValidationConfig::disabled() {
             None
         } else {
-            Some(ValidationEngine::new(&assembly_view, validation_config)?)
+            match ValidationEngine::new(&assembly_view, validation_config) {
+                Ok(engine) => Some(engine),
+                Err(error) => {
+                    return Err(ViewLoadError {
+                        error,
+                        view: Box::new(assembly_view),
+                    })
+                }
+            }
         };
         if let Some(engine) = engine
             .as_ref()
             .filter(|_| validation_config.should_validate_raw())
         {
-            engine
-                .execute_stage1_validation(&assembly_view, None)?
-                .into_result()?;
+            let raw = engine
+                .execute_stage1_validation(&assembly_view, None)
+                .and_then(|result| result.into_result());
+            if let Err(error) = raw {
+                return Err(ViewLoadError {
+                    error,
+                    view: Box::new(assembly_view),
+                });
+            }
         }
 
-        let data = CilObjectData::from_assembly_view(
+        let data = match CilObjectData::from_assembly_view(
             &assembly_view,
             None,
             validation_config.lenient,
             standalone_pdb,
-        )?;
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                return Err(ViewLoadError {
+                    error,
+                    view: Box::new(assembly_view),
+                })
+            }
+        };
         let object = CilObject {
             assembly_view,
             data,
@@ -745,7 +824,17 @@ impl CilObject {
         };
 
         if let Some(engine) = engine.filter(|_| validation_config.should_validate_owned()) {
-            engine.execute_stage2_validation(&object)?.into_result()?;
+            let owned = engine
+                .execute_stage2_validation(&object)
+                .and_then(|result| result.into_result());
+            if let Err(error) = owned {
+                // The owned data holds no borrow of the view: drop it and hand the view back
+                let CilObject { assembly_view, .. } = object;
+                return Err(ViewLoadError {
+                    error,
+                    view: Box::new(assembly_view),
+                });
+            }
         }
         debug!(
             "Assembly loaded: {} types, {} methods",
@@ -787,7 +876,7 @@ impl CilObject {
     ///
     /// This method is thread-safe and designed to be called concurrently from multiple threads
     /// with the same `ProjectContext`. The `ProjectContext` handles barrier synchronization.
-    pub(crate) fn from_project(
+    pub fn from_project(
         assembly_view: CilAssemblyView,
         project_context: &ProjectContext,
         validation_config: ValidationConfig,
@@ -1737,7 +1826,7 @@ impl CilObject {
     /// }
     /// # Ok::<(), dotscope::Error>(())
     /// ```
-    pub fn resolve_method_name(&self, token: Token) -> Option<String> {
+    pub fn resolve_method_name(&self, token: Token) -> Option<SharedStr> {
         match token.table() {
             0x06 => method_name_by_token(&self.data.methods, &token),
             0x0A => member_ref_name_by_token(&self.data.refs_member, &token),
@@ -1764,11 +1853,11 @@ impl CilObject {
     /// The declaring type's full name (`System.String`), or `None` when the
     /// token is not a method token, its row is missing, or its declaring type
     /// cannot be resolved.
-    pub fn resolve_method_declaring_type(&self, token: Token) -> Option<String> {
+    pub fn resolve_method_declaring_type(&self, token: Token) -> Option<FullName> {
         let method_def = |method: Option<MethodRc>| {
             method
                 .and_then(|method| method.declaring_type_rc())
-                .map(|ty| ty.fullname().to_string())
+                .map(|ty| ty.fullname())
         };
         let parent = |member: &MemberRefRc| member.declaredby.fullname();
         match token.table() {
@@ -1907,7 +1996,11 @@ impl CilObject {
         drop(self);
         let assembly_view =
             CilAssemblyView::load_with_validation(file, ValidationConfig::disabled())?;
-        Self::load_validated(assembly_view, validation_config, Some(pdb))
+        Ok(Self::load_validated(
+            assembly_view,
+            validation_config,
+            Some(pdb),
+        )?)
     }
 
     /// Returns the type registry containing all type definitions and references.
@@ -2212,7 +2305,49 @@ impl CilObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{metadata::tables::TableId, testkit::get_testfile_crafted2};
+    use crate::{
+        metadata::tables::TableId,
+        testkit::{fixtures::fixture, get_testfile_crafted2},
+    };
+
+    /// A load from a view that fails hands the view back, unchanged: its error is the one
+    /// loading the file directly gives, and its raw tables are those a fresh parse of the
+    /// file reads. One fixture is refused while the owned data is built (a method body past
+    /// its section), the other by raw validation (a signature past the blob heap).
+    #[test]
+    fn a_failed_load_from_a_view_hands_the_view_back() {
+        for rel in [
+            "metadata/sections/body_past_virtual_size.exe",
+            "metadata/streams/junk_after.exe",
+        ] {
+            let path = fixture(rel);
+            // As `CilObject::from_path` builds its view: the object load validates
+            let view =
+                CilAssemblyView::from_path_with_validation(&path, ValidationConfig::disabled())
+                    .expect("the view loads");
+            let Err(failure) = CilObject::from_view(view) else {
+                panic!("{rel}: the object load succeeds");
+            };
+            let Err(direct) = CilObject::from_path(&path) else {
+                panic!("{rel}: the direct load succeeds");
+            };
+            assert_eq!(failure.error.to_string(), direct.to_string(), "{rel}");
+
+            let fresh =
+                CilAssemblyView::from_path_with_validation(&path, ValidationConfig::disabled())
+                    .expect("the view loads");
+            let tables = failure.view.tables().expect("the view has its tables");
+            let fresh_tables = fresh.tables().expect("the view has its tables");
+            for table in [TableId::TypeDef, TableId::MethodDef, TableId::Field] {
+                assert_eq!(
+                    tables.table_row_count(table),
+                    fresh_tables.table_row_count(table),
+                    "{rel}: {table:?}"
+                );
+            }
+            assert!(tables.table_row_count(TableId::MethodDef) > 0, "{rel}");
+        }
+    }
 
     /// Every Field row is in [`CilObject::fields`], and it is the same field its owning type
     /// lists.

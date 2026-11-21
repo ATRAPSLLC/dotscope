@@ -14,7 +14,7 @@
 //! # Key Components
 //!
 //! - [`crate::metadata::validation::ValidationEngine`] - Main validation orchestrator
-//! - [`crate::metadata::validation::ValidationStatistics`] - Runtime validation statistics
+//! - [`crate::metadata::validation::EngineStatistics`] - Runtime validation statistics
 //! - [`crate::metadata::validation::TwoStageValidationResult`] - Results from both validation stages
 //! - [`crate::metadata::validation::ReferenceScanner`] - Shared reference scanning infrastructure
 //!

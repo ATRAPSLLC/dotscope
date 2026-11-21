@@ -120,7 +120,7 @@ use crate::{
         diagnostics::{DiagnosticCategory, Diagnostics},
         identity::{AssemblyIdentity, AssemblyVersion, Identity, ProcessorArchitecture},
         root::Root,
-        streams::{Blob, Guid, StreamHeader, Strings, TablesHeader, UserStrings},
+        streams::{Blob, Guid, SharedStr, StreamHeader, Strings, TablesHeader, UserStrings},
         tables::{skip_unreadable, AssemblyProcessorRaw, AssemblyRaw, AssemblyRefRaw, ModuleRaw},
         validation::ValidationEngine,
     },
@@ -747,7 +747,7 @@ impl CilAssemblyView {
     ///
     /// Returns a fully constructed `CilAssemblyView` with parsed metadata structures
     /// or an error if parsing or validation fails.
-    pub(crate) fn load_with_validation(
+    pub fn load_with_validation(
         file: Arc<File>,
         validation_config: ValidationConfig,
     ) -> Result<Self> {
@@ -1080,12 +1080,12 @@ impl CilAssemblyView {
         let blobs = self.blobs();
 
         // Get assembly name and version directly from raw row (doesn't need blob heap)
-        let name = strings.get(assembly_row.name as usize)?.to_string();
+        let name = strings.get_shared(assembly_row.name as usize)?;
 
         let culture = if assembly_row.culture == 0 {
             None
         } else {
-            Some(strings.get(assembly_row.culture as usize)?.to_string())
+            Some(strings.get_shared(assembly_row.culture as usize)?)
         };
 
         // Public key requires blob heap - only fail if we need it but don't have it
@@ -1093,7 +1093,7 @@ impl CilAssemblyView {
             None
         } else if let Some(blobs) = blobs {
             Some(Identity::PubKey(
-                blobs.get(assembly_row.public_key as usize)?.to_vec(),
+                blobs.get(assembly_row.public_key as usize)?.into(),
             ))
         } else {
             // Has public key index but no blob heap - this is malformed
@@ -1131,7 +1131,7 @@ impl CilAssemblyView {
     ///
     /// * `Some(String)` - The module name (e.g., "MyModule.dll" or "Helper.netmodule")
     /// * `None` - If the Module table is missing or name cannot be resolved
-    pub fn module_name(&self) -> Option<String> {
+    pub fn module_name(&self) -> Option<SharedStr> {
         let tables = self.tables()?;
         let strings = self.strings()?;
 
@@ -1139,7 +1139,7 @@ impl CilAssemblyView {
         // Module is RID 1 by definition (ECMA-335 II.22.30).
         let module_row = module_table.get(1).ok().flatten()?;
 
-        strings.get(module_row.name as usize).ok().map(String::from)
+        strings.get_shared(module_row.name as usize).ok()
     }
 
     /// Check if this is a netmodule (module without assembly manifest).
@@ -1208,8 +1208,7 @@ impl CilAssemblyView {
         // Strip extension from module name (e.g., "helper.netmodule" -> "helper")
         let name = module_name
             .rsplit_once('.')
-            .map(|(base, _)| base.to_string())
-            .unwrap_or(module_name);
+            .map_or_else(|| module_name.clone(), |(base, _)| SharedStr::from(base));
 
         Ok(AssemblyIdentity {
             name,

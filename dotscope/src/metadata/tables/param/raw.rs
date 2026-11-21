@@ -148,7 +148,7 @@ impl ParamRaw {
             flags: ParamAttributes::new(self.flags),
             sequence: self.sequence,
             name: if self.name != 0 {
-                Some(strings.get(self.name as usize)?.to_string())
+                Some(strings.get_shared(self.name as usize)?)
             } else {
                 None
             },

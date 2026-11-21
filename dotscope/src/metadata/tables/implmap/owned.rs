@@ -9,7 +9,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::{
-    metadata::{method::MethodRc, tables::ModuleRefRc, token::Token},
+    metadata::{method::MethodRc, streams::SharedStr, tables::ModuleRefRc, token::Token},
     Result,
 };
 
@@ -63,7 +63,7 @@ pub struct ImplMap {
     /// library. May be subject to name mangling based on the [`mapping_flags`].
     ///
     /// [`mapping_flags`]: Self::mapping_flags
-    pub import_name: String,
+    pub import_name: SharedStr,
 
     /// Resolved reference to the module containing the target native function.
     ///

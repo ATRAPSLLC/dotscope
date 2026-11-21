@@ -19,11 +19,11 @@ use crate::{
 };
 
 /// The bytes of one `READYTORUN_IMPORT_SECTION`.
-pub(crate) const IMPORT_SECTION_SIZE: usize = 20;
+pub const IMPORT_SECTION_SIZE: usize = 20;
 
 /// `ReadyToRunImportSectionFlags::GCRefMap`: each cell's signature is
 /// prefixed by its argument GC reference map.
-pub(crate) const GC_REF_MAP: u16 = 0x0008;
+pub const GC_REF_MAP: u16 = 0x0008;
 
 /// `READYTORUN_FIXUP_ModuleOverride`, or-ed into a fixup's kind: the kind is
 /// followed by the index of the module whose metadata its tokens are in.
@@ -75,7 +75,7 @@ impl Fixup {
     ///
     /// # Errors
     ///
-    /// [`Error::MalformedInput`] when the signature ends before the subject
+    /// [`crate::Error::Parse`] when the signature ends before the subject
     /// its kind takes.
     pub fn read(bytes: &[u8], gc_ref_map: bool) -> Result<Self> {
         let mut reader = SignatureReader { bytes, at: 0 };
@@ -331,7 +331,7 @@ pub fn helper_name(number: u32) -> Option<&'static str> {
 /// # Errors
 ///
 /// When a section's signature array does not read.
-pub(crate) fn read_cells<'a>(
+pub fn read_cells<'a>(
     table: &[u8],
     at: impl Fn(u32) -> Option<&'a [u8]>,
 ) -> Result<Vec<ImportCell>> {

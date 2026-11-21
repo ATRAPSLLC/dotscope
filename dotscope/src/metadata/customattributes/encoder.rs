@@ -184,7 +184,7 @@ pub fn encode_custom_attribute_value(value: &CustomAttributeValue) -> Result<Vec
 /// FIELD    ::= NAMED_ARG_TYPE::FIELD (0x53)
 /// PROPERTY ::= NAMED_ARG_TYPE::PROPERTY (0x54)
 /// ```
-pub(crate) fn encode_named_arguments(
+pub fn encode_named_arguments(
     args: &[CustomAttributeNamedArgument],
     buffer: &mut Vec<u8>,
 ) -> Result<()> {

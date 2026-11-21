@@ -18,7 +18,14 @@
 //!
 //! The Portable PDB v1.0 format specification, "Document Name Blob".
 
-use crate::{file::parser::Parser, metadata::streams::Blob, utils::write_compressed_uint, Result};
+use std::{fmt, sync::Arc};
+
+use crate::{
+    file::parser::Parser,
+    metadata::streams::{Blob, SharedStr},
+    utils::write_compressed_uint,
+    Result,
+};
 
 /// A DocumentNameBlob as it is stored: the separator and each part's `#Blob` index.
 ///
@@ -177,6 +184,205 @@ pub fn document_name(blob: &[u8], blobs: &Blob<'_>) -> Result<String> {
     Ok(name)
 }
 
+/// A Document row's name: its DocumentNameBlob, read against the PDB's `#Blob` heap when the
+/// name is used.
+///
+/// The name is a separator and the `#Blob` indices of its parts, and the path is their
+/// join (see [`document_name`]). A name blob of N parts naming one long part blob joins to N
+/// times its length, so joining every row's name while loading let a small heap grow into
+/// gigabytes. A `DocumentName` instead keeps a reference to a shared copy of the heap and the
+/// index of its name blob, a few bytes per row, and joins the parts only when displayed or
+/// compared, as System.Reflection.Metadata reads a `DocumentNameBlobHandle` on request.
+///
+/// The name blob and every part were checked when the row was read, so displaying cannot
+/// fail. It displays as the joined path; [`ToString::to_string`] gives it as a `String`, and
+/// it compares with a `str` part by part, without joining. A name built outside a heap (a
+/// [`Document::new`](crate::metadata::tables::Document::new) of a path) converts from a
+/// `String` or `&str` and holds the path itself.
+///
+/// # Examples
+///
+/// ```rust
+/// use dotscope::metadata::streams::Blob;
+///
+/// // Blobs "src" at 1 and "a.cs" at 5, and the name blob `/ 1 5` at 10
+/// let heap = [0, 3, b's', b'r', b'c', 4, b'a', b'.', b'c', b's', 3, b'/', 1, 5];
+/// let blobs = Blob::from(&heap)?;
+/// let name = blobs.document_name(10)?;
+/// assert_eq!(name, "src/a.cs");
+/// assert_eq!(name.to_string(), "src/a.cs");
+/// # Ok::<(), dotscope::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct DocumentName(NameSource);
+
+/// Where a [`DocumentName`]'s path comes from.
+#[derive(Clone)]
+enum NameSource {
+    /// A DocumentNameBlob of a heap
+    Heap {
+        /// A copy of the `#Blob` heap, shared by every name and blob read from it
+        heap: Arc<[u8]>,
+        /// The index of the name's DocumentNameBlob in `heap`
+        blob: u32,
+    },
+    /// A path given as text
+    Path(SharedStr),
+}
+
+impl DocumentName {
+    /// The name whose DocumentNameBlob is at `blob` in `blobs`, after checking that the blob
+    /// reads and that every part is a blob of the heap.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`document_name`] gives for the blob: it does not read, its
+    /// separator is not ASCII, or a part's index names no blob.
+    pub fn read(blobs: &Blob<'_>, blob: u32) -> Result<Self> {
+        let stored = DocumentNameBlob::parse(blobs.get(blob as usize)?)?;
+        for &part in &stored.parts {
+            if part != 0 {
+                blobs.get(part as usize)?;
+            }
+        }
+        Ok(Self(NameSource::Heap {
+            heap: blobs.shared_heap(),
+            blob,
+        }))
+    }
+
+    /// Calls `part` with the separator (as its own piece) and each part of the name in order,
+    /// each part decoded as UTF-8 with an invalid sequence as U+FFFD.
+    ///
+    /// Stops at the first error `part` returns.
+    fn for_each_piece<E>(
+        &self,
+        mut part: impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let (heap, blob) = match &self.0 {
+            NameSource::Heap { heap, blob } => (heap, *blob),
+            NameSource::Path(path) => return part(path),
+        };
+        // The heap was checked when the name was read: a lookup that fails here leaves the
+        // piece out rather than failing a display.
+        let Ok(heap) = Blob::from(heap) else {
+            return Ok(());
+        };
+        let Some(stored) = heap
+            .get(blob as usize)
+            .ok()
+            .and_then(|blob| DocumentNameBlob::parse(blob).ok())
+        else {
+            return Ok(());
+        };
+        let separator = char::from(stored.separator);
+        let mut buffer = [0u8; 4];
+        for (index, &index_of_part) in stored.parts.iter().enumerate() {
+            if index > 0 && stored.separator != 0 {
+                part(separator.encode_utf8(&mut buffer))?;
+            }
+            if index_of_part != 0 {
+                if let Ok(bytes) = heap.get(index_of_part as usize) {
+                    for chunk in bytes.utf8_chunks() {
+                        part(chunk.valid())?;
+                        if !chunk.invalid().is_empty() {
+                            part("\u{FFFD}")?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The separator the parts of a heap name are joined with; `None` for none, and for a
+    /// name given as a path.
+    #[must_use]
+    pub fn separator(&self) -> Option<char> {
+        let NameSource::Heap { heap, blob } = &self.0 else {
+            return None;
+        };
+        Blob::from(heap)
+            .ok()
+            .and_then(|heap| {
+                heap.get(*blob as usize)
+                    .ok()
+                    .and_then(|b| b.first().copied())
+            })
+            .filter(|&separator| separator != 0)
+            .map(char::from)
+    }
+}
+
+impl fmt::Display for DocumentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.for_each_piece(|piece| f.write_str(piece))
+    }
+}
+
+impl fmt::Debug for DocumentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.to_string(), f)
+    }
+}
+
+impl PartialEq<str> for DocumentName {
+    /// Compares part by part, stopping at the first difference, without joining the name.
+    fn eq(&self, other: &str) -> bool {
+        let mut rest = other;
+        let matched = self.for_each_piece(|piece| match rest.strip_prefix(piece) {
+            Some(after) => {
+                rest = after;
+                Ok(())
+            }
+            None => Err(()),
+        });
+        matched.is_ok() && rest.is_empty()
+    }
+}
+
+impl PartialEq<&str> for DocumentName {
+    fn eq(&self, other: &&str) -> bool {
+        *self == **other
+    }
+}
+
+impl PartialEq<String> for DocumentName {
+    fn eq(&self, other: &String) -> bool {
+        *self == *other.as_str()
+    }
+}
+
+impl PartialEq for DocumentName {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (
+                NameSource::Heap { heap, blob },
+                NameSource::Heap {
+                    heap: other_heap,
+                    blob: other_blob,
+                },
+            ) if Arc::ptr_eq(heap, other_heap) && blob == other_blob => true,
+            (_, NameSource::Path(path)) => *self == **path,
+            _ => *other == *self.to_string(),
+        }
+    }
+}
+
+impl Eq for DocumentName {}
+
+impl From<String> for DocumentName {
+    fn from(path: String) -> Self {
+        Self(NameSource::Path(SharedStr::from(path)))
+    }
+}
+
+impl From<&str> for DocumentName {
+    fn from(path: &str) -> Self {
+        Self(NameSource::Path(SharedStr::from(path)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +397,93 @@ mod tests {
             data.extend_from_slice(part);
         }
         (data, indexes)
+    }
+
+    /// A heap holding `parts` and then each name blob of `names`, with the index of each name
+    /// blob.
+    fn heap_with_names(parts: &[&[u8]], names: &[Vec<u8>]) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
+        let (mut data, at) = heap(parts);
+        let mut name_at = Vec::new();
+        for name in names {
+            name_at.push(u32::try_from(data.len()).unwrap());
+            let mut prefix = Vec::new();
+            write_compressed_uint(u32::try_from(name.len()).unwrap(), &mut prefix).unwrap();
+            data.extend_from_slice(&prefix);
+            data.extend_from_slice(name);
+        }
+        (data, at, name_at)
+    }
+
+    /// A [`DocumentName`] displays, and compares, as the path [`document_name`] joins, for
+    /// rooted, separator-less, backslashed and invalid-UTF-8 names.
+    #[test]
+    fn a_document_name_reads_as_document_name_joins_it() {
+        let parts: [&[u8]; 4] = [b"_", b"src", b"a\xffb", b"x.cs"];
+        let (_, at) = heap(&parts);
+        let byte = |i: usize| u8::try_from(at[i]).unwrap();
+        let names = vec![
+            vec![b'/', 0, byte(0), byte(1), byte(3)],
+            vec![0, byte(1), byte(3)],
+            vec![b'\\', byte(1), byte(2)],
+            vec![b'/'],
+        ];
+        let (data, _, name_at) = heap_with_names(&parts, &names);
+        let blobs = Blob::from(&data).unwrap();
+        for (name, &index) in names.iter().zip(&name_at) {
+            let joined = document_name(name, &blobs).unwrap();
+            let shared = blobs.document_name(index).unwrap();
+            assert_eq!(shared.to_string(), joined);
+            assert_eq!(shared, *joined.as_str());
+            assert_eq!(shared, DocumentName::from(joined.as_str()));
+            assert!(shared != *format!("{joined}!").as_str());
+            if let Some((last, _)) = joined.char_indices().last() {
+                assert!(shared != *joined.get(..last).unwrap());
+            }
+        }
+        assert_eq!(
+            blobs.document_name(name_at[2]).unwrap().separator(),
+            Some('\\')
+        );
+        assert_eq!(blobs.document_name(name_at[1]).unwrap().separator(), None);
+    }
+
+    /// A name of many parts naming one long blob is a view: reading it does not join it, and
+    /// every name shares the one copy of the heap.
+    #[test]
+    fn a_long_name_is_a_view_of_the_shared_heap() {
+        let long = vec![b'a'; 100];
+        let (_, at) = heap(&[&long]);
+        let part = u8::try_from(at[0]).unwrap();
+        let mut name = vec![b'/'];
+        name.extend(std::iter::repeat_n(part, 1000));
+        let (data, _, name_at) = heap_with_names(&[&long], &[name]);
+        let blobs = Blob::from(&data).unwrap();
+
+        let names: Vec<DocumentName> = (0..100)
+            .map(|_| blobs.document_name(name_at[0]).unwrap())
+            .collect();
+        let heap = blobs.shared_heap();
+        assert_eq!(
+            Arc::strong_count(&heap),
+            names.len() + 3,
+            "the names, the cached one, the heap's own copy and this handle share one heap"
+        );
+        assert_eq!(names[0].to_string().len(), 1000 * 100 + 999);
+    }
+
+    /// A name blob that does not read, or names a part that is no blob, fails when read.
+    #[test]
+    fn a_bad_name_blob_fails_when_read() {
+        let (data, _, name_at) = heap_with_names(&[b"x"], &[vec![0xFF, 1], vec![b'/', 0x7F]]);
+        let blobs = Blob::from(&data).unwrap();
+        assert!(
+            blobs.document_name(name_at[0]).is_err(),
+            "a non-ASCII separator"
+        );
+        assert!(
+            blobs.document_name(name_at[1]).is_err(),
+            "a part past the heap"
+        );
     }
 
     /// A path joins its parts with the separator; an empty first part (index 0) gives the

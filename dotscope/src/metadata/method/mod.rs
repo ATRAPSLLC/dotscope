@@ -120,11 +120,12 @@ use crate::{
         signatures::{
             parse_local_var_signature, SignatureLocalVariable, SignatureMethod, TypeSignature,
         },
-        streams::Blob,
+        streams::{Blob, SharedStr},
         tables::{GenericParamList, MetadataTable, MethodSpecList, ParamList, StandAloneSigRaw},
         token::Token,
         typesystem::{
-            CilModifier, CilTypeRc, CilTypeRef, CilTypeReference, TypeRegistry, TypeResolver,
+            CilModifier, CilTypeRc, CilTypeRef, CilTypeReference, FullName, TypeRegistry,
+            TypeResolver,
         },
     },
     utils::{LazyList, RowList},
@@ -155,8 +156,9 @@ pub type MethodRc = Arc<Method>;
 ///
 /// # Returns
 ///
-/// The method name as a `String` if a method with the given token exists, `None` otherwise.
-pub fn method_name_by_token(map: &MethodMap, token: &Token) -> Option<String> {
+/// The method name, shared with the method, if a method with the given token exists, `None`
+/// otherwise.
+pub fn method_name_by_token(map: &MethodMap, token: &Token) -> Option<SharedStr> {
     map.get(token).map(|e| e.value().name.clone())
 }
 
@@ -396,7 +398,7 @@ impl MethodRef {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
-    pub fn name(&self) -> Option<String> {
+    pub fn name(&self) -> Option<SharedStr> {
         self.upgrade().map(|m| m.name.clone())
     }
 
@@ -466,7 +468,8 @@ impl From<MethodRc> for MethodRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MethodRvaKind {
-    /// IL code lives at the given RVA. Equivalent to `Method.rva == Some(addr)`.
+    /// The method's code (IL, or a native method's machine code) lives at the given RVA.
+    /// Equivalent to `Method.rva == Some(addr)`; [`Method::code_kind`] says which code.
     Resolved(u32),
     /// Method is declared abstract - body is supplied by an overriding type
     /// in this or another assembly.
@@ -509,6 +512,53 @@ impl std::fmt::Display for MethodRvaKind {
     }
 }
 
+/// What implements a method, as [`Method::code_kind`] reports it: the code type
+/// (ECMA-335 II.23.1.11, `CodeTypeMask`) of a method whose code is in this image, or that the
+/// image holds none for it.
+///
+/// # Stability
+///
+/// `#[non_exhaustive]`: consumers include a wildcard arm when matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MethodCodeKind {
+    /// CIL at the method's RVA, after its tiny or fat header.
+    Il,
+    /// Optimized CIL (`OPTIL`, reserved: conforming implementations do not write it) at the
+    /// method's RVA.
+    OptIl,
+    /// Native machine code at the method's RVA (a mixed-mode assembly's native method), with
+    /// no CIL header.
+    Native,
+    /// Implemented by the runtime (`RUNTIME`): no code in the image, an RVA or not.
+    Runtime,
+    /// No code in the image: an abstract method, a P/Invoke, an internal call, or any other
+    /// method without an RVA.
+    None,
+}
+
+impl MethodCodeKind {
+    /// Returns a stable `&'static str` identifier for this code kind: `"il"`, `"opt_il"`,
+    /// `"native"`, `"runtime"` or `"none"`. The strings are part of the stable public API and
+    /// safe to persist.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            MethodCodeKind::Il => "il",
+            MethodCodeKind::OptIl => "opt_il",
+            MethodCodeKind::Native => "native",
+            MethodCodeKind::Runtime => "runtime",
+            MethodCodeKind::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for MethodCodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Represents all the information about a CIL method.
 ///
 /// The `Method` struct contains all metadata, code, and analysis results for a single .NET method.
@@ -547,7 +597,7 @@ pub struct Method {
     /// The offset in the `MetadataTable`
     pub meta_offset: usize,
     /// This methods name
-    pub name: String,
+    pub name: SharedStr,
     /// `MethodImplAttributes`, §II.23.1.10
     pub impl_code_type: MethodImplCodeType,
     /// `MethodImplAttributes`, §II.23.1.10
@@ -784,9 +834,11 @@ impl Method {
 
     /// Returns true if the method has IL code.
     ///
-    /// This checks the `MethodImplCodeType::IL` flag in the method's implementation
-    /// attributes to determine if the method contains Common Intermediate Language (CIL)
-    /// instructions that can be disassembled and analyzed.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::IL`: the
+    /// method contains Common Intermediate Language (CIL) instructions that can be
+    /// disassembled and analyzed. The code type is a two-bit enumeration, not a set of
+    /// flags, so exactly one of `is_code_il`, `is_code_native`, `is_code_opt_il` and
+    /// `is_code_runtime` holds for a method.
     ///
     /// # Examples
     ///
@@ -804,14 +856,14 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_il(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::IL)
+        self.impl_code_type == MethodImplCodeType::IL
     }
 
     /// Returns true if the method has native code (P/Invoke).
     ///
-    /// This checks the `MethodImplCodeType::NATIVE` flag to determine if the method
-    /// is implemented in native code rather than IL. This is typical for P/Invoke
-    /// methods that call into unmanaged libraries.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::NATIVE`:
+    /// the method is implemented in native code rather than IL, as a mixed-mode assembly's
+    /// native methods are. A runtime-implemented method is not native.
     ///
     /// # Examples
     ///
@@ -829,14 +881,14 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_native(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::NATIVE)
+        self.impl_code_type == MethodImplCodeType::NATIVE
     }
 
     /// Returns true if the method has optimized IL code.
     ///
-    /// This checks the `MethodImplCodeType::OPTIL` flag to determine if the method
-    /// contains optimized Common Intermediate Language that may have been transformed
-    /// by the runtime or tools for better performance.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::OPTIL`,
+    /// optimized Common Intermediate Language (reserved: conforming implementations write
+    /// zero). A runtime-implemented method is not optimized IL.
     ///
     /// # Examples
     ///
@@ -854,13 +906,14 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_opt_il(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::OPTIL)
+        self.impl_code_type == MethodImplCodeType::OPTIL
     }
 
     /// Returns true if the method is implemented in the runtime.
     ///
-    /// This checks the `MethodImplCodeType::RUNTIME` flag to determine if the method
-    /// is implemented directly by the .NET runtime rather than containing user code.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::RUNTIME`:
+    /// the method is implemented directly by the .NET runtime rather than containing user
+    /// code.
     /// This is common for intrinsic methods and runtime-provided functionality.
     ///
     /// # Examples
@@ -879,7 +932,7 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_runtime(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::RUNTIME)
+        self.impl_code_type == MethodImplCodeType::RUNTIME
     }
 
     /// Returns true if the method is unmanaged.
@@ -1011,33 +1064,6 @@ impl Method {
         self.impl_options.contains(MethodImplOptions::INTERNAL_CALL)
     }
 
-    /// Returns true if the method implementation is forwarded through P/Invoke.
-    ///
-    /// This checks the `MethodImplOptions::MAX_METHOD_IMPL_VAL` flag to determine
-    /// if the method implementation is forwarded to an external library through
-    /// the Platform Invoke (P/Invoke) mechanism.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use dotscope::CilObject;
-    /// use std::path::Path;
-    ///
-    /// let assembly = CilObject::from_path(Path::new("tests/samples/WindowsBase.dll"))?;
-    /// for entry in assembly.methods().iter() {
-    ///     let method = entry.value();
-    ///     if method.is_forwarded_pinvoke() {
-    ///         println!("Forwarded P/Invoke method: {}", method.name);
-    ///     }
-    /// }
-    /// # Ok::<(), dotscope::Error>(())
-    /// ```
-    #[must_use]
-    pub fn is_forwarded_pinvoke(&self) -> bool {
-        self.impl_options
-            .contains(MethodImplOptions::MAX_METHOD_IMPL_VAL)
-    }
-
     /// Returns true if the method is a constructor (.ctor or .cctor).
     #[must_use]
     pub fn is_constructor(&self) -> bool {
@@ -1140,10 +1166,64 @@ impl Method {
         if self.flags_modifiers.contains(MethodModifiers::PINVOKE_IMPL) {
             return MethodRvaKind::PInvoke;
         }
-        if self.impl_code_type.contains(MethodImplCodeType::RUNTIME) {
+        if self.impl_code_type == MethodImplCodeType::RUNTIME {
             return MethodRvaKind::Runtime;
         }
         MethodRvaKind::UnresolvedZero
+    }
+
+    /// What implements this method: the code type of a method with code at its RVA, and
+    /// [`MethodCodeKind::None`] for one without an RVA (abstract, P/Invoke, internal call).
+    /// A runtime-implemented method is [`MethodCodeKind::Runtime`] whether or not its row
+    /// names an RVA: the runtime supplies its code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::CilObject;
+    /// use dotscope::metadata::method::MethodCodeKind;
+    ///
+    /// let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
+    /// let native = assembly
+    ///     .methods()
+    ///     .iter()
+    ///     .filter(|entry| entry.value().code_kind() == MethodCodeKind::Native)
+    ///     .count();
+    /// println!("{native} native methods");
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    #[must_use]
+    pub fn code_kind(&self) -> MethodCodeKind {
+        if self.is_code_runtime() {
+            return MethodCodeKind::Runtime;
+        }
+        if self.rva.is_none() {
+            return MethodCodeKind::None;
+        }
+        if self.is_code_native() {
+            MethodCodeKind::Native
+        } else if self.is_code_opt_il() {
+            MethodCodeKind::OptIl
+        } else {
+            MethodCodeKind::Il
+        }
+    }
+
+    /// The RVA of the method's first instruction: after the tiny or fat header for CIL (the
+    /// method's RVA plus the size of the header its body was read with), and the RVA itself
+    /// for native code. `None` when the image holds no code for it ([`Method::code_kind`] is
+    /// `Runtime` or `None`) or its CIL body was not read (a lenient load drops a body it
+    /// cannot read).
+    #[must_use]
+    pub fn code_rva(&self) -> Option<u32> {
+        match self.code_kind() {
+            MethodCodeKind::Il | MethodCodeKind::OptIl => {
+                let header = u32::try_from(self.body.get()?.size_header).ok()?;
+                self.rva?.checked_add(header)
+            }
+            MethodCodeKind::Native => self.rva,
+            _ => None,
+        }
     }
 
     /// Returns true if the method has public access.
@@ -1163,8 +1243,8 @@ impl Method {
 
     /// Returns the fully-qualified name of the declaring type, if available.
     #[must_use]
-    pub fn declaring_type_fullname(&self) -> Option<String> {
-        self.declaring_type_rc().map(|t| t.fullname().to_string())
+    pub fn declaring_type_fullname(&self) -> Option<FullName> {
+        self.declaring_type_rc().map(|t| t.fullname())
     }
 
     /// Returns the fully-qualified method name in `"DeclaringType::MethodName"` format.
@@ -1175,7 +1255,7 @@ impl Method {
     pub fn fullname(&self) -> String {
         match self.declaring_type_fullname() {
             Some(type_name) if !type_name.is_empty() => format!("{}::{}", type_name, self.name),
-            _ => self.name.clone(),
+            _ => self.name.to_string(),
         }
     }
 
@@ -1321,7 +1401,14 @@ impl Method {
             return Ok(());
         };
 
-        let local_var_sig_data = match sigs_table.get(body.local_var_sig_token & 0x00FF_FFFF)? {
+        // A token naming another table names no local signature (ECMA-335 §II.25.4.3)
+        let Some(sig_rid) = body.local_var_sig_rid() else {
+            return Err(malformed_error!(
+                "Local variable signature token 0x{:08X} is not a StandAloneSig token",
+                body.local_var_sig_token
+            ));
+        };
+        let local_var_sig_data = match sigs_table.get(sig_rid)? {
             Some(var_sig_row) => blobs.get(var_sig_row.signature as usize)?,
             None => {
                 return Err(malformed_error!(
@@ -1729,6 +1816,7 @@ impl Method {
                         // block when the decoder's marker and the IL offset disagree - an
                         // overlap analyssa reports as a malformed clause.
                         filter_range: range(filter_start_block, handler_start_block),
+                        selector: None,
                     });
                 }
 
@@ -1959,7 +2047,7 @@ mod tests {
         assembly::{
             BasicBlock, FlowType, Instruction, InstructionCategory, Operand, StackBehavior,
         },
-        testkit::builders::MethodBuilder,
+        testkit::{builders::MethodBuilder, helpers::load_sample},
     };
 
     #[test]
@@ -2268,7 +2356,7 @@ mod tests {
         assert_eq!(method_ref.token(), Some(Token::new(0x06000001)));
 
         // Test name
-        assert_eq!(method_ref.name(), Some("TestMethod".to_string()));
+        assert_eq!(method_ref.name().as_deref(), Some("TestMethod"));
     }
 
     #[test]
@@ -2297,13 +2385,104 @@ mod tests {
         assert!(!regular.is_constructor());
     }
 
+    /// A method's code kind is its code type when it has an RVA, `Runtime` for a runtime
+    /// method with or without one, and `None` for any other method without an RVA; a native
+    /// method's code starts at its RVA and one without code has no code start.
     #[test]
-    fn test_is_forwarded_pinvoke() {
-        // Test that the renamed method works correctly
-        let method = MethodBuilder::new().with_name("TestMethod").build();
+    fn code_kind_follows_the_code_type_and_the_rva() {
+        let cases = [
+            (MethodImplCodeType::IL, true, MethodCodeKind::Il),
+            (MethodImplCodeType::OPTIL, true, MethodCodeKind::OptIl),
+            (MethodImplCodeType::NATIVE, true, MethodCodeKind::Native),
+            (MethodImplCodeType::RUNTIME, true, MethodCodeKind::Runtime),
+            (MethodImplCodeType::IL, false, MethodCodeKind::None),
+            (MethodImplCodeType::OPTIL, false, MethodCodeKind::None),
+            (MethodImplCodeType::NATIVE, false, MethodCodeKind::None),
+            (MethodImplCodeType::RUNTIME, false, MethodCodeKind::Runtime),
+        ];
+        for (code_type, with_rva, kind) in cases {
+            let builder = MethodBuilder::new().with_impl_code_type(code_type);
+            let method = if with_rva {
+                builder.with_rva(0x2050)
+            } else {
+                builder.without_rva()
+            }
+            .build();
+            assert_eq!(method.code_kind(), kind, "{code_type:?}, RVA {with_rva}");
+            let code_rva = match kind {
+                // No body was read for a built method
+                MethodCodeKind::Native => Some(0x2050),
+                _ => None,
+            };
+            assert_eq!(method.code_rva(), code_rva, "{code_type:?}, RVA {with_rva}");
+        }
+    }
 
-        // Default method should not have forwarded pinvoke flag
-        assert!(!method.is_forwarded_pinvoke());
+    /// The first instruction of a CIL method follows its header, read from the image's
+    /// bytes as ECMA-335 II.25.4 lays them out: a tiny header (low bits `0b10`) is one byte,
+    /// a fat header (`0b11`) is its size field (the top four bits of its first word) times
+    /// four. Every method of the sample with a body is checked, tiny and fat alike.
+    #[test]
+    fn code_rva_is_the_first_instruction_after_the_header() {
+        let assembly = load_sample("WindowsBase.dll");
+        let file = assembly.file();
+        let (mut tiny, mut fat) = (0usize, 0usize);
+        for entry in assembly.methods().iter() {
+            let method = entry.value();
+            let (Some(rva), Some(_)) = (method.rva, method.body.get()) else {
+                continue;
+            };
+            assert_eq!(method.code_kind(), MethodCodeKind::Il, "{}", method.name);
+            let offset = file
+                .rva_to_offset(rva as usize)
+                .expect("the body's RVA maps");
+            let header = file
+                .data_slice(offset, 2)
+                .expect("the header is in the file");
+            let size = match header[0] & 0b11 {
+                0b10 => {
+                    tiny += 1;
+                    1
+                }
+                0b11 => {
+                    fat += 1;
+                    u32::from(header[1] >> 4) * 4
+                }
+                other => panic!("{}: header format {other:#b}", method.name),
+            };
+            assert_eq!(method.code_rva(), Some(rva + size), "{}", method.name);
+        }
+        assert!(tiny > 0 && fat > 0, "tiny {tiny}, fat {fat}");
+    }
+
+    /// The code type is a two-bit enumeration (ECMA-335 II.23.1.11): for each of its four
+    /// values exactly one predicate holds. Tested as flags, IL (zero) held for every method,
+    /// and native (one) and optimized IL (two) for a runtime method (three).
+    #[test]
+    fn exactly_one_code_type_predicate_holds() {
+        for code_type in [
+            MethodImplCodeType::IL,
+            MethodImplCodeType::NATIVE,
+            MethodImplCodeType::OPTIL,
+            MethodImplCodeType::RUNTIME,
+        ] {
+            let method = MethodBuilder::new().with_impl_code_type(code_type).build();
+            let holds = [
+                (MethodImplCodeType::IL, method.is_code_il()),
+                (MethodImplCodeType::NATIVE, method.is_code_native()),
+                (MethodImplCodeType::OPTIL, method.is_code_opt_il()),
+                (MethodImplCodeType::RUNTIME, method.is_code_runtime()),
+            ];
+            for (predicate, result) in holds {
+                assert_eq!(
+                    result,
+                    predicate == code_type,
+                    "code type {:#x}: the predicate for {:#x}",
+                    code_type.bits(),
+                    predicate.bits()
+                );
+            }
+        }
     }
 
     #[test]

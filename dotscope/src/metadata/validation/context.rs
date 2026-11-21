@@ -62,7 +62,7 @@ use crate::{
         cilobject::CilObject,
         method::Method,
         token::Token,
-        typesystem::{CilTypeRc, TypeSource},
+        typesystem::{CilTypeRc, TypeRegistry, TypeSource},
         validation::{config::ValidationConfig, scanner::ReferenceScanner},
     },
 };
@@ -561,15 +561,39 @@ impl<'a> OwnedValidationContext<'a> {
     }
 }
 
+/// Receives the tokens a signature names, in order, and keeps the first the type system
+/// does not hold ([`OwnedValidationContext::unresolved_type`]).
+pub struct FirstUnresolved<'a> {
+    /// The type system the tokens are looked up in
+    types: &'a TypeRegistry,
+    /// The first token it does not hold, once one arrived
+    found: Option<Token>,
+}
+
+impl Extend<Token> for FirstUnresolved<'_> {
+    fn extend<I: IntoIterator<Item = Token>>(&mut self, tokens: I) {
+        for token in tokens {
+            if self.found.is_none() && self.types.get(&token).is_none() {
+                self.found = Some(token);
+            }
+        }
+    }
+}
+
 impl OwnedValidationContext<'_> {
     /// The first type a signature names that this assembly's type system does not hold: a
     /// TypeDef, TypeRef or TypeSpec token no loaded row answers. `names` adds the signature's
-    /// tokens (a `type_tokens` method of the signature types).
-    pub fn unresolved_type(&self, names: impl FnOnce(&mut Vec<Token>)) -> Option<Token> {
-        let mut tokens = Vec::new();
-        names(&mut tokens);
+    /// tokens (a `type_tokens` method of the signature types), which are checked as they
+    /// arrive: a signature is checked for every method and parameter, and collecting its
+    /// tokens first cost an allocation each.
+    pub fn unresolved_type(&self, names: impl FnOnce(&mut FirstUnresolved<'_>)) -> Option<Token> {
         let types = self.object.types();
-        tokens.into_iter().find(|token| types.get(token).is_none())
+        let mut first = FirstUnresolved {
+            types: &types,
+            found: None,
+        };
+        names(&mut first);
+        first.found
     }
 
     /// Get types that belong to the assembly being validated (cached).

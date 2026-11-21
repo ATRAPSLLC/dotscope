@@ -73,7 +73,7 @@ use crate::metadata::{
 ///   Marks a C# primary constructor.
 ///
 /// A GUID none of these name decodes to
-/// [`CustomDebugInfo::Unknown`](crate::metadata::customdebuginformation::CustomDebugInfo::Unknown),
+/// [`CustomDebugInfo::Unknown`],
 /// which keeps its blob.
 ///
 /// # Parent Element

@@ -27,10 +27,10 @@ const SIG_OWNER_TYPE: u32 = 0x40;
 const METHOD_SIG_UPDATE_CONTEXT: u32 = 0x80;
 
 /// The metadata table of a `MethodDef` token.
-pub(crate) const METHOD_DEF_TABLE: u32 = 0x06;
+pub const METHOD_DEF_TABLE: u32 = 0x06;
 
 /// The metadata table of a `MemberRef` token.
-pub(crate) const MEMBER_REF_TABLE: u32 = 0x0a;
+pub const MEMBER_REF_TABLE: u32 = 0x0a;
 
 /// The metadata table of a `Field` token.
 const FIELD_TABLE: u32 = 0x04;
@@ -47,7 +47,7 @@ pub struct ModuleToken {
 
 impl ModuleToken {
     /// The token of row `rid` of `table`, read in `module`.
-    pub(crate) fn new(table: u32, rid: u32, module: Option<u32>) -> Self {
+    pub fn new(table: u32, rid: u32, module: Option<u32>) -> Self {
         Self {
             token: (table << 24) | (rid & 0x00ff_ffff),
             module,
@@ -120,7 +120,7 @@ impl SignatureElement {
 
 impl SignatureType {
     /// Reads the type at the reader's position, its tokens read in `module`.
-    pub(crate) fn read(reader: &mut SignatureReader<'_>, module: Option<u32>) -> Result<Self> {
+    pub fn read(reader: &mut SignatureReader<'_>, module: Option<u32>) -> Result<Self> {
         let mut elements = Vec::new();
         let mut frames = vec![Frame {
             types: 1,
@@ -394,16 +394,16 @@ fn primitive_name(element: u8) -> Option<&'static str> {
 }
 
 /// A reader of a signature's compressed numbers and element types.
-pub(crate) struct SignatureReader<'a> {
+pub struct SignatureReader<'a> {
     /// The signature, and whatever follows it in the image.
-    pub(crate) bytes: &'a [u8],
+    pub bytes: &'a [u8],
     /// The position of the next byte.
-    pub(crate) at: usize,
+    pub at: usize,
 }
 
 impl SignatureReader<'_> {
     /// The next byte.
-    pub(crate) fn byte(&mut self) -> Result<u8> {
+    pub fn byte(&mut self) -> Result<u8> {
         let byte = *self
             .bytes
             .get(self.at)
@@ -414,7 +414,7 @@ impl SignatureReader<'_> {
 
     /// The next ECMA-335 compressed unsigned number: one byte below `0x80`,
     /// two under `10` high bits, four under `110`.
-    pub(crate) fn unsigned(&mut self) -> Result<u32> {
+    pub fn unsigned(&mut self) -> Result<u32> {
         let first = u32::from(self.byte()?);
         if first & 0x80 == 0 {
             return Ok(first);
@@ -432,7 +432,7 @@ impl SignatureReader<'_> {
     /// Reads a method signature (`ReadyToRunMethodSigFlags`) as far as its
     /// token: the flags, the module the tokens are read in, the owning type.
     /// `None` for a method named by a vtable slot rather than a token.
-    pub(crate) fn method(&mut self, module: Option<u32>) -> Result<Option<ModuleToken>> {
+    pub fn method(&mut self, module: Option<u32>) -> Result<Option<ModuleToken>> {
         let flags = self.unsigned()?;
         let module = if flags & METHOD_SIG_UPDATE_CONTEXT != 0 {
             Some(self.unsigned()?)
@@ -456,7 +456,7 @@ impl SignatureReader<'_> {
 
     /// Reads a field signature (`ReadyToRunFieldSigFlags`): the flags, the
     /// owning type, the token.
-    pub(crate) fn field(&mut self, module: Option<u32>) -> Result<ModuleToken> {
+    pub fn field(&mut self, module: Option<u32>) -> Result<ModuleToken> {
         let flags = self.unsigned()?;
         if flags & SIG_OWNER_TYPE != 0 {
             SignatureType::read(self, module)?;
@@ -471,7 +471,7 @@ impl SignatureReader<'_> {
     }
 
     /// The error of a signature that does not read, at the current position.
-    pub(crate) fn malformed(&self, what: &str) -> Error {
+    pub fn malformed(&self, what: &str) -> Error {
         malformed_error!("ReadyToRun fixup signature at byte {}: {what}", self.at)
     }
 }

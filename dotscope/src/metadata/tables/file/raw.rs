@@ -142,7 +142,7 @@ impl FileRaw {
             token: self.token,
             offset: self.offset,
             flags: FileAttributes::new(self.flags),
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             hash_value: AssemblyRefHash::new(blob.get(self.hash_value as usize)?)?,
             custom_attributes: Default::default(),
         }))

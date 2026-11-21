@@ -225,7 +225,7 @@ impl MemberRefRaw {
             token: self.token,
             offset: self.offset,
             declaredby,
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             signature,
             params,
             custom_attributes: Default::default(),

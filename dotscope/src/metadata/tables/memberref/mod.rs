@@ -8,7 +8,7 @@
 //! # Module Components
 //! - [`MemberRefRaw`] - Raw table structure with unresolved coded indexes and heap references
 //! - [`MemberRef`] - Owned variant with resolved references and parsed signatures
-//! - [`MemberRefLoader`] - Internal loader for processing table entries (crate-private)
+//! - [`MemberRefLoader`](crate::metadata::loader::tables::MemberRefLoader) - Internal loader for processing table entries (crate-private)
 //! - [`MemberRefSignature`] - Union type for method and field signature representations
 //! - Type aliases for collections: [`MemberRefMap`], [`MemberRefList`], [`MemberRefRc`]
 //!
@@ -52,18 +52,17 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::metadata::{
     signatures::{SignatureField, SignatureMethod},
+    streams::SharedStr,
     token::Token,
 };
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 
@@ -98,8 +97,9 @@ pub type MemberRefRc = Arc<MemberRef>;
 ///
 /// # Returns
 ///
-/// The member name as a `String` if a reference with the given token exists, `None` otherwise.
-pub fn member_ref_name_by_token(map: &MemberRefMap, token: &Token) -> Option<String> {
+/// The member name, shared with the reference, if a reference with the given token exists,
+/// `None` otherwise.
+pub fn member_ref_name_by_token(map: &MemberRefMap, token: &Token) -> Option<SharedStr> {
     map.get(token).map(|e| e.value().name.clone())
 }
 

@@ -86,7 +86,7 @@ impl StateMachineMethodRaw {
     /// or an error if either method reference cannot be resolved.
     ///
     /// # Errors
-    /// Returns [`TypeNotFound`] if either the `move_next_method` or `kickoff_method` cannot be resolved from the map.
+    /// Returns [`crate::Error::TypeNotFound`] if either the `move_next_method` or `kickoff_method` cannot be resolved from the map.
     ///
     /// # Example
     ///

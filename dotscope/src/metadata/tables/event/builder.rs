@@ -117,7 +117,7 @@ impl EventBuilder {
     /// Sets the event flags (attributes).
     ///
     /// Event flags control special behaviors and characteristics.
-    /// Common flag values from [`EventAttributes`](crate::metadata::tables::EventAttributes):
+    /// Common flag values from [`EventAttributes`]:
     /// - `0x0000`: No special flags (default for most events)
     /// - `0x0200`: SPECIAL_NAME - Event has special naming conventions
     /// - `0x0400`: RTSPECIAL_NAME - Runtime provides special behavior based on name

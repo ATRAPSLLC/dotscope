@@ -97,7 +97,7 @@
 //! # Integration with Blob Heaps
 //!
 //! All builders produce signature structures that can be encoded using the existing
-//! [`crate::metadata::typesystem::encoder::TypeSignatureEncoder`] and stored in blob heaps.
+//! [`crate::metadata::typesystem::TypeSignatureEncoder`] and stored in blob heaps.
 //! Integration with the assembly modification system is provided through the
 //! [`crate::cilassembly::CilAssembly`].
 //!

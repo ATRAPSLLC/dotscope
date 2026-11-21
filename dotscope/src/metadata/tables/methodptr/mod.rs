@@ -8,7 +8,7 @@
 //! # Module Components
 //! - [`MethodPtrRaw`] - Raw table structure with unresolved indexes
 //! - [`MethodPtr`] - Owned variant with resolved references and indirection information
-//! - [`MethodPtrLoader`] - Internal loader for processing table entries (crate-private)
+//! - [`MethodPtrLoader`](crate::metadata::loader::tables::MethodPtrLoader) - Internal loader for processing table entries (crate-private)
 //! - Type aliases for collections: [`MethodPtrMap`], [`MethodPtrList`], [`MethodPtrRc`]
 //!
 //! # Table Structure (ECMA-335 §22.28)
@@ -59,14 +59,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

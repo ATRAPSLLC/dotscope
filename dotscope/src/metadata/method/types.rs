@@ -34,7 +34,7 @@
 //!
 //! ## Variable Types
 //! - [`crate::metadata::method::LocalVariable`] - Resolved local variable with type information
-//! - [`crate::metadata::method::VarArg`] - Variable argument parameter with type information
+//! - [`SignatureMethod::varargs`](crate::metadata::signatures::SignatureMethod::varargs) - Variable argument parameters with type information
 //!
 //! # Usage Patterns
 //!
@@ -129,7 +129,7 @@
 //!
 //! All components in this module are designed for safe concurrent access:
 //! - **Flag Types**: All bitflag types are [`std::marker::Copy`] and immutable, making them inherently thread-safe
-//! - **Variable Types**: [`crate::metadata::method::LocalVariable`] and [`crate::metadata::method::VarArg`] use [`std::sync::Arc`]-based reference counting for safe sharing
+//! - **Variable Types**: [`crate::metadata::method::LocalVariable`] and [`SignatureParameter`](crate::metadata::signatures::SignatureParameter) use [`std::sync::Arc`]-based reference counting for safe sharing
 //! - **Constants**: All mask constants are immutable and safe for concurrent access
 //! - **Extraction Methods**: All flag extraction methods are pure functions without shared state
 //!
@@ -173,14 +173,17 @@ pub const METHOD_VTABLE_LAYOUT_MASK: u32 = 0x0100;
 // Method implementation flags split into logical groups
 
 metadata_flags! {
-    /// Method implementation code type flags as defined in ECMA-335 II.23.1.10.
+    /// Method implementation code type as defined in ECMA-335 II.23.1.11.
     ///
-    /// These flags specify how a method is implemented and where its code originates.
-    /// The flags are mutually exclusive - each method has exactly one implementation type.
+    /// The code type specifies how a method is implemented and where its code originates.
+    /// It is a two-bit enumeration, not a set of flags: each method has exactly one code
+    /// type, and its values share bits (`RUNTIME` is `NATIVE | OPTIL`, `IL` is zero), so it
+    /// is compared with `==`. `contains(IL)` holds for every method and `contains(NATIVE)`
+    /// for a runtime-implemented one.
     ///
     /// # ECMA-335 Reference
     ///
-    /// From Partition II, Section 23.1.10 (MethodImplAttributes):
+    /// From Partition II, Section 23.1.11 (MethodImplAttributes):
     /// > The CodeTypeMask sub-field of the Flags field in the MethodImpl table can hold any
     /// > of the values specified in the enumeration below. These values indicate the kind
     /// > of implementation the method has.
@@ -193,7 +196,7 @@ metadata_flags! {
     /// // Extract from raw implementation flags
     /// let raw_flags = 0x0001; // Native implementation
     /// let code_type = MethodImplCodeType::from_impl_flags(raw_flags);
-    /// assert!(code_type.contains(MethodImplCodeType::NATIVE));
+    /// assert!(code_type == MethodImplCodeType::NATIVE);
     /// ```
     pub struct MethodImplCodeType(u32);
 }
@@ -250,9 +253,9 @@ impl MethodImplCodeType {
     /// ```rust,no_run
     /// use dotscope::metadata::method::MethodImplCodeType;
     ///
-    /// let raw_flags = 0x1001; // RUNTIME + some other flags
+    /// let raw_flags = 0x1003; // RUNTIME, and INTERNAL_CALL outside the code type
     /// let code_type = MethodImplCodeType::from_impl_flags(raw_flags);
-    /// assert!(code_type.contains(MethodImplCodeType::RUNTIME));
+    /// assert!(code_type == MethodImplCodeType::RUNTIME);
     /// ```
     #[must_use]
     pub fn from_impl_flags(flags: u32) -> Self {
@@ -262,7 +265,7 @@ impl MethodImplCodeType {
 }
 
 metadata_flags! {
-    /// Method implementation management flags as defined in ECMA-335 II.23.1.10.
+    /// Method implementation management flags as defined in ECMA-335 II.23.1.11.
     ///
     /// These flags determine whether a method executes in the managed or unmanaged
     /// execution environment. Most .NET methods are managed, but some special methods
@@ -330,7 +333,7 @@ impl MethodImplManagement {
 }
 
 metadata_flags! {
-    /// Method implementation additional options as defined in ECMA-335 II.23.1.10.
+    /// Method implementation additional options as defined in ECMA-335 II.23.1.11.
     ///
     /// These flags provide additional control over method implementation behavior,
     /// covering aspects like inlining, synchronization, P/Invoke semantics, and
@@ -409,7 +412,8 @@ impl MethodImplOptions {
     /// Maximum valid value for method implementation attributes.
     ///
     /// This constant defines the upper bound for valid MethodImplAttributes
-    /// values and can be used for validation and range checking.
+    /// values and can be used for validation and range checking. It is a range, not a
+    /// flag: no method's options contain it.
     pub const MAX_METHOD_IMPL_VAL: Self = Self(0xFFFF);
 }
 
@@ -895,7 +899,7 @@ metadata_flags! {
     /// // Extract from raw method attributes
     /// let override_flags = 0x0000; // Method override (reuses slot)
     /// let vtable = MethodVtableFlags::from_method_flags(override_flags);
-    /// assert!(vtable.contains(MethodVtableFlags::REUSE_SLOT));
+    /// assert!(vtable == MethodVtableFlags::REUSE_SLOT);
     ///
     /// let new_method_flags = 0x0100; // New virtual method
     /// let vtable = MethodVtableFlags::from_method_flags(new_method_flags);
@@ -945,7 +949,7 @@ impl MethodVtableFlags {
     /// // Method override (reuses existing vtable slot)
     /// let override_flags = 0x0040; // VIRTUAL without NEW_SLOT
     /// let vtable = MethodVtableFlags::from_method_flags(override_flags);
-    /// assert!(vtable.contains(MethodVtableFlags::REUSE_SLOT));
+    /// assert!(vtable == MethodVtableFlags::REUSE_SLOT);
     ///
     /// // New virtual method (gets new vtable slot)
     /// let new_virtual_flags = 0x0140; // VIRTUAL + NEW_SLOT

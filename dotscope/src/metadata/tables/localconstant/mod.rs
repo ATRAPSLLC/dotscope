@@ -9,7 +9,7 @@
 //!
 //! - [`LocalConstantRaw`]: Raw table structure with unresolved heap indices
 //! - [`LocalConstant`]: Owned variant with resolved references and constant information
-//! - [`LocalConstantLoader`]: Internal loader for processing `LocalConstant` table data
+//! - [`LocalConstantLoader`](crate::metadata::loader::tables::LocalConstantLoader): Internal loader for processing `LocalConstant` table data
 //! - Type aliases for efficient collections and reference management
 //!
 //! # `LocalConstant` Table Structure
@@ -51,14 +51,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

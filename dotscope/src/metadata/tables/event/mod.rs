@@ -18,7 +18,7 @@
 //!
 //! - [`crate::metadata::tables::event::EventRaw`] - Raw table structure with unresolved heap indices
 //! - [`crate::metadata::tables::event::Event`] - Owned variant with resolved references and parsed event metadata
-//! - [`crate::metadata::tables::event::EventLoader`] - Internal loader for processing Event table data
+//! - [`crate::metadata::loader::tables::EventLoader`] - Internal loader for processing Event table data
 //! - [`crate::metadata::tables::event::EventMap`] - Thread-safe concurrent map for caching event entries
 //! - [`crate::metadata::tables::event::EventList`] - Thread-safe append-only vector for event collections
 //! - [`crate::metadata::tables::event::EventRc`] - Reference-counted pointer for shared ownership
@@ -80,17 +80,15 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::metadata::token::Token;
+use crate::{metadata::token::Token, utils::LazyList};
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 
@@ -103,8 +101,9 @@ pub type EventMap = SkipMap<Token, EventRc>;
 /// A vector that holds a list of [`Event`] references
 ///
 /// Thread-safe append-only vector for storing event collections. Uses atomic operations
-/// for lock-free concurrent access and is optimized for scenarios with frequent reads.
-pub type EventList = Arc<boxcar::Vec<EventRc>>;
+/// for lock-free concurrent access and is optimized for scenarios with frequent reads. A
+/// list allocates its storage on its first push: most types hold none.
+pub type EventList = LazyList<EventRc>;
 
 /// A reference-counted pointer to an [`Event`]
 ///

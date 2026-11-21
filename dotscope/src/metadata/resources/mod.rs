@@ -364,7 +364,7 @@ impl Resources {
     /// // Advanced map operations
     /// let all_resources = resources.all();
     /// let resource_names: Vec<String> = all_resources.iter()
-    ///     .map(|entry| entry.value().name.clone())
+    ///     .map(|entry| entry.value().name.to_string())
     ///     .collect();
     ///
     /// println!("All resource names: {:?}", resource_names);
@@ -682,7 +682,7 @@ mod tests {
                 data_offset: 0,
                 data_size: 0,
                 flags: ManifestResourceAttributes::PUBLIC,
-                name: format!("resource{rid}"),
+                name: format!("resource{rid}").into(),
                 source: None,
             }));
         }

@@ -37,7 +37,7 @@ type TypeFilter<'a> = Box<dyn Fn(&CilType) -> bool + 'a>;
 /// A boxed filter predicate over [`Method`] references.
 type MethodFilter<'a> = Box<dyn Fn(&Method) -> bool + 'a>;
 
-/// A boxed filter predicate over [`Field`](crate::metadata::tables::Field) references.
+/// A boxed filter predicate over [`Field`] references.
 type FieldFilter<'a> = Box<dyn Fn(&Field) -> bool + 'a>;
 
 /// A composable query builder for filtering types in an assembly.
@@ -162,7 +162,7 @@ impl<'a> TypeQuery<'a> {
     /// Filters to types whose fullname matches exactly.
     #[must_use]
     pub fn fullname(mut self, fqn: &'a str) -> Self {
-        self.filters.push(Box::new(move |t| &*t.fullname() == fqn));
+        self.filters.push(Box::new(move |t| t.fullname() == fqn));
         self
     }
 

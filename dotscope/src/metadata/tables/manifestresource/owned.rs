@@ -8,7 +8,8 @@
 //! [`ManifestResourceRaw`]: crate::metadata::tables::ManifestResourceRaw
 
 use crate::metadata::{
-    tables::ManifestResourceAttributes, token::Token, typesystem::CilTypeReference,
+    streams::SharedStr, tables::ManifestResourceAttributes, token::Token,
+    typesystem::CilTypeReference,
 };
 
 /// Owned `ManifestResource` table entry with resolved references and resource access.
@@ -67,7 +68,7 @@ pub struct ManifestResource {
     ///
     /// Owned string containing the unique name used to identify and access this resource
     /// at runtime. Resource names are typically hierarchical (e.g., "Resources.Images.Icon.png").
-    pub name: String,
+    pub name: SharedStr,
 
     /// Resolved reference to the resource implementation source.
     ///

@@ -134,7 +134,7 @@ use crate::{
 /// This structure is internal to the loader system. External code should use
 /// [`crate::CilObject`] which provides a safe, ergonomic interface to the
 /// underlying metadata.
-pub(crate) struct CilObjectData {
+pub struct CilObjectData {
     /// Assembly references to external .NET assemblies.
     pub refs_assembly: AssemblyRefMap,
     /// Module references to external modules and native libraries.
@@ -222,7 +222,7 @@ impl CilObjectData {
     ///
     /// This method is thread-safe but should only be called once per CilAssemblyView.
     /// The resulting [`CilObjectData`] can be safely accessed from multiple threads.
-    pub(crate) fn from_assembly_view(
+    pub fn from_assembly_view(
         view: &CilAssemblyView,
         project_context: Option<&ProjectContext>,
         lenient: bool,

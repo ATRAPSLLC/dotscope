@@ -8,8 +8,8 @@ use std::sync::OnceLock;
 use crate::{
     metadata::{
         customattributes::CustomAttributeValueList, method::MethodRef,
-        signatures::SignatureProperty, tables::PropertyAttributes, token::Token,
-        typesystem::CilPrimitive,
+        signatures::SignatureProperty, streams::SharedStr, tables::PropertyAttributes,
+        token::Token, typesystem::CilPrimitive,
     },
     utils::RowList,
 };
@@ -68,7 +68,7 @@ pub struct Property {
     ///
     /// This field contains the property name as resolved from the string heap,
     /// providing the identifier used for property access and reflection operations.
-    pub name: String,
+    pub name: SharedStr,
 
     /// The complete type signature of this property.
     ///

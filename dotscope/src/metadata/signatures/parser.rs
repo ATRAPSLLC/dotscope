@@ -203,7 +203,7 @@ const MAX_NATIVE_RECURSION_DEPTH: usize = 64;
 /// The runtime's largest rank (CoreCLR's `MAX_RANK`): no array has more, and a signature's
 /// rank sizes what is read and spelled after it, so a larger one is refused as malformed
 /// rather than allocated against.
-pub(crate) const MAX_ARRAY_DIMENSIONS: u32 = 32;
+pub const MAX_ARRAY_DIMENSIONS: u32 = 32;
 
 /// Maximum number of local variables in a method: locals are numbered by an unsigned 16-bit
 /// index (ECMA-335 III.3.43). The declared count is refused past it before anything is
@@ -423,7 +423,48 @@ impl<'a> SignatureParser<'a> {
         result
     }
 
-    /// Inner implementation of [`parse_type`]; native depth is handled by the caller.
+    /// The type a leaf element type starts, its operand (a token or an index) read from the
+    /// signature: a primitive, a class or value type, a generic parameter, or one of the
+    /// markers. `None`, with nothing read, for an element type that builds on a type after
+    /// it (a pointer, array, instance, modifier or function pointer) or that is not one.
+    fn leaf_type(&mut self, element_type: u8) -> Result<Option<TypeSignature>> {
+        Ok(Some(match element_type {
+            ELEMENT_TYPE::VOID => TypeSignature::Void,
+            ELEMENT_TYPE::BOOLEAN => TypeSignature::Boolean,
+            ELEMENT_TYPE::CHAR => TypeSignature::Char,
+            ELEMENT_TYPE::I1 => TypeSignature::I1,
+            ELEMENT_TYPE::U1 => TypeSignature::U1,
+            ELEMENT_TYPE::I2 => TypeSignature::I2,
+            ELEMENT_TYPE::U2 => TypeSignature::U2,
+            ELEMENT_TYPE::I4 => TypeSignature::I4,
+            ELEMENT_TYPE::U4 => TypeSignature::U4,
+            ELEMENT_TYPE::I8 => TypeSignature::I8,
+            ELEMENT_TYPE::U8 => TypeSignature::U8,
+            ELEMENT_TYPE::R4 => TypeSignature::R4,
+            ELEMENT_TYPE::R8 => TypeSignature::R8,
+            ELEMENT_TYPE::STRING => TypeSignature::String,
+            ELEMENT_TYPE::VALUETYPE => {
+                TypeSignature::ValueType(self.parser.read_compressed_token()?)
+            }
+            ELEMENT_TYPE::CLASS => TypeSignature::Class(self.parser.read_compressed_token()?),
+            ELEMENT_TYPE::VAR => {
+                TypeSignature::GenericParamType(self.parser.read_compressed_uint()?)
+            }
+            ELEMENT_TYPE::TYPEDBYREF => TypeSignature::TypedByRef,
+            ELEMENT_TYPE::I => TypeSignature::I,
+            ELEMENT_TYPE::U => TypeSignature::U,
+            ELEMENT_TYPE::OBJECT => TypeSignature::Object,
+            ELEMENT_TYPE::MVAR => {
+                TypeSignature::GenericParamMethod(self.parser.read_compressed_uint()?)
+            }
+            ELEMENT_TYPE::INTERNAL => TypeSignature::Internal,
+            ELEMENT_TYPE::MODIFIER => TypeSignature::Modifier,
+            ELEMENT_TYPE::SENTINEL => TypeSignature::Sentinel,
+            _ => return Ok(None),
+        }))
+    }
+
+    /// Inner implementation of [`parse_type`](Self::parse_type); native depth is handled by the caller.
     fn parse_type_inner(&mut self) -> Result<TypeSignature> {
         /// Work items for the iterative parsing stack
         enum WorkItem {
@@ -442,7 +483,25 @@ impl<'a> SignatureParser<'a> {
             BuildSzArray(Vec<CustomModifier>),
             /// Build PINNED from the type on the stack
             BuildPinned,
+            /// Build a modified type from a run of same-kind custom modifiers and the type
+            /// on the stack, which is the type the run is a prefix to
+            BuildModified {
+                required: bool,
+                modifiers: Vec<CustomModifier>,
+            },
         }
+
+        // Most types a signature names are leaves (a primitive, or a class or value type's
+        // token); they are read here, without the stacks the compound types need
+        if self.base_depth >= MAX_NESTING_DEPTH {
+            return Err(DepthLimitExceeded(MAX_NESTING_DEPTH));
+        }
+        let start = self.parser.pos();
+        let first = self.parser.read_le::<u8>()?;
+        if let Some(leaf) = self.leaf_type(first)? {
+            return Ok(leaf);
+        }
+        self.parser.seek(start)?;
 
         let mut work_stack: Vec<WorkItem> = vec![WorkItem::ParseType];
         let mut result_stack: Vec<TypeSignature> = Vec::new();
@@ -459,41 +518,16 @@ impl<'a> SignatureParser<'a> {
                         return Err(DepthLimitExceeded(MAX_NESTING_DEPTH));
                     }
                     let current_byte = self.parser.read_le::<u8>()?;
+                    if let Some(leaf) = self.leaf_type(current_byte)? {
+                        result_stack.push(leaf);
+                        continue;
+                    }
                     let mut wrap = |item: WorkItem, work_stack: &mut Vec<WorkItem>| {
                         work_stack.push(item);
                         open = open.saturating_add(1);
                         work_stack.push(WorkItem::ParseType);
                     };
                     match current_byte {
-                        ELEMENT_TYPE::VOID => result_stack.push(TypeSignature::Void),
-                        ELEMENT_TYPE::BOOLEAN => result_stack.push(TypeSignature::Boolean),
-                        ELEMENT_TYPE::CHAR => result_stack.push(TypeSignature::Char),
-                        ELEMENT_TYPE::I1 => result_stack.push(TypeSignature::I1),
-                        ELEMENT_TYPE::U1 => result_stack.push(TypeSignature::U1),
-                        ELEMENT_TYPE::I2 => result_stack.push(TypeSignature::I2),
-                        ELEMENT_TYPE::U2 => result_stack.push(TypeSignature::U2),
-                        ELEMENT_TYPE::I4 => result_stack.push(TypeSignature::I4),
-                        ELEMENT_TYPE::U4 => result_stack.push(TypeSignature::U4),
-                        ELEMENT_TYPE::I8 => result_stack.push(TypeSignature::I8),
-                        ELEMENT_TYPE::U8 => result_stack.push(TypeSignature::U8),
-                        ELEMENT_TYPE::R4 => result_stack.push(TypeSignature::R4),
-                        ELEMENT_TYPE::R8 => result_stack.push(TypeSignature::R8),
-                        ELEMENT_TYPE::STRING => result_stack.push(TypeSignature::String),
-                        ELEMENT_TYPE::VALUETYPE => {
-                            let token = self.parser.read_compressed_token()?;
-                            result_stack.push(TypeSignature::ValueType(token));
-                        }
-                        ELEMENT_TYPE::CLASS => {
-                            let token = self.parser.read_compressed_token()?;
-                            result_stack.push(TypeSignature::Class(token));
-                        }
-                        ELEMENT_TYPE::VAR => {
-                            let index = self.parser.read_compressed_uint()?;
-                            result_stack.push(TypeSignature::GenericParamType(index));
-                        }
-                        ELEMENT_TYPE::TYPEDBYREF => result_stack.push(TypeSignature::TypedByRef),
-                        ELEMENT_TYPE::I => result_stack.push(TypeSignature::I),
-                        ELEMENT_TYPE::U => result_stack.push(TypeSignature::U),
                         ELEMENT_TYPE::FNPTR => {
                             // The signature's types sit below this one in the tree
                             let enclosing = self.base_depth;
@@ -502,14 +536,6 @@ impl<'a> SignatureParser<'a> {
                             self.base_depth = enclosing;
                             result_stack.push(TypeSignature::FnPtr(Box::new(method_sig?)));
                         }
-                        ELEMENT_TYPE::OBJECT => result_stack.push(TypeSignature::Object),
-                        ELEMENT_TYPE::MVAR => {
-                            let index = self.parser.read_compressed_uint()?;
-                            result_stack.push(TypeSignature::GenericParamMethod(index));
-                        }
-                        ELEMENT_TYPE::INTERNAL => result_stack.push(TypeSignature::Internal),
-                        ELEMENT_TYPE::MODIFIER => result_stack.push(TypeSignature::Modifier),
-                        ELEMENT_TYPE::SENTINEL => result_stack.push(TypeSignature::Sentinel),
                         ELEMENT_TYPE::PTR => {
                             let modifiers = self.parse_custom_mods()?;
                             wrap(WorkItem::BuildPtr(modifiers), &mut work_stack);
@@ -542,27 +568,32 @@ impl<'a> SignatureParser<'a> {
                             let modifiers = self.parse_custom_mods()?;
                             wrap(WorkItem::BuildSzArray(modifiers), &mut work_stack);
                         }
-                        ELEMENT_TYPE::CMOD_REQD => {
-                            // We consumed the CMOD_REQD byte, go back so parse_custom_mods can handle it
-                            let prev_pos = self
-                                .parser
-                                .pos()
-                                .checked_sub(1)
-                                .ok_or_else(|| malformed_error!("Parser position underflow"))?;
-                            self.parser.seek(prev_pos)?;
-                            let modifiers = self.parse_custom_mods()?;
-                            result_stack.push(TypeSignature::ModifiedRequired(modifiers));
-                        }
-                        ELEMENT_TYPE::CMOD_OPT => {
-                            // We consumed the CMOD_OPT byte, go back so parse_custom_mods can handle it
-                            let prev_pos = self
-                                .parser
-                                .pos()
-                                .checked_sub(1)
-                                .ok_or_else(|| malformed_error!("Parser position underflow"))?;
-                            self.parser.seek(prev_pos)?;
-                            let modifiers = self.parse_custom_mods()?;
-                            result_stack.push(TypeSignature::ModifiedOptional(modifiers));
+                        ELEMENT_TYPE::CMOD_REQD | ELEMENT_TYPE::CMOD_OPT => {
+                            // A run of custom modifiers is a prefix to the type after it
+                            // (ECMA-335 II.23.2.7). One run of a kind is read here; a run of
+                            // the other kind that follows is parsed as the modified type,
+                            // and nests inside this one.
+                            let required = current_byte == ELEMENT_TYPE::CMOD_REQD;
+                            let mut modifiers = vec![CustomModifier {
+                                is_required: required,
+                                modifier_type: self.parser.read_compressed_token()?,
+                            }];
+                            while self.parser.has_more_data()
+                                && self.parser.peek_byte()? == current_byte
+                            {
+                                self.parser.advance()?;
+                                modifiers.push(CustomModifier {
+                                    is_required: required,
+                                    modifier_type: self.parser.read_compressed_token()?,
+                                });
+                            }
+                            wrap(
+                                WorkItem::BuildModified {
+                                    required,
+                                    modifiers,
+                                },
+                                &mut work_stack,
+                            );
                         }
                         ELEMENT_TYPE::PINNED => wrap(WorkItem::BuildPinned, &mut work_stack),
                         _ => {
@@ -628,6 +659,19 @@ impl<'a> SignatureParser<'a> {
                         .pop()
                         .ok_or_else(|| malformed_error!("Missing base type for PINNED"))?;
                     result_stack.push(TypeSignature::Pinned(Box::new(base_type)));
+                }
+                WorkItem::BuildModified {
+                    required,
+                    modifiers,
+                } => {
+                    let base_type = result_stack
+                        .pop()
+                        .ok_or_else(|| malformed_error!("Missing modified type for CMOD"))?;
+                    result_stack.push(if required {
+                        TypeSignature::ModifiedRequired(modifiers, Box::new(base_type))
+                    } else {
+                        TypeSignature::ModifiedOptional(modifiers, Box::new(base_type))
+                    });
                 }
             }
         }
@@ -1747,37 +1791,10 @@ impl<'a> SignatureParser<'a> {
         // First, parse any custom modifiers at the beginning
         let modifiers = self.parse_custom_mods()?;
 
-        // Then parse the base type signature
-        let base_type_sig = self.parse_type()?;
-
-        // If we got a ModifiedRequired/Optional from parse_type, we need to handle it specially.
-        //
-        // Matched by reference and drained rather than moved out: `TypeSignature` implements
-        // `Drop` (for iterative teardown), which makes moving a field out of it illegal.
-        let mut base_type_sig = base_type_sig;
-        match &mut base_type_sig {
-            TypeSignature::ModifiedRequired(mod_modifiers)
-            | TypeSignature::ModifiedOptional(mod_modifiers) => {
-                // Combine the modifiers from parse_custom_mods() and from the ModifiedRequired
-                let mut all_modifiers = modifiers;
-                all_modifiers.append(mod_modifiers);
-
-                // Parse the base type that follows the modifiers
-                let base_type = self.parse_type()?;
-
-                Ok(SignatureTypeSpec {
-                    modifiers: all_modifiers,
-                    base: base_type,
-                })
-            }
-            _ => {
-                // No additional modifiers, just use what we found
-                Ok(SignatureTypeSpec {
-                    modifiers,
-                    base: base_type_sig,
-                })
-            }
-        }
+        // Then the type they modify: the leading run is consumed above, so the type does not
+        // start with a modifier
+        let base = self.parse_type()?;
+        Ok(SignatureTypeSpec { modifiers, base })
     }
 
     /// Parse a method specification signature from the signature blob according to ECMA-335 II.23.2.15.
@@ -1953,7 +1970,9 @@ impl<'a> SignatureParser<'a> {
 mod tests {
     use super::*;
     use crate::{
-        metadata::signatures::encode_field_signature, prelude::Token, Error, ParseFailure,
+        metadata::{signatures::encode_field_signature, typesystem::TypeSignatureEncoder},
+        prelude::Token,
+        Error, ParseFailure,
     };
 
     #[test]
@@ -2360,6 +2379,47 @@ mod tests {
             assert_eq!(args[0], TypeSignature::String);
             assert_eq!(args[1], TypeSignature::I4);
         }
+    }
+
+    /// A custom modifier in a type is a prefix to the type after it (ECMA-335 II.23.2.7): a
+    /// generic argument `modreq(A) modopt(B) int32` is the modified `int32`, nested one
+    /// variant per same-kind run, and the arguments after it still parse; the encoding of the
+    /// parsed value is the input.
+    #[test]
+    fn a_modifier_in_a_type_prefixes_the_type_after_it() {
+        let bytes = [
+            0x15, 0x12, 0x08, 0x02, // GENERICINST CLASS TypeDef 2, two arguments
+            0x1F, 0x0C, 0x1F, 0x05, // modreq(TypeDef 3) modreq(TypeRef 1)
+            0x20, 0x10, // modopt(TypeDef 4)
+            0x08, // int32
+            0x0E, // string
+        ];
+        let parsed = SignatureParser::new(&bytes).parse_type().unwrap();
+        let modifier = |is_required, token| CustomModifier {
+            is_required,
+            modifier_type: Token::new(token),
+        };
+        assert_eq!(
+            parsed,
+            TypeSignature::GenericInst(
+                Box::new(TypeSignature::Class(Token::new(0x0200_0002))),
+                vec![
+                    TypeSignature::ModifiedRequired(
+                        vec![modifier(true, 0x0200_0003), modifier(true, 0x0100_0001)],
+                        Box::new(TypeSignature::ModifiedOptional(
+                            vec![modifier(false, 0x0200_0004)],
+                            Box::new(TypeSignature::I4),
+                        )),
+                    ),
+                    TypeSignature::String,
+                ],
+            )
+        );
+        let encoded = TypeSignatureEncoder::encode(&parsed).unwrap();
+        assert_eq!(encoded, bytes);
+
+        // A run with no type after it is truncated, not a type
+        assert!(SignatureParser::new(&[0x1F, 0x0C]).parse_type().is_err());
     }
 
     #[test]

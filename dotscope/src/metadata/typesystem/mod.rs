@@ -40,6 +40,7 @@
 mod base;
 mod builder;
 mod encoder;
+mod fullname;
 mod hash;
 mod primitives;
 mod registry;
@@ -58,6 +59,7 @@ pub use base::{
 };
 pub use builder::TypeBuilder;
 pub use encoder::TypeSignatureEncoder;
+pub use fullname::FullName;
 pub use hash::TypeSignatureHash;
 pub use primitives::{CilPrimitive, CilPrimitiveData, CilPrimitiveKind};
 pub use registry::{CompleteTypeSpec, TypeRegistry, TypeSource};
@@ -70,6 +72,7 @@ use crate::{
         query::{FieldQuery, MethodQuery},
         security::Security,
         signatures::TypeSignature,
+        streams::SharedStr,
         tables::{
             EventList, FieldAttributes, FieldList, FieldRc, GenericParamList, InterfaceEntryList,
             MethodSpec, MethodSpecList, PropertyList, TableId, TypeAttributes,
@@ -161,9 +164,9 @@ pub struct CilType {
     /// Computed type flavor - lazily determined from context and inheritance chain
     flavor: OnceLock<CilFlavor>,
     /// Type namespace (empty for global types and some special cases like `<Module>`)
-    pub namespace: String,
+    pub namespace: SharedStr,
     /// Type name (class name, interface name, etc.)
-    pub name: String,
+    pub name: SharedStr,
     /// The scope the type belongs to: for a type reference where it resolves (`AssemblyRef`,
     /// `File`, `ModuleRef`, an enclosing `TypeRef`); for a type definition its own assembly.
     /// Set for both, so it does not tell an imported type from a defined one: the token's
@@ -199,16 +202,17 @@ pub struct CilType {
     pub class_size: OnceLock<u32>,
     /// `TypeSpec` specifiers providing additional type information for complex types
     pub spec: OnceLock<CilFlavor>,
-    /// Type modifiers from `TypeSpec` (required/optional modifiers, pinned types, etc.)
-    pub modifiers: Arc<boxcar::Vec<CilModifier>>,
+    /// Type modifiers from `TypeSpec` (required/optional modifiers, pinned types, etc.),
+    /// allocated on the first push
+    pub modifiers: LazyList<CilModifier>,
     /// The type's declarative security, a `DeclSecurity` row each, in table order: a type may
     /// demand permissions under several actions (a link demand and an inheritance demand,
     /// say).
     pub security: RowList<Security>,
     /// Enclosing type for nested types - used for reverse lookup to build hierarchical names
     pub enclosing_type: OnceLock<CilTypeRef>,
-    /// Cached full name to avoid expensive recomputation.
-    fullname: RwLock<Option<Arc<str>>>,
+    /// Cached full name, cleared when this type or an enclosing type is nested.
+    fullname: RwLock<Option<FullName>>,
     // vtable
     // security
     // default_constructor: Option<MethodRef>
@@ -246,11 +250,10 @@ impl CilType {
     /// ```rust,no_run
     /// use dotscope::metadata::{
     ///     method::MethodRefList,
-    ///     tables::TypeAttributes,
+    ///     tables::{FieldList, TypeAttributes},
     ///     typesystem::{CilType, CilFlavor},
     ///     token::Token,
     /// };
-    /// use std::sync::Arc;
     ///
     /// let cil_type = CilType::new(
     ///     Token::new(0x02000001), // TypeDef token
@@ -259,7 +262,7 @@ impl CilType {
     ///     None, // Not an external type
     ///     None, // No base type specified yet
     ///     TypeAttributes::new(0x00100001), // TypeAttributes flags
-    ///     Arc::new(boxcar::Vec::new()), // Empty fields list
+    ///     FieldList::new(), // Empty fields list, allocated on first push
     ///     MethodRefList::new(), // Empty methods list, allocated on first push
     ///     Some(CilFlavor::Class), // Explicit class flavor
     /// );
@@ -267,8 +270,8 @@ impl CilType {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: Token,
-        namespace: String,
-        name: String,
+        namespace: impl Into<SharedStr>,
+        name: impl Into<SharedStr>,
         external: Option<CilTypeReference>,
         base: Option<CilTypeRef>,
         flags: TypeAttributes,
@@ -293,16 +296,16 @@ impl CilType {
 
         CilType {
             token,
-            namespace,
-            name,
+            namespace: namespace.into(),
+            name: name.into(),
             external: external_lock,
             base: base_lock,
             flags,
             flavor: flavor_lock,
             fields,
             methods,
-            properties: Arc::new(boxcar::Vec::new()),
-            events: Arc::new(boxcar::Vec::new()),
+            properties: LazyList::new(),
+            events: LazyList::new(),
             interfaces: Default::default(),
             overwrites: Default::default(),
             nested_types: Default::default(),
@@ -312,7 +315,7 @@ impl CilType {
             packing_size: OnceLock::new(),
             class_size: OnceLock::new(),
             spec: OnceLock::new(),
-            modifiers: Arc::new(boxcar::Vec::new()),
+            modifiers: LazyList::new(),
             security: RowList::new(),
             enclosing_type: OnceLock::new(),
             fullname: RwLock::new(None),
@@ -471,7 +474,7 @@ impl CilType {
     /// // Safe against attacker-supplied inheritance cycles.
     /// let derives_from_exception = cil_type
     ///     .base_chain()
-    ///     .any(|ancestor| &*ancestor.fullname() == "System.Exception");
+    ///     .any(|ancestor| ancestor.fullname() == "System.Exception");
     /// # }
     /// ```
     #[must_use]
@@ -510,11 +513,10 @@ impl CilType {
     pub fn set_enclosing_type(&self, enclosing_type: &CilTypeRef) -> Result<()> {
         match self.enclosing_type.set(enclosing_type.clone()) {
             Ok(()) => {
-                // Invalidate the cached fullname so it will be recomputed
-                // with the enclosing type prefix on next access.
-                if let Ok(mut guard) = self.fullname.write() {
-                    *guard = None;
-                }
+                // Invalidate the cached full names so they are recomputed with the enclosing
+                // type's prefix on next access: this type's, and those of the types nested in
+                // it, which may have been computed before it was nested itself.
+                self.clear_fullnames();
                 Ok(())
             }
             Err(_) => {
@@ -683,7 +685,7 @@ impl CilType {
     /// flavor have run, and a flavor computed then is a class forever. A
     /// primitive keeps its own flavor. Has no effect once the flavor has been
     /// computed.
-    pub(crate) fn mark_value_type(&self) {
+    pub fn mark_value_type(&self) {
         let computed = self.compute_flavor();
         let flavor = if computed.is_value_type() {
             computed
@@ -784,14 +786,14 @@ impl CilType {
             let base_fullname = base_type.fullname();
 
             // Direct well-known base types
-            if &*base_fullname == wellknown::names::VALUE_TYPE
-                || &*base_fullname == wellknown::names::ENUM
+            if base_fullname == wellknown::names::VALUE_TYPE
+                || base_fullname == wellknown::names::ENUM
             {
                 return Some(CilFlavor::ValueType);
             }
 
-            if &*base_fullname == wellknown::names::DELEGATE
-                || &*base_fullname == wellknown::names::MULTICAST_DELEGATE
+            if base_fullname == wellknown::names::DELEGATE
+                || base_fullname == wellknown::names::MULTICAST_DELEGATE
             {
                 return Some(CilFlavor::Class); // Delegates are reference types but special classes
             }
@@ -1072,7 +1074,7 @@ impl CilType {
     #[must_use]
     pub fn is_enum(&self) -> bool {
         self.base()
-            .is_some_and(|b| &*b.fullname() == wellknown::names::ENUM)
+            .is_some_and(|b| b.fullname() == wellknown::names::ENUM)
     }
 
     /// Returns an enum's underlying type: the type of its one instance field
@@ -1234,107 +1236,116 @@ impl CilType {
             .collect()
     }
 
-    /// Returns the full name (Namespace.Name) of the type.
+    /// Get the full name (namespace + name) of this type.
     ///
     /// Combines the namespace and name to create a fully qualified type name,
     /// which is useful for type lookup and identification. For nested types,
     /// uses "/" separators as per .NET runtime convention.
     ///
     /// # Returns
-    /// A string containing the full name in the format:
+    /// The [`FullName`], which displays and compares as:
     /// - `"Namespace.Name"` for top-level types
     /// - `"Namespace.Outer/Inner"` for nested types
     ///
+    /// A type with an empty name is named `<unnamed_TTTTTTTT>` after its token. A chain of
+    /// enclosing types that comes back to a type already in it ends at the last type before
+    /// the repeat, which counts as the outermost.
+    ///
     /// # Caching
-    /// The result is cached after first computation for performance.
-    pub fn fullname(&self) -> Arc<str> {
-        if let Ok(guard) = self.fullname.read() {
-            if let Some(cached) = guard.as_ref() {
-                return Arc::clone(cached);
-            }
+    /// The result is cached after first computation, and the names of the enclosing types
+    /// along with it when the chain has no cycle. A `FullName` joins its text only when it is
+    /// shown or read as a `str`.
+    pub fn fullname(&self) -> FullName {
+        if let Some(cached) = self.cached_fullname() {
+            return cached;
         }
 
-        let fullname: Arc<str> = Arc::from(self.compute_fullname());
+        // The enclosing types, innermost first, up to the outermost one, one whose name is
+        // cached, or a type the chain has already passed (a cycle)
+        let mut enclosing_types: Vec<CilTypeRc> = Vec::new();
+        let mut visited = HashSet::from([self.token]);
+        let mut cached_scope = None;
+        let mut cyclic = false;
+        let mut current = self.enclosing_type();
+        while let Some(enclosing) = current {
+            if !visited.insert(enclosing.token) {
+                cyclic = true;
+                break;
+            }
+            if let Some(cached) = enclosing.cached_fullname() {
+                cached_scope = Some(cached);
+                break;
+            }
+            current = enclosing.enclosing_type();
+            enclosing_types.push(enclosing);
+        }
+
+        let mut scope = cached_scope;
+        for enclosing in enclosing_types.iter().rev() {
+            let name = Self::scoped_name(scope, enclosing);
+            if !cyclic {
+                enclosing.store_fullname(&name);
+            }
+            scope = Some(name);
+        }
+        let name = Self::scoped_name(scope, self);
+        self.store_fullname(&name);
+        name
+    }
+
+    /// The full name of `ty` within `scope`: nested in it, or top-level without one.
+    fn scoped_name(scope: Option<FullName>, ty: &CilType) -> FullName {
+        let name = if ty.name.is_empty() {
+            SharedStr::from(format!("<unnamed_{:08X}>", ty.token.value()))
+        } else {
+            ty.name.clone()
+        };
+        match scope {
+            Some(enclosing) => FullName::nested(enclosing, name),
+            None => FullName::top_level(ty.namespace.clone(), name),
+        }
+    }
+
+    /// The cached full name, if computed since this type or an enclosing type was nested.
+    fn cached_fullname(&self) -> Option<FullName> {
+        self.fullname
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    /// Caches `name` as this type's full name.
+    fn store_fullname(&self, name: &FullName) {
         if let Ok(mut guard) = self.fullname.write() {
-            *guard = Some(Arc::clone(&fullname));
+            *guard = Some(name.clone());
         }
-        fullname
     }
 
-    /// Computes the full name by traversing the enclosing type hierarchy.
-    ///
-    /// This is the core implementation separated from caching logic for clarity.
-    fn compute_fullname(&self) -> String {
-        let (path_components, outermost_namespace) = self.collect_type_path();
-
-        if path_components.len() > 1 {
-            // This is a nested type - use "/" separators like .NET runtime.
-            // The namespace comes from the outermost enclosing type, not self,
-            // because nested types in ECMA-335 typically have an empty namespace field.
-            let nested_path = path_components.join("/");
-            if outermost_namespace.is_empty() {
-                nested_path
-            } else {
-                format!("{outermost_namespace}.{nested_path}")
+    /// Clears the cached full names of this type and of every type nested in it, at any
+    /// depth (each once, so a cyclic nesting ends).
+    fn clear_fullnames(&self) {
+        let mut visited = HashSet::from([self.token]);
+        if let Ok(mut guard) = self.fullname.write() {
+            *guard = None;
+        }
+        let mut pending: Vec<CilTypeRc> = self
+            .nested_types
+            .into_iter()
+            .filter_map(|(_, nested)| nested.upgrade())
+            .collect();
+        while let Some(nested) = pending.pop() {
+            if !visited.insert(nested.token) {
+                continue;
             }
-        } else {
-            // This is a top-level type - use traditional "." separator
-            self.format_toplevel_fullname()
-        }
-    }
-
-    /// Collects the type path from innermost (self) to outermost enclosing type.
-    ///
-    /// Returns the path components in outermost-to-innermost order and the
-    /// outermost enclosing type's namespace (which is the namespace that applies
-    /// to the entire nested type chain in ECMA-335 metadata).
-    fn collect_type_path(&self) -> (Vec<String>, String) {
-        let mut path_components = Vec::new();
-
-        path_components.push(self.safe_type_name());
-
-        let mut outermost_namespace = self.namespace.clone();
-        let mut visited_tokens = HashSet::new();
-        visited_tokens.insert(self.token);
-
-        let mut current_type = self.enclosing_type();
-        while let Some(enclosing) = current_type {
-            if visited_tokens.contains(&enclosing.token) {
-                break; // Cycle detected
+            if let Ok(mut guard) = nested.fullname.write() {
+                *guard = None;
             }
-            visited_tokens.insert(enclosing.token);
-
-            outermost_namespace = enclosing.namespace.clone();
-            path_components.push(Self::safe_name_for(&enclosing.name, enclosing.token));
-            current_type = enclosing.enclosing_type();
-        }
-
-        // Reverse to get outermost-to-innermost order
-        path_components.reverse();
-        (path_components, outermost_namespace)
-    }
-
-    /// Returns a safe type name, using a placeholder for empty names.
-    fn safe_type_name(&self) -> String {
-        Self::safe_name_for(&self.name, self.token)
-    }
-
-    /// Returns a safe name string, using a token-based placeholder if empty.
-    fn safe_name_for(name: &str, token: Token) -> String {
-        if name.is_empty() {
-            format!("<unnamed_{:08X}>", token.value())
-        } else {
-            name.to_string()
-        }
-    }
-
-    /// Formats the full name for a top-level type using "." separator.
-    fn format_toplevel_fullname(&self) -> String {
-        let type_name = self.safe_type_name();
-        if self.namespace.is_empty() {
-            type_name
-        } else {
-            format!("{}.{}", self.namespace, type_name)
+            pending.extend(
+                nested
+                    .nested_types
+                    .into_iter()
+                    .filter_map(|(_, inner)| inner.upgrade()),
+            );
         }
     }
 
@@ -1851,5 +1862,41 @@ mod tests {
         b.set_base(&CilTypeRef::new(&a)).expect("set_base b -> a");
 
         assert!(!a.implements_interface(&iface));
+    }
+
+    /// Nests `inner` in `outer` as the NestedClass loader does.
+    fn nest(outer: &CilTypeRc, inner: &CilTypeRc) {
+        outer
+            .nested_types
+            .push_row(inner.token, inner.clone().into());
+        inner.set_enclosing_type(&outer.clone().into()).unwrap();
+    }
+
+    /// A nested type's full name follows its enclosing types nested after it was computed:
+    /// nesting a type clears the cached names of the types nested in it too.
+    #[test]
+    fn a_full_name_follows_an_enclosing_type_nested_later() {
+        let (outer, middle, inner) = (typ(1, "A"), typ(2, "B"), typ(3, "C"));
+        nest(&middle, &inner);
+        assert_eq!(inner.fullname(), "Test.B/C");
+        assert_eq!(middle.fullname(), "Test.B");
+
+        nest(&outer, &middle);
+        assert_eq!(middle.fullname(), "Test.A/B");
+        assert_eq!(inner.fullname(), "Test.A/B/C");
+        assert_eq!(inner.fullname().to_string(), "Test.A/B/C");
+    }
+
+    /// A deep chain of nested types names each type once: computing the innermost name
+    /// caches every enclosing type's along the way.
+    #[test]
+    fn a_deep_nesting_chain_names_each_type_once() {
+        let types: Vec<CilTypeRc> = (1..=2000).map(|rid| typ(rid, "N")).collect();
+        for pair in types.windows(2) {
+            nest(&pair[0], &pair[1]);
+        }
+        let innermost = types.last().unwrap().fullname();
+        assert_eq!(innermost.len(), "Test.".len() + 2000 * 2 - 1);
+        assert!(types.iter().all(|ty| ty.fullname.read().unwrap().is_some()));
     }
 }

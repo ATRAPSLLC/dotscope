@@ -314,11 +314,12 @@ use crate::{
         EventPtrRaw, EventRaw, ExportedTypeRaw, FieldLayoutRaw, FieldMarshalRaw, FieldPtrRaw,
         FieldRaw, FieldRvaRaw, FileRaw, GenericParamConstraintRaw, GenericParamRaw, ImplMapRaw,
         ImportScopeRaw, InterfaceImplRaw, LocalConstantRaw, LocalScopeRaw, LocalVariableRaw,
-        ManifestResourceRaw, MemberRefRaw, MetadataTable, MethodDebugInformationRaw, MethodDefRaw,
-        MethodImplRaw, MethodPtrRaw, MethodSemanticsRaw, MethodSpecRaw, ModuleRaw, ModuleRefRaw,
-        NestedClassRaw, ParamPtrRaw, ParamRaw, PropertyMapRaw, PropertyPtrRaw, PropertyRaw,
-        RowReadable, StandAloneSigRaw, StateMachineMethodRaw, TableAccess, TableData, TableId,
-        TableInfo, TableInfoRef, TypeDefRaw, TypeRefRaw, TypeSpecRaw,
+        ManifestResourceRaw, MemberList, MemberRanges, MemberRefRaw, MetadataTable,
+        MethodDebugInformationRaw, MethodDefRaw, MethodImplRaw, MethodPtrRaw, MethodSemanticsRaw,
+        MethodSpecRaw, ModuleRaw, ModuleRefRaw, NestedClassRaw, ParamPtrRaw, ParamRaw,
+        PropertyMapRaw, PropertyPtrRaw, PropertyRaw, RowReadable, StandAloneSigRaw,
+        StateMachineMethodRaw, TableAccess, TableData, TableId, TableInfo, TableInfoRef,
+        TypeDefRaw, TypeRefRaw, TypeSpecRaw,
     },
     utils::read_le,
     Error, ParseFailure, ParseStage, Result,
@@ -1525,6 +1526,161 @@ impl<'a> TablesHeader<'a> {
         }
     }
 
+    /// The normalized runs of one list column, read from this header's tables.
+    ///
+    /// Reads the owner table's column once per row and normalizes it with
+    /// [`MemberRanges::new`]: runs are clamped to the member table, made non-overlapping, and
+    /// an owner whose column is 0 or whose row cannot be read owns nothing. When the list's Ptr
+    /// table has rows (an uncompressed `#-` stream), the runs cover the Ptr table's positions
+    /// and [`MemberRanges::is_indirect`] is set; a Ptr table that is absent or empty means the
+    /// columns index members directly, as both CoreCLR and `System.Reflection.Metadata` decide.
+    ///
+    /// The cost is one row decode per owner row; build it once per load, not per owner.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::{
+    ///     metadata::tables::{MemberList, TypeDefRaw},
+    ///     CilAssemblyView,
+    /// };
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> dotscope::Result<()> {
+    /// let view = CilAssemblyView::from_path(Path::new("tests/samples/WindowsBase.dll"))?;
+    /// let tables = view.tables().expect("a #~ stream");
+    /// let methods = tables.member_ranges(MemberList::TypeDefMethods);
+    /// for rid in 1..=methods.owner_rows() {
+    ///     println!("TypeDef {rid} owns methods {:?}", methods.range(rid));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn member_ranges(&self, list: MemberList) -> MemberRanges {
+        fn read<'t, T: RowReadable>(
+            list: MemberList,
+            table: Option<&MetadataTable<'t, T>>,
+            members: u32,
+            indirect: bool,
+            column: impl Fn(&T) -> u32,
+        ) -> MemberRanges {
+            let Some(table) = table else {
+                return MemberRanges::new(list, 0, members, indirect, |_| None);
+            };
+            MemberRanges::new(list, table.row_count, members, indirect, |rid| {
+                table.get(rid).ok().flatten().map(|row| column(&row))
+            })
+        }
+
+        let ptr_rows = list.ptr_table().map_or(0, |ptr| self.table_row_count(ptr));
+        let indirect = ptr_rows > 0;
+        let members = if indirect {
+            ptr_rows
+        } else {
+            self.table_row_count(list.member_table())
+        };
+
+        match list {
+            MemberList::TypeDefFields => {
+                read(list, self.table::<TypeDefRaw>(), members, indirect, |row| {
+                    row.field_list
+                })
+            }
+            MemberList::TypeDefMethods => {
+                read(list, self.table::<TypeDefRaw>(), members, indirect, |row| {
+                    row.method_list
+                })
+            }
+            MemberList::MethodDefParams => read(
+                list,
+                self.table::<MethodDefRaw>(),
+                members,
+                indirect,
+                |row| row.param_list,
+            ),
+            MemberList::EventMapEvents => read(
+                list,
+                self.table::<EventMapRaw>(),
+                members,
+                indirect,
+                |row| row.event_list,
+            ),
+            MemberList::PropertyMapProperties => read(
+                list,
+                self.table::<PropertyMapRaw>(),
+                members,
+                indirect,
+                |row| row.property_list,
+            ),
+            MemberList::LocalScopeVariables => read(
+                list,
+                self.table::<LocalScopeRaw>(),
+                members,
+                indirect,
+                |row| row.variable_list,
+            ),
+            MemberList::LocalScopeConstants => read(
+                list,
+                self.table::<LocalScopeRaw>(),
+                members,
+                indirect,
+                |row| row.constant_list,
+            ),
+        }
+    }
+
+    /// The member rows owner `owner_rid` owns under `ranges`, as rids in the member table.
+    ///
+    /// For direct runs these are the positions of [`MemberRanges::range`]. For
+    /// [indirect](MemberRanges::is_indirect) runs each position is looked up in the list's Ptr
+    /// table and its target row is yielded instead, so a `#-` stream yields the rows the
+    /// runtime would bind, not the Ptr positions. A Ptr row that cannot be read, or whose
+    /// target is 0 or past the member table, is skipped: it names no member.
+    ///
+    /// `ranges` must have been built from this header (see [`member_ranges`](Self::member_ranges)).
+    pub fn member_rids<'r>(
+        &'r self,
+        ranges: &'r MemberRanges,
+        owner_rid: u32,
+    ) -> impl Iterator<Item = u32> + 'r {
+        let list = ranges.list();
+        let member_rows = self.table_row_count(list.member_table());
+        ranges
+            .range(owner_rid)
+            .filter_map(move |position| {
+                if !ranges.is_indirect() {
+                    return Some(position);
+                }
+                match list {
+                    MemberList::TypeDefFields => self
+                        .table::<FieldPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.field),
+                    MemberList::TypeDefMethods => self
+                        .table::<MethodPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.method),
+                    MemberList::MethodDefParams => self
+                        .table::<ParamPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.param),
+                    MemberList::EventMapEvents => self
+                        .table::<EventPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.event),
+                    MemberList::PropertyMapProperties => self
+                        .table::<PropertyPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.property),
+                    MemberList::LocalScopeVariables | MemberList::LocalScopeConstants => {
+                        Some(position)
+                    }
+                }
+            })
+            .filter(move |&rid| rid != 0 && rid <= member_rows)
+    }
+
     /// Get a summary of all present metadata tables with their row counts.
     ///
     /// Returns a vector of summary structs containing the table ID and row count
@@ -1840,6 +1996,158 @@ mod tests {
         let header = TablesHeader::from(data, false).unwrap();
 
         verify_tableheader(&header);
+    }
+
+    /// A tables stream holding `tables` (id, row count, row bytes), every index two bytes wide.
+    fn stream(tables: &[(TableId, u32, Vec<u8>)]) -> Vec<u8> {
+        let valid = tables
+            .iter()
+            .fold(0u64, |mask, (id, _, _)| mask | (1u64 << (*id as u8)));
+        let mut data = vec![0, 0, 0, 0, 2, 0, 0, 1];
+        data.extend_from_slice(&valid.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        for (_, rows, _) in tables {
+            data.extend_from_slice(&rows.to_le_bytes());
+        }
+        for (_, _, bytes) in tables {
+            data.extend_from_slice(bytes);
+        }
+        data
+    }
+
+    /// TypeDef rows (flags, name, namespace, extends, field list, method list) with the given
+    /// field lists and method list 1.
+    fn typedefs(field_lists: &[u16]) -> Vec<u8> {
+        field_lists
+            .iter()
+            .flat_map(|list| {
+                let mut row = vec![0u8; 10];
+                row.extend_from_slice(&list.to_le_bytes());
+                row.extend_from_slice(&1u16.to_le_bytes());
+                row
+            })
+            .collect()
+    }
+
+    fn u16_rows(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn member_rids_of(header: &TablesHeader, list: MemberList) -> Vec<Vec<u32>> {
+        let ranges = header.member_ranges(list);
+        (1..=ranges.owner_rows())
+            .map(|rid| header.member_rids(&ranges, rid).collect())
+            .collect()
+    }
+
+    #[test]
+    fn member_ranges_follow_a_permuted_ptr_table() {
+        // `#-` stream: TypeDef field lists index FieldPtr positions, which name Field rows
+        // out of order.
+        let data = stream(&[
+            (TableId::TypeDef, 3, typedefs(&[1, 3, 3])),
+            (TableId::FieldPtr, 4, u16_rows(&[3, 1, 4, 2])),
+            (TableId::Field, 4, vec![0; 4 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        let ranges = header.member_ranges(MemberList::TypeDefFields);
+        assert!(ranges.is_indirect());
+        assert_eq!(ranges.member_rows(), 4);
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![3, 1], vec![], vec![4, 2]]
+        );
+        // MethodDef is absent: every type owns no methods.
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefMethods),
+            vec![Vec::<u32>::new(); 3]
+        );
+    }
+
+    #[test]
+    fn member_ranges_clamp_hostile_columns() {
+        // The second type's field list is far past the three fields, the third goes back to
+        // 2: read literally, the first would own nothing past 0xFFFF and the third would
+        // re-own fields 2 and 3.
+        let data = stream(&[
+            (TableId::TypeDef, 3, typedefs(&[1, 0xFFFF, 2])),
+            (TableId::Field, 3, vec![0; 3 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        let ranges = header.member_ranges(MemberList::TypeDefFields);
+        assert!(!ranges.is_indirect());
+        assert_eq!(ranges.adjusted(), &[2, 3]);
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![1, 2, 3], vec![], vec![]]
+        );
+    }
+
+    #[test]
+    fn member_rids_skip_ptr_entries_naming_no_member() {
+        let data = stream(&[
+            (TableId::TypeDef, 1, typedefs(&[1])),
+            (TableId::FieldPtr, 3, u16_rows(&[2, 0, 9])),
+            (TableId::Field, 2, vec![0; 2 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![2]]
+        );
+    }
+
+    #[test]
+    fn an_empty_ptr_table_means_direct_runs() {
+        // A Ptr table that is present but has no rows does not redirect the columns, as
+        // CoreCLR and System.Reflection.Metadata decide by its row count.
+        let data = stream(&[
+            (TableId::TypeDef, 2, typedefs(&[1, 2])),
+            (TableId::FieldPtr, 0, Vec::new()),
+            (TableId::Field, 2, vec![0; 2 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        assert!(!header
+            .member_ranges(MemberList::TypeDefFields)
+            .is_indirect());
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn member_ranges_match_the_literal_runs_of_a_real_stream() {
+        // WindowsBase is compiler output: its runs are well formed, so the normalized ranges
+        // must be exactly the literal "this start to the next start" reading.
+        let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
+        let header = TablesHeader::from(data, false).unwrap();
+        let typedefs = header.table::<TypeDefRaw>().unwrap();
+        let rows: Vec<TypeDefRaw> = typedefs.iter().map(|row| row.unwrap()).collect();
+        for (list, column, members) in [
+            (
+                MemberList::TypeDefFields,
+                (|row: &TypeDefRaw| row.field_list) as fn(&TypeDefRaw) -> u32,
+                header.table_row_count(TableId::Field),
+            ),
+            (
+                MemberList::TypeDefMethods,
+                |row: &TypeDefRaw| row.method_list,
+                header.table_row_count(TableId::MethodDef),
+            ),
+        ] {
+            let ranges = header.member_ranges(list);
+            assert!(ranges.adjusted().is_empty() && ranges.absent().is_empty());
+            for (index, row) in rows.iter().enumerate() {
+                let end = rows.get(index + 1).map_or(members + 1, column);
+                assert_eq!(
+                    ranges.range(row.rid),
+                    column(row)..end,
+                    "{list:?} {}",
+                    row.rid
+                );
+            }
+        }
     }
 
     #[test]

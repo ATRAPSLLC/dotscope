@@ -119,7 +119,7 @@ impl PropertyRaw {
         Ok(Arc::new(Property {
             token: self.token,
             flags: PropertyAttributes::new(self.flags),
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             signature: parse_property_signature(blob.get(self.signature as usize)?)?,
             default: OnceLock::new(),
             fn_setter: OnceLock::new(),

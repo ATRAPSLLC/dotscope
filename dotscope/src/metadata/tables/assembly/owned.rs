@@ -8,6 +8,7 @@ use crate::{
     metadata::{
         customattributes::CustomAttributeValueList,
         security::Security,
+        streams::SharedStr,
         tables::{AssemblyFlags, HashAlgorithmId},
         token::Token,
     },
@@ -106,14 +107,14 @@ pub struct Assembly {
     /// The filename of the assembly without the file extension. For example,
     /// "System.Core" for the System.Core.dll assembly. This is the primary
     /// identifier used for assembly loading and binding.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Localization culture
     ///
     /// Specifies the culture for localized assemblies (e.g., "en-US", "fr-FR").
     /// `None` indicates a culture-neutral assembly that can be used with any culture.
     /// Satellite assemblies typically have specific culture values.
-    pub culture: Option<String>,
+    pub culture: Option<SharedStr>,
 
     /// The assembly's declarative security, a `DeclSecurity` row each, in table order: an
     /// assembly may request permissions under several actions (minimum, optional, refused).

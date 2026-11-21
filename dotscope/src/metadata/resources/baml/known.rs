@@ -9,7 +9,7 @@
 
 /// The known types by `KnownElements` value: each type's full name, or
 /// `None` for the enum's sentinels (`UnknownElement`, `MaxElement`).
-pub(crate) const KNOWN_TYPES: &[Option<&str>] = &[
+pub const KNOWN_TYPES: &[Option<&str>] = &[
     None,
     Some("System.Windows.Controls.AccessText"),
     Some("System.Windows.Controls.AdornedElementPlaceholder"),
@@ -776,7 +776,7 @@ pub(crate) const KNOWN_TYPES: &[Option<&str>] = &[
 /// The known properties by `KnownProperties` value: the index of the known
 /// type that declares each and its name, or `None` for the sentinels
 /// (`UnknownProperty`, `MaxProperty`).
-pub(crate) const KNOWN_PROPERTIES: &[Option<(u16, &str)>] = &[
+pub const KNOWN_PROPERTIES: &[Option<(u16, &str)>] = &[
     None,
     Some((1, "Text")),
     Some((17, "Storyboard")),

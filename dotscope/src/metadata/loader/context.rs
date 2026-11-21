@@ -80,11 +80,12 @@ use crate::{
             AssemblyRefProcessorMap, ClassLayoutMap, CodedIndex, ConstantMap, CustomAttributeMap,
             DeclSecurityMap, EncLogMap, EncMapMap, EventMap, EventMapEntryMap, EventPtrMap,
             FieldLayoutMap, FieldMap, FieldMarshalMap, FieldPtrMap, FieldRVAMap, FileMap,
-            GenericParamConstraintMap, GenericParamMap, InterfaceImplMap, MemberRefMap,
-            MethodImplMap, MethodPtrMap, MethodSemanticsMap, MethodSpecMap, ModuleRc, ModuleRefMap,
-            NestedClassMap, ParamMap, ParamPtrMap, PropertyMap, PropertyMapEntryMap,
+            GenericParamConstraintMap, GenericParamMap, InterfaceImplMap, MemberList, MemberRanges,
+            MemberRefMap, MethodImplMap, MethodPtrMap, MethodSemanticsMap, MethodSpecMap, ModuleRc,
+            ModuleRefMap, NestedClassMap, ParamMap, ParamPtrMap, PropertyMap, PropertyMapEntryMap,
             PropertyPtrMap, RowReadable, StandAloneSigMap, TableId, TypeSpecMap,
         },
+        token::Token,
         typesystem::{CilTypeReference, TypeRegistry},
     },
     Result,
@@ -127,7 +128,7 @@ use crate::{
 /// Every table loader receives one; `CustomAttributeLoader`
 /// (`metadata/tables/customattribute/loader.rs`) reads its maps and resolves coded indices
 /// through it.
-pub(crate) struct LoaderContext<'a> {
+pub struct LoaderContext<'a> {
     // Core Assembly Data
     /// Input file reference for the assembly being loaded.
     pub input: Arc<File>,
@@ -272,7 +273,7 @@ pub(crate) struct LoaderContext<'a> {
 /// For debug tables in the image's own metadata these are the image's tables and heaps; for
 /// an embedded or standalone PDB, the PDB's own. Either way their columns index the image's
 /// tables, which the loaders resolve through the [`LoaderContext`].
-pub(crate) struct PdbSource<'a> {
+pub struct PdbSource<'a> {
     /// The tables stream holding the debug tables
     pub meta: Option<&'a TablesHeader<'a>>,
     /// The `#Strings` heap
@@ -581,7 +582,7 @@ impl LoaderContext<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Malformed`] when a row fails to parse in strict mode.
+    /// Returns [`crate::Error::Parse`] when a row fails to parse in strict mode.
     pub fn handle_row<T: RowReadable>(&self, row: Result<T>, index: usize) -> Result<Option<T>> {
         self.handle_row_in(self.lenient, row, index)
     }
@@ -655,5 +656,45 @@ impl LoaderContext<'_> {
                 }
             }
         }
+    }
+
+    /// The normalized runs of `list` in `header`, with a warning for every fix-up.
+    ///
+    /// Builds [`TablesHeader::member_ranges`] (one pass over the owner table) and reports the
+    /// owners whose column was moved into the member table or above its predecessor, and the
+    /// owners whose column was 0 or whose row could not be read, as one warning each naming
+    /// the count and the first owner token. Neither fails a strict load: the runs are still
+    /// well defined, and the owners' members load as the normalized runs give them (a row
+    /// that cannot be read fails the strict load on its own when its loader reaches it).
+    ///
+    /// `header` is the image's tables for the type-system lists and the PDB's for the
+    /// `LocalScope` lists.
+    pub fn member_ranges(&self, header: &TablesHeader, list: MemberList) -> MemberRanges {
+        let ranges = header.member_ranges(list);
+        let owner = list.owner_table();
+        let report = |rids: &[u32], what: &str| {
+            if let Some(&first) = rids.first() {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticSeverity::Warning,
+                        DiagnosticCategory::Table,
+                        format!(
+                            "{list:?}: {} {owner:?} row(s) {what} (first: row {first})",
+                            rids.len()
+                        ),
+                    )
+                    .with_token(Token::from_parts(owner, first).value()),
+                );
+            }
+        };
+        report(
+            ranges.adjusted(),
+            "start their run outside the member table or before the previous row's run; clamped",
+        );
+        report(
+            ranges.absent(),
+            "have no run (list column 0 or unreadable row); they own no members",
+        );
+        ranges
     }
 }

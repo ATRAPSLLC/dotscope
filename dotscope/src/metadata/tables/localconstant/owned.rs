@@ -4,7 +4,7 @@
 //! the high-level, resolved form of `LocalConstant` table entries with
 //! all heap references resolved to actual string and binary data.
 
-use crate::metadata::{pdb::LocalConstantSig, token::Token};
+use crate::metadata::{pdb::LocalConstantSig, streams::SharedStr, token::Token};
 
 /// High-level representation of a `LocalConstant` table entry
 ///
@@ -43,7 +43,7 @@ pub struct LocalConstant {
     ///
     /// The actual name string for this local constant. May be empty for
     /// anonymous or compiler-generated constants where no name was specified.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Parsed constant signature: the constant's type and its value
     ///

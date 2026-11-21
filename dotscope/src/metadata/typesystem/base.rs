@@ -92,12 +92,13 @@ use crate::{
     metadata::{
         method::MethodRef,
         signatures::{SignatureMethod, TypeSignature},
+        streams::SharedStr,
         tables::{
             AssemblyRc, AssemblyRefRc, DeclSecurityRc, EventRc, ExportedTypeRc, FieldRc, FileRc,
             GenericParamConstraintRc, GenericParamRc, InterfaceImplRc, MemberRefRc, MethodSpecList,
             MethodSpecRc, ModuleRc, ModuleRefRc, ParamRc, PropertyRc, StandAloneSigRc,
         },
-        typesystem::{CilPrimitive, CilPrimitiveKind, CilType, CilTypeRc},
+        typesystem::{CilPrimitive, CilPrimitiveKind, CilType, CilTypeRc, FullName},
     },
     prelude::{GenericParamList, Token},
     utils::RowList,
@@ -332,19 +333,19 @@ impl CilTypeRef {
         self.upgrade().map(|t| t.token)
     }
 
-    /// Gets a clone of the name, or [`None`] if dropped.
+    /// Gets the name, shared with the type, or [`None`] if dropped.
     ///
     /// See the [Convenience Accessors](#convenience-accessors) section above for performance notes.
     #[must_use]
-    pub fn name(&self) -> Option<String> {
+    pub fn name(&self) -> Option<SharedStr> {
         self.upgrade().map(|t| t.name.clone())
     }
 
-    /// Gets a clone of the namespace, or [`None`] if dropped.
+    /// Gets the namespace, shared with the type, or [`None`] if dropped.
     ///
     /// See the [Convenience Accessors](#convenience-accessors) section above for performance notes.
     #[must_use]
-    pub fn namespace(&self) -> Option<String> {
+    pub fn namespace(&self) -> Option<SharedStr> {
         self.upgrade().map(|t| t.namespace.clone())
     }
 
@@ -352,8 +353,8 @@ impl CilTypeRef {
     ///
     /// See the [Convenience Accessors](#convenience-accessors) section above for performance notes.
     #[must_use]
-    pub fn fullname(&self) -> Option<String> {
-        self.upgrade().map(|t| t.fullname().to_string())
+    pub fn fullname(&self) -> Option<FullName> {
+        self.upgrade().map(|t| t.fullname())
     }
 
     /// Gets a clone of the nested types collection, or [`None`] if dropped.
@@ -756,7 +757,7 @@ impl CilTypeReference {
     /// that field directly. Returns `None` for variants without a meaningful
     /// name or if the weak reference has been dropped.
     #[must_use]
-    pub fn name(&self) -> Option<String> {
+    pub fn name(&self) -> Option<SharedStr> {
         match self {
             Self::TypeRef(r) | Self::TypeDef(r) | Self::TypeSpec(r) => r.name(),
             Self::Field(r) => Some(r.name.clone()),
@@ -782,10 +783,12 @@ impl CilTypeReference {
     /// For type variants (`TypeRef`, `TypeDef`, `TypeSpec`), delegates to
     /// [`CilTypeRef::fullname()`]. For other variants, falls back to [`name()`](Self::name).
     #[must_use]
-    pub fn fullname(&self) -> Option<String> {
+    pub fn fullname(&self) -> Option<FullName> {
         match self {
             Self::TypeRef(r) | Self::TypeDef(r) | Self::TypeSpec(r) => r.fullname(),
-            _ => self.name(),
+            _ => self
+                .name()
+                .map(|name| FullName::top_level(SharedStr::default(), name)),
         }
     }
 }
@@ -1757,10 +1760,9 @@ impl From<&TypeSignature> for CilFlavor {
                 }
             }
 
-            // Custom modifiers - these don't carry the base type, just modifier metadata
-            // They appear in signature parsing context where the actual type comes separately
-            TypeSignature::ModifiedRequired(_) | TypeSignature::ModifiedOptional(_) => {
-                CilFlavor::Unknown
+            // A modifier does not change the flavor of the type it modifies
+            TypeSignature::ModifiedRequired(_, base) | TypeSignature::ModifiedOptional(_, base) => {
+                CilFlavor::from(base.as_ref())
             }
 
             // Fallback/unknown: Unknown, Internal CLI types, Modifier marker,

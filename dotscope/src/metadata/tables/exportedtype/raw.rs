@@ -192,11 +192,11 @@ impl ExportedTypeRaw {
             offset: self.offset,
             flags: TypeAttributes::new(self.flags),
             type_def_id: self.type_def_id | 0x0200_0000,
-            name: string.get(self.name as usize)?.to_string(),
+            name: string.get_shared(self.name as usize)?,
             namespace: if self.namespace == 0 {
                 None
             } else {
-                Some(string.get(self.namespace as usize)?.to_string())
+                Some(string.get_shared(self.namespace as usize)?)
             },
             implementation: implementation_lock,
             custom_attributes: Default::default(),

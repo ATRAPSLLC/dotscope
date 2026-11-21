@@ -63,15 +63,15 @@ mod references;
 mod schema;
 mod tokens;
 
-pub use references::ReferenceValidator;
-pub use schema::SchemaValidator;
+pub use references::{ReferenceAnalysis, ReferenceStatistics, ReferenceValidator};
+pub use schema::{SchemaValidationStatistics, SchemaValidator};
 pub use tokens::{TokenValidationResult, TokenValidator};
 
 /// Returns the canonical [`crate::Error::Parse`] error used by raw validators
 /// when the assembly view does not contain the expected `#~` metadata-tables
 /// stream. Centralized so all 14+ raw-validator call sites surface the same
 /// structured failure.
-pub(crate) fn err_no_metadata_tables() -> crate::Error {
+pub fn err_no_metadata_tables() -> crate::Error {
     crate::Error::Parse(crate::ParseFailure::InvalidField {
         stage: crate::ParseStage::Validation,
         field: "metadata_tables",

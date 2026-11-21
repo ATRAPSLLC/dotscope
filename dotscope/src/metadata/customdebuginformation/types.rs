@@ -80,7 +80,7 @@
 //! [`CustomDebugKind`] and [`CustomDebugInfo`] implement [`std::fmt::Display`] for a short,
 //! human-readable summary (the kind's name, and the value's size or count). The values encode
 //! back to their blobs with
-//! [`encode_custom_debug_blob`](crate::metadata::customdebuginformation::encode_custom_debug_blob);
+//! [`encode_custom_debug_blob`];
 //! Serde is not supported.
 //!
 //! # Integration
@@ -350,7 +350,7 @@ pub struct AsyncAwait {
 /// A custom debug information value, decoded by its kind.
 ///
 /// Each variant holds the content of one kind's blob, as the blob stores it, so that
-/// [`encode_custom_debug_blob`](crate::metadata::customdebuginformation::encode_custom_debug_blob)
+/// [`encode_custom_debug_blob`]
 /// writes it back unchanged. A kind dotscope does not know is [`CustomDebugInfo::Unknown`],
 /// with its GUID and blob.
 ///

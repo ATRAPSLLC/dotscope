@@ -44,7 +44,24 @@ struct Rows<T> {
 
 /// An append-only concurrent list that iterates in metadata table order.
 ///
-/// See the [module docs](self) for why the order needs keeping.
+/// [`RowList`] is a [`LazyList`](crate::metadata::LazyList) for the lists metadata rows attach
+/// themselves to: the custom attributes of a type, its interfaces, its nested types, its generic
+/// parameters and their constraints, a method's overrides. The loaders build those rows in
+/// parallel, so the rows arrive in whatever order the threads finish. A plain append-only list
+/// kept that order, and the same file listed an owner's attributes differently from one load to
+/// the next.
+///
+/// Each entry is recorded under the token of the row it came from, and iteration walks entries by
+/// that token, so the list reads in table order however it was filled. For generic parameters,
+/// whose table is sorted by owner and number, that is also parameter order. Entries pushed without
+/// a row (built in memory rather than read from a table) follow every row entry, in the order
+/// they were pushed.
+///
+/// # Concurrency
+///
+/// As [`LazyList`](crate::metadata::LazyList): the storage is allocated on first push, pushes take
+/// `&self`, and clones share storage. The entries live in a `boxcar::Vec`, which hands out stable
+/// references; a concurrent ordered index over them decides the order.
 pub struct RowList<T> {
     inner: OnceLock<Arc<Rows<T>>>,
 }

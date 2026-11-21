@@ -23,7 +23,7 @@ use crate::{
 /// This resolver handles setting base types for TypeDef entries, consolidating
 /// all inheritance resolution logic in one place to properly handle circular
 /// dependencies and complex generic type instantiations.
-pub(crate) struct InheritanceResolver;
+pub struct InheritanceResolver;
 
 impl MetadataLoader for InheritanceResolver {
     /// Resolves inheritance relationships after all type tables are loaded.

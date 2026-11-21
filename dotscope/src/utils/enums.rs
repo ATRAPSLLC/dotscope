@@ -206,8 +206,8 @@ mod tests {
         let spec = |flavor, namespace: &str, name: &str, base_type| CompleteTypeSpec {
             token_init: None,
             flavor,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+            namespace: namespace.into(),
+            name: name.into(),
             source: TypeSource::Unknown,
             generic_args: None,
             base_type,

@@ -32,7 +32,7 @@
 /// # Examples
 ///
 /// The `examples::truncate_chars_example` test in this module runs this example.
-pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> &str {
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => s.split_at(byte_idx).0,
         None => s,

@@ -70,6 +70,8 @@
 //! - Type loading and assembly isolation
 //! - Cross-assembly type reference resolution
 
+use std::sync::Arc;
+
 #[cfg(feature = "legacy-crypto")]
 use crate::utils::{compute_md5, compute_sha1};
 use crate::{
@@ -133,7 +135,7 @@ pub enum Identity {
     /// - ASN.1 DER encoding for the public key structure
     /// - May include additional .NET-specific metadata
     /// - Variable length depending on key size (typically 1024-4096 bits)
-    PubKey(Vec<u8>),
+    PubKey(Arc<[u8]>),
 
     /// Compact 8-byte token derived from hashing the public key.
     ///
@@ -173,7 +175,7 @@ pub enum Identity {
     /// - Fixed byte sequences for standard framework components
     /// - Platform-specific variations for Mono/Unity implementations
     /// - Standardized keys for cross-platform compatibility
-    EcmaKey(Vec<u8>),
+    EcmaKey(Arc<[u8]>),
 }
 
 impl Identity {
@@ -233,8 +235,8 @@ impl Identity {
     pub fn from(data: &[u8], is_pub: bool) -> Result<Self> {
         Ok(if is_pub {
             match data.len() {
-                16 => Identity::EcmaKey(data.to_vec()),
-                _ => Identity::PubKey(data.to_vec()),
+                16 => Identity::EcmaKey(data.into()),
+                _ => Identity::PubKey(data.into()),
             }
         } else {
             let token = data.first_chunk::<8>().ok_or(ParseFailure::Truncated {
@@ -393,7 +395,7 @@ mod tests {
         let Identity::PubKey(pubkey_data) = identity else {
             panic!("Expected PubKey variant, got {:?}", identity);
         };
-        assert_eq!(pubkey_data, data);
+        assert_eq!(pubkey_data, data.into());
     }
 
     #[test]
@@ -408,7 +410,7 @@ mod tests {
         let Identity::EcmaKey(ecma_data) = identity else {
             panic!("Expected EcmaKey variant, got {:?}", identity);
         };
-        assert_eq!(ecma_data, data);
+        assert_eq!(ecma_data, data.into());
         assert_eq!(ecma_data.len(), 16);
     }
 
@@ -447,7 +449,7 @@ mod tests {
     #[test]
     fn test_to_token_from_pubkey_md5() {
         let pubkey_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let identity = Identity::PubKey(pubkey_data.clone());
+        let identity = Identity::PubKey(pubkey_data.clone().into());
 
         let token = identity.to_token(AssemblyHashAlgorithm::MD5).unwrap();
 
@@ -462,7 +464,7 @@ mod tests {
     #[test]
     fn test_to_token_from_pubkey_sha1() {
         let pubkey_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let identity = Identity::PubKey(pubkey_data.clone());
+        let identity = Identity::PubKey(pubkey_data.clone().into());
 
         let token = identity.to_token(AssemblyHashAlgorithm::SHA1).unwrap();
 
@@ -477,7 +479,7 @@ mod tests {
     #[test]
     fn test_to_token_from_pubkey_sha256() {
         let pubkey_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let identity = Identity::PubKey(pubkey_data.clone());
+        let identity = Identity::PubKey(pubkey_data.clone().into());
 
         let token = identity.to_token(AssemblyHashAlgorithm::SHA256).unwrap();
 
@@ -492,7 +494,7 @@ mod tests {
     #[test]
     fn test_to_token_from_pubkey_sha384() {
         let pubkey_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let identity = Identity::PubKey(pubkey_data.clone());
+        let identity = Identity::PubKey(pubkey_data.clone().into());
 
         let token = identity.to_token(AssemblyHashAlgorithm::SHA384).unwrap();
 
@@ -507,7 +509,7 @@ mod tests {
     #[test]
     fn test_to_token_from_pubkey_sha512() {
         let pubkey_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let identity = Identity::PubKey(pubkey_data.clone());
+        let identity = Identity::PubKey(pubkey_data.clone().into());
 
         let token = identity.to_token(AssemblyHashAlgorithm::SHA512).unwrap();
 
@@ -537,7 +539,7 @@ mod tests {
     #[test]
     fn test_to_token_unsupported_algorithm() {
         let pubkey_data = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let identity = Identity::PubKey(pubkey_data);
+        let identity = Identity::PubKey(pubkey_data.into());
 
         // Using an unsupported algorithm should return an error
         let result = identity.to_token(0x9999);
@@ -558,7 +560,7 @@ mod tests {
             0x06, 0x28, 0xAC, 0x03, 0x00, 0x06, 0x7A, 0x06, 0x6F, 0xAB, 0x02, 0x00, 0x0A, 0x0B,
             0x17, 0x6A,
         ];
-        let identity = Identity::EcmaKey(ecma_data);
+        let identity = Identity::EcmaKey(ecma_data.into());
 
         let result = identity.to_token(0x9999);
         assert!(result.is_err());
@@ -566,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_to_token_empty_pubkey_md5() {
-        let identity = Identity::PubKey(vec![]);
+        let identity = Identity::PubKey(vec![].into());
         let token = identity.to_token(AssemblyHashAlgorithm::MD5).unwrap();
 
         // Hash of empty data should still produce a valid token
@@ -579,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_to_token_empty_pubkey_sha1() {
-        let identity = Identity::PubKey(vec![]);
+        let identity = Identity::PubKey(vec![].into());
         let token = identity.to_token(AssemblyHashAlgorithm::SHA1).unwrap();
 
         // Hash of empty data should still produce a valid token
@@ -594,7 +596,7 @@ mod tests {
     fn test_large_pubkey_data() {
         // Test with a larger public key (typical RSA key size)
         let large_pubkey: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
-        let identity = Identity::PubKey(large_pubkey.clone());
+        let identity = Identity::PubKey(large_pubkey.clone().into());
 
         let token_md5 = identity.to_token(AssemblyHashAlgorithm::MD5).unwrap();
         let token_sha1 = identity.to_token(AssemblyHashAlgorithm::SHA1).unwrap();
@@ -610,7 +612,7 @@ mod tests {
     #[test]
     fn test_hash_algorithm_consistency() {
         let pubkey_data = vec![42, 123, 255, 0, 17, 88, 99, 200];
-        let identity = Identity::PubKey(pubkey_data);
+        let identity = Identity::PubKey(pubkey_data.into());
 
         // Multiple calls with the same algorithm should produce the same result
         let token1 = identity.to_token(AssemblyHashAlgorithm::MD5).unwrap();

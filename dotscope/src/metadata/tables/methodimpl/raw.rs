@@ -28,7 +28,7 @@
 //! This module integrates with several core components of the metadata system:
 //!
 //! - **[`crate::metadata::tables::methodimpl::owned`]**: Target for owned structure conversion via [`to_owned`](MethodImplRaw::to_owned)
-//! - **[`crate::metadata::tables::methodimpl::loader`]**: Coordinates the parsing and processing of raw table data
+//! - **[`crate::metadata::loader::tables::MethodImplLoader`]**: Coordinates the parsing and processing of raw table data
 //! - **[`crate::metadata::typesystem`]**: Provides type registry for class resolution and type reference management
 //! - **[`crate::metadata::tables::methoddef`]**: Resolves local method definitions for implementation mappings
 //! - **[`crate::metadata::tables::memberref`]**: Handles external method references for cross-assembly scenarios

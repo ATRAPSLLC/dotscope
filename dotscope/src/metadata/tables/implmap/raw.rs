@@ -133,7 +133,7 @@ impl ImplMapRaw {
 
                     match modules.get(&Token::new(self.import_scope | 0x1A00_0000)) {
                         Some(module_ref) => {
-                            let import_name = strings.get(self.import_name as usize)?.to_string();
+                            let import_name = strings.get_shared(self.import_name as usize)?;
                             imports.add_method(
                                 import_name,
                                 &self.token,
@@ -218,7 +218,7 @@ impl ImplMapRaw {
             offset: self.offset,
             mapping_flags: self.mapping_flags,
             member_forwarded,
-            import_name: strings.get(self.import_name as usize)?.to_string(),
+            import_name: strings.get_shared(self.import_name as usize)?,
             import_scope: match modules.get(&Token::new(self.import_scope | 0x1A00_0000)) {
                 Some(module_ref) => module_ref.value().clone(),
                 None => {

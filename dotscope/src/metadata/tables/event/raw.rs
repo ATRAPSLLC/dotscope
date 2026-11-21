@@ -115,7 +115,7 @@ impl EventRaw {
             token: self.token,
             offset: self.offset,
             flags: EventAttributes::new(self.flags),
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             event_type: match types.get(&self.event_type.token) {
                 Some(parent) => parent.into(),
                 None => {

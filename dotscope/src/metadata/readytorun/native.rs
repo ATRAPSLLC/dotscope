@@ -12,7 +12,7 @@ use crate::{Error, Result};
 const BLOCK_SIZE: u32 = 16;
 
 /// A reader of NativeFormat-encoded numbers and arrays over one section.
-pub(crate) struct NativeReader<'a>(pub(crate) &'a [u8]);
+pub struct NativeReader<'a>(pub &'a [u8]);
 
 impl NativeReader<'_> {
     /// Decodes the unsigned number at `offset` (`NativeReader::DecodeUnsigned`).
@@ -22,7 +22,7 @@ impl NativeReader<'_> {
     /// it: none to three hold the number little-endian above those tag bits,
     /// and four hold a whole `u32` after a tag byte. Five set bits encode
     /// nothing.
-    pub(crate) fn unsigned(&self, offset: usize) -> Result<(u32, usize)> {
+    pub fn unsigned(&self, offset: usize) -> Result<(u32, usize)> {
         let first = *self.0.get(offset).ok_or_else(|| self.overrun(offset))?;
         let width = first.trailing_ones() as usize + 1;
         if width > 5 {
@@ -58,7 +58,7 @@ impl NativeReader<'_> {
     ///
     /// When an offset of the array leaves the section or a number is not one
     /// NativeFormat encodes.
-    pub(crate) fn array(&self) -> Result<Vec<(u32, usize)>> {
+    pub fn array(&self) -> Result<Vec<(u32, usize)>> {
         let (header, base) = self.unsigned(0)?;
         let count = header >> 2;
         // The block index's entries are one, two or four bytes wide.
@@ -131,14 +131,14 @@ impl NativeReader<'_> {
 }
 
 /// The little-endian `u16` at `bytes[at..]`.
-pub(crate) fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
+pub fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
     ))
 }
 
 /// The little-endian `u32` at `bytes[at..]`.
-pub(crate) fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+pub fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
     ))

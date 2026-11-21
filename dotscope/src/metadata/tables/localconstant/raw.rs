@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::{
     metadata::{
         pdb::LocalConstantSig,
-        streams::{Blob, Strings},
+        streams::{Blob, SharedStr, Strings},
         tables::{LocalConstant, LocalConstantRc, TableInfoRef, TableRow},
         token::Token,
     },
@@ -95,9 +95,9 @@ impl LocalConstantRaw {
     /// ```
     pub fn to_owned(&self, strings: &Strings, blobs: &Blob) -> Result<LocalConstantRc> {
         let name = if self.name == 0 {
-            String::new()
+            SharedStr::default()
         } else {
-            strings.get(self.name as usize)?.to_string()
+            strings.get_shared(self.name as usize)?
         };
 
         // A constant's signature is its type and value: there is no constant without one

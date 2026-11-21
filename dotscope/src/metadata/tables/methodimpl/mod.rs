@@ -11,7 +11,7 @@
 //!
 //! - **Raw Processing**: [`crate::metadata::tables::methodimpl::raw::MethodImplRaw`] handles direct table parsing with coded index resolution
 //! - **Owned Structures**: [`crate::metadata::tables::methodimpl::owned::MethodImpl`] provides resolved references and semantic relationships
-//! - **Parallel Loading**: [`crate::metadata::tables::methodimpl::loader::MethodImplLoader`] coordinates dependency-aware processing
+//! - **Parallel Loading**: [`crate::metadata::loader::tables::MethodImplLoader`] coordinates dependency-aware processing
 //! - **Collection Types**: Thread-safe containers enable concurrent access and efficient lookup operations
 //!
 //! # Processing Pipeline
@@ -27,7 +27,7 @@
 //! # Module Components
 //! - [`MethodImplRaw`] - Raw table structure with unresolved coded indexes
 //! - [`MethodImpl`] - Owned variant with resolved references and implementation mappings
-//! - [`MethodImplLoader`] - Internal loader for processing table entries (crate-private)
+//! - [`MethodImplLoader`](crate::metadata::loader::tables::MethodImplLoader) - Internal loader for processing table entries (crate-private)
 //! - Type aliases for collections: [`MethodImplMap`], [`MethodImplList`], [`MethodImplRc`]
 //!
 //! # Table Structure (ECMA-335 §22.27)
@@ -172,14 +172,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

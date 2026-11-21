@@ -29,7 +29,27 @@ use std::{
 
 /// An append-only concurrent list whose backing storage is allocated on first use.
 ///
-/// See the [module docs](self) for why the deferral matters.
+/// [`LazyList`] wraps `Arc<boxcar::Vec<T>>` behind a [`OnceLock`], allocating the backing vector
+/// on first push rather than at construction.
+///
+/// # Why this exists
+///
+/// `boxcar::Vec` is not a thin handle. It is `{ inflight: AtomicUsize, buckets: [AtomicPtr; 58],
+/// count: AtomicUsize }`: 480 bytes inline, and `Buckets::new` materialises all 58 slots as
+/// null rather than allocating them lazily. With the `Arc` header that is ~496 bytes for an
+/// empty list.
+///
+/// Metadata rows carry many such lists that are almost always empty: a method rarely has
+/// varargs, generic arguments, overrides, local variables or interface implementations. Eagerly
+/// constructing them made a 14-byte MethodDef row cost roughly 4 KB of zeroed bucket arrays,
+/// a 300-500× amplification from table bytes to resident memory, driven entirely by attacker-
+/// controlled row counts.
+///
+/// # Concurrency
+///
+/// Unchanged from the eager form. `OnceLock` makes first-push initialisation race-free, and
+/// `boxcar::Vec` itself provides the append-only concurrent semantics; [`push`](LazyList::push)
+/// still takes `&self`.
 pub struct LazyList<T> {
     inner: OnceLock<Arc<boxcar::Vec<T>>>,
 }

@@ -328,18 +328,19 @@ impl TypeSignatureEncoder {
                 )?;
             }
 
-            // Custom modifiers
-            TypeSignature::ModifiedRequired(modifiers)
-            | TypeSignature::ModifiedOptional(modifiers) => {
+            // Custom modifiers: the run (each of the variant's kind), then the type it modifies
+            TypeSignature::ModifiedRequired(modifiers, base)
+            | TypeSignature::ModifiedOptional(modifiers, base) => {
+                let kind = if matches!(signature, TypeSignature::ModifiedRequired(..)) {
+                    0x1F // ELEMENT_TYPE_CMOD_REQD
+                } else {
+                    0x20 // ELEMENT_TYPE_CMOD_OPT
+                };
                 for modifier in modifiers {
-                    let modifier_type = if modifier.is_required {
-                        0x1F // ELEMENT_TYPE_CMOD_REQD
-                    } else {
-                        0x20 // ELEMENT_TYPE_CMOD_OPT
-                    };
-                    buffer.push(modifier_type);
+                    buffer.push(kind);
                     Self::encode_typedefref_token(modifier.modifier_type, buffer)?;
                 }
+                Self::encode_type_signature_internal(base, buffer, depth.saturating_add(1))?;
             }
 
             // Special types for custom attributes and internal use
@@ -387,7 +388,7 @@ impl TypeSignatureEncoder {
     ///
     /// [`crate::Error::RecursionLimit`] past the nesting limit, and any error encoding a
     /// parameter's type.
-    pub(crate) fn encode_method_signature(
+    pub fn encode_method_signature(
         method_sig: &SignatureMethod,
         buffer: &mut Vec<u8>,
         depth: usize,
@@ -433,7 +434,7 @@ impl TypeSignatureEncoder {
     /// # Errors
     ///
     /// Any error encoding a modifier or the type.
-    pub(crate) fn encode_parameter(
+    pub fn encode_parameter(
         parameter: &SignatureParameter,
         buffer: &mut Vec<u8>,
         depth: usize,

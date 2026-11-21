@@ -7,7 +7,7 @@
 //! # Module Components
 //! - [`ImplMapRaw`] - Raw table structure with unresolved coded indexes
 //! - [`ImplMap`] - Owned variant with resolved references and owned data
-//! - [`ImplMapLoader`] - Internal loader for processing table entries (crate-private)
+//! - [`ImplMapLoader`](crate::metadata::loader::tables::ImplMapLoader) - Internal loader for processing table entries (crate-private)
 //! - [`crate::metadata::tables::PInvokeAttributes`] - Strongly-typed P/Invoke attribute flags
 //! - Type aliases for collections: [`ImplMapMap`], [`ImplMapList`], [`ImplMapRc`]
 //!
@@ -56,14 +56,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

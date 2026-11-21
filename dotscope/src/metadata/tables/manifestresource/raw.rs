@@ -226,7 +226,7 @@ impl ManifestResourceRaw {
             data_offset,
             data_size,
             flags: ManifestResourceAttributes::new(self.flags),
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             source,
         }))
     }

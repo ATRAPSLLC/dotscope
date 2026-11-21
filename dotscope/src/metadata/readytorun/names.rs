@@ -10,6 +10,7 @@ use crate::{
         },
         tables::TableId,
         token::Token,
+        typesystem::FullName,
     },
     CilObject,
 };
@@ -28,7 +29,7 @@ pub struct FixupNames<'a> {
     asm: &'a CilObject,
     /// Each field's declaring type's full name, by the field's token, built
     /// the first time a field is named.
-    field_owners: OnceLock<HashMap<u32, String>>,
+    field_owners: OnceLock<HashMap<u32, FullName>>,
 }
 
 impl<'a> FixupNames<'a> {
@@ -96,7 +97,7 @@ impl<'a> FixupNames<'a> {
                     continue;
                 }
                 let owner = entry.value();
-                let fullname = owner.fullname().to_string();
+                let fullname = owner.fullname();
                 for (_, field) in owner.fields.iter() {
                     owners.insert(field.token.value(), fullname.clone());
                 }
@@ -130,7 +131,7 @@ impl<'a> FixupNames<'a> {
 }
 
 /// `owner::name`, or `name` alone with no owner.
-fn qualified(owner: Option<String>, name: &str) -> String {
+fn qualified(owner: Option<FullName>, name: &str) -> String {
     match owner.filter(|owner| !owner.is_empty()) {
         Some(owner) => format!("{owner}::{name}"),
         None => name.to_owned(),

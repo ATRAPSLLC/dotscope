@@ -15,7 +15,7 @@
 //!
 //! - [`crate::metadata::tables::assemblyprocessor::raw::AssemblyProcessorRaw`] - Raw table structure
 //! - [`crate::metadata::tables::assemblyprocessor::AssemblyProcessor`] - Type alias to Raw
-//! - [`crate::metadata::tables::assemblyprocessor::loader::AssemblyProcessorLoader`] - Internal loader
+//! - [`crate::metadata::loader::tables::AssemblyProcessorLoader`] - Internal loader
 //! - [`crate::metadata::tables::assemblyprocessor::AssemblyProcessorMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::assemblyprocessor::AssemblyProcessorList`] - Collection type
 //! - [`crate::metadata::tables::assemblyprocessor::AssemblyProcessorRc`] - Reference-counted pointer
@@ -54,13 +54,11 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use raw::*;
 
 /// A map that holds the mapping of [`crate::metadata::token::Token`] to parsed [`crate::metadata::tables::assemblyprocessor::AssemblyProcessor`]

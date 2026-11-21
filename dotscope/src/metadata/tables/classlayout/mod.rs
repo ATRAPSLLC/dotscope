@@ -15,7 +15,7 @@
 //!
 //! - [`crate::metadata::tables::classlayout::raw::ClassLayoutRaw`] - Raw table structure with unresolved indexes
 //! - [`crate::metadata::tables::classlayout::owned::ClassLayout`] - Owned variant with resolved references
-//! - [`crate::metadata::tables::classlayout::loader::ClassLayoutLoader`] - Internal loader for processing table data
+//! - [`crate::metadata::loader::tables::ClassLayoutLoader`] - Internal loader for processing table data
 //! - [`crate::metadata::tables::classlayout::ClassLayoutMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::classlayout::ClassLayoutList`] - Collection type
 //! - [`crate::metadata::tables::classlayout::ClassLayoutRc`] - Reference-counted pointer
@@ -62,14 +62,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

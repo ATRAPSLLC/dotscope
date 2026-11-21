@@ -466,21 +466,7 @@ impl NativeImports {
             }
         }
 
-        let iat_rva = self.allocate_iat_rva()?;
-        let dll = self
-            .descriptors
-            .get_mut(dll_name)
-            .ok_or_else(|| malformed_error!("DLL '{dll_name}' disappeared from import table"))?;
-        dll.push(Import {
-            dll: Arc::clone(&dll.descriptor.dll_name),
-            name: Some(function_name.to_owned()),
-            ordinal: None,
-            rva: iat_rva,
-            hint: 0,
-            ilt_value: 0,
-        });
-
-        Ok(())
+        self.append(dll_name, Some(function_name.to_owned()), None)
     }
 
     /// Add an ordinal-based function import.
@@ -536,20 +522,62 @@ impl NativeImports {
             }
         }
 
+        self.append(dll_name, None, Some(ordinal))
+    }
+
+    /// Add an entry of an image's own import table as it is.
+    ///
+    /// Unlike [`Self::add_function`] and [`Self::add_function_by_ordinal`], a function the
+    /// DLL already imports is added again: an image may import one function twice from one
+    /// DLL (two IAT slots its code calls through), and writing the image back keeps both
+    /// entries, each with its own IAT slot. The DLL is added when missing.
+    ///
+    /// # Arguments
+    /// * `dll_name` - Name of the DLL the entry imports from
+    /// * `import` - The entry, by name or else by ordinal
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the DLL name or the function name is empty, the ordinal is 0,
+    /// or the entry has neither a name nor an ordinal.
+    pub fn add_entry(&mut self, dll_name: &str, import: &Import) -> Result<()> {
+        self.add_dll(dll_name)?;
+        match (&import.name, import.ordinal) {
+            (Some(name), _) if name.is_empty() => {
+                Err(malformed_error!("Function name cannot be empty"))
+            }
+            (Some(name), _) => self.append(dll_name, Some(name.clone()), None),
+            (None, Some(0)) => Err(malformed_error!("Ordinal cannot be 0")),
+            (None, Some(ordinal)) => self.append(dll_name, None, Some(ordinal)),
+            (None, None) => Err(malformed_error!(
+                "an import from {dll_name} has neither a name nor an ordinal"
+            )),
+        }
+    }
+
+    /// Append an import of `name`, else of `ordinal`, from `dll_name` with the next IAT slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the DLL is not in the table or the IAT has no room.
+    fn append(&mut self, dll_name: &str, name: Option<String>, ordinal: Option<u16>) -> Result<()> {
         let iat_rva = self.allocate_iat_rva()?;
         let dll = self
             .descriptors
             .get_mut(dll_name)
-            .ok_or_else(|| malformed_error!("DLL '{dll_name}' disappeared from import table"))?;
+            .ok_or_else(|| malformed_error!("DLL '{dll_name}' not found in import table"))?;
+        let ilt_value = match (&name, ordinal) {
+            (None, Some(ordinal)) => 0x8000_0000_0000_0000u64 | u64::from(ordinal),
+            _ => 0,
+        };
         dll.push(Import {
             dll: Arc::clone(&dll.descriptor.dll_name),
-            name: None,
-            ordinal: Some(ordinal),
+            name,
+            ordinal,
             rva: iat_rva,
             hint: 0,
-            ilt_value: 0x8000_0000_0000_0000u64 | u64::from(ordinal),
+            ilt_value,
         });
-
         Ok(())
     }
 
@@ -1269,6 +1297,61 @@ mod tests {
         imports.add_function_by_ordinal("kernel32.dll", 6).unwrap();
         assert!(imports.add_function("kernel32.dll", "Beep").is_err());
         assert_eq!(imports.total_function_count(), 4);
+    }
+
+    /// An image importing one function twice from one DLL keeps both entries when its
+    /// table is copied for writing, each with its own IAT slot, by name and by ordinal; the
+    /// builder still refuses adding a function twice.
+    #[test]
+    fn a_function_imported_twice_keeps_both_entries() {
+        let read = |name: Option<&str>, ordinal: Option<u16>, rva: u32| Import {
+            dll: "kernel32.dll".into(),
+            name: name.map(str::to_string),
+            ordinal,
+            rva,
+            hint: 0,
+            ilt_value: 0,
+        };
+        let original = NativeImports::from_pe_imports(
+            &[
+                read(Some("Sleep"), None, 0x2000),
+                read(Some("Sleep"), None, 0x2004),
+                read(None, Some(5), 0x2008),
+                read(None, Some(5), 0x200C),
+            ],
+            false,
+        )
+        .unwrap();
+
+        let mut copy = NativeImports::new();
+        for descriptor in original.descriptors() {
+            for function in &descriptor.functions {
+                copy.add_entry(&descriptor.dll_name, function).unwrap();
+            }
+        }
+        let functions = &copy.get_descriptor("kernel32.dll").unwrap().functions;
+        assert_eq!(functions.len(), 4);
+        let mut slots: Vec<u32> = functions.iter().map(|function| function.rva).collect();
+        slots.dedup();
+        assert_eq!(slots.len(), 4, "each entry has its own IAT slot");
+        assert_eq!(
+            copy.iat_byte_size(false).unwrap(),
+            original.iat_byte_size(false).unwrap()
+        );
+
+        assert!(copy.add_function("kernel32.dll", "Sleep").is_err());
+        assert!(copy.add_function_by_ordinal("kernel32.dll", 5).is_err());
+        let empty = Import {
+            name: Some(String::new()),
+            ..read(None, None, 0)
+        };
+        assert!(copy.add_entry("kernel32.dll", &empty).is_err());
+        assert!(copy
+            .add_entry("kernel32.dll", &read(None, None, 0))
+            .is_err());
+        assert!(copy
+            .add_entry("kernel32.dll", &read(None, Some(0), 0))
+            .is_err());
     }
 
     /// A descriptor's functions share its DLL's name rather than a copy each.

@@ -117,10 +117,9 @@ mod parser;
 mod types;
 
 pub use encoder::*;
-pub(crate) use parser::CustomAttributeParser;
 pub use parser::{
     parse_custom_attribute_blob, parse_custom_attribute_blob_with_registry,
-    parse_custom_attribute_data, parse_custom_attribute_data_with_registry,
+    parse_custom_attribute_data, parse_custom_attribute_data_with_registry, CustomAttributeParser,
 };
 pub use types::*;
 

@@ -13,6 +13,7 @@ use crate::{
         customattributes::CustomAttributeValueList,
         marshalling::MarshallingInfo,
         signatures::{SignatureMethod, SignatureParameter},
+        streams::SharedStr,
         tables::{ParamAttributes, ParamList},
         token::Token,
         typesystem::{CilPrimitive, CilTypeRef, CilTypeRefList, TypeRegistry, TypeResolver},
@@ -80,7 +81,7 @@ pub struct Param {
     ///
     /// Human-readable parameter name for debugging and reflection.
     /// May be None for compiler-generated or unnamed parameters.
-    pub name: Option<String>,
+    pub name: Option<SharedStr>,
 
     /// Default value for this parameter when `HAS_DEFAULT` flag is set.
     ///

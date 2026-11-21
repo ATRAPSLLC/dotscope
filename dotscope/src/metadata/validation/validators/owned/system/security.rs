@@ -22,7 +22,7 @@
 //! - [`crate::metadata::validation::validators::owned::system::security::OwnedSecurityValidator`] - Main validator implementation providing comprehensive security validation
 //! - [`crate::metadata::validation::validators::owned::system::security::OwnedSecurityValidator::validate_security_permission_declarations`] - Security permission declaration and syntax validation
 //! - [`crate::metadata::validation::validators::owned::system::security::OwnedSecurityValidator::validate_security_transparency`] - Security transparency rule validation and boundary enforcement
-//! - [`crate::metadata::validation::validators::owned::system::security::OwnedSecurityValidator::validate_permission_set_format`] - Permission set XML format and structure validation
+//! - [`PermissionSet`](crate::metadata::security::PermissionSet) - Permission set XML format and structure: decoded when the row loads, which refuses a malformed one
 //!
 //! # Usage Examples
 //!

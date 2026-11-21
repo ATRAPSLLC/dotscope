@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::{
     metadata::{
         tables::{
-            MetadataTable, PropertyList, PropertyMap, PropertyMapEntry, PropertyMapEntryRc,
+            MemberRanges, PropertyList, PropertyMap, PropertyMapEntry, PropertyMapEntryRc,
             PropertyPtrMap, TableId, TableInfoRef, TableRow,
         },
         token::Token,
@@ -77,89 +77,36 @@ impl PropertyMapRaw {
     /// ## Property Resolution Logic
     /// 1. **Direct Properties**: When no `PropertyPtr` table exists, properties are accessed directly
     /// 2. **Indirect Properties**: When `PropertyPtr` table exists, properties are accessed through indirection
-    /// 3. **Range Calculation**: End index is determined by the next `PropertyMap` entry or table end
+    /// 3. **Range Calculation**: End index is determined by the next `PropertyMap` entry or table end,
+    ///    read from `ranges`, which holds the runs of the whole table clamped to the `Property`
+    ///    table and made non-overlapping (see [`MemberRanges`]); whether `PropertyPtr` is used is
+    ///    decided there too, by whether that table has rows
     ///
     /// ## Arguments
     /// * `properties` - Map of all resolved `Property` entries for lookup
     /// * `property_ptr` - Map of `PropertyPtr` entries for indirection resolution
-    /// * `map` - The `PropertyMap` table for determining ranges between entries
+    /// * `ranges` - The normalized `PropertyList` runs of the whole `PropertyMap` table
+    ///   ([`TablesHeader::member_ranges`](crate::metadata::streams::TablesHeader::member_ranges)
+    ///   with [`MemberList::PropertyMapProperties`](crate::metadata::tables::MemberList::PropertyMapProperties))
     ///
     /// ## Returns
     /// Returns a [`crate::metadata::tables::PropertyList`] containing the resolved
     /// `Property` entries for this type, or an empty list if no properties exist.
     ///
     /// ## Errors
-    /// - Returns error if property indices are out of bounds
-    /// - Returns error if `PropertyPtr` indirection fails
-    /// - Returns error if `Property` entries cannot be resolved
+    /// - Returns error if a position in the run names a `PropertyPtr` row that is not loaded
+    /// - Returns error if a position (or its `PropertyPtr` entry) names a property that is not
+    ///   loaded
     fn resolve_property_list(
         &self,
         properties: &PropertyMap,
         property_ptr: &PropertyPtrMap,
-        map: &MetadataTable<PropertyMapRaw>,
+        ranges: &MemberRanges,
     ) -> Result<PropertyList> {
-        if self.property_list == 0 || properties.is_empty() {
-            return Ok(Arc::new(boxcar::Vec::new()));
+        let property_list = PropertyList::new();
+        for property in ranges.members(self.rid, property_ptr, |ptr| ptr.property, properties) {
+            _ = property_list.push(property?);
         }
-
-        let next_row_id = self
-            .rid
-            .checked_add(1)
-            .ok_or_else(|| malformed_error!("PropertyMap rid overflow: {}", self.rid))?;
-        let start = self.property_list as usize;
-        let end = if next_row_id > map.row_count {
-            properties.len().saturating_add(1)
-        } else {
-            match map.get(next_row_id)? {
-                Some(next_row) => next_row.property_list as usize,
-                None => {
-                    return Err(malformed_error!(
-                        "Failed to resolve property_end from next row - {}",
-                        next_row_id
-                    ))
-                }
-            }
-        };
-
-        if start > properties.len() || end > properties.len().saturating_add(1) || end < start {
-            return Ok(Arc::new(boxcar::Vec::new()));
-        }
-
-        let property_list = Arc::new(boxcar::Vec::with_capacity(end.saturating_sub(start)));
-        for counter in start..end {
-            let property_rid = u32::try_from(counter)
-                .map_err(|_| malformed_error!("Property row index out of range: {}", counter))?;
-            let actual_property_token = if property_ptr.is_empty() {
-                Token::from_parts(TableId::Property, property_rid)
-            } else {
-                // Built from the TableId enum rather than a hand-written prefix so the table
-                // id cannot drift from the value `PropertyPtrReader` keys rows under.
-                let property_ptr_token = Token::from_parts(TableId::PropertyPtr, property_rid);
-
-                match property_ptr.get(&property_ptr_token) {
-                    Some(property_ptr_entry) => {
-                        Token::from_parts(TableId::Property, property_ptr_entry.value().property)
-                    }
-                    None => {
-                        return Err(malformed_error!(
-                            "Failed to resolve PropertyPtr - {}",
-                            property_ptr_token.value()
-                        ))
-                    }
-                }
-            };
-
-            match properties.get(&actual_property_token) {
-                Some(property) => _ = property_list.push(property.value().clone()),
-                None => {
-                    return Err(malformed_error!(
-                        "Failed to resolve property - {}",
-                        actual_property_token.value()
-                    ))
-                }
-            }
-        }
-
         Ok(property_list)
     }
 
@@ -174,7 +121,8 @@ impl PropertyMapRaw {
     /// * `types` - The [`crate::metadata::typesystem::TypeRegistry`] for resolving parent types
     /// * `properties` - Map of all resolved `Property` entries for lookup
     /// * `property_ptr` - Map of `PropertyPtr` entries for indirection resolution
-    /// * `map` - The `PropertyMap` table for determining property ranges
+    /// * `ranges` - The normalized `PropertyList` runs of the whole `PropertyMap` table (see
+    ///   [`MemberRanges`])
     ///
     /// ## Returns
     /// Returns an [`std::sync::Arc`]-wrapped [`crate::metadata::tables::PropertyMapEntry`]
@@ -189,7 +137,7 @@ impl PropertyMapRaw {
         types: &TypeRegistry,
         properties: &PropertyMap,
         property_ptr: &PropertyPtrMap,
-        map: &MetadataTable<PropertyMapRaw>,
+        ranges: &MemberRanges,
     ) -> Result<PropertyMapEntryRc> {
         let parent = match types.get(&Token::new(self.parent | 0x0200_0000)) {
             Some(parent_type) => parent_type.into(),
@@ -206,7 +154,7 @@ impl PropertyMapRaw {
             token: self.token,
             offset: self.offset,
             parent,
-            properties: self.resolve_property_list(properties, property_ptr, map)?,
+            properties: self.resolve_property_list(properties, property_ptr, ranges)?,
         }))
     }
 
@@ -225,24 +173,20 @@ impl PropertyMapRaw {
     /// * `types` - The [`crate::metadata::typesystem::TypeRegistry`] containing all parsed types
     /// * `properties` - Map of all resolved Property entries for lookup
     /// * `property_ptr` - Map of `PropertyPtr` entries for indirection resolution
-    /// * `map` - The `PropertyMap` table for determining property ranges
+    /// * `ranges` - The normalized `PropertyList` runs of the whole `PropertyMap` table (see
+    ///   [`MemberRanges`])
     ///
     /// ## Errors
     /// - Returns error if the property list resolution fails
     /// - Returns error if the parent type cannot be found in the `TypeRegistry`
-    /// - Returns error if property indices are invalid
     pub fn apply(
         &self,
         types: &TypeRegistry,
         properties: &PropertyMap,
         property_ptr: &PropertyPtrMap,
-        map: &MetadataTable<PropertyMapRaw>,
+        ranges: &MemberRanges,
     ) -> Result<()> {
-        let property_list = self.resolve_property_list(properties, property_ptr, map)?;
-
-        if property_list.is_empty() && (self.property_list != 0 && !properties.is_empty()) {
-            return Err(malformed_error!("Invalid property_list"));
-        }
+        let property_list = self.resolve_property_list(properties, property_ptr, ranges)?;
 
         match types.get(&Token::new(self.parent | 0x0200_0000)) {
             Some(entry) => {

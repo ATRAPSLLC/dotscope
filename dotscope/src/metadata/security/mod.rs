@@ -7,13 +7,13 @@
 //!
 //! # Key Components
 //!
-//! - [`PermissionSet`] decodes a permission set blob, binary or XML, into its [`Permission`]s.
-//! - [`Permission`] is a permission's class and the properties it sets, as custom attribute
+//! - [`PermissionSet`](crate::metadata::security::PermissionSet) decodes a permission set blob, binary or XML, into its [`Permission`](crate::metadata::security::Permission)s.
+//! - [`Permission`](crate::metadata::security::Permission) is a permission's class and the properties it sets, as custom attribute
 //!   named arguments ([`crate::metadata::customattributes::CustomAttributeNamedArgument`]).
-//! - [`encode_permission_set`] writes permissions back as a blob; a binary set decoded and
+//! - [`encode_permission_set`](crate::metadata::security::encode_permission_set) writes permissions back as a blob; a binary set decoded and
 //!   encoded again is its own bytes.
-//! - [`PermissionSetBuilder`] builds a binary set as a compiler writes it.
-//! - [`SecurityAction`] is a row's action, [`SecurityPermissionFlags`] the
+//! - [`PermissionSetBuilder`](crate::metadata::security::PermissionSetBuilder) builds a binary set as a compiler writes it.
+//! - [`SecurityAction`](crate::metadata::security::SecurityAction) is a row's action, [`SecurityPermissionFlags`](crate::metadata::security::SecurityPermissionFlags) the
 //!   `SecurityPermissionFlag` enum.
 //!
 //! # Examples

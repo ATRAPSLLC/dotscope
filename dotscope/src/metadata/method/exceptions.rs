@@ -1182,10 +1182,7 @@ pub fn exception_structure_defects(
         }
 
         let leaves = instruction.flow_type == FlowType::Leave;
-        let falls_through = matches!(
-            instruction.flow_type,
-            FlowType::Sequential | FlowType::Call | FlowType::ConditionalBranch | FlowType::Switch
-        );
+        let falls_through = instruction.flow_type.falls_through();
         let mut successors: Vec<u64> = instruction
             .branch_targets
             .iter()

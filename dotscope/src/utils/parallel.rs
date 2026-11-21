@@ -9,7 +9,7 @@ use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use crate::Result;
 
 /// `try_for_each` that fails with the error of the first failing item in iteration order.
-pub(crate) trait TryForEachInOrder: IndexedParallelIterator {
+pub trait TryForEachInOrder: IndexedParallelIterator {
     /// Runs `operation` on every item, in parallel, and returns the error of the failing item
     /// with the lowest index, or `Ok(())` when none fails.
     ///

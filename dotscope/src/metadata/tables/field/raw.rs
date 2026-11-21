@@ -117,7 +117,7 @@ impl FieldRaw {
             token: self.token,
             offset: self.offset,
             flags: FieldAttributes::new(self.flags),
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             signature: parse_field_signature(blob.get(self.signature as usize)?)?,
             default: OnceLock::new(),
             rva: OnceLock::new(),

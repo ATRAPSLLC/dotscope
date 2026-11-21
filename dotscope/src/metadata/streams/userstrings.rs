@@ -432,7 +432,7 @@ pub struct UserStringsIterator<'a> {
 
 impl<'a> UserStringsIterator<'a> {
     /// Create a new iterator starting at position 1 (after the null entry)
-    pub(crate) fn new(user_strings: &'a UserStrings<'a>) -> Self {
+    pub fn new(user_strings: &'a UserStrings<'a>) -> Self {
         Self {
             user_strings,
             position: 1,

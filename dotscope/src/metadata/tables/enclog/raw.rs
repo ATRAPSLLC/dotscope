@@ -35,7 +35,7 @@
 //! This module integrates with:
 //! - [`crate::metadata::tables`] - Core metadata table infrastructure
 //! - [`crate::metadata::token`] - Token representation for metadata references
-//! - [`crate::file::io`] - Binary data reading utilities
+//! - [`crate::io`] - Binary data reading utilities
 //!
 //! # References
 //!

@@ -334,6 +334,20 @@ pub use streamheader::StreamHeader;
 mod strings;
 pub use strings::{StringEntries, Strings, StringsIterator};
 
+/// The string type of metadata names, shared by every row that names one `#Strings` entry.
+///
+/// Provides [`crate::metadata::streams::SharedStr`], which reads as a `str` and costs a row
+/// the same whatever its name's length.
+mod sharedstr;
+pub use sharedstr::{Run, SharedStr};
+
+/// The byte type of blob values a metadata row keeps, a view of a shared copy of `#Blob`.
+///
+/// Provides [`crate::metadata::streams::SharedBytes`], which reads as a `[u8]` and costs a row
+/// the same whatever its blob's length.
+mod sharedbytes;
+pub use sharedbytes::SharedBytes;
+
 /// UTF-16 user string heap (`#US`) implementation.
 ///
 /// Provides [`crate::metadata::streams::userstrings::UserStrings`] and [`crate::metadata::streams::userstrings::UserStringsIterator`] for accessing
@@ -346,7 +360,7 @@ pub use userstrings::{UserStrings, UserStringsIterator};
 /// Provides [`crate::metadata::streams::tablesheader::TablesHeader`] for parsing compressed and uncompressed
 /// metadata table headers, schemas, and row count information.
 mod tablesheader;
-pub use tablesheader::TablesHeader;
+pub use tablesheader::{TableSummary, TablesHeader};
 
 /// 128-bit GUID array (`#GUID`) implementation.
 ///

@@ -200,9 +200,18 @@
 //! - **ECMA-335 II.24.2.3**: Strings heap format and UTF-8 encoding requirements
 //! - **ECMA-335 II.22**: Metadata tables and string reference mechanisms
 
-use std::{ffi::CStr, str};
+use std::{
+    ffi::CStr,
+    str,
+    sync::{Arc, OnceLock},
+};
 
-use crate::{metadata::streams::sentinel_heap, Error, HeapKind, ParseFailure, Result};
+use dashmap::DashMap;
+
+use crate::{
+    metadata::streams::{sentinel_heap, sharedstr::Run, SharedStr},
+    Error, HeapKind, ParseFailure, Result,
+};
 
 /// ECMA-335 compliant `#Strings` heap providing UTF-8 identifier string access.
 ///
@@ -375,6 +384,22 @@ use crate::{metadata::streams::sentinel_heap, Error, HeapKind, ParseFailure, Res
 pub struct Strings<'a> {
     /// Raw bytes of the strings heap
     data: &'a [u8],
+    /// The heap's strings as shared copies, built on the first [`Self::get_shared`]
+    shared: OnceLock<SharedRuns>,
+}
+
+/// The shared copies of a strings heap's NUL-terminated runs.
+///
+/// Any offset into the heap names the suffix of one run, the bytes up to the next NUL. A run
+/// is copied once, on the first name inside it, and every name inside it shares the copy:
+/// memory stays within the heap's size, and each lookup costs a binary search, however many
+/// rows name the run and at whatever offsets.
+struct SharedRuns {
+    /// The offset of every NUL byte of the heap, ascending: the end of each run.
+    ends: Vec<u32>,
+    /// By run (its index in `ends`): the offset its longest valid UTF-8 suffix starts at,
+    /// and a copy of that suffix.
+    runs: DashMap<usize, (usize, Arc<Run>)>,
 }
 
 impl<'a> Strings<'a> {
@@ -530,6 +555,7 @@ impl<'a> Strings<'a> {
     pub fn from(data: &[u8]) -> Result<Strings<'_>> {
         Ok(Strings {
             data: sentinel_heap(data, HeapKind::Strings)?,
+            shared: OnceLock::new(),
         })
     }
 
@@ -783,6 +809,87 @@ impl<'a> Strings<'a> {
             },
             Err(_) => Err(corrupt().into()),
         }
+    }
+
+    /// Access the string at the specified heap offset as a [`SharedStr`].
+    ///
+    /// Resolves the same string as [`Self::get`], and fails exactly where it fails (out of
+    /// bounds, no terminating NUL, not valid UTF-8 from `index`), but returns a string that
+    /// shares its storage with every other name of the same NUL-terminated run of the
+    /// heap. A metadata row keeps its name this way: a run is copied once, however many rows
+    /// name it and at whatever offsets inside it, so a hostile image pointing many rows at
+    /// one long string costs no more memory than the heap, and a lookup costs a binary
+    /// search instead of a scan of the string.
+    ///
+    /// The first call indexes the heap's NUL bytes (one pass over the heap).
+    ///
+    /// # Arguments
+    /// * `index` - Byte offset within the strings heap where the string begins
+    ///
+    /// # Errors
+    /// Returns an error when `index` is past the heap, when no NUL ends the string, or when
+    /// the bytes from `index` to the NUL are not valid UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dotscope::metadata::streams::Strings;
+    ///
+    /// let data = [0u8, b'L', b'i', b's', b't', 0];
+    /// let strings = Strings::from(&data)?;
+    /// assert_eq!(strings.get_shared(1)?, "List");
+    /// assert_eq!(strings.get_shared(3)?, "st", "an offset inside a string names its tail");
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    pub fn get_shared(&self, index: usize) -> Result<SharedStr> {
+        let oob = || ParseFailure::HeapOutOfBounds {
+            heap: HeapKind::Strings,
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+        };
+        let corrupt = || ParseFailure::HeapCorrupt {
+            heap: HeapKind::Strings,
+            reason: format!("invalid UTF-8 string at index {index}"),
+        };
+        if index >= self.data.len() {
+            return Err(oob().into());
+        }
+
+        let shared = self.shared.get_or_init(|| SharedRuns {
+            ends: self
+                .data
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == 0)
+                .filter_map(|(offset, _)| u32::try_from(offset).ok())
+                .collect(),
+            runs: DashMap::new(),
+        });
+        let run = shared
+            .ends
+            .partition_point(|end| usize::try_from(*end).is_ok_and(|end| end < index));
+        let end = shared
+            .ends
+            .get(run)
+            .and_then(|end| usize::try_from(*end).ok())
+            .ok_or_else(|| Error::from(corrupt()))?;
+        let run_start = match run.checked_sub(1) {
+            Some(previous) => shared
+                .ends
+                .get(previous)
+                .and_then(|end| usize::try_from(*end).ok())
+                .map_or(0, |end| end.saturating_add(1)),
+            None => 0,
+        };
+
+        let (valid_start, buf) = shared
+            .runs
+            .entry(run)
+            .or_insert_with(|| valid_suffix(self.data, run_start, end))
+            .clone();
+        index
+            .checked_sub(valid_start)
+            .and_then(|start| SharedStr::suffix(buf, start))
+            .ok_or_else(|| corrupt().into())
     }
 
     /// Create an iterator for sequential traversal of all strings in the heap.
@@ -1134,6 +1241,32 @@ impl<'a> Strings<'a> {
     }
 }
 
+/// The longest suffix of `data[start..end]` that is valid UTF-8, with the offset it starts
+/// at.
+///
+/// A string read from an offset is valid exactly when the bytes from there to the NUL are:
+/// the valid suffixes of a run are those starting on a char boundary of its longest valid
+/// suffix, which begins after the run's last invalid sequence (an empty string at `end` when
+/// the run ends inside one).
+fn valid_suffix(data: &[u8], start: usize, end: usize) -> (usize, Arc<Run>) {
+    let mut from = start;
+    while from < end {
+        let Some(bytes) = data.get(from..end) else {
+            break;
+        };
+        match str::from_utf8(bytes) {
+            Ok(text) => return (from, Run::new(text)),
+            Err(error) => {
+                let skip = error
+                    .valid_up_to()
+                    .saturating_add(error.error_len().unwrap_or(bytes.len()));
+                from = from.saturating_add(skip.max(1));
+            }
+        }
+    }
+    (end, Run::new(""))
+}
+
 impl<'a> IntoIterator for &'a Strings<'a> {
     type Item = (usize, &'a str);
     type IntoIter = StringsIterator<'a>;
@@ -1288,7 +1421,7 @@ impl<'a> StringsIterator<'a> {
     /// # Returns
     ///
     /// A new iterator that will yield all strings in the heap in order.
-    pub(crate) fn new(strings: &'a Strings<'a>) -> Self {
+    pub fn new(strings: &'a Strings<'a>) -> Self {
         Self {
             entries: strings.entries(),
         }
@@ -1334,6 +1467,54 @@ impl<'a> Iterator for StringEntries<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `get_shared` resolves every offset as `get` does, string or error, over heaps with
+    /// valid runs, invalid and truncated UTF-8 sequences, an empty run and no final NUL.
+    #[test]
+    fn get_shared_agrees_with_get_at_every_offset() {
+        let heaps: [&[u8]; 6] = [
+            b"\0List\0Namespace.Type\0\0x\0",
+            b"\0ab\xffcd\0\xe2\x82\xacEuro\0",
+            b"\0ok\xe2\x82\0\xc3\0tail\0",
+            "\0caf\u{e9}\0\u{1f600}x\0".as_bytes(),
+            b"\0no terminator",
+            b"\0\xff\xfe\xfd\0a\xff\0",
+        ];
+        for data in heaps {
+            let strings = Strings::from(data).unwrap();
+            for index in 0..=data.len() {
+                let borrowed = strings.get(index);
+                let shared = strings.get_shared(index);
+                match (&borrowed, &shared) {
+                    (Ok(text), Ok(name)) => assert_eq!(*text, name.as_str(), "{data:?} at {index}"),
+                    (Err(_), Err(_)) => {}
+                    _ => panic!("{data:?} at {index}: get {borrowed:?}, get_shared {shared:?}"),
+                }
+            }
+        }
+    }
+
+    /// Names inside one run share one copy of it, whatever offsets they start at.
+    #[test]
+    fn names_inside_one_run_share_one_copy() {
+        let mut data = vec![0u8];
+        data.extend(std::iter::repeat_n(b'a', 1 << 16));
+        data.push(0);
+        let strings = Strings::from(&data).unwrap();
+        let names: Vec<SharedStr> = (1..=1 << 16)
+            .map(|index| strings.get_shared(index).unwrap())
+            .collect();
+        assert_eq!(names[0].len(), 1 << 16);
+        assert_eq!(names[names.len() - 1], "a");
+        let shared = strings.shared.get().unwrap();
+        assert_eq!(shared.runs.len(), 1, "one copy of the run");
+        let (_, run) = shared.runs.get(&1).unwrap().clone();
+        assert_eq!(
+            Arc::strong_count(&run),
+            names.len() + 2,
+            "every name holds the one copy"
+        );
+    }
 
     /// A `#Strings` stream of no bytes is a heap with no entries: index 0 is the empty string,
     /// any other index out of bounds.

@@ -22,7 +22,7 @@
 //!
 //! - [`NestedClassRaw`] - Raw table data with unresolved indexes for initial parsing
 //! - [`NestedClass`] - Processed data with resolved type references
-//! - [`NestedClassLoader`] - Handles conversion between raw and processed representations
+//! - [`NestedClassLoader`](crate::metadata::loader::tables::NestedClassLoader) - Handles conversion between raw and processed representations
 //! - [`NestedClassMap`] - Thread-safe storage mapping tokens to processed entries
 //! - [`NestedClassList`] - Thread-safe collection for sequential access
 //!
@@ -60,14 +60,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

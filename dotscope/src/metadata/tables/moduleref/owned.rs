@@ -3,7 +3,9 @@
 //! This module provides the owned variant of `ModuleRef` table entries with resolved
 //! references and owned data structures for efficient runtime access.
 
-use crate::metadata::{customattributes::CustomAttributeValueList, token::Token};
+use crate::metadata::{
+    customattributes::CustomAttributeValueList, streams::SharedStr, token::Token,
+};
 
 /// Owned representation of a `ModuleRef` table entry with resolved references.
 ///
@@ -51,7 +53,7 @@ pub struct ModuleRef {
     ///
     /// Human-readable string identifying the external module, resolved from the string heap.
     /// Typically contains the module file name or logical name used for cross-module references.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Custom attributes attached to this module reference.
     ///

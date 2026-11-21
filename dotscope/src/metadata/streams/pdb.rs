@@ -121,6 +121,50 @@ impl PdbStream {
             type_system_rows,
         })
     }
+
+    /// The stream's bytes, as [`PdbStream::from`] reads them: the id, the entry point's token
+    /// (0 for none), the mask, then the row count of every table the mask names, in table
+    /// order.
+    ///
+    /// A row count in [`PdbStream::type_system_rows`] for a table the mask does not name is
+    /// not written: the mask decides which counts the stream holds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dotscope::metadata::{streams::PdbStream, tables::TableId, token::Token};
+    ///
+    /// let mut type_system_rows = [0u32; 64];
+    /// type_system_rows[TableId::MethodDef as usize] = 3;
+    /// let stream = PdbStream {
+    ///     id: [7; 20],
+    ///     entry_point: Some(Token::new(0x0600_0001)),
+    ///     referenced_tables: 1 << TableId::MethodDef as u8,
+    ///     type_system_rows,
+    /// };
+    /// assert_eq!(PdbStream::from(&stream.to_bytes())?, stream);
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(
+            FIXED_SIZE.saturating_add((self.referenced_tables.count_ones() as usize) * 4),
+        );
+        data.extend_from_slice(&self.id);
+        data.extend_from_slice(
+            &self
+                .entry_point
+                .map_or(0, |token| token.value())
+                .to_le_bytes(),
+        );
+        data.extend_from_slice(&self.referenced_tables.to_le_bytes());
+        for (index, rows) in self.type_system_rows.iter().enumerate() {
+            if self.referenced_tables & (1u64 << index) != 0 {
+                data.extend_from_slice(&rows.to_le_bytes());
+            }
+        }
+        data
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +216,24 @@ mod tests {
         let pdb = PdbStream::from(&stream(0, &[])).unwrap();
         assert_eq!(pdb.entry_point, None);
         assert_eq!(pdb.referenced_tables, 0);
+    }
+
+    /// A stream encodes back to the bytes it was read from.
+    #[test]
+    fn a_stream_encodes_back_to_its_bytes() {
+        for data in [
+            stream(
+                0x0600_0003,
+                &[(TableId::MethodDef, 70_000), (TableId::TypeDef, 12)],
+            ),
+            stream(0, &[]),
+            stream(
+                0x0600_0001,
+                &[(TableId::Module, 1), (TableId::GenericParamConstraint, 9)],
+            ),
+        ] {
+            assert_eq!(PdbStream::from(&data).unwrap().to_bytes(), data);
+        }
     }
 
     /// A mask naming a PDB table, or no table, is refused; a stream cut before its counts is.

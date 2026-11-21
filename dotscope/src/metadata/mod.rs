@@ -185,11 +185,13 @@ pub mod imports;
 /// Implementation of import scope parsing for Portable PDB format
 pub mod importscope;
 /// Implementation of our `MetaDataTable` loader
-pub(crate) mod loader;
+mod loader;
 /// Implementation of the type marshalling for native code invokations
 pub mod marshalling;
 /// Implementation of the MethodHeader of CIL
 pub mod method;
+/// Extending text hashes, the identity of the type names joined from shared parts.
+mod texthash;
 
 /// Portable PDB metadata: standalone `.pdb` files and PDBs embedded in images.
 pub mod pdb;
@@ -223,3 +225,6 @@ pub mod typesystem;
 pub mod validation;
 /// VTable fixup directory parsing for mixed-mode and COM interop assemblies
 pub mod vtfixup;
+pub use texthash::TextHash;
+
+pub use crate::utils::{LazyList, LazyListIter, RowList, RowListIter};

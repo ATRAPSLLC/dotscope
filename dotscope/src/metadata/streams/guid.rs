@@ -970,7 +970,7 @@ impl<'a> GuidIterator<'a> {
     /// # Note
     /// This method is internal and called by [`crate::metadata::streams::guid::Guid::iter`]. Users should
     /// prefer the public `iter()` method for creating iterators.
-    pub(crate) fn new(guid: &'a Guid<'a>) -> Self {
+    pub fn new(guid: &'a Guid<'a>) -> Self {
         Self {
             guid,
             index: 1, // GUID indices start at 1

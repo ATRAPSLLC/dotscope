@@ -116,6 +116,7 @@ use std::{fmt, fmt::Write as _, str::FromStr, sync::atomic::Ordering};
 use crate::{
     metadata::{
         identity::cryptographic::Identity,
+        streams::SharedStr,
         tables::{Assembly, AssemblyHashAlgorithm, AssemblyRef},
     },
     Error, Result,
@@ -168,7 +169,7 @@ use crate::{
 ///
 /// // Create identity for a simple library
 /// let identity = AssemblyIdentity {
-///     name: "MyLibrary".to_string(),
+///     name: "MyLibrary".into(),
 ///     version: AssemblyVersion::new(1, 0, 0, 0),
 ///     culture: None,
 ///     strong_name: None,
@@ -187,7 +188,7 @@ pub struct AssemblyIdentity {
     /// The primary identifier used for basic assembly lookup and display.
     /// This name appears in assembly references and is used for file system
     /// resolution when no culture or architecture specificity is required.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Four-part version number for compatibility and binding.
     ///
@@ -206,7 +207,7 @@ pub struct AssemblyIdentity {
     /// - `None` - Culture-neutral assembly (default)
     /// - `Some("en-US")` - US English localized assembly
     /// - `Some("fr-FR")` - French (France) localized assembly
-    pub culture: Option<String>,
+    pub culture: Option<SharedStr>,
 
     /// Cryptographic strong name identity.
     ///
@@ -249,6 +250,30 @@ impl std::hash::Hash for AssemblyIdentity {
         // Note: strong_name is excluded from hash calculation
         // This ensures assemblies with different strong name representations
         // hash to the same value for consistent HashMap behavior
+    }
+}
+
+/// Orders identities by name, then version, culture and processor architecture: the fields
+/// equality compares, so two identities are `Equal` exactly when they are `==`.
+///
+/// The order gives multi-assembly containers a deterministic iteration order (a project
+/// lists its assemblies, and searches them, in this order), independent of load timing.
+impl Ord for AssemblyIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.version.cmp(&other.version))
+            .then_with(|| self.culture.cmp(&other.culture))
+            .then_with(|| {
+                self.processor_architecture
+                    .cmp(&other.processor_architecture)
+            })
+    }
+}
+
+impl PartialOrd for AssemblyIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -326,7 +351,7 @@ pub struct AssemblyVersion {
 /// - **AMD64**: 64-bit x86-64 architecture (Intel/AMD)
 /// - **ARM**: ARM processor architecture
 /// - **ARM64**: 64-bit ARM architecture
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProcessorArchitecture {
     /// Microsoft Intermediate Language - architecture neutral.
     ///
@@ -404,9 +429,9 @@ impl AssemblyIdentity {
     /// );
     /// ```
     pub fn new(
-        name: impl Into<String>,
+        name: impl Into<SharedStr>,
         version: AssemblyVersion,
-        culture: Option<String>,
+        culture: Option<SharedStr>,
         strong_name: Option<Identity>,
         processor_architecture: Option<ProcessorArchitecture>,
     ) -> Self {
@@ -618,9 +643,9 @@ impl AssemblyIdentity {
         }
 
         Ok(Self {
-            name,
+            name: name.into(),
             version,
-            culture,
+            culture: culture.map(Into::into),
             strong_name,
             processor_architecture,
         })
@@ -644,7 +669,7 @@ impl AssemblyIdentity {
     /// let identity = AssemblyIdentity::new(
     ///     "MyLibrary",
     ///     AssemblyVersion::new(1, 2, 3, 4),
-    ///     Some("en-US".to_string()),
+    ///     Some("en-US".into()),
     ///     None,
     ///     None,
     /// );
@@ -1225,9 +1250,9 @@ mod tests {
             "mscorlib",
             AssemblyVersion::new(4, 0, 0, 0),
             None,
-            Some(Identity::EcmaKey(vec![
-                0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0,
-            ])),
+            Some(Identity::EcmaKey(
+                vec![0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0].into(),
+            )),
             None,
         );
         assert!(identity
@@ -1476,7 +1501,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(identity.name, "Resources");
-        assert_eq!(identity.culture, Some("en-US".to_string()));
+        assert_eq!(identity.culture.as_deref(), Some("en-US"));
         assert!(identity.strong_name.is_none());
     }
 
@@ -1598,7 +1623,7 @@ mod tests {
         let identity = AssemblyIdentity::new(
             "Resources",
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("fr-FR".to_string()),
+            Some("fr-FR".into()),
             None,
             None,
         );
@@ -1619,7 +1644,7 @@ mod tests {
             "StrongLib",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::PubKey(pubkey_data)),
+            Some(Identity::PubKey(pubkey_data.into())),
             None,
         );
 
@@ -1651,7 +1676,7 @@ mod tests {
             "FrameworkLib",
             AssemblyVersion::new(4, 0, 0, 0),
             None,
-            Some(Identity::EcmaKey(ecma_data)),
+            Some(Identity::EcmaKey(ecma_data.into())),
             None,
         );
 
@@ -1714,7 +1739,7 @@ mod tests {
         let localized = AssemblyIdentity::new(
             "Resources",
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("de-DE".to_string()),
+            Some("de-DE".into()),
             None,
             None,
         );
@@ -1851,7 +1876,7 @@ mod tests {
         let original = AssemblyIdentity::new(
             "StrongLib",
             AssemblyVersion::new(1, 2, 3, 4),
-            Some("en-US".to_string()),
+            Some("en-US".into()),
             Some(Identity::Token([
                 0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89,
             ])),
@@ -1917,7 +1942,7 @@ mod tests {
     fn test_assembly_identity_parse_case_insensitive_culture() {
         // Culture value should be preserved as-is (case-sensitive)
         let identity = AssemblyIdentity::parse("MyLib, Version=1.0.0.0, Culture=EN-us").unwrap();
-        assert_eq!(identity.culture, Some("EN-us".to_string()));
+        assert_eq!(identity.culture.as_deref(), Some("EN-us"));
     }
 
     #[test]
@@ -2135,7 +2160,7 @@ mod tests {
         let en_us = AssemblyIdentity::new(
             "MyLib".to_string(),
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("en-US".to_string()),
+            Some("en-US".into()),
             None,
             None,
         );
@@ -2143,7 +2168,7 @@ mod tests {
         let fr_fr = AssemblyIdentity::new(
             "MyLib".to_string(),
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("fr-FR".to_string()),
+            Some("fr-FR".into()),
             None,
             None,
         );

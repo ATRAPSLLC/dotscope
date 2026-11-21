@@ -65,7 +65,7 @@
 //!
 //! # Error Handling
 //!
-//! Decoding returns [`crate::Error::Malformed`] when a blob is not in its kind's format: it
+//! Decoding returns [`crate::Error::Parse`] when a blob is not in its kind's format: it
 //! ends inside a value, a count or offset is out of range, it has bytes after its value, or
 //! text the format defines as UTF-8 is not. Encoding fails when a value cannot be written in
 //! its format, such as text holding the NUL that ends it or a count past a compressed
@@ -142,7 +142,7 @@ const SYNTAX_OFFSET_BASELINE: u8 = 0xFF;
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Malformed`] when the blob is not in its kind's format: it ends
+/// Returns [`crate::Error::Parse`] when the blob is not in its kind's format: it ends
 /// inside a value, a count or offset is out of range, bytes follow the value, or text the
 /// format defines as UTF-8 is not.
 ///
@@ -351,7 +351,7 @@ pub fn parse_custom_debug_blob(data: &[u8], kind: CustomDebugKind) -> Result<Cus
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Malformed`] when the value cannot be written in its format: a
+/// Returns [`crate::Error::Parse`] when the value cannot be written in its format: a
 /// count, ordinal or syntax offset outside what a compressed integer holds, a catch handler
 /// offset of `u32::MAX`, or text holding the NUL that the format ends it with.
 ///
@@ -514,7 +514,7 @@ impl CustomDebugInfo {
     ///
     /// # Errors
     ///
-    /// The inner result is [`crate::Error::Malformed`] when the format is negative
+    /// The inner result is [`crate::Error::Parse`] when the format is negative
     /// (reserved), the content is not a deflate stream, or it inflates to more or fewer bytes
     /// than the format states.
     ///

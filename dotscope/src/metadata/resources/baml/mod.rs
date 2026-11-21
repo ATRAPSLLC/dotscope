@@ -27,7 +27,7 @@
 //! stream, the tree is built without recursion, and a record of a type no
 //! layout states ends the read with what was read before it.
 
-mod known;
+pub mod known;
 
 use std::collections::HashMap;
 

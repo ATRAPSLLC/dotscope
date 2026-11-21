@@ -374,7 +374,7 @@ impl OwnedInheritanceValidator {
         let derived_flavor = derived_type.flavor();
         if derived_flavor.is_value_type() {
             let base_fullname = base_type.fullname();
-            if &*base_fullname != "System.ValueType" && &*base_fullname != "System.Enum" {
+            if base_fullname != "System.ValueType" && base_fullname != "System.Enum" {
                 return Err(Error::ValidationOwnedFailed {
                     validator: self.name().to_string(),
                     message: format!(

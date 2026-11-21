@@ -109,7 +109,7 @@ impl<'a> SectionMap<'a> {
 
     /// Where the zero-filled part `rva` is in ends, when it is in one: every RVA from `rva` up
     /// to it reads as zero.
-    pub(crate) fn zero_fill_end(&self, rva: u32) -> Option<u32> {
+    pub fn zero_fill_end(&self, rva: u32) -> Option<u32> {
         match self.locate(rva) {
             Some((extent, delta)) if delta >= extent.raw => {
                 Some(extent.start.saturating_add(extent.size))

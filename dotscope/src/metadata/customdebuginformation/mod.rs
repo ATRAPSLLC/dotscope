@@ -24,15 +24,15 @@
 //!
 //! # Key Components
 //!
-//! - [`CustomDebugKind`] - the kinds, each with its GUID ([`crate::metadata::pdb::guids`])
-//! - [`CustomDebugInfo`] - a blob decoded by its kind, one variant per kind
-//! - [`parse_custom_debug_blob`] - decodes a blob of a kind
-//! - [`encode_custom_debug_blob`] - writes a value back to its blob, byte for byte as the
+//! - [`CustomDebugKind`](crate::metadata::customdebuginformation::CustomDebugKind) - the kinds, each with its GUID ([`crate::metadata::pdb::guids`])
+//! - [`CustomDebugInfo`](crate::metadata::customdebuginformation::CustomDebugInfo) - a blob decoded by its kind, one variant per kind
+//! - [`parse_custom_debug_blob`](crate::metadata::customdebuginformation::parse_custom_debug_blob) - decodes a blob of a kind
+//! - [`encode_custom_debug_blob`](crate::metadata::customdebuginformation::encode_custom_debug_blob) - writes a value back to its blob, byte for byte as the
 //!   compilers write it
-//! - [`CustomDebugInfo::embedded_source_text`] - an embedded source's text, inflated on
+//! - [`CustomDebugInfo::embedded_source_text`](crate::metadata::customdebuginformation::CustomDebugInfo::embedded_source_text) - an embedded source's text, inflated on
 //!   request and bounded by the size the blob states
-//! - The record types the variants hold: [`HoistedLocalScope`], [`EncLocalSlot`],
-//!   [`EncLambda`], [`EncStateMachineState`], [`MetadataReferenceInfo`], [`AsyncAwait`]
+//! - The record types the variants hold: [`HoistedLocalScope`](crate::metadata::customdebuginformation::HoistedLocalScope), [`EncLocalSlot`](crate::metadata::customdebuginformation::EncLocalSlot),
+//!   [`EncLambda`](crate::metadata::customdebuginformation::EncLambda), [`EncStateMachineState`](crate::metadata::customdebuginformation::EncStateMachineState), [`MetadataReferenceInfo`](crate::metadata::customdebuginformation::MetadataReferenceInfo), [`AsyncAwait`](crate::metadata::customdebuginformation::AsyncAwait)
 //!
 //! # Formats
 //!
@@ -188,7 +188,7 @@
 //!
 //! # Error Handling
 //!
-//! Decoding returns [`crate::Error::Malformed`] for a blob that is not in its kind's format
+//! Decoding returns [`crate::Error::Parse`] for a blob that is not in its kind's format
 //! (truncated, with trailing bytes, an out-of-range count or offset, or text that is not
 //! UTF-8). An embedded source's content is checked only when it is read: its value holds the
 //! stored bytes, and inflating them fails if they do not inflate to the size they state.

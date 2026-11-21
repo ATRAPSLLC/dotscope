@@ -9,6 +9,7 @@
 
 use crate::metadata::{
     customattributes::CustomAttributeValueList,
+    streams::SharedStr,
     tables::{MemberRefSignature, ParamList},
     token::Token,
     typesystem::CilTypeReference,
@@ -59,7 +60,7 @@ pub struct MemberRef {
     ///
     /// Owned string containing the member name used for identification and lookup.
     /// For constructors, this is typically ".ctor" (instance) or ".cctor" (static).
-    pub name: String,
+    pub name: SharedStr,
 
     /// Parsed member signature information.
     ///

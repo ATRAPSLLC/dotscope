@@ -318,9 +318,9 @@ impl OwnedTypeDefinitionValidator {
                 // Value types should typically inherit from System.ValueType or System.Enum
                 if let Some(base_type) = type_entry.base() {
                     let base_fullname = base_type.fullname();
-                    if &*base_fullname != "System.ValueType"
-                        && &*base_fullname != "System.Enum"
-                        && &*base_fullname != "System.Object"
+                    if base_fullname != "System.ValueType"
+                        && base_fullname != "System.Enum"
+                        && base_fullname != "System.Object"
                     {
                         // Object is allowed for primitives
                         // Allow some flexibility for special cases

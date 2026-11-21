@@ -31,6 +31,7 @@ use std::sync::atomic::AtomicU32;
 use crate::metadata::{
     customattributes::CustomAttributeValueList,
     identity::Identity,
+    streams::SharedStr,
     tables::{AssemblyFlags, AssemblyRefHash},
     token::Token,
 };
@@ -92,13 +93,13 @@ pub struct AssemblyRef {
     ///
     /// The assembly name without file extension (e.g., "mscorlib", "System.Core").
     /// This is the primary identifier used during assembly resolution.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Culture string for localized assemblies
     ///
     /// Specifies the culture for satellite assemblies containing localized resources.
     /// `None` indicates a culture-neutral assembly (the common case for most assemblies).
-    pub culture: Option<String>,
+    pub culture: Option<SharedStr>,
 
     /// Major version number (first component of version)
     ///

@@ -12,7 +12,7 @@
 //! # Usage
 //!
 //! These functions are primarily used by:
-//! - [`crate::cilassembly::changes::HeapChanges`] for tracking heap modifications
+//! - [`crate::HeapChanges`] for tracking heap modifications
 //! - [`crate::cilassembly::writer::heaps`] for deduplication during heap streaming
 //!
 use std::hash::{Hash, Hasher};

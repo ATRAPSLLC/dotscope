@@ -9,8 +9,8 @@ use std::sync::OnceLock;
 
 use crate::{
     metadata::{
-        customattributes::CustomAttributeValueList, method::MethodRef, tables::EventAttributes,
-        token::Token, typesystem::CilTypeRef,
+        customattributes::CustomAttributeValueList, method::MethodRef, streams::SharedStr,
+        tables::EventAttributes, token::Token, typesystem::CilTypeRef,
     },
     utils::RowList,
 };
@@ -71,7 +71,7 @@ pub struct Event {
     /// The name of the event as it appears in source code. Event names typically
     /// follow C# conventions (`PascalCase`) and should be descriptive of the notification
     /// being provided. This name is used for reflection and debugging.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Type reference for the event handler delegate
     ///

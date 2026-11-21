@@ -22,7 +22,7 @@
 //!
 //! - [`ParamRaw`] - Raw table data with unresolved indexes for initial parsing
 //! - [`Param`] - Processed data with resolved parameter names
-//! - [`ParamLoader`] - Handles conversion between raw and processed representations
+//! - [`ParamLoader`](crate::metadata::loader::tables::ParamLoader) - Handles conversion between raw and processed representations
 //! - [`ParamMap`] - Thread-safe storage mapping tokens to processed entries
 //! - [`ParamList`] - Thread-safe collection for sequential access
 //!
@@ -67,14 +67,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::{metadata::token::Token, utils::LazyList};
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

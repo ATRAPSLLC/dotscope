@@ -31,6 +31,7 @@ use std::{
 use crate::{
     metadata::{
         customattributes::CustomAttributeValueList,
+        streams::SharedStr,
         tables::GenericParamAttributes,
         token::Token,
         typesystem::{CilTypeRef, CilTypeReference},
@@ -151,7 +152,7 @@ pub struct GenericParam {
     ///
     /// The parameter name as it appears in source code and metadata, resolved
     /// from the strings heap. Used for reflection and debugging purposes.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Custom attributes applied to this generic parameter.
     ///
