@@ -3,15 +3,7 @@
 //! This module provides result types for project loading operations, tracking
 //! successfully loaded assemblies, failures, and missing dependencies.
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
-};
-
-use crate::{
-    metadata::{cilassemblyview::CilAssemblyView, identity::AssemblyIdentity},
-    project::CilProject,
-};
+use crate::{metadata::identity::AssemblyIdentity, project::CilProject};
 
 /// A version mismatch between a required and actual assembly version.
 ///
@@ -27,12 +19,10 @@ pub struct VersionMismatch {
 
 /// Result of a project loading operation.
 ///
-/// Contains the loaded project along with statistics about the loading process,
-/// including which assemblies were successfully loaded, which failed, and which
-/// dependencies could not be found.
-///
-/// During loading, this struct also holds temporary state for discovery and
-/// parallel loading phases. This state is cleaned up before the result is returned.
+/// Contains the loaded project along with a report of the loading process: which
+/// assemblies were loaded, which referenced names were not found, which files or
+/// assemblies failed to load (with the error each gave), and which references were
+/// satisfied only by another version.
 ///
 /// # Usage
 ///
@@ -63,26 +53,19 @@ pub struct ProjectResult {
     pub project: CilProject,
     /// Successfully loaded assembly identities
     pub loaded_assemblies: Vec<AssemblyIdentity>,
-    /// Dependencies that could not be found or loaded
+    /// Names referenced by an AssemblyRef that no search directory holds an assembly for
     pub missing_dependencies: Vec<String>,
-    /// Detailed failure information (file path -> error message)
+    /// Files and assemblies that were found but failed to load, each with its error:
+    /// a file that does not read, a dependency left out of the project because its load
+    /// failed or panicked, a referenced name that is not a valid simple name, or a
+    /// candidate file that resolves outside its search directory
     pub failed_loads: Vec<(String, String)>,
     /// Version mismatches detected during dependency resolution
     pub version_mismatches: Vec<VersionMismatch>,
-    /// Total number of successfully loaded assemblies
+    /// Total number of successfully loaded assemblies (`loaded_assemblies.len()`)
     pub loaded_count: usize,
-    /// Total number of failed loading attempts
+    /// Total number of problems: `missing_dependencies.len() + failed_loads.len()`
     pub failed_count: usize,
-
-    // Internal state used during loading (cleared before return)
-    /// Discovered assembly views pending full load
-    pub(crate) pending_views: HashMap<AssemblyIdentity, CilAssemblyView>,
-    /// Identity of the primary assembly
-    pub(crate) primary_identity: Option<AssemblyIdentity>,
-    /// Paths already processed during discovery
-    pub(crate) processed_paths: HashSet<PathBuf>,
-    /// Queue of paths to discover
-    pub(crate) discovery_queue: VecDeque<PathBuf>,
 }
 
 impl std::fmt::Debug for ProjectResult {
@@ -95,8 +78,7 @@ impl std::fmt::Debug for ProjectResult {
             .field("version_mismatches", &self.version_mismatches)
             .field("loaded_count", &self.loaded_count)
             .field("failed_count", &self.failed_count)
-            .field("pending_views_count", &self.pending_views.len())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -112,44 +94,7 @@ impl ProjectResult {
             version_mismatches: Vec::new(),
             loaded_count: 0,
             failed_count: 0,
-            pending_views: HashMap::new(),
-            primary_identity: None,
-            processed_paths: HashSet::new(),
-            discovery_queue: VecDeque::new(),
         }
-    }
-
-    // Discovery phase helpers (used by ProjectLoader)
-
-    /// Check if an assembly identity is already discovered.
-    pub(crate) fn has_compatible_version(&self, required: &AssemblyIdentity) -> bool {
-        self.pending_views.keys().any(|id| id.satisfies(required))
-    }
-
-    /// Add a path to the discovery queue if not already processed.
-    pub(crate) fn enqueue(&mut self, path: PathBuf) {
-        if !self.processed_paths.contains(&path) {
-            self.discovery_queue.push_back(path);
-        }
-    }
-
-    /// Get the next path to process, marking it as processed.
-    pub(crate) fn next_path(&mut self) -> Option<PathBuf> {
-        while let Some(path) = self.discovery_queue.pop_front() {
-            if !self.processed_paths.contains(&path) {
-                self.processed_paths.insert(path.clone());
-                return Some(path);
-            }
-        }
-        None
-    }
-
-    /// Take the pending views for parallel loading, clearing internal state.
-    pub(crate) fn take_pending_views(&mut self) -> HashMap<AssemblyIdentity, CilAssemblyView> {
-        // Clear discovery state - no longer needed
-        self.processed_paths.clear();
-        self.discovery_queue.clear();
-        std::mem::take(&mut self.pending_views)
     }
 
     /// Check if the loading operation was completely successful (no failures).
@@ -173,22 +118,29 @@ impl ProjectResult {
     }
 
     /// Record a successful assembly load.
-    pub(crate) fn record_success(&mut self, identity: Option<AssemblyIdentity>) {
-        if let Some(identity) = identity {
-            self.loaded_assemblies.push(identity);
-        }
+    pub fn record_success(&mut self, identity: AssemblyIdentity) {
+        self.loaded_assemblies.push(identity);
         self.loaded_count = self.loaded_count.saturating_add(1);
     }
 
-    /// Record a failed assembly load.
-    pub(crate) fn record_failure(&mut self, file_path: String, error_message: String) {
-        self.failed_loads.push((file_path.clone(), error_message));
-        self.missing_dependencies.push(file_path);
+    /// Record a file or assembly that was found but failed to load.
+    ///
+    /// # Arguments
+    /// * `subject` - The file path or assembly name that failed
+    /// * `error_message` - The error it failed with
+    pub fn record_failure(&mut self, subject: String, error_message: String) {
+        self.failed_loads.push((subject, error_message));
+        self.failed_count = self.failed_count.saturating_add(1);
+    }
+
+    /// Record a referenced assembly name that no search directory holds.
+    pub fn record_missing(&mut self, name: String) {
+        self.missing_dependencies.push(name);
         self.failed_count = self.failed_count.saturating_add(1);
     }
 
     /// Record a version mismatch between required and actual assembly.
-    pub(crate) fn record_version_mismatch(
+    pub fn record_version_mismatch(
         &mut self,
         required: AssemblyIdentity,
         actual: AssemblyIdentity,
