@@ -135,7 +135,12 @@ pub struct BasicBlock {
     pub instructions: Vec<Instruction>,
     /// IDs of blocks that can transfer control to this block
     pub predecessors: Vec<usize>,
-    /// IDs of blocks that this block can transfer control to
+    /// IDs of blocks that this block can transfer control to. Ordered by the last
+    /// instruction's flow: a conditional branch lists its target, then the path not taken;
+    /// a `switch` lists one entry per case in order (cases sharing a target repeat it),
+    /// then its default (the next block, see
+    /// [`crate::assembly::Instruction::fall_through`]); a block that falls through lists
+    /// the next block
     pub successors: Vec<usize>,
     /// Indices of exception handlers that cover this block (this block is in their try region)
     pub exceptions: Vec<usize>,
@@ -313,9 +318,10 @@ impl BasicBlock {
     ///
     /// # Returns
     ///
-    /// `true` if the block's last instruction has [`crate::assembly::FlowType::Return`] or
-    /// [`crate::assembly::FlowType::Throw`], `false` if the block can transfer control to
-    /// other blocks or is empty.
+    /// `true` if the block's last instruction has [`crate::assembly::FlowType::Return`],
+    /// [`crate::assembly::FlowType::Throw`] or [`crate::assembly::FlowType::MethodJump`]
+    /// (control leaves the method), `false` if the block can transfer control to other
+    /// blocks or is empty.
     ///
     /// # Examples
     ///
@@ -327,7 +333,7 @@ impl BasicBlock {
     /// // Empty blocks are not exit blocks
     /// assert!(!block.is_exit());
     ///
-    /// // Blocks ending with return/throw are exit blocks
+    /// // Blocks ending with return, throw or jmp are exit blocks
     /// // (This example assumes you have a return instruction)
     /// // block.instructions.push(return_instruction);
     /// // assert!(block.is_exit());
@@ -340,7 +346,10 @@ impl BasicBlock {
     #[must_use]
     pub fn is_exit(&self) -> bool {
         if let Some(last_instr) = self.instruction_last() {
-            matches!(last_instr.flow_type, FlowType::Return | FlowType::Throw)
+            matches!(
+                last_instr.flow_type,
+                FlowType::Return | FlowType::Throw | FlowType::MethodJump
+            )
         } else {
             false
         }
@@ -499,6 +508,17 @@ mod tests {
         assert!(block.is_exit());
     }
 
+    /// `jmp` leaves the method (ECMA-335 III.3.37), as `ret` and `throw` do.
+    #[test]
+    fn test_is_exit_method_jump_instruction() {
+        let mut block = BasicBlock::new(0, 0x1000, 0x500);
+        block
+            .instructions
+            .push(create_sample_instruction(FlowType::MethodJump));
+
+        assert!(block.is_exit());
+    }
+
     #[test]
     fn test_is_exit_non_terminating_instructions() {
         let flow_types = [
@@ -506,6 +526,7 @@ mod tests {
             FlowType::ConditionalBranch,
             FlowType::UnconditionalBranch,
             FlowType::Call,
+            FlowType::CallIndirect,
         ];
 
         for flow_type in &flow_types {

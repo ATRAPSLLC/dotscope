@@ -73,7 +73,7 @@ use crate::{
 
 /// The SSA instruction a run of emitted instructions implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct OpTag {
+pub struct OpTag {
     /// The SSA block.
     pub block: usize,
     /// The instruction's index within the block.
@@ -83,7 +83,7 @@ pub(crate) struct OpTag {
 /// Emitted instructions `[start, end)`, by index in the finished body, that
 /// implement one SSA instruction.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct EmitGroup {
+pub struct EmitGroup {
     /// Index of the first instruction.
     pub start: usize,
     /// Index one past the last instruction.
@@ -93,7 +93,7 @@ pub(crate) struct EmitGroup {
 }
 
 /// Everything the validator reads.
-pub(crate) struct Validation<'a> {
+pub struct Validation<'a> {
     /// The SSA the body was generated from.
     pub ssa: &'a SsaFunction,
     /// The finished bytecode.
@@ -120,7 +120,7 @@ pub(crate) struct Validation<'a> {
 /// the body reads a value other than the one the SSA names, reorders or drops an
 /// effect, or truncates a value into a narrow slot. Returns a decoding error if
 /// the bytecode does not decode.
-pub(crate) fn validate(input: &Validation<'_>) -> Result<()> {
+pub fn validate(input: &Validation<'_>) -> Result<()> {
     let instructions = decode_stream(&mut Parser::new(input.bytecode), 0)?;
     validate_instructions(input, &instructions)
 }

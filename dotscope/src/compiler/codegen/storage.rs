@@ -44,7 +44,7 @@ use crate::{
 
 /// A value's storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Place {
+pub enum Place {
     /// An argument slot.
     Arg(u16),
     /// A local slot.
@@ -53,7 +53,7 @@ pub(crate) enum Place {
 
 /// How a value without a place is produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Materialise {
+pub enum Materialise {
     /// Emitted at its single use as an expression tree.
     Folded,
     /// A constant emitted again at each use.
@@ -61,7 +61,7 @@ pub(crate) enum Materialise {
 }
 
 /// Everything emission needs to know about storage.
-pub(crate) struct Storage {
+pub struct Storage {
     /// By value index: the place a value is stored in and read from.
     place: Vec<Option<Place>>,
     /// Values that are also written to an address-taken slot, because a
@@ -170,7 +170,7 @@ impl Storage {
     /// of an address-taken local is read after something may have written the
     /// local through its address, which needs a copy this generator does not
     /// make.
-    pub(crate) fn build(ssa: &SsaFunction) -> Result<Self> {
+    pub fn build(ssa: &SsaFunction) -> Result<Self> {
         let count = ssa.var_id_capacity();
         let defuse = DefUseIndex::build_with_ops(ssa);
         let address_taken = ssa.address_taken_slots();
@@ -237,6 +237,7 @@ impl Storage {
             &defuse,
             &CilFolds { pinned: &pinned },
             PointerSize::Bit64,
+            None,
         );
 
         let mut materialise: Vec<Option<Materialise>> = vec![None; count];
@@ -371,6 +372,11 @@ impl Storage {
             groups,
             conflicts: Some(conflicts),
             must_share: &must_share,
+            // Nothing is anchored: another value may take an argument's slot after the
+            // argument's last read (`starg` writes it), which CIL allows, since the
+            // slot is typed by the signature and the conflicts keep a value of another
+            // kind out of it
+            anchored: &[],
         }
         // A phi operand without a row is produced on the edge and has no place
         // to share: offered to the result's web, the copy that writes the
@@ -630,33 +636,33 @@ impl Storage {
     }
 
     /// The place `var` is stored in.
-    pub(crate) fn place(&self, var: SsaVarId) -> Option<Place> {
+    pub fn place(&self, var: SsaVarId) -> Option<Place> {
         self.place.get(var.index()).copied().flatten()
     }
 
     /// The address-taken slot `var` is also written to, when its own place
     /// shadows that slot.
-    pub(crate) fn also_store(&self, var: SsaVarId) -> Option<Place> {
+    pub fn also_store(&self, var: SsaVarId) -> Option<Place> {
         self.also_store.get(&var).copied()
     }
 
     /// How `var` is produced when it has no place.
-    pub(crate) fn materialise(&self, var: SsaVarId) -> Option<Materialise> {
+    pub fn materialise(&self, var: SsaVarId) -> Option<Materialise> {
         self.materialise.get(var.index()).copied().flatten()
     }
 
     /// Whether `var` is an exception object its handler only discards.
-    pub(crate) fn discarded(&self, var: SsaVarId) -> bool {
+    pub fn discarded(&self, var: SsaVarId) -> bool {
         self.discarded.contains(&var)
     }
 
     /// How many times `var` is read.
-    pub(crate) fn uses(&self, var: SsaVarId) -> usize {
+    pub fn uses(&self, var: SsaVarId) -> usize {
         self.uses.get(var.index()).copied().unwrap_or(0)
     }
 
     /// The phi copies owed on the edge `from -> to`, as `(result, operand)`.
-    pub(crate) fn copies_on(
+    pub fn copies_on(
         &self,
         ssa: &SsaFunction,
         from: usize,
@@ -675,12 +681,12 @@ impl Storage {
     }
 
     /// The temporary a staged phi result is written through.
-    pub(crate) fn staged(&self, result: SsaVarId) -> Option<u16> {
+    pub fn staged(&self, result: SsaVarId) -> Option<u16> {
         self.staged.get(&result).copied()
     }
 
     /// The staged phi results of `block`, with their temporaries.
-    pub(crate) fn staged_in(&self, ssa: &SsaFunction, block: usize) -> Vec<(SsaVarId, u16)> {
+    pub fn staged_in(&self, ssa: &SsaFunction, block: usize) -> Vec<(SsaVarId, u16)> {
         ssa.block(block)
             .map(|block| {
                 block
@@ -693,12 +699,12 @@ impl Storage {
     }
 
     /// The type of every local slot.
-    pub(crate) fn local_types(&self) -> &[SsaType] {
+    pub fn local_types(&self) -> &[SsaType] {
         &self.local_types
     }
 
     /// By slot: the method's own local the slot is, if it is one.
-    pub(crate) fn declared(&self) -> &[Option<u16>] {
+    pub fn declared(&self) -> &[Option<u16>] {
         &self.declared
     }
 }
@@ -713,7 +719,7 @@ fn is_entry(ssa: &SsaFunction, var: SsaVarId) -> bool {
 /// width; never a sub-word type with anything else, since storing into a slot
 /// narrower than four bytes truncates; never a reference type with another
 /// (the slot's declared type is what `ldloc` pushes); never an unknown type.
-pub(crate) fn slot_compatible(a: &SsaType, b: &SsaType) -> bool {
+pub fn slot_compatible(a: &SsaType, b: &SsaType) -> bool {
     if a.is_unknown() || b.is_unknown() {
         return false;
     }
@@ -743,7 +749,7 @@ pub(crate) fn slot_compatible(a: &SsaType, b: &SsaType) -> bool {
 /// Whether a local can be declared with type `ty`: not `void`, and a type
 /// rather than the absence of one, which a signature could only spell as a
 /// guess.
-pub(crate) fn is_slot_type(ty: &SsaType) -> bool {
+pub fn is_slot_type(ty: &SsaType) -> bool {
     !matches!(ty, SsaType::Void | SsaType::Unknown | SsaType::Varying)
 }
 
@@ -801,7 +807,7 @@ fn finally_resume_phis(ssa: &SsaFunction) -> BTreeSet<SsaVarId> {
 /// Returns an error when none of these knows a type: a slot for such a value
 /// could only be guessed, and a guessed slot type is a wrong `stloc` waiting
 /// to happen.
-pub(crate) fn infer_type(ssa: &SsaFunction, var: SsaVarId) -> Result<SsaType> {
+pub fn infer_type(ssa: &SsaFunction, var: SsaVarId) -> Result<SsaType> {
     let mut visited = BTreeSet::new();
     infer_type_inner(ssa, var, &mut visited)
 }

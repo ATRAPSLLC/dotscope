@@ -17,7 +17,7 @@
 //!    operands are loaded from their slots or produced in place as expression
 //!    trees; its result is stored to its slot, or left for the consumer it was
 //!    folded into. Phi copies are one parallel copy per predecessor.
-//! 4. **Validation** ([`validate`]): the finished body is checked against the
+//! 4. **Validation** ([`validate`](mod@validate)): the finished body is checked against the
 //!    SSA by an independent abstract interpretation. A body that reads a value
 //!    other than the one the SSA names, reorders an effect or truncates a value
 //!    in a narrow slot is refused, and the method keeps its original IL.
@@ -26,7 +26,7 @@
 //!
 //! - [`emitter`]: Low-level CIL instruction emission helpers
 //! - [`storage`]: Folding, slot sharing and slot typing
-//! - [`validate`]: Translation validation of generated bodies
+//! - [`validate`](mod@validate): Translation validation of generated bodies
 
 mod emitter;
 mod storage;
@@ -1645,6 +1645,8 @@ impl SsaCodeGenerator {
     ///
     /// A clause's protected region is placed before its filter, and its filter
     /// before its handler, so the offsets run in the order the clause states them.
+    /// Within a filter, the block ending in `endfilter` is placed last: the
+    /// instruction must be the filter's lexically last (ECMA-335 III.3.34).
     ///
     /// # Within a level
     ///
@@ -1812,6 +1814,22 @@ impl SsaCodeGenerator {
             }
         }
 
+        // A filter ends with its `endfilter` (ECMA-335 III.3.34): in a filter's level the block
+        // holding it is placed after every other unit of the filter, whatever the fall-through
+        // order would give
+        let filter_nodes: BTreeSet<usize> = ssa
+            .exception_handlers()
+            .iter()
+            .filter_map(|eh| eh.filter_range)
+            .filter_map(|range| node_of(range.start(), range.end()))
+            .collect();
+        let ends_filter = |block: usize| {
+            matches!(
+                ssa.block(block).and_then(|b| b.control_terminator()),
+                Some(SsaOp::EndFilter { .. })
+            )
+        };
+
         let mut layout = Vec::with_capacity(blocks_to_include.len());
         let mut placed_blocks: BTreeSet<usize> = BTreeSet::new();
         let mut placed_regions: BTreeSet<usize> = BTreeSet::new();
@@ -1837,9 +1855,23 @@ impl SsaCodeGenerator {
             if let Some(unit) = level.worklist.pop() {
                 match unit {
                     Unit::Block(block) => {
-                        if !placed_blocks.insert(block) {
+                        if placed_blocks.contains(&block) {
                             continue;
                         }
+                        // The filter's end waits for the rest of the filter
+                        let waits = filter_nodes.contains(&id)
+                            && ends_filter(block)
+                            && nodes.get(id).is_some_and(|node| {
+                                node.loose_blocks.iter().any(|&other| {
+                                    other != block
+                                        && !placed_blocks.contains(&other)
+                                        && !ends_filter(other)
+                                }) || node.children.iter().any(|r| !placed_regions.contains(r))
+                            });
+                        if waits {
+                            continue;
+                        }
+                        placed_blocks.insert(block);
                         layout.push(block);
                         if let Some(next) = preferred_successor(ssa, block, &leave_targets)
                             .filter(|next| blocks_to_include.contains(next))
@@ -1881,7 +1913,14 @@ impl SsaCodeGenerator {
                         .filter_map(|&r| region_entry(r).map(|first| (first, Unit::Region(r)))),
                 )
                 .collect();
-            candidates.sort_by_key(|(first, _)| *first);
+            // In a filter, the block ending it goes last
+            let in_filter = filter_nodes.contains(&id);
+            candidates.sort_by_key(|&(first, unit)| {
+                (
+                    in_filter && matches!(unit, Unit::Block(block) if ends_filter(block)),
+                    first,
+                )
+            });
             let eligible = |unit: &Unit| match unit {
                 Unit::Region(r) => prerequisites
                     .get(r)

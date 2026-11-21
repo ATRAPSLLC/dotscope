@@ -100,7 +100,10 @@ pub use callgraph::{
     CallGraph, CallGraphNode, CallGraphStats, CallResolver, CallSite, CallTarget, CallType,
     ResolverStats,
 };
-pub use cfg::{CfgEdge, CfgEdgeKind, ControlFlowGraph, LoopAnalyzer, LoopForest, LoopInfo};
+pub use cfg::{
+    BlockRole, BlockSemantics, CfgEdge, CfgEdgeKind, ControlFlowGraph, LoopAnalyzer, LoopForest,
+    LoopInfo, LoopSemantics, SemanticAnalyzer,
+};
 pub use dataflow::{
     AnalysisResults, ConstantPropagation, DataFlowAnalysis, DataFlowSolver, Direction,
     LiveVariables, LivenessResult, ReachingDefinitions, ScalarValue, SccpResult,
@@ -113,10 +116,6 @@ pub type DefUseIndex<T = ssa::CilTarget> = analyssa::analysis::defuse::DefUseInd
 /// CIL-defaulted alias of [`analyssa::analysis::range::ValueRange`].
 pub type ValueRange = analyssa::analysis::range::ValueRange;
 pub use analyssa::graph::NodeId;
-// Re-export crate-internal types (used by other crate modules via crate::analysis::X)
-#[cfg(feature = "compiler")]
-#[allow(unused_imports)]
-pub(crate) use cfg::SsaLoopAnalysis;
 #[cfg(feature = "z3")]
 pub use ssa::Z3Solver;
 pub use ssa::{
@@ -125,13 +124,14 @@ pub use ssa::{
     Callee, CilPrefix, CilTarget, CilVariableFacts, ClauseLayout, ClausePart, CmpKind,
     ConstEvaluator, ConstValue, ConstValueCilExt, Constraint, ControlFlow, DefSite,
     DispatcherPattern, EvaluatorMark, ExceptionBlocks, ExceptionTableError, ExecutionTrace,
-    FieldRef, FloatBits, FloatFormat, HandlerKind, IndirectLocation, InstrId, LaidOutHandler,
-    MemoryDefSite, MemoryLocation, MemoryOp, MemoryPhi, MemoryPhiOperand, MemorySsa,
-    MemorySsaStats, MemoryVersion, MethodPurity, MethodRef, NumericOp, OpaquePredicatePattern,
-    PathConstraint, PatternDetector, PhiAnalyzer, PhiNode, PhiOperand, PredicateResolution,
-    ReturnInfo, RuntimeValueKind, SourceBlock, SsaBlock, SsaCfg, SsaConverter, SsaEvaluator,
-    SsaExceptionHandler, SsaExceptionHandlerCilExt, SsaFunction, SsaFunctionBuilder,
-    SsaFunctionCilExt, SsaFunctionSemanticsExt, SsaInstruction, SsaOp, SsaOpCilExt, SsaType,
+    FieldRef, FloatBits, FloatFormat, FnPtrSig, HandlerKind, IndirectLocation, InstrId,
+    LaidOutHandler, MemoryDefSite, MemoryLocation, MemoryOp, MemoryPhi, MemoryPhiOperand,
+    MemorySsa, MemorySsaStats, MemoryVersion, MethodPurity, MethodRef, NoSymbol, NumericOp,
+    OpaquePredicatePattern, PathConstraint, PatternDetector, PhiAnalyzer, PhiNode, PhiOperand,
+    PredicateResolution, ReturnInfo, RuntimeValueKind, SigRef, SourceBlock, SsaBlock,
+    SsaBlockBuilder, SsaCfg, SsaConverter, SsaEvaluator, SsaExceptionHandler,
+    SsaExceptionHandlerCilExt, SsaFunction, SsaFunctionBuilder, SsaFunctionCilExt,
+    SsaFunctionContext, SsaFunctionSemanticsExt, SsaInstruction, SsaOp, SsaOpCilExt, SsaType,
     SsaVarId, SsaVariable, SsaVerifier, SymbolicEvaluator, SymbolicExpr, Target, TypeClass,
     TypeContext, TypeProvider, TypeRef, UnaryOpKind, UseSite, ValueResolver, ValueResolverCilExt,
     VariableOrigin, VerifierError, VerifyLevel,
@@ -240,10 +240,10 @@ mod tests {
             let def_site = var.def_site();
             if !def_site.is_phi() {
                 assert!(
-                    def_site.block < ssa.block_count(),
+                    def_site.block() < ssa.block_count(),
                     "Variable {} defined in non-existent block {}",
                     var.id(),
-                    def_site.block
+                    def_site.block()
                 );
             }
         }

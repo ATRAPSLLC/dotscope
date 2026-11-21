@@ -24,6 +24,7 @@ use crate::{
     assembly::{Instruction, Operand},
     metadata::{
         method::Method,
+        streams::SharedStr,
         tables::MemberRefSignature,
         token::Token,
         typesystem::{CilTypeReference, TypeRegistry},
@@ -399,7 +400,7 @@ impl CallGraph {
                     // Get the declaring type name
                     let type_name = Self::get_external_type_name(&member_ref.declaredby);
                     let full_name = if type_name.is_empty() {
-                        member_ref.name.clone()
+                        member_ref.name.to_string()
                     } else {
                         format!("{}::{}", type_name, member_ref.name)
                     };
@@ -447,12 +448,15 @@ impl CallGraph {
         match type_ref {
             CilTypeReference::TypeRef(t)
             | CilTypeReference::TypeDef(t)
-            | CilTypeReference::TypeSpec(t) => t.fullname().unwrap_or_default(),
+            | CilTypeReference::TypeSpec(t) => t
+                .fullname()
+                .map(|name| name.to_string())
+                .unwrap_or_default(),
             CilTypeReference::MemberRef(mr) => {
                 // For MemberRef as parent, recurse to get its declaring type
                 Self::get_external_type_name(&mr.declaredby)
             }
-            CilTypeReference::ModuleRef(m) => m.name.clone(),
+            CilTypeReference::ModuleRef(m) => m.name.to_string(),
             _ => String::new(),
         }
     }
@@ -462,7 +466,7 @@ impl CallGraph {
         assembly: &CilObject,
         resolver: &CallResolver,
         method_ref: &CilTypeReference,
-    ) -> (String, String, String, bool) {
+    ) -> (SharedStr, String, String, bool) {
         match method_ref {
             CilTypeReference::MethodDef(mr) => {
                 if let Some(method) = mr.upgrade() {
@@ -477,7 +481,7 @@ impl CallGraph {
                     )
                 } else {
                     (
-                        "unknown".to_string(),
+                        SharedStr::from("unknown"),
                         "unknown".to_string(),
                         String::new(),
                         false,
@@ -487,7 +491,7 @@ impl CallGraph {
             CilTypeReference::MemberRef(mr) => {
                 let type_name = Self::get_external_type_name(&mr.declaredby);
                 let full_name = if type_name.is_empty() {
-                    mr.name.clone()
+                    mr.name.to_string()
                 } else {
                     format!("{}::{}", type_name, mr.name)
                 };
@@ -498,7 +502,7 @@ impl CallGraph {
                 (mr.name.clone(), full_name, signature, mr.is_constructor())
             }
             _ => (
-                "unknown".to_string(),
+                SharedStr::from("unknown"),
                 "unknown".to_string(),
                 String::new(),
                 false,

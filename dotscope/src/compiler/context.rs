@@ -9,13 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use analyssa::analysis::WorkBudget;
+use analyssa::analysis::{Machine, WorkBudget};
 use crossbeam_skiplist::SkipSet;
 use dashmap::{DashMap, DashSet};
 use rayon::prelude::*;
 
 use crate::{
-    analysis::{CallGraph, ConstValue, SsaFunction, SsaFunctionCilExt, SsaOp, SsaVarId},
+    analysis::{CallGraph, CilTarget, ConstValue, SsaFunction, SsaFunctionCilExt, SsaOp, SsaVarId},
     compiler::{
         summary::{CallSiteInfo, MethodSummary},
         EventLog, ProcessingState,
@@ -158,6 +158,18 @@ impl CompilerContext {
     #[must_use]
     pub fn assembly(&self) -> Option<Arc<CilObject>> {
         self.assembly_slot.read().ok().and_then(|s| s.clone())
+    }
+
+    /// Returns the machine the assembly runs on.
+    ///
+    /// If the assembly is set, its PE header states the pointer width. Test
+    /// contexts without an assembly take the 64-bit target, dotscope's
+    /// default (`CilTarget::x64`).
+    #[must_use]
+    pub fn machine(&self) -> Machine {
+        self.assembly()
+            .map_or_else(CilTarget::x64, |assembly| CilTarget::of(&assembly))
+            .machine()
     }
 
     /// Releases the assembly handle held in this context. Required

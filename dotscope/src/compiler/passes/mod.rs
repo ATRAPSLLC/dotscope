@@ -93,6 +93,7 @@ pub use analyssa::passes::{
     LoopCanonicalizationPass, MemoryOptimizationPass, OpaquePredicatePass, PredicateResult,
     ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
 };
+pub use proxy::{ForwardKind, ProxyArgSource};
 
 // CIL-specific pass impls remain dotscope-side. `copying` keeps its custom
 // hook (CIL local-type propagation); `deadcode` keeps its CIL-call-graph-aware

@@ -30,7 +30,10 @@ use crate::{
 /// Decode x86/x64 bytes into our instruction representation.
 ///
 /// This function uses linear disassembly, decoding instructions sequentially
-/// from the start until a `RET` instruction is encountered.
+/// from the start until a `RET` instruction that no jump decoded before it passes:
+/// code after a `RET` that an earlier jump goes to is part of the function. An
+/// instruction this decoder does not model is kept as
+/// [`X86Instruction::Unsupported`].
 ///
 /// # Arguments
 ///
@@ -48,7 +51,6 @@ use crate::{
 /// - `bytes` is empty
 /// - `bitness` is not 32 or 64
 /// - An invalid instruction is encountered
-/// - An unsupported instruction is encountered
 ///
 pub fn x86_decode_all(
     bytes: &[u8],
@@ -85,6 +87,9 @@ pub fn x86_decode_all_limited(
 
     let mut decoder = Decoder::with_ip(bitness, bytes, base_address, DecoderOptions::NONE);
     let mut instructions = Vec::new();
+    // The furthest offset a jump decoded so far goes to: a RET before it is not the end of
+    // the function, since code after the RET is reached by that jump
+    let mut furthest_target: Option<u64> = None;
 
     for instr in &mut decoder {
         let offset = instr
@@ -108,16 +113,28 @@ pub fn x86_decode_all_limited(
             )));
         }
 
-        let converted = convert_instruction(&instr, base_address)?;
+        // An instruction this decoder does not model is kept as unsupported, as the
+        // traversal decoder keeps it: the decode stays whole, and a translation of it refuses
+        let converted = convert_instruction(&instr, base_address).unwrap_or_else(|_| {
+            X86Instruction::Unsupported {
+                offset,
+                mnemonic: format!("{:?}", instr.mnemonic()),
+            }
+        });
         let is_ret = matches!(converted, X86Instruction::Ret);
+        if let X86Instruction::Jmp { target } | X86Instruction::Jcc { target, .. } = converted {
+            if let Some(target) = target.checked_sub(base_address) {
+                furthest_target = Some(furthest_target.map_or(target, |t| t.max(target)));
+            }
+        }
         instructions.push(X86DecodedInstruction {
             offset,
             length,
             instruction: converted,
         });
 
-        // Stop at RET instruction (end of function)
-        if is_ret {
+        // Stop at a RET (the end of the function) that no jump decoded so far passes
+        if is_ret && furthest_target.is_none_or(|target| target <= offset) {
             break;
         }
     }
@@ -625,13 +642,12 @@ fn convert_instruction(instr: &Instruction, base_address: u64) -> Result<X86Inst
             src: convert_operand(instr, 0)?,
             bit: convert_operand(instr, 1)?,
         }),
-        Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
-            // BTS/BTR/BTC modify the bit but we approximate as BT (test only)
-            Ok(X86Instruction::Bt {
-                src: convert_operand(instr, 0)?,
-                bit: convert_operand(instr, 1)?,
-            })
-        }
+        // BTS, BTR and BTC set, clear or flip the bit they test: as BT they would leave
+        // it as it was
+        Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => Err(Error::X86Error(format!(
+            "{:?} (a bit test that changes the bit) is not modelled",
+            instr.mnemonic()
+        ))),
 
         // Exchange and add
         Mnemonic::Xadd => convert_binary_op(instr, |dst, src| X86Instruction::Xadd { dst, src }),
@@ -701,8 +717,12 @@ fn convert_instruction(instr: &Instruction, base_address: u64) -> Result<X86Inst
         Mnemonic::Nop | Mnemonic::Fnop => Ok(X86Instruction::Nop),
         Mnemonic::Cdq | Mnemonic::Cqo => Ok(X86Instruction::Cdq),
         Mnemonic::Cwde | Mnemonic::Cdqe => Ok(X86Instruction::Cwde),
-        Mnemonic::Cbw => Ok(X86Instruction::Cwde), // Sign-extend AL into AX
-        Mnemonic::Cwd => Ok(X86Instruction::Cdq),  // Sign-extend AX into DX:AX
+        // CBW extends AL into AX and CWD extends AX into DX:AX: as CWDE and CDQ they would
+        // extend the wrong bits into the wrong register
+        Mnemonic::Cbw | Mnemonic::Cwd => Err(Error::X86Error(format!(
+            "{:?} (a 16-bit sign extension) is not modelled",
+            instr.mnemonic()
+        ))),
 
         // Flag manipulation without computational side effects.
         // CLD/STD only affect direction flag (relevant for string ops we don't support).
@@ -798,14 +818,12 @@ fn convert_imul(instr: &Instruction) -> Result<X86Instruction> {
     let op_count = instr.op_count();
 
     if op_count == 1 {
-        // One-operand form: imul r/m (result in EDX:EAX)
-        // We don't support this form well, but capture it
-        let src = convert_operand(instr, 0)?;
-        Ok(X86Instruction::Imul {
-            dst: X86Register::Eax, // Result goes to EAX (low part)
-            src,
-            src2: None,
-        })
+        // One-operand form: imul r/m, the signed product in EDX:EAX. As
+        // `Imul { dst: Eax, src, src2: None }` it would read as the two-operand
+        // `imul eax, r/m`, which writes EAX alone; it decodes as unsupported instead
+        Err(Error::X86Error(
+            "the one-operand IMUL (a product in EDX:EAX) is not modelled".to_string(),
+        ))
     } else if op_count == 2 {
         // Two-operand form: imul r, r/m
         let dst = convert_register(instr.op0_register())?;

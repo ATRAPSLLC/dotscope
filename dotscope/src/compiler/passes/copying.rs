@@ -29,7 +29,7 @@ use crate::{
 /// copy. Uses an iterative fixed-point algorithm to handle cascading copies
 /// and newly exposed opportunities after each round of propagation, as many
 /// rounds as the host's
-/// [`Budget::CopyRounds`](analyssa::analysis::Budget::CopyRounds) allows.
+/// [`Budget::CopyRounds`] allows.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CopyPropagationPass;
 

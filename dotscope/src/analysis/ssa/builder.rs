@@ -311,7 +311,7 @@ impl SsaFunctionContext<'_> {
     ///
     /// If `index >= num_args`, allocates a fresh stack variable instead. This
     /// keeps construction non-panicking; misuse will surface during type
-    /// validation in [`SsaFunctionBuilder::build`].
+    /// validation in [`SsaFunctionBuilder::build_with`].
     #[must_use]
     pub fn arg(&mut self, index: usize, ty: SsaType) -> SsaVarId {
         let Some(&id) = self.builder.arg_vars.get(index) else {
@@ -327,7 +327,7 @@ impl SsaFunctionContext<'_> {
     ///
     /// If `index >= num_locals`, allocates a fresh stack variable instead. This
     /// keeps construction non-panicking; misuse will surface during type
-    /// validation in [`SsaFunctionBuilder::build`].
+    /// validation in [`SsaFunctionBuilder::build_with`].
     #[must_use]
     pub fn local(&mut self, index: usize, ty: SsaType) -> SsaVarId {
         let Some(&id) = self.builder.local_vars.get(index) else {

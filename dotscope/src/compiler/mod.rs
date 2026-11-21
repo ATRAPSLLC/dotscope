@@ -78,9 +78,10 @@ pub use pass::{
 pub use passes::{
     AlgebraicSimplificationPass, BlockMergingPass, ConstantPropagationPass,
     ControlFlowSimplificationPass, CopyPropagationPass, DeadCodeEliminationPass,
-    DeadMethodEliminationPass, GlobalValueNumberingPass, InliningPass, JumpThreadingPass, LicmPass,
-    LoopCanonicalizationPass, MemoryOptimizationPass, OpaquePredicatePass, PredicateResult,
-    ProxyDevirtualizationPass, ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
+    DeadMethodEliminationPass, ForwardKind, GlobalValueNumberingPass, InliningPass,
+    JumpThreadingPass, LicmPass, LoopCanonicalizationPass, MemoryOptimizationPass,
+    OpaquePredicatePass, PredicateResult, ProxyArgSource, ProxyDevirtualizationPass,
+    ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
 };
 pub use scheduler::PassScheduler;
 pub use state::ProcessingState;

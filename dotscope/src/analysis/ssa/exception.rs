@@ -54,6 +54,8 @@ pub fn from_exception_handler(handler: &ExceptionHandler) -> SsaExceptionHandler
         protected_range: None,
         handler_range: None,
         filter_range: None,
+        // The CLR hands a handler no choice among clauses.
+        selector: None,
     }
 }
 

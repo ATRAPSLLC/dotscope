@@ -12,12 +12,15 @@
 //!
 //! The module uses iced-x86 for decoding and provides a simplified instruction
 //! representation focused on the operations commonly used in obfuscator stubs.
+//! Decoding handles 32- and 64-bit code; the translation to SSA
+//! ([`X86ToSsaTranslator`]) models 32-bit code exactly and refuses the rest, so a
+//! caller keeps the native code wherever the lift would not compute the same values.
 //!
 //! # Components
 //!
 //! - [`types`] - Simplified x86 instruction types ([`X86Instruction`], [`X86Register`], etc.)
 //! - [`decoder`] - Decoding using iced-x86 ([`x86_decode_all`], [`x86_detect_prologue`])
-//! - [`cfg`] - Control flow graph construction ([`X86Function`])
+//! - [`cfg`](mod@cfg) - Control flow graph construction ([`X86Function`])
 //!
 //! # Decoding Strategies
 //!

@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+#[cfg(feature = "emulation")]
+use crate::emulation::{ConversionType, EmValue};
 use crate::{
     analysis::{
         AccessQualifiers, Budget, CallData, CallGraph, Callee, CilTarget, CmpKind, ConstValue,
@@ -875,153 +877,122 @@ fn test_types_no_match() {
     ));
 }
 
-#[test]
-fn test_is_safe_widening_chain_same_sign() {
-    // Unsigned widening: source <= inner < outer
-    // conv.u32(conv.u8(x)) where x is u8 - both conversions widen
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U8,  // inner target (same as source - no-op)
-        &SsaType::U32, // outer target
-        true,
-        true
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U16, // inner target
-        &SsaType::U64, // outer target
-        true,
-        true
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U16, // source
-        &SsaType::U32, // inner target
-        &SsaType::U64, // outer target
-        true,
-        true
-    ));
+/// The integer conversion targets, each with the `conv` that produces it and whether it is
+/// unsigned (the inner conversion's `unsigned` flag).
+#[cfg(feature = "emulation")]
+const CONVERSIONS: [(SsaType, ConversionType, bool); 8] = [
+    (SsaType::I8, ConversionType::I1, false),
+    (SsaType::U8, ConversionType::U1, true),
+    (SsaType::I16, ConversionType::I2, false),
+    (SsaType::U16, ConversionType::U2, true),
+    (SsaType::I32, ConversionType::I4, false),
+    (SsaType::U32, ConversionType::U4, true),
+    (SsaType::I64, ConversionType::I8, false),
+    (SsaType::U64, ConversionType::U8, true),
+];
 
-    // Signed widening: source <= inner < outer
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I8,  // inner target
-        &SsaType::I32, // outer target
-        false,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I16, // inner target
-        &SsaType::I64, // outer target
-        false,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I16, // source
-        &SsaType::I32, // inner target
-        &SsaType::I64, // outer target
-        false,
-        false
-    ));
+/// Values of `source` as the evaluation stack holds them: a type narrower than 32 bits
+/// extended to 32 by its own signedness, wider ones as they are. Every value of an 8- or
+/// 16-bit type, and the edges of the wider ones.
+#[cfg(feature = "emulation")]
+fn stack_values(source: &SsaType) -> Vec<EmValue> {
+    let wide: [i64; 8] = [
+        0,
+        1,
+        -1,
+        127,
+        -128,
+        i64::from(i32::MAX),
+        i64::from(i32::MIN),
+        i64::from(u32::MAX),
+    ];
+    match source {
+        SsaType::I8 => (i8::MIN..=i8::MAX)
+            .map(|v| EmValue::I32(i32::from(v)))
+            .collect(),
+        SsaType::U8 => (u8::MIN..=u8::MAX)
+            .map(|v| EmValue::I32(i32::from(v)))
+            .collect(),
+        SsaType::I16 => (i16::MIN..=i16::MAX)
+            .map(|v| EmValue::I32(i32::from(v)))
+            .collect(),
+        SsaType::U16 => (u16::MIN..=u16::MAX)
+            .map(|v| EmValue::I32(i32::from(v)))
+            .collect(),
+        SsaType::I32 | SsaType::U32 => wide.iter().map(|&v| EmValue::I32(v as i32)).collect(),
+        _ => wide
+            .iter()
+            .chain(&[i64::MAX, i64::MIN])
+            .map(|&v| EmValue::I64(v))
+            .collect(),
+    }
 }
 
+/// Whenever the pass skips the inner conversion of `conv.T2(conv.T1(x))`, the result is the
+/// same for every value `x` can hold, by the emulator's conversions (an oracle independent
+/// of the pass); and every chain whose inner conversion is the identity on the stack value
+/// is skipped. Every integer source, `T1` and wider `T2` is tried.
+#[cfg(feature = "emulation")]
 #[test]
-fn test_is_safe_widening_chain_unsigned_to_signed() {
-    // unsigned to signed widening is safe (zero extend then reinterpret)
-    // conv.i32(conv.u8(x)) where x is u8
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U8,  // inner target
-        &SsaType::I32, // outer target
-        true,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U16, // inner target
-        &SsaType::I64, // outer target
-        true,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U16, // source
-        &SsaType::U32, // inner target
-        &SsaType::I64, // outer target
-        true,
-        false
-    ));
+fn a_widening_chain_is_skipped_exactly_when_the_result_is_the_same() {
+    let convert = |value: &EmValue, conversion: ConversionType| {
+        value.convert(conversion, PointerSize::Bit64).unwrap()
+    };
+    for (source, _, _) in &CONVERSIONS {
+        let values = stack_values(source);
+        for (inner, inner_conversion, inner_unsigned) in &CONVERSIONS {
+            for (outer, outer_conversion, _) in &CONVERSIONS {
+                if outer.size_bytes() <= inner.size_bytes() {
+                    continue;
+                }
+                let skipped = ConstantPropagationPass::is_safe_widening_chain(
+                    source,
+                    inner,
+                    outer,
+                    *inner_unsigned,
+                );
+                let same = values.iter().all(|value| {
+                    convert(&convert(value, *inner_conversion), *outer_conversion)
+                        == convert(value, *outer_conversion)
+                });
+                let identity = values
+                    .iter()
+                    .all(|value| &convert(value, *inner_conversion) == value);
+                if skipped {
+                    assert!(
+                        same,
+                        "{source:?} through {inner:?} to {outer:?} is skipped and differs"
+                    );
+                }
+                if identity {
+                    assert!(
+                        skipped,
+                        "{source:?} through {inner:?} to {outer:?} is the identity and kept"
+                    );
+                }
+            }
+        }
+    }
 }
 
+/// The chains the rule is about, named: an `int16` through `conv.u2` is no longer -1, so
+/// `conv.i8` of it differs from `conv.i8` of the source; a value narrower than its unsigned
+/// `T1` keeps its zero upper bits; a source wider than `T1` is truncated; floats are kept.
 #[test]
-fn test_is_safe_widening_chain_signed_to_unsigned() {
-    // signed to unsigned widening is NOT safe (sign extend vs zero extend)
-    // conv.u32(conv.i8(x)) where x is i8 - inner is signed, outer is unsigned
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I8,  // inner target
-        &SsaType::U32, // outer target
-        false,
-        true
-    ));
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I16, // inner target
-        &SsaType::U64, // outer target
-        false,
-        true
-    ));
-}
-
-#[test]
-fn test_is_safe_widening_chain_narrowing_rejected() {
-    // Outer narrowing is NOT safe - inner >= outer means data loss
-    // conv.i32(conv.i64(x)) where x is i32 - outer narrows from i64 to i32
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I32, // source
-        &SsaType::I64, // inner target
-        &SsaType::I32, // outer target (narrowing!)
-        false,
-        false
-    ));
-    // conv.u8(conv.u32(x)) where x is u8 - outer narrows from u32 to u8
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U32, // inner target
-        &SsaType::U8,  // outer target (narrowing!)
-        true,
-        true
-    ));
-
-    // Inner narrowing is also NOT safe - source > inner means truncation
-    // conv.i32(conv.u1(x)) where x is i32 - inner truncates i32 to u8
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I32, // source (larger than inner!)
-        &SsaType::U8,  // inner target (truncates source)
-        &SsaType::I32, // outer target
-        true,
-        false
-    ));
-}
-
-#[test]
-fn test_is_safe_widening_chain_float_rejected() {
-    // Float conversions are NOT safe - precision loss
-    // conv.f64(conv.f32(x)) - float widening can lose precision
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::F32, // source
-        &SsaType::F32, // inner target
-        &SsaType::F64, // outer target
-        false,
-        false
-    ));
-    // conv.f64(conv.i32(x)) - int to float conversion
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I32, // source
-        &SsaType::I32, // inner target
-        &SsaType::F64, // outer target
-        false,
-        false
-    ));
+fn widening_chains_follow_the_source_signedness() {
+    let safe = |source, inner, outer, inner_unsigned| {
+        ConstantPropagationPass::is_safe_widening_chain(&source, &inner, &outer, inner_unsigned)
+    };
+    assert!(!safe(SsaType::I16, SsaType::U16, SsaType::I64, true));
+    assert!(safe(SsaType::I16, SsaType::I16, SsaType::U64, false));
+    assert!(safe(SsaType::U8, SsaType::U16, SsaType::I64, true));
+    assert!(!safe(SsaType::I8, SsaType::U16, SsaType::I32, true));
+    assert!(safe(SsaType::I8, SsaType::I16, SsaType::U64, false));
+    assert!(safe(SsaType::I8, SsaType::U32, SsaType::I64, true));
+    assert!(!safe(SsaType::I32, SsaType::U8, SsaType::I32, true));
+    assert!(!safe(SsaType::I32, SsaType::I64, SsaType::I32, false));
+    assert!(!safe(SsaType::F32, SsaType::F32, SsaType::F64, false));
+    assert!(!safe(SsaType::I32, SsaType::I32, SsaType::F64, false));
 }
 
 #[test]

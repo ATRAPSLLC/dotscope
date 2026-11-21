@@ -52,7 +52,7 @@
 //! - [`crate::metadata::method`] - Supports method-level disassembly and caching
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
@@ -108,6 +108,8 @@ struct Decoder<'a> {
     /// Indices stay valid because blocks are only ever *appended*: `split_block_at` pushes the
     /// tail as a new block rather than inserting it, so no existing index shifts.
     block_starts: BTreeMap<u64, usize>,
+    /// The branch targets of the instruction being decoded, reused across instructions
+    targets: Vec<u64>,
     /// Exclusive upper bound on offsets this decoder may read.
     ///
     /// The parser spans the whole file image so that offsets stay file-absolute - the
@@ -194,6 +196,7 @@ impl<'a> Decoder<'a> {
             offset_start: offset,
             rva_start: rva,
             block_starts: BTreeMap::new(),
+            targets: Vec::new(),
             max_offset,
         })
     }
@@ -250,7 +253,15 @@ impl<'a> Decoder<'a> {
     /// # Thread Safety
     ///
     /// This method is thread-safe and can be called concurrently from multiple threads.
-    pub fn into_blocks(self) -> Vec<BasicBlock> {
+    pub fn into_blocks(mut self) -> Vec<BasicBlock> {
+        // The blocks outlive the load, as long as the method; the room their vectors grew
+        // while decoding is given back (about a third of the instructions' bytes). A block
+        // fills in place, rather than in a buffer moved in once it ends, because a branch
+        // decoded later in the same block can split it.
+        for block in &mut self.blocks {
+            block.instructions.shrink_to_fit();
+        }
+        self.blocks.shrink_to_fit();
         self.blocks
     }
 
@@ -428,6 +439,19 @@ impl<'a> Decoder<'a> {
 
             self.mark_visited(current_offset, instr_size);
 
+            // Where control goes next is read before the instruction moves into its block,
+            // and acted on after: a branch back into this block splits it, and the split must
+            // find the branch in the block. The targets go through a buffer kept across
+            // instructions, so a branch costs no allocation of its own.
+            let flow_type = instruction.flow_type;
+            let fall_through = instruction.fall_through();
+            let mut targets = std::mem::take(&mut self.targets);
+            targets.clear();
+            targets.extend_from_slice(&instruction.branch_targets);
+            let next_rva = current_rva
+                .checked_add(instruction.size)
+                .ok_or_else(|| malformed_error!("instruction RVA overflow"));
+
             {
                 let block = self
                     .blocks
@@ -437,54 +461,41 @@ impl<'a> Decoder<'a> {
                     .size
                     .checked_add(instr_size)
                     .ok_or_else(|| malformed_error!("block size overflow"))?;
-                block.instructions.push(instruction.clone());
+                block.instructions.push(instruction);
             }
 
-            match instruction.flow_type {
-                FlowType::ConditionalBranch => {
-                    for &target_rva in &instruction.branch_targets {
+            let ends_block = match flow_type {
+                FlowType::ConditionalBranch | FlowType::Switch => {
+                    // The branch targets, and the path not taken (a switch's default)
+                    for &target_rva in &targets {
                         self.add_entry_point(target_rva, entry_points);
                     }
-
-                    let fall_through_rva = current_rva
-                        .checked_add(instruction.size)
+                    let fall_through_rva = fall_through
                         .ok_or_else(|| malformed_error!("fall-through RVA overflow"))?;
                     self.add_entry_point(fall_through_rva, entry_points);
-
-                    break;
+                    true
                 }
                 FlowType::UnconditionalBranch | FlowType::Leave => {
-                    for &target_rva in &instruction.branch_targets {
+                    for &target_rva in &targets {
                         self.add_entry_point(target_rva, entry_points);
                     }
-                    break;
+                    true
                 }
-                FlowType::Switch => {
-                    // Switch has branch targets AND a fall-through (default)
-                    for &target_rva in &instruction.branch_targets {
-                        self.add_entry_point(target_rva, entry_points);
-                    }
-                    // Add fall-through as entry point for the default case
-                    let fall_through_rva = current_rva
-                        .checked_add(instruction.size)
-                        .ok_or_else(|| malformed_error!("fall-through RVA overflow"))?;
-                    self.add_entry_point(fall_through_rva, entry_points);
-                    break;
-                }
-                FlowType::Return | FlowType::Throw | FlowType::EndFinally => {
-                    break;
-                }
-                _ => {
-                    // Sequential instruction - continue
-                }
+                FlowType::Return
+                | FlowType::Throw
+                | FlowType::EndFinally
+                | FlowType::MethodJump => true,
+                FlowType::Sequential | FlowType::Call | FlowType::CallIndirect => false,
+            };
+            self.targets = targets;
+            if ends_block {
+                break;
             }
 
             current_offset = current_offset
                 .checked_add(instr_size)
                 .ok_or_else(|| malformed_error!("instruction offset overflow"))?;
-            current_rva = current_rva
-                .checked_add(instruction.size)
-                .ok_or_else(|| malformed_error!("instruction RVA overflow"))?;
+            current_rva = next_rva?;
         }
 
         Ok(())
@@ -697,14 +708,6 @@ impl<'a> Decoder<'a> {
             return Ok(());
         };
 
-        // Build a map from RVA to block index for handler entry detection
-        let rva_to_block: HashMap<u64, usize> = self
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(idx, block)| (block.rva, idx))
-            .collect();
-
         // Exception handler offsets are relative to IL code start.
         // Add base RVA to convert to absolute RVA for block lookup.
         let base_rva = self.rva_start as u64;
@@ -734,7 +737,7 @@ impl<'a> Decoder<'a> {
             let handler_rva = base_rva
                 .checked_add(u64::from(handler.handler_offset))
                 .ok_or_else(|| malformed_error!("handler_offset RVA overflow"))?;
-            if let Some(&handler_block_idx) = rva_to_block.get(&handler_rva) {
+            if let Some(handler_block_idx) = self.block_at(handler_rva) {
                 if let Some(b) = self.blocks.get_mut(handler_block_idx) {
                     b.handler_entry = Some(HandlerEntryInfo::new(handler_idx, handler.flags));
                 }
@@ -745,7 +748,7 @@ impl<'a> Decoder<'a> {
                 let filter_rva = base_rva
                     .checked_add(u64::from(handler.filter_offset))
                     .ok_or_else(|| malformed_error!("filter_offset RVA overflow"))?;
-                if let Some(&filter_block_idx) = rva_to_block.get(&filter_rva) {
+                if let Some(filter_block_idx) = self.block_at(filter_rva) {
                     if let Some(b) = self.blocks.get_mut(filter_block_idx) {
                         b.handler_entry = Some(HandlerEntryInfo::new(
                             handler_idx,
@@ -775,14 +778,6 @@ impl<'a> Decoder<'a> {
             return Ok(());
         };
 
-        // Build a map from RVA to block index
-        let rva_to_block: HashMap<u64, usize> = self
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(idx, block)| (block.rva, idx))
-            .collect();
-
         // Exception handler offsets are relative to IL code start.
         // Add base RVA to convert to absolute RVA for block lookup.
         let base_rva = self.rva_start as u64;
@@ -792,7 +787,7 @@ impl<'a> Decoder<'a> {
             let handler_rva = base_rva
                 .checked_add(u64::from(handler.handler_offset))
                 .ok_or_else(|| malformed_error!("handler_offset RVA overflow"))?;
-            let Some(&handler_block_idx) = rva_to_block.get(&handler_rva) else {
+            let Some(handler_block_idx) = self.block_at(handler_rva) else {
                 continue;
             };
 
@@ -826,6 +821,15 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
+    /// The index of the block starting at `rva`. The blocks are sorted by RVA, one block
+    /// per start, once decoding ends, so this is a binary search, where a map from RVA to
+    /// block was built three times per method.
+    fn block_at(&self, rva: u64) -> Option<usize> {
+        self.blocks
+            .binary_search_by_key(&rva, |block| block.rva)
+            .ok()
+    }
+
     /// Wire up control flow edges (successors/predecessors) between blocks.
     ///
     /// This method is called after all blocks have been decoded and exception handlers
@@ -848,15 +852,8 @@ impl<'a> Decoder<'a> {
     /// relationship is also recorded. This enables both forward and backward
     /// traversal of the control flow graph.
     fn wire_control_flow_edges(&mut self) {
-        let rva_to_block: HashMap<u64, usize> = self
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(idx, block)| (block.rva, idx))
-            .collect();
-
         for block_idx in 0..self.blocks.len() {
-            let successors = self.compute_block_successors(block_idx, &rva_to_block);
+            let successors = self.compute_block_successors(block_idx);
 
             if let Some(b) = self.blocks.get_mut(block_idx) {
                 b.successors.clone_from(&successors);
@@ -891,17 +888,12 @@ impl<'a> Decoder<'a> {
     /// # Arguments
     ///
     /// * `block_idx` - Index of the block in `self.blocks`
-    /// * `rva_to_block` - Map from RVA to block index for target resolution
     ///
     /// # Returns
     ///
     /// A vector of block indices representing all possible control flow successors.
     /// The vector may be empty for terminal blocks (return, throw, endfinally).
-    fn compute_block_successors(
-        &self,
-        block_idx: usize,
-        rva_to_block: &HashMap<u64, usize>,
-    ) -> Vec<usize> {
+    fn compute_block_successors(&self, block_idx: usize) -> Vec<usize> {
         let Some(block) = self.blocks.get(block_idx) else {
             return vec![];
         };
@@ -911,8 +903,8 @@ impl<'a> Decoder<'a> {
         let fall_through_rva = block.rva.checked_add(block.size as u64);
 
         match last_instr.flow_type {
-            FlowType::Return | FlowType::Throw => {
-                // No successors for terminal instructions
+            FlowType::Return | FlowType::Throw | FlowType::MethodJump => {
+                // No successors: control leaves the method (`jmp` too, ECMA-335 III.3.37)
                 vec![]
             }
             FlowType::UnconditionalBranch => {
@@ -920,7 +912,7 @@ impl<'a> Decoder<'a> {
                 last_instr
                     .branch_targets
                     .iter()
-                    .filter_map(|&target_rva| rva_to_block.get(&target_rva).copied())
+                    .filter_map(|&target_rva| self.block_at(target_rva))
                     .collect()
             }
             FlowType::ConditionalBranch => {
@@ -929,14 +921,14 @@ impl<'a> Decoder<'a> {
 
                 // Add branch target(s)
                 for &target_rva in &last_instr.branch_targets {
-                    if let Some(&target_idx) = rva_to_block.get(&target_rva) {
+                    if let Some(target_idx) = self.block_at(target_rva) {
                         successors.push(target_idx);
                     }
                 }
 
                 // Add fall-through target (instruction immediately after this block)
                 if let Some(rva) = fall_through_rva {
-                    if let Some(&fall_through_idx) = rva_to_block.get(&rva) {
+                    if let Some(fall_through_idx) = self.block_at(rva) {
                         successors.push(fall_through_idx);
                     }
                 }
@@ -948,12 +940,12 @@ impl<'a> Decoder<'a> {
                 let mut successors: Vec<usize> = last_instr
                     .branch_targets
                     .iter()
-                    .filter_map(|&target_rva| rva_to_block.get(&target_rva).copied())
+                    .filter_map(|&target_rva| self.block_at(target_rva))
                     .collect();
 
                 // Add fall-through as the default (last successor)
                 if let Some(rva) = fall_through_rva {
-                    if let Some(&fall_through_idx) = rva_to_block.get(&rva) {
+                    if let Some(fall_through_idx) = self.block_at(rva) {
                         successors.push(fall_through_idx);
                     }
                 }
@@ -965,17 +957,17 @@ impl<'a> Decoder<'a> {
                 last_instr
                     .branch_targets
                     .iter()
-                    .filter_map(|&target_rva| rva_to_block.get(&target_rva).copied())
+                    .filter_map(|&target_rva| self.block_at(target_rva))
                     .collect()
             }
             FlowType::EndFinally => {
                 // EndFinally returns to caller of finally block - no static successors
                 vec![]
             }
-            FlowType::Sequential | FlowType::Call => {
+            FlowType::Sequential | FlowType::Call | FlowType::CallIndirect => {
                 // Fall through to next block
                 fall_through_rva
-                    .and_then(|rva| rva_to_block.get(&rva).copied())
+                    .and_then(|rva| self.block_at(rva))
                     .map(|idx| vec![idx])
                     .unwrap_or_default()
             }
@@ -990,23 +982,57 @@ impl<'a> Decoder<'a> {
 /// so each body is decoded once, by whichever method reaches it first, and
 /// every other method naming it takes that result. Decoding it again per
 /// method would only repeat the work.
+///
+/// A body only one method names is decoded straight into that method, without passing
+/// through the cache: the cache keeps a body's blocks until the load ends and hands each
+/// method a copy, so a body nobody shares would be held twice. The cache needs to know
+/// which bodies are shared for that ([`DecodedBodies::for_rvas`]); one made with
+/// [`DecodedBodies::new`] treats every body as possibly shared.
 #[derive(Default)]
 pub struct DecodedBodies {
     by_rva: DashMap<u32, Arc<OnceLock<Result<Vec<BasicBlock>>>>>,
+    /// The RVAs more than one method names, when they are known; `None` treats every RVA
+    /// as shared
+    shared: Option<HashSet<u32>>,
 }
 
 impl DecodedBodies {
-    /// An empty cache.
+    /// An empty cache, for methods whose bodies may all be shared.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty cache for the methods whose body RVAs `rvas` lists, one entry per method:
+    /// only a body more than one method names goes through the cache.
+    #[must_use]
+    pub fn for_rvas(rvas: impl IntoIterator<Item = u32>) -> Self {
+        let mut seen = HashSet::new();
+        let mut shared = HashSet::new();
+        for rva in rvas {
+            if !seen.insert(rva) {
+                shared.insert(rva);
+            }
+        }
+        Self {
+            by_rva: DashMap::new(),
+            shared: Some(shared),
+        }
+    }
+
+    /// Whether the body at `rva` may be named by more than one method.
+    fn may_be_shared(&self, rva: u32) -> bool {
+        self.shared
+            .as_ref()
+            .is_none_or(|shared| shared.contains(&rva))
     }
 }
 
 /// Disassembles a method's body into basic blocks and stores them on the method.
 ///
 /// The body is decoded once per RVA through `bodies`; a method sharing its
-/// body with another one gets a copy of the same blocks.
+/// body with another one gets a copy of the same blocks, and a body no other method names
+/// is decoded straight into the method.
 ///
 /// # Arguments
 ///
@@ -1024,10 +1050,15 @@ impl DecodedBodies {
 ///
 /// Safe to call concurrently for different methods. Methods sharing a body wait
 /// for the one decoding it rather than decoding it again.
-pub(crate) fn decode_method(method: &Method, file: &File, bodies: &DecodedBodies) -> Result<()> {
+pub fn decode_method(method: &Method, file: &File, bodies: &DecodedBodies) -> Result<()> {
     let Some(rva) = method.rva else {
         return Ok(());
     };
+    if !bodies.may_be_shared(rva) {
+        let blocks = decode_body(method, file, rva as usize)?;
+        let _ = method.blocks.set(blocks);
+        return Ok(());
+    }
 
     // The map's guard is released before waiting on the cell, so a thread
     // waiting for one body never holds a shard another thread needs.
@@ -1486,7 +1517,7 @@ pub fn decode_instruction(parser: &mut Parser, rva: u64) -> Result<Instruction> 
                 let branch_offset = <Immediate as Into<u64>>::into(value);
                 let target = next_instruction_rva.wrapping_add(branch_offset);
                 instruction.operand = Operand::Target(target);
-                instruction.branch_targets.push(target);
+                instruction.branch_targets = vec![target];
             }
         }
         FlowType::Switch => {
@@ -1494,13 +1525,18 @@ pub fn decode_instruction(parser: &mut Parser, rva: u64) -> Result<Instruction> 
                 let next_instruction_rva = rva
                     .checked_add(instruction.size)
                     .ok_or_else(|| malformed_error!("switch instruction RVA overflow"))?;
-                for &target in targets {
-                    // Sign-extend i32 offset to i64 for proper signed arithmetic
-                    let offset = i64::from(target);
-                    #[allow(clippy::cast_sign_loss)]
-                    let abs_target = next_instruction_rva.cast_signed().wrapping_add(offset) as u64;
-                    instruction.branch_targets.push(abs_target);
-                }
+                // Collected from the cases, so the list holds exactly one slot per case
+                instruction.branch_targets = targets
+                    .iter()
+                    .map(|&target| {
+                        // Sign-extend i32 offset to i64 for proper signed arithmetic
+                        let offset = i64::from(target);
+                        #[allow(clippy::cast_sign_loss)]
+                        let abs_target =
+                            next_instruction_rva.cast_signed().wrapping_add(offset) as u64;
+                        abs_target
+                    })
+                    .collect();
             }
         }
         _ => {}
@@ -1514,7 +1550,7 @@ mod tests {
     use crate::{
         assembly::{
             decode_blocks, decode_instruction, decode_stream, FlowType, Immediate,
-            InstructionCategory, Operand,
+            InstructionCategory, InstructionEncoder, Operand,
         },
         metadata::{
             tables::{MethodDefRaw, TableDataOwned, TableId},
@@ -1523,6 +1559,136 @@ mod tests {
         testkit::helpers::load_sample,
         Error, Parser,
     };
+
+    /// Control leaves the method with `jmp` (ECMA-335 III.3.37): its block ends there with
+    /// no successor, and the bytes after it are not decoded as code it continues into.
+    #[test]
+    fn jmp_ends_its_block_with_no_successor() {
+        let code = [0x00, 0x27, 0x01, 0x00, 0x00, 0x06, 0x00];
+        let blocks = decode_blocks(&code, 0, 0x1000, None).expect("decodes");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let block = &blocks[0];
+        assert_eq!(block.instructions.len(), 2);
+        assert_eq!(block.instructions[1].mnemonic, "jmp");
+        assert!(block.successors.is_empty(), "{:?}", block.successors);
+    }
+
+    /// Every flow kind states where control goes without the opcode byte: an indirect call
+    /// (`calli`) returns to the next instruction like a call, `jmp` leaves the method, and
+    /// the next instruction is the default of a `switch` and the path a conditional branch
+    /// does not take. One instruction per kind, decoded at 0x1000.
+    #[test]
+    fn each_flow_kind_states_where_control_goes() {
+        let cases: [(&str, &[u8], FlowType, Option<u64>); 13] = [
+            ("nop", &[0x00], FlowType::Sequential, Some(0x1001)),
+            (
+                "call",
+                &[0x28, 0x01, 0x00, 0x00, 0x06],
+                FlowType::Call,
+                Some(0x1005),
+            ),
+            (
+                "callvirt",
+                &[0x6F, 0x01, 0x00, 0x00, 0x06],
+                FlowType::Call,
+                Some(0x1005),
+            ),
+            (
+                "newobj",
+                &[0x73, 0x01, 0x00, 0x00, 0x06],
+                FlowType::Call,
+                Some(0x1005),
+            ),
+            (
+                "calli",
+                &[0x29, 0x01, 0x00, 0x00, 0x11],
+                FlowType::CallIndirect,
+                Some(0x1005),
+            ),
+            (
+                "jmp",
+                &[0x27, 0x01, 0x00, 0x00, 0x06],
+                FlowType::MethodJump,
+                None,
+            ),
+            (
+                "brtrue.s",
+                &[0x2D, 0x00],
+                FlowType::ConditionalBranch,
+                Some(0x1002),
+            ),
+            (
+                "switch",
+                &[0x45, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                FlowType::Switch,
+                Some(0x1009),
+            ),
+            ("br.s", &[0x2B, 0x00], FlowType::UnconditionalBranch, None),
+            ("ret", &[0x2A], FlowType::Return, None),
+            ("throw", &[0x7A], FlowType::Throw, None),
+            ("leave.s", &[0xDE, 0x00], FlowType::Leave, None),
+            ("endfinally", &[0xDC], FlowType::EndFinally, None),
+        ];
+        for (mnemonic, code, flow_type, fall_through) in cases {
+            let mut parser = Parser::new(code);
+            let instruction = decode_instruction(&mut parser, 0x1000).expect("decodes");
+            assert_eq!(instruction.mnemonic, mnemonic);
+            assert_eq!(instruction.flow_type, flow_type, "{mnemonic}");
+            assert_eq!(instruction.fall_through(), fall_through, "{mnemonic}");
+            assert_eq!(
+                instruction.flow_type.falls_through(),
+                fall_through.is_some(),
+                "{mnemonic}"
+            );
+        }
+    }
+
+    /// A block ending in `calli` continues to the next block, as one ending in a call does
+    /// and one ending in `jmp` does not.
+    #[test]
+    fn calli_continues_to_the_next_block() {
+        // brtrue.s +5 (to the ret, so a block ends after calli); calli; ret
+        let code = [0x2D, 0x05, 0x29, 0x01, 0x00, 0x00, 0x11, 0x2A];
+        let blocks = decode_blocks(&code, 0, 0x1000, None).expect("decodes");
+        let calli = blocks
+            .iter()
+            .find(|block| {
+                block
+                    .instructions
+                    .last()
+                    .is_some_and(|i| i.mnemonic == "calli")
+            })
+            .expect("a block ends with calli");
+        let ret = blocks
+            .iter()
+            .position(|block| block.rva == 0x1007)
+            .expect("a block starts at the ret");
+        assert_eq!(calli.successors, vec![ret], "{blocks:?}");
+        assert!(!calli.is_exit());
+    }
+
+    /// A branch back into its own block, past the block's start, splits the block, and the
+    /// branch ends the half it lands in: decoding the loop of a do-while, the branch must
+    /// already be in the block when the split happens.
+    #[test]
+    fn a_branch_back_into_its_own_block_ends_the_split_half() {
+        // nop; ldarg.0 (the loop head, 0x1001); brtrue.s -3 (to 0x1001); ret
+        let code = [0x00, 0x02, 0x2D, 0xFD, 0x2A];
+        let blocks = decode_blocks(&code, 0, 0x1000, None).expect("decodes");
+        let starts: Vec<u64> = blocks.iter().map(|block| block.rva).collect();
+        assert_eq!(starts, vec![0x1000, 0x1001, 0x1004], "{blocks:?}");
+        let mnemonics = |index: usize| -> Vec<&str> {
+            blocks[index]
+                .instructions
+                .iter()
+                .map(|i| i.mnemonic)
+                .collect()
+        };
+        assert_eq!(mnemonics(0), vec!["nop"]);
+        assert_eq!(mnemonics(1), vec!["ldarg.0", "brtrue.s"]);
+        assert_eq!(mnemonics(2), vec!["ret"]);
+        assert_eq!(blocks[1].size, 3, "{blocks:?}");
+    }
 
     /// Two methods whose rows name the same body both decode it. ECMA-335
     /// lets methods share a body; with a map of decoded bytes shared by every
@@ -2133,6 +2299,29 @@ mod tests {
         // Branch target should be computed: next_rva (0x1002) + offset (5) = 0x1007
         assert_eq!(result.branch_targets.len(), 1);
         assert_eq!(result.branch_targets[0], 0x1007);
+    }
+
+    /// `no.` (`0xFE 0x19`) decodes as a prefix with its flags byte, and encodes back to the
+    /// same bytes (ECMA-335 III.2.2).
+    #[test]
+    fn the_no_prefix_decodes_and_encodes_back() {
+        let bytes = [0xFE, 0x19, 0x02];
+        let mut parser = Parser::new(&bytes);
+        let no = decode_instruction(&mut parser, 0x1000).unwrap();
+        assert_eq!(no.mnemonic, "no.");
+        assert_eq!((no.prefix, no.opcode, no.size), (0xFE, 0x19, 3));
+        assert!(matches!(
+            no.operand,
+            Operand::Immediate(Immediate::UInt8(0x02))
+        ));
+        assert_eq!(no.category, InstructionCategory::Prefix);
+        assert!(no.is_prefix());
+
+        let mut encoder = InstructionEncoder::new();
+        encoder
+            .emit_instruction("no.", Some(Operand::Immediate(Immediate::UInt8(0x02))))
+            .unwrap();
+        assert_eq!(encoder.finalize().unwrap().0, bytes);
     }
 
     #[test]

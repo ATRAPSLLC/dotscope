@@ -102,9 +102,9 @@ pub mod opcodes;
 
 pub use block::{BasicBlock, HandlerEntryInfo};
 pub use builder::{FinishedWithLabels, InstructionAssembler};
-pub(crate) use decoder::decode_method;
 pub use decoder::{
-    decode_blocks, decode_blocks_with_handlers, decode_instruction, decode_stream, DecodedBodies,
+    decode_blocks, decode_blocks_with_handlers, decode_instruction, decode_method, decode_stream,
+    DecodedBodies,
 };
 pub use encoder::{InstructionEncoder, LabelFixup};
 pub use instruction::{

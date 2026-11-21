@@ -68,6 +68,9 @@ pub fn decompose_instruction(
     if instr.prefix == 0xFE {
         return match instr.opcode {
             0x12 | 0x13 | 0x14 | 0x16 | 0x1E => decompose_prefix(instr).map(Decomposed::Prefix),
+            // no.: the instruction after it *may* skip the checks it names (ECMA-335
+            // III.2.2). Lifted as nothing, the checks stay, which is a run it allows.
+            0x19 => Ok(Decomposed::Op(SsaOp::Nop)),
             _ => decompose_fe_instruction(instr, uses, def).map(Decomposed::Op),
         };
     }
@@ -1706,6 +1709,24 @@ mod tests {
             prefix(0x1E, "readonly.", Operand::None),
             Ok(CilPrefix::Readonly)
         );
+    }
+
+    /// `no.` only allows the next instruction to skip checks, so it lifts to nothing and the
+    /// checks stay: a run the prefix allows.
+    #[test]
+    fn the_no_prefix_lifts_to_nothing() {
+        let instr = make_instruction(
+            0x19,
+            0xFE,
+            "no.",
+            Operand::Immediate(Immediate::UInt8(0x04)),
+            0,
+            0,
+        );
+        assert!(matches!(
+            decompose_instruction(&instr, &[], None, &[], None),
+            Ok(Decomposed::Op(SsaOp::Nop))
+        ));
     }
 
     /// `unaligned.` states an alignment of 1, 2 or 4 bytes (ECMA-335

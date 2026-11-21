@@ -39,7 +39,6 @@ use analyssa::{
     analysis::{Budget, Machine, Rounds},
     events::{Event, EventListener},
     passes::utils::resolve_chains,
-    scheduling::SsaPassHost,
     BitSet,
 };
 
@@ -126,9 +125,9 @@ enum StringFoldOp {
     SubstringRange,
     /// `String.Replace(String, String)` — instance, args = [this, old, new].
     Replace,
-    /// `String.ToLower()` — instance, args = [this].
+    /// `String.ToLower()` — instance, args = \[this\].
     ToLower,
-    /// `String.ToUpper()` — instance, args = [this].
+    /// `String.ToUpper()` — instance, args = \[this\].
     ToUpper,
 }
 
@@ -137,7 +136,7 @@ enum StringFoldOp {
 /// This pass combines the SCCP analysis with additional optimizations
 /// for identity operations, absorbing elements, and type conversions, folded
 /// as many rounds as the host's
-/// [`Budget::FoldRounds`](analyssa::analysis::Budget::FoldRounds) allows.
+/// [`Budget::FoldRounds`] allows.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConstantPropagationPass;
 
@@ -555,7 +554,6 @@ impl ConstantPropagationPass {
                                 &inner_conv.target,
                                 target,
                                 inner_conv.unsigned,
-                                *unsigned,
                             ) {
                                 transformations.push(ConvTransform::ReplaceOperand {
                                     block_idx,
@@ -678,70 +676,71 @@ impl ConstantPropagationPass {
         )
     }
 
-    /// Determines if a widening conversion chain can be safely simplified.
+    /// Whether `conv.T2(conv.T1(x))` computes what `conv.T2(x)` does, for `x` of type
+    /// `source_type`, `T1` = `inner_target` and `T2` = `outer_target`, so that the inner
+    /// conversion can be skipped.
     ///
-    /// For `conv.T2(conv.T1(x))` to become `conv.T2(x)`:
-    /// - The inner conversion (source → T1) must NOT be narrowing (truncating)
-    /// - T1 must be smaller than or equal to T2 (outer must be widening)
-    /// - The signedness must be consistent or the conversion must be truly lossless
-    /// - Float conversions are NOT simplified (conv.r8(conv.r4(x)) loses precision)
+    /// It can exactly when the inner conversion leaves `x`'s stack value as it is: the outer
+    /// conversion then sees the same value either way. On the evaluation stack a value
+    /// narrower than 32 bits is held extended to 32 bits by its own signedness (`int8` -1 is
+    /// `0xFFFFFFFF`, `uint8` 255 is `0x000000FF`), and a conversion to a narrow type
+    /// truncates and extends again by the *target's* signedness (ECMA-335 III.3.27). So:
+    ///
+    /// - a source wider than `T1` is truncated, and the conversion cannot be skipped;
+    /// - a 4-byte `T1` leaves any 32-bit stack value as it is (`conv.i4`, `conv.u4`);
+    /// - a narrower `T1` leaves the value as it is when the source has its width and its
+    ///   signedness, or is narrower and either unsigned (its upper bits are zero, which any
+    ///   extension keeps) or held under a signed `T1` (sign extension of a sign-extended
+    ///   value). An `int16` -1 through `conv.u2` becomes 65535, not -1, and `conv.i8` then
+    ///   differs from `conv.i8` of the source.
+    ///
+    /// The chain is only considered when the outer conversion widens past `T1`, and float
+    /// conversions are left alone (`conv.r8(conv.r4(x))` rounds twice). The outer
+    /// conversion's own signedness does not matter: it is applied to the same value.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_type` - The type of the inner conversion's operand
+    /// * `inner_target` - `T1`
+    /// * `outer_target` - `T2`
+    /// * `inner_unsigned` - Whether `T1` is unsigned (`conv.u1`, `conv.u2`, `conv.u4`)
     fn is_safe_widening_chain(
         source_type: &SsaType,
         inner_target: &SsaType,
         outer_target: &SsaType,
         inner_unsigned: bool,
-        outer_unsigned: bool,
     ) -> bool {
-        // Don't optimize float conversions - they can lose precision
         if source_type.is_float() || inner_target.is_float() || outer_target.is_float() {
             return false;
         }
-
-        // Get sizes of all types
-        let source_size = source_type.size_bytes();
-        let inner_size = inner_target.size_bytes();
-        let outer_size = outer_target.size_bytes();
-
-        // All must have known sizes
-        let (Some(source_size), Some(inner_size), Some(outer_size)) =
-            (source_size, inner_size, outer_size)
-        else {
-            return false; // Native types - be conservative
+        let (Some(source_size), Some(inner_size), Some(outer_size)) = (
+            source_type.size_bytes(),
+            inner_target.size_bytes(),
+            outer_target.size_bytes(),
+        ) else {
+            // Native widths depend on the machine: be conservative
+            return false;
         };
-
-        // Inner conversion must NOT be narrowing (source must be <= inner target)
-        // If source > inner_target, the inner conversion truncates and we can't skip it
-        if source_size > inner_size {
+        if source_size > inner_size || inner_size >= outer_size {
             return false;
         }
-
-        // Outer conversion must be widening (inner smaller than outer)
-        if inner_size >= outer_size {
-            return false;
-        }
-
-        // For widening conversions, signedness matters:
-        // - unsigned widening is always safe (zero extension)
-        // - signed to signed widening is safe (sign extension)
-        // - signed to unsigned widening can change the value (e.g., -1 as i8 -> u32 = 255, not 0xFFFFFFFF)
-
-        // If both have the same unsigned flag, it's safe
-        if inner_unsigned == outer_unsigned {
+        if inner_size >= 4 {
             return true;
         }
-
-        // If inner is unsigned and outer is signed, it's safe (zero-extend then reinterpret)
-        // e.g., conv.i8(conv.u4(x)) - zero extends then treats as signed, same as conv.i8.u(x)
-        if inner_unsigned && !outer_unsigned {
-            return true;
+        let source_unsigned = matches!(
+            source_type,
+            SsaType::U8
+                | SsaType::U16
+                | SsaType::U32
+                | SsaType::U64
+                | SsaType::Bool
+                | SsaType::Char
+        );
+        if source_size == inner_size {
+            source_unsigned == inner_unsigned
+        } else {
+            source_unsigned || !inner_unsigned
         }
-
-        // If inner is signed and outer is unsigned:
-        // conv.u8(conv.i4(x)) vs conv.u8(x)
-        // If x is negative, conv.i4 sign-extends, then conv.u8 reinterprets
-        // But conv.u8(x) would just zero-extend or truncate
-        // This can differ, so don't optimize
-        false
     }
 
     /// Folds overflow-checked arithmetic operations when result doesn't overflow.
@@ -1645,11 +1644,7 @@ impl ConstantPropagationPass {
                             targets,
                             default,
                         } => {
-                            // Skip simplification for preserved dispatch variables
-                            // These control input-dependent control flow that must be preserved
-                            if ssa.is_preserved_dispatch_var(*value) {
-                                None
-                            } else if loop_headers.contains(&block_idx) {
+                            if loop_headers.contains(&block_idx) {
                                 // Don't fold switches at loop headers. A switch whose
                                 // value is constant on the initial iteration may take
                                 // different values on subsequent iterations (via the

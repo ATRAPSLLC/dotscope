@@ -3,9 +3,9 @@
 //! [`CompilerContext`] is the dotscope-side adapter that the analyssa
 //! [`PassScheduler`](analyssa::scheduling::PassScheduler) drives. This
 //! module wires it into the analyssa host trait family
-//! ([`World`](analyssa::World), [`SsaStore`](analyssa::SsaStore),
-//! [`DirtySet`](analyssa::DirtySet),
-//! [`SsaPassHost`](analyssa::scheduling::SsaPassHost)) and adds the CIL
+//! ([`World`], [`SsaStore`],
+//! [`DirtySet`],
+//! [`SsaPassHost`]) and adds the CIL
 //! extension trait [`CilHost`] which surfaces the assembly handle and
 //! other .NET-specific accessors that target-generic analyssa passes don't
 //! need to know about.
@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use analyssa::{
-    analysis::{Machine, WorkBudget},
+    analysis::AnalysisContext,
     events::EventListener,
     host::{DirtySet, SsaStore},
     ir::function::SsaFunction,
@@ -149,17 +149,8 @@ impl SsaPassHost<CilTarget> for CompilerContext {
         &self.events
     }
 
-    fn budget(&self) -> WorkBudget {
-        Self::budget(self)
-    }
-
-    fn machine(&self) -> Machine {
-        // If the assembly is set, its PE header states the pointer width. Test
-        // contexts without an assembly take the 64-bit target, dotscope's
-        // default (`CilTarget::x64`).
-        self.assembly()
-            .map_or_else(CilTarget::x64, |assembly| CilTarget::of(&assembly))
-            .machine()
+    fn context(&self) -> AnalysisContext<'_> {
+        AnalysisContext::new(Self::machine(self)).with_budget(Self::budget(self))
     }
 }
 

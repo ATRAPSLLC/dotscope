@@ -145,7 +145,7 @@ impl Target for CilTarget {
     ///
     /// Every milestone in the shared vocabulary has a CIL spelling, so the
     /// answer is always `Some`: the conversion is total and lives on
-    /// [`CilCapability`](crate::compiler::CilCapability). Without the
+    /// [`CilCapability`]. Without the
     /// compiler feature there are no capabilities to name and nothing is
     /// scheduled by them.
     #[cfg(feature = "compiler")]

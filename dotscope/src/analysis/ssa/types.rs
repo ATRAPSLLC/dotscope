@@ -17,7 +17,7 @@
 //! - **References**: Object references, arrays, and pointers
 //! - **Special**: Generic parameters and analysis-only types
 
-use std::fmt;
+use std::{fmt, sync::OnceLock};
 
 use crate::{
     metadata::{
@@ -1136,10 +1136,13 @@ impl SsaType {
                 signature, assembly, nested,
             ))),
 
-            // Modifiers and special types - not representable
-            TypeSignature::ModifiedRequired(_)
-            | TypeSignature::ModifiedOptional(_)
-            | TypeSignature::Sentinel
+            // A modifier does not change the value's representation
+            TypeSignature::ModifiedRequired(_, base) | TypeSignature::ModifiedOptional(_, base) => {
+                Self::from_signature_at(base, assembly, nested)
+            }
+
+            // Special types - not representable
+            TypeSignature::Sentinel
             | TypeSignature::Unknown
             | TypeSignature::Internal
             | TypeSignature::Modifier
@@ -1418,13 +1421,23 @@ pub struct TypeContext<'a> {
     method: &'a Method,
     /// The assembly containing the method.
     assembly: &'a CilObject,
+    /// The method's local variable signatures, read from its LocalVarSig blob the first time
+    /// they are asked for: the lift asks for a local's type at every load and store of it.
+    local_signatures: OnceLock<Option<Vec<SignatureLocalVariable>>>,
+    /// Each local's type, resolved from those signatures once.
+    local_types: OnceLock<Box<[SsaType]>>,
 }
 
 impl<'a> TypeContext<'a> {
     /// Creates a new type context for SSA construction.
     #[must_use]
     pub fn new(method: &'a Method, assembly: &'a CilObject) -> Self {
-        Self { method, assembly }
+        Self {
+            method,
+            assembly,
+            local_signatures: OnceLock::new(),
+            local_types: OnceLock::new(),
+        }
     }
 
     /// Returns the assembly reference.
@@ -1477,20 +1490,30 @@ impl<'a> TypeContext<'a> {
     /// lossy round-trip through `to_signature_local()` → `type_ref_to_signature()`,
     /// which produces artificial 0xF0 tokens for constructed types (generic
     /// instances, arrays, pointers).
+    ///
+    /// Every local's type is resolved the first time one is asked for, and kept.
     #[must_use]
     pub fn local_type(&self, idx: u16) -> SsaType {
-        // Prefer raw blob signatures which preserve original metadata tokens.
-        // Fall back to Method::get_local_type_signatures() only when the raw
-        // blob path is unavailable (e.g., missing body or local_var_sig_token).
-        let signatures = self
-            .local_type_signatures()
-            .or_else(|| self.method.get_local_type_signatures());
-
-        signatures
-            .and_then(|types| types.into_iter().nth(idx as usize))
-            .map_or(SsaType::Unknown, |sig| {
-                self.validate_generic_params(SsaType::from_local(&sig, self.assembly))
+        self.local_types
+            .get_or_init(|| {
+                let resolve = |sig: &SignatureLocalVariable| {
+                    self.validate_generic_params(SsaType::from_local(sig, self.assembly))
+                };
+                // Prefer raw blob signatures which preserve original metadata tokens.
+                // Fall back to Method::get_local_type_signatures() only when the raw
+                // blob path is unavailable (e.g., missing body or local_var_sig_token).
+                match self.parsed_local_signatures() {
+                    Some(signatures) => signatures.iter().map(resolve).collect(),
+                    None => self
+                        .method
+                        .get_local_type_signatures()
+                        .map(|signatures| signatures.iter().map(resolve).collect())
+                        .unwrap_or_default(),
+                }
             })
+            .get(usize::from(idx))
+            .cloned()
+            .unwrap_or(SsaType::Unknown)
     }
 
     /// Returns the return type of a called method.
@@ -1740,20 +1763,24 @@ impl<'a> TypeContext<'a> {
     /// back to metadata, rather than artificial tokens created by the `TypeResolver`.
     #[must_use]
     pub fn local_type_signatures(&self) -> Option<Vec<SignatureLocalVariable>> {
-        let body = self.method.body.get()?;
-        if body.local_var_sig_token == 0 {
-            return None;
-        }
-        let tables = self.assembly.tables()?;
-        let table = tables.table::<StandAloneSigRaw>()?;
-        let raw = table
-            .get(body.local_var_sig_token & 0x00FF_FFFF)
-            .ok()
-            .flatten()?;
-        let blob = self.assembly.blob()?;
-        let sig_data = blob.get(raw.signature as usize).ok()?;
-        let locals_sig = parse_local_var_signature(sig_data).ok()?;
-        Some(locals_sig.locals)
+        self.parsed_local_signatures().cloned()
+    }
+
+    /// The local signatures [`Self::local_type_signatures`] returns, parsed from the
+    /// LocalVarSig blob once.
+    fn parsed_local_signatures(&self) -> Option<&Vec<SignatureLocalVariable>> {
+        self.local_signatures
+            .get_or_init(|| {
+                let sig_rid = self.method.body.get()?.local_var_sig_rid()?;
+                let tables = self.assembly.tables()?;
+                let table = tables.table::<StandAloneSigRaw>()?;
+                let raw = table.get(sig_rid).ok().flatten()?;
+                let blob = self.assembly.blob()?;
+                let sig_data = blob.get(raw.signature as usize).ok()?;
+                let locals_sig = parse_local_var_signature(sig_data).ok()?;
+                Some(locals_sig.locals)
+            })
+            .as_ref()
     }
 
     /// Returns the catch handler's exception type as an `SsaType`.
@@ -2039,7 +2066,7 @@ mod tests {
                 .types()
                 .iter()
                 .map(|entry| entry.value().clone())
-                .find(|ty| ty.token.table() == 0x01 && &*ty.fullname() == name)
+                .find(|ty| ty.token.table() == 0x01 && ty.fullname() == name)
                 .map(|ty| ty.token)
                 .unwrap_or_else(|| panic!("{name} is imported"))
         };

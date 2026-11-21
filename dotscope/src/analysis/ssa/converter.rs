@@ -43,7 +43,10 @@
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 
-use std::collections::BTreeMap;
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, HashSet},
+};
 
 use analyssa::{
     graph::NodeId,
@@ -65,7 +68,7 @@ use crate::{
             SsaType, SsaVarId, StackSimulator, TypeProvider, VariableOrigin,
         },
     },
-    assembly::{opcodes, Immediate, Instruction, Operand},
+    assembly::{opcodes, FlowType, Immediate, Instruction, Operand},
     metadata::{
         signatures::TypeSignature,
         tables::{MemberRefSignature, StandAloneSigRaw, StandAloneSignature},
@@ -116,6 +119,35 @@ pub struct SsaConverter<'a, 'cfg> {
     /// Variables are assigned correct types at creation time based on method
     /// signature, local variable signature, and call return types.
     type_provider: &'a dyn TypeProvider,
+
+    /// The corelib runtime handle types, each resolved the first time a value of it is typed
+    /// ([`Self::handle_type`]): an `ldtoken` asks for one per instruction, several times.
+    handle_types: [OnceCell<SsaType>; RuntimeHandle::COUNT],
+}
+
+/// The corelib value types the lift gives the values it makes itself: `ldtoken`'s handles,
+/// `arglist`'s and `refanytype`'s.
+#[derive(Debug, Clone, Copy)]
+enum RuntimeHandle {
+    Type,
+    Method,
+    Field,
+    Argument,
+}
+
+impl RuntimeHandle {
+    /// How many handle types there are.
+    const COUNT: usize = 4;
+
+    /// The handle type's full name in the core library.
+    fn fullname(self) -> &'static str {
+        match self {
+            Self::Type => "System.RuntimeTypeHandle",
+            Self::Method => "System.RuntimeMethodHandle",
+            Self::Field => "System.RuntimeFieldHandle",
+            Self::Argument => "System.RuntimeArgumentHandle",
+        }
+    }
 }
 
 impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
@@ -223,6 +255,24 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         SsaType::binary_numeric(&a, &b, additive).unwrap_or(SsaType::Unknown)
     }
 
+    /// The corelib value type `handle` names, resolved once per method
+    /// ([`resolve_corelib_valuetype`]); [`SsaType::Unknown`] without an assembly or when the
+    /// assembly imports no such type.
+    fn handle_type(&self, handle: RuntimeHandle) -> SsaType {
+        self.handle_types
+            .get(handle as usize)
+            .map_or(SsaType::Unknown, |cell| {
+                cell.get_or_init(|| {
+                    self.type_provider
+                        .assembly()
+                        .map_or(SsaType::Unknown, |assembly| {
+                            resolve_corelib_valuetype(assembly, handle.fullname())
+                        })
+                })
+                .clone()
+            })
+    }
+
     /// Infers the result type of an SSA operation using the TypeContext.
     ///
     /// This is the core type inference routine that resolves types for all ops,
@@ -281,24 +331,9 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                 // construction — never a tokenless placeholder. The
                 // operand's own token is the *subject* of the handle,
                 // not its type, and is already preserved on the op.
-                ConstValue::Type(_) => self
-                    .type_provider
-                    .assembly()
-                    .map_or(SsaType::Unknown, |a| {
-                        resolve_corelib_valuetype(a, "System.RuntimeTypeHandle")
-                    }),
-                ConstValue::MethodHandle(_) => self
-                    .type_provider
-                    .assembly()
-                    .map_or(SsaType::Unknown, |a| {
-                        resolve_corelib_valuetype(a, "System.RuntimeMethodHandle")
-                    }),
-                ConstValue::FieldHandle(_) => self
-                    .type_provider
-                    .assembly()
-                    .map_or(SsaType::Unknown, |a| {
-                        resolve_corelib_valuetype(a, "System.RuntimeFieldHandle")
-                    }),
+                ConstValue::Type(_) => self.handle_type(RuntimeHandle::Type),
+                ConstValue::MethodHandle(_) => self.handle_type(RuntimeHandle::Method),
+                ConstValue::FieldHandle(_) => self.handle_type(RuntimeHandle::Field),
             },
 
             // Comparison results are always bool (represented as I32 on stack).
@@ -390,12 +425,8 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             }
             SsaOp::MakeTypedRef { .. } => SsaType::TypedReference,
             // The two handles are corelib value types, as `ldtoken`'s are.
-            SsaOp::ArgList { .. } => self.type_provider.assembly().map_or(SsaType::Unknown, |a| {
-                resolve_corelib_valuetype(a, "System.RuntimeArgumentHandle")
-            }),
-            SsaOp::TypedRefType { .. } => self.type_provider.assembly().map_or(SsaType::Unknown, |a| {
-                resolve_corelib_valuetype(a, "System.RuntimeTypeHandle")
-            }),
+            SsaOp::ArgList { .. } => self.handle_type(RuntimeHandle::Argument),
+            SsaOp::TypedRefType { .. } => self.handle_type(RuntimeHandle::Type),
 
             // Unbox operations - resolve value type through type provider for primitives
             SsaOp::Unbox { value_type, .. } => {
@@ -682,6 +713,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             var_stack_positions: BTreeMap::new(),
             slot_versions: BTreeMap::new(),
             type_provider,
+            handle_types: Default::default(),
         };
 
         // Get assembly reference from type provider for stack simulation
@@ -1056,7 +1088,9 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         for &handler_idx in &handler_blocks {
             all_blocks.push(NodeId::new(handler_idx));
         }
+        self.check_control_stays_in_method(&all_blocks)?;
         let exit_depths = self.compute_stack_depths(&all_blocks, assembly)?;
+        self.check_stack_depths(&all_blocks, &exit_depths, assembly)?;
 
         // Create a single simulator for the entire method to ensure unique variable IDs
         // across all blocks within this method. In well-formed CIL, the stack is always
@@ -1139,62 +1173,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
 
                 // Apply stack effects of each instruction
                 for instr in &cfg_block.instructions {
-                    // For CALL/CALLVIRT/NEWOBJ/CALLI, resolve actual argument counts from
-                    // signatures since static stack_behavior metadata is often incorrect
-                    // (CALLI has VarPop/VarPush so net_effect=0 without resolution)
-                    let net_effect = match instr.opcode {
-                        opcodes::CALL | opcodes::CALLVIRT | opcodes::NEWOBJ => assembly
-                            .zip(Self::extract_token(&instr.operand))
-                            .and_then(|(asm, token)| {
-                                Self::resolve_call_info(asm, token).map(
-                                    |(param_count, has_this, has_return)| {
-                                        let is_newobj = instr.opcode == opcodes::NEWOBJ;
-                                        let pops = if is_newobj {
-                                            param_count
-                                        } else {
-                                            param_count.saturating_add(usize::from(has_this))
-                                        };
-                                        let pushes = if is_newobj {
-                                            1
-                                        } else {
-                                            usize::from(has_return)
-                                        };
-                                        #[allow(
-                                            clippy::cast_possible_truncation,
-                                            clippy::cast_possible_wrap
-                                        )]
-                                        ((pushes as i32)
-                                            .saturating_sub(pops as i32)
-                                            .clamp(i32::from(i8::MIN), i32::from(i8::MAX))
-                                            as i8)
-                                    },
-                                )
-                            })
-                            .unwrap_or(instr.stack_behavior.net_effect),
-                        opcodes::CALLI => assembly
-                            .zip(Self::extract_token(&instr.operand))
-                            .and_then(|(asm, token)| {
-                                Self::resolve_calli_info(asm, token).map(
-                                    |(param_count, has_this, has_return)| {
-                                        // calli pops: param_count + has_this + 1 (function pointer)
-                                        let pops = param_count
-                                            .saturating_add(usize::from(has_this))
-                                            .saturating_add(1);
-                                        let pushes = usize::from(has_return);
-                                        #[allow(
-                                            clippy::cast_possible_truncation,
-                                            clippy::cast_possible_wrap
-                                        )]
-                                        ((pushes as i32)
-                                            .saturating_sub(pops as i32)
-                                            .clamp(i32::from(i8::MIN), i32::from(i8::MAX))
-                                            as i8)
-                                    },
-                                )
-                            })
-                            .unwrap_or(instr.stack_behavior.net_effect),
-                        _ => instr.stack_behavior.net_effect,
-                    };
+                    let (net_effect, _) = Self::net_stack_effect(instr, assembly);
 
                     // Apply effect, clamping to 0 if it would go negative (shouldn't happen in valid CIL)
                     #[allow(clippy::cast_sign_loss)] // Sign checked in condition
@@ -1208,8 +1187,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                 // Special handling for leave instructions: they clear the stack
                 // The target of a leave instruction has stack depth 0
                 if let Some(last_instr) = cfg_block.instructions.last() {
-                    if last_instr.opcode == opcodes::LEAVE || last_instr.opcode == opcodes::LEAVE_S
-                    {
+                    if last_instr.flow_type == FlowType::Leave {
                         depth = 0;
                     }
                 }
@@ -1228,6 +1206,173 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         }
 
         Ok(exit_depths)
+    }
+
+    /// The net effect of `instr` on the evaluation stack, and whether it is exact.
+    ///
+    /// A call's effect comes from its signature when `assembly` resolves it; otherwise, and for
+    /// a call through a pointer whose signature does not resolve, from the opcode's static
+    /// stack behaviour, which does not know the arguments: the effect is then not exact.
+    fn net_stack_effect(instr: &Instruction, assembly: Option<&CilObject>) -> (i8, bool) {
+        /// `pushes - pops`, clamped to an `i8`.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        fn net(pushes: usize, pops: usize) -> i8 {
+            (pushes as i32)
+                .saturating_sub(pops as i32)
+                .clamp(i32::from(i8::MIN), i32::from(i8::MAX)) as i8
+        }
+        let resolved = match instr.opcode {
+            opcodes::CALL | opcodes::CALLVIRT | opcodes::NEWOBJ => assembly
+                .zip(Self::extract_token(&instr.operand))
+                .and_then(|(asm, token)| Self::resolve_call_info(asm, token))
+                .map(|(param_count, has_this, has_return)| {
+                    if instr.opcode == opcodes::NEWOBJ {
+                        net(1, param_count)
+                    } else {
+                        net(
+                            usize::from(has_return),
+                            param_count.saturating_add(usize::from(has_this)),
+                        )
+                    }
+                }),
+            opcodes::CALLI => assembly
+                .zip(Self::extract_token(&instr.operand))
+                .and_then(|(asm, token)| Self::resolve_calli_info(asm, token))
+                // calli pops the arguments, `this` and the function pointer
+                .map(|(param_count, has_this, has_return)| {
+                    net(
+                        usize::from(has_return),
+                        param_count
+                            .saturating_add(usize::from(has_this))
+                            .saturating_add(1),
+                    )
+                }),
+            _ => return (instr.stack_behavior.net_effect, true),
+        };
+        match resolved {
+            Some(effect) => (effect, true),
+            None => (instr.stack_behavior.net_effect, false),
+        }
+    }
+
+    /// Refuses code whose control leaves the method or its instruction stream: a reachable
+    /// block that ends in an instruction control continues past (a sequential instruction, a
+    /// call other than `jmp`, a conditional branch or a switch) with no instruction after it, a branch to an
+    /// offset that starts no block, or a block that starts inside another decoded instruction
+    /// (a branch into an operand, which decodes the same bytes twice, as two different
+    /// instructions). ECMA-335 III.1.7.5: control may not fall off the end of a method body,
+    /// and a branch target is the start of an instruction in it; the runtime refuses such a
+    /// method with `InvalidProgramException`, and it has no SSA form.
+    ///
+    /// # Errors
+    /// Returns an error naming the instruction control leaves the method from, or the
+    /// instruction a block starts inside.
+    fn check_control_stays_in_method(&self, blocks: &[NodeId]) -> Result<()> {
+        let starts: HashSet<u64> = self
+            .cfg
+            .node_ids()
+            .filter_map(|node| self.cfg.block(node).map(|block| block.rva))
+            .collect();
+        let mut spans: Vec<(u64, u64)> = self
+            .cfg
+            .node_ids()
+            .filter_map(|node| self.cfg.block(node))
+            .flat_map(|block| &block.instructions)
+            .map(|instr| (instr.rva, instr.rva.saturating_add(instr.size)))
+            .collect();
+        spans.sort_unstable();
+        for &start in &starts {
+            let before = spans.partition_point(|&(rva, _)| rva < start);
+            if let Some(&(rva, end)) = before.checked_sub(1).and_then(|i| spans.get(i)) {
+                if start < end {
+                    return Err(Error::SsaError(format!(
+                        "a block starts at RVA 0x{start:X}, inside the instruction at RVA \
+                         0x{rva:X} (ECMA-335 III.1.7.5)"
+                    )));
+                }
+            }
+        }
+        for &node in blocks {
+            let Some(block) = self.cfg.block(node) else {
+                continue;
+            };
+            let Some(last) = block.instructions.last() else {
+                continue;
+            };
+            if last.flow_type.falls_through() {
+                let next = block.rva.checked_add(block.size as u64);
+                if !next.is_some_and(|next| starts.contains(&next)) {
+                    return Err(Error::SsaError(format!(
+                        "control falls off the end of the method after the instruction at \
+                         RVA 0x{:X} (ECMA-335 III.1.7.5)",
+                        last.rva
+                    )));
+                }
+            }
+            if let Some(target) = last
+                .branch_targets
+                .iter()
+                .find(|target| !starts.contains(target))
+            {
+                return Err(Error::SsaError(format!(
+                    "the branch at RVA 0x{:X} targets RVA 0x{target:X}, which starts no \
+                     instruction of the method (ECMA-335 III.1.7.5)",
+                    last.rva
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses code that reaches a join with different stack depths along different paths,
+    /// when every stack effect in it is exact (see [`Self::net_stack_effect`]). ECMA-335
+    /// III.1.7.5: the stack has the same depth along every path to an instruction, and the
+    /// runtime refuses code where it does not. Where a call's effect is not exact the depths
+    /// are estimates, and the code is not judged by them. A stack underflow needs no check
+    /// here: once the joins agree, the simulation's entry depths are exact and it refuses an
+    /// instruction that pops an empty stack.
+    ///
+    /// # Errors
+    /// Returns an error naming the join.
+    fn check_stack_depths(
+        &self,
+        blocks: &[NodeId],
+        exit_depths: &BTreeMap<usize, usize>,
+        assembly: Option<&CilObject>,
+    ) -> Result<()> {
+        let exact = blocks.iter().all(|&node| {
+            self.cfg.block(node).is_some_and(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .all(|instr| Self::net_stack_effect(instr, assembly).1)
+            })
+        });
+        if !exact {
+            return Ok(());
+        }
+        for &node in blocks {
+            let Some(block) = self.cfg.block(node) else {
+                continue;
+            };
+            if node.index() == self.cfg.entry().index() || block.handler_entry.is_some() {
+                continue;
+            }
+            let mut depths = self
+                .cfg
+                .predecessors(node)
+                .filter_map(|pred| exit_depths.get(&pred.index()).copied());
+            if let Some(first) = depths.next() {
+                if let Some(other) = depths.find(|&depth| depth != first) {
+                    return Err(Error::SsaError(format!(
+                        "the stack is {first} deep on one path to the instruction at RVA \
+                         0x{:X} and {other} on another (ECMA-335 III.1.7.5)",
+                        block.rva
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Computes the stack depth at block entry based on predecessor exit depths.
@@ -1866,13 +2011,12 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             let Some(var) = self.function.variable(var_id) else {
                 continue;
             };
-            let (Some(instr), true) = (var.def_site().instruction, var.var_type().is_unknown())
-            else {
+            let (Some(instr), true) = (var.def_site().index(), var.var_type().is_unknown()) else {
                 continue;
             };
             let arithmetic = self
                 .function
-                .block(var.def_site().block)
+                .block(var.def_site().block())
                 .and_then(|block| block.instruction(instr))
                 .is_some_and(|instruction| {
                     let no_enum_unresolved = instruction.op().uses().iter().all(|operand| {
@@ -2000,7 +2144,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                     continue;
                 };
                 let ds = var.def_site();
-                (var.var_type().is_unknown(), ds.block, ds.instruction)
+                (var.var_type().is_unknown(), ds.block(), ds.index())
             };
             if !is_unknown {
                 continue;
@@ -2159,8 +2303,49 @@ mod tests {
     use crate::{
         analysis::{SsaVerifier, TypeRef, VerifyLevel},
         assembly::InstructionAssembler,
-        testkit::{build_cfg, build_ssa, TestTypeProvider},
+        testkit::{build_cfg, build_ssa, build_ssa_with_handlers, TestTypeProvider},
     };
+
+    /// The SSA of `code`, a method of one `int32` argument, or its error's text.
+    fn lift(code: &[u8]) -> std::result::Result<SsaFunction, String> {
+        build_ssa_with_handlers(code, &[], &TestTypeProvider::all_i32(1, 0))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Code the runtime refuses has no SSA form (ECMA-335 III.1.7.5): control falling off
+    /// the end, a branch to no instruction of the method, a branch into an instruction's
+    /// operand, a join reached at two stack depths and a stack underflow are refused; valid
+    /// code still lifts.
+    #[test]
+    fn code_the_runtime_refuses_does_not_lift() {
+        let refused = [
+            (&[0x00u8][..], "falls off the end"),
+            (&[0x00, 0x00], "falls off the end"),
+            (&[0x02, 0x2D, 0x01, 0x00, 0x17], "falls off the end"),
+            (&[0x2B, 0x05, 0x2A], "starts no instruction"),
+            (&[0x02, 0x2D, 0x01, 0x17, 0x2A], "deep on one path"),
+            (&[0x26, 0x2A], "Stack simulation failed"),
+            (
+                &[0x02, 0x2D, 0x01, 0x1F, 0x2A, 0x2A],
+                "inside the instruction",
+            ),
+        ];
+        for (code, why) in refused {
+            let error = lift(code).expect_err("the code is refused");
+            assert!(error.contains(why), "{code:02X?}: {error}");
+        }
+        for code in [
+            &[0x02u8, 0x2A][..],
+            &[0x02, 0x2D, 0x01, 0x2A, 0x2A],
+            &[0x2A],
+        ] {
+            lift(code).unwrap_or_else(|error| panic!("{code:02X?} lifts: {error}"));
+        }
+        // A method that ends in `jmp` does not fall off its end: control leaves with it.
+        // (SSA has no form for `jmp`, so it still does not lift, but not for that reason.)
+        let error = lift(&[0x27, 0x01, 0x00, 0x00, 0x06]).expect_err("jmp does not lift");
+        assert!(!error.contains("falls off the end"), "{error}");
+    }
 
     #[test]
     fn test_simple_function() {
@@ -3266,12 +3451,12 @@ mod tests {
         // At least one should be defined by an instruction (not phi)
         for var in local0_defs {
             assert!(
-                var.def_site().instruction.is_some(),
+                var.def_site().index().is_some(),
                 "Non-phi variable should have instruction def site"
             );
             // def_site block should be valid
             assert!(
-                var.def_site().block < ssa.block_count(),
+                var.def_site().block() < ssa.block_count(),
                 "Def site block out of range"
             );
         }
@@ -3342,7 +3527,7 @@ mod tests {
             // The return value should come from a PHI (def_site.instruction should be None)
             if let Some(var_info) = ssa.variable(*ret_var) {
                 assert!(
-                    var_info.def_site().instruction.is_none(),
+                    var_info.def_site().index().is_none(),
                     "Return value {:?} should be from a PHI (stack merge), not a single predecessor",
                     ret_var
                 );

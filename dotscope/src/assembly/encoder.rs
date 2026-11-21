@@ -338,7 +338,7 @@ impl InstructionEncoder {
         // After these, there's no fall-through - execution only continues via labels.
         if matches!(
             metadata.flow,
-            FlowType::Return | FlowType::Throw | FlowType::EndFinally
+            FlowType::Return | FlowType::Throw | FlowType::EndFinally | FlowType::MethodJump
         ) {
             self.unreachable = true;
         }

@@ -3395,6 +3395,7 @@ fn a_method_that_fails_after_interning_leaves_the_assembly_unchanged() {
         protected_range: BlockRange::new(1, 2),
         handler_range: BlockRange::new(2, 3),
         filter_range: None,
+        selector: None,
     }]);
     ssa.recompute_uses();
 
@@ -4603,6 +4604,7 @@ fn a_value_computed_in_a_try_reaches_the_code_after_its_finally() {
         protected_range: BlockRange::new(1, 2),
         handler_range: BlockRange::new(2, 3),
         filter_range: None,
+        selector: None,
     }]);
     ssa.recompute_uses();
 
@@ -4693,6 +4695,7 @@ fn a_value_handed_to_a_finally_and_read_after_it_keeps_its_value() {
         protected_range: BlockRange::new(1, 2),
         handler_range: BlockRange::new(2, 3),
         filter_range: None,
+        selector: None,
     }]);
     ssa.recompute_uses();
 
@@ -4852,6 +4855,7 @@ fn a_local_reset_each_iteration_keeps_its_value_through_a_finally() {
         protected_range: BlockRange::new(2, 5),
         handler_range: BlockRange::new(5, 6),
         filter_range: None,
+        selector: None,
     }]);
     ssa.recompute_uses();
 
@@ -4892,6 +4896,7 @@ fn region_layout_function(terminators: Vec<SsaOp>, clauses: &[ClauseBlocks]) -> 
                     protected_range: BlockRange::new(try_start, try_end),
                     handler_range: BlockRange::new(handler_start, handler_end),
                     filter_range: None,
+                    selector: None,
                 },
             )
             .collect(),
@@ -4929,6 +4934,50 @@ fn assert_regions_laid_out_whole(ssa: &SsaFunction, layout: &[usize]) {
             "the handler precedes its protected region in {layout:?}"
         );
     }
+}
+
+/// A filter's `endfilter` is its last instruction, wherever the fall-through
+/// reaches it first.
+///
+/// The filter `B2..B6` tests a condition: its false arm `B3` jumps straight to
+/// the `endfilter` block `B5`, and its true arm `B4` reaches it too. Following
+/// the fall-through placed `B5` after `B3` and `B4` after it, so code followed
+/// the `endfilter` and the method kept its original IL.
+#[test]
+fn a_filters_endfilter_is_laid_out_last() {
+    let condition = SsaVarId::from_index(0);
+    let mut ssa = region_layout_function(
+        vec![
+            SsaOp::Jump { target: 1 },
+            SsaOp::Leave { target: 7 },
+            SsaOp::Branch {
+                condition,
+                true_target: 4,
+                false_target: 3,
+            },
+            SsaOp::Jump { target: 5 },
+            SsaOp::Jump { target: 5 },
+            SsaOp::EndFilter { result: condition },
+            SsaOp::Leave { target: 7 },
+            SsaOp::returns(None),
+        ],
+        &[],
+    );
+    ssa.set_exception_handlers(vec![SsaExceptionHandler {
+        flags: ExceptionHandlerFlags::FILTER,
+        try_offset: 0,
+        try_length: 0,
+        handler_offset: 0,
+        handler_length: 0,
+        class_token_or_filter: 0,
+        protected_range: BlockRange::new(1, 2),
+        handler_range: BlockRange::new(6, 7),
+        filter_range: BlockRange::new(2, 6),
+        selector: None,
+    }]);
+    let included: BTreeSet<usize> = (0..8).collect();
+    let layout = SsaCodeGenerator::compute_block_layout(&ssa, &included);
+    assert_eq!(layout, [0, 1, 2, 3, 4, 5, 6, 7]);
 }
 
 /// A fall-through chain that reaches a protected region past its entry

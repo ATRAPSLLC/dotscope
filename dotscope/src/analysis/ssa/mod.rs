@@ -106,7 +106,7 @@ pub use analyssa::ir::{
     instruction::InstrId,
     FloatBits, FloatFormat,
 };
-pub use builder::SsaFunctionBuilder;
+pub use builder::{SsaBlockBuilder, SsaFunctionBuilder, SsaFunctionContext};
 pub use converter::SsaConverter;
 pub use exception::{
     BlockRange, ClauseLayout, ClausePart, ExceptionBlocks, ExceptionTableError, HandlerKind,
@@ -141,10 +141,10 @@ pub use stack::{SimulationResult, StackSimulator};
 #[cfg(feature = "z3")]
 pub use symbolic::Z3Solver;
 pub use symbolic::{NumericOp, SymbolicEvaluator, SymbolicExpr};
-pub use target::CilTarget;
+pub use target::{CilTarget, NoSymbol};
 pub use types::{
-    resolve_corelib_valuetype, FieldRef, MethodRef, SsaType, TypeClass, TypeContext, TypeProvider,
-    TypeRef,
+    resolve_corelib_valuetype, FieldRef, FnPtrSig, MethodRef, SigRef, SsaType, TypeClass,
+    TypeContext, TypeProvider, TypeRef,
 };
 pub use value::{AbstractValue, ConstValue, ConstValueCilExt};
 

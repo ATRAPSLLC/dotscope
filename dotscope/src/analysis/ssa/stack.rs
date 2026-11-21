@@ -171,7 +171,7 @@ pub struct StackSimulator {
 /// name a mixture of the two.
 ///
 /// Expressed in `u32`, because that is the width an
-/// [`SsaVarId`](crate::analysis::SsaVarId) keeps:
+/// [`SsaVarId`] keeps:
 /// [`SsaVarId::from_index`](crate::analysis::SsaVarId::from_index) truncates its
 /// `usize` argument. An offset above `u32::MAX` therefore wraps back onto the
 /// dense ids it was chosen to avoid - `usize::MAX / 2` truncates to `u32::MAX`,
