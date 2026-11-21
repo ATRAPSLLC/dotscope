@@ -41,7 +41,7 @@ mod streaming;
 use std::collections::HashMap;
 
 // Row patching utilities
-pub(crate) use rowpatch::patch_row_heap_refs;
+pub use rowpatch::patch_row_heap_refs;
 pub use streaming::{
     compute_blob_heap_offsets, compute_guid_heap_offsets, compute_strings_heap_offsets,
     compute_userstring_heap_offsets, stream_blob_heap, stream_guid_heap, stream_strings_heap,
@@ -53,7 +53,7 @@ use crate::{
         changes::AssemblyChanges,
         writer::{blobs::BlobRemap, context::WriteContext},
     },
-    CilAssemblyView, Result,
+    Blob, CilAssemblyView, Guid, Result, Strings, UserStrings,
 };
 
 /// Captures the mapping from old heap offsets to new offsets after heap rebuilding.
@@ -156,6 +156,58 @@ impl HeapRemapping {
     }
 }
 
+/// The bytes each heap is rebuilt from: the heap a change replaced it with, else the
+/// assembly's own heap, else an empty heap (the empty entry alone; #GUID has none).
+///
+/// Every pass that reads a source heap goes through this one selector: the pre-pass that
+/// resolves heap placeholders and sizes the table indices, the pass that writes the heaps,
+/// and the output size estimate. A pass reading another source than the write gives the
+/// tables offsets and index widths of a heap that is never written.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceHeaps<'a> {
+    /// The #Strings source.
+    pub strings: &'a [u8],
+    /// The #Blob source.
+    pub blobs: &'a [u8],
+    /// The #GUID source.
+    pub guids: &'a [u8],
+    /// The #US source.
+    pub userstrings: &'a [u8],
+}
+
+impl<'a> SourceHeaps<'a> {
+    /// The source of each heap of `view` under `changes`.
+    pub fn new(view: &'a CilAssemblyView, changes: &'a AssemblyChanges) -> Self {
+        const EMPTY_ENTRY: &[u8] = &[0];
+        Self {
+            strings: changes
+                .string_heap_changes
+                .replacement_heap()
+                .map(Vec::as_slice)
+                .or_else(|| view.strings().map(Strings::data))
+                .unwrap_or(EMPTY_ENTRY),
+            blobs: changes
+                .blob_heap_changes
+                .replacement_heap()
+                .map(Vec::as_slice)
+                .or_else(|| view.blobs().map(Blob::data))
+                .unwrap_or(EMPTY_ENTRY),
+            guids: changes
+                .guid_heap_changes
+                .replacement_heap()
+                .map(Vec::as_slice)
+                .or_else(|| view.guids().map(Guid::data))
+                .unwrap_or(&[]),
+            userstrings: changes
+                .userstring_heap_changes
+                .replacement_heap()
+                .map(Vec::as_slice)
+                .or_else(|| view.userstrings().map(UserStrings::data))
+                .unwrap_or(EMPTY_ENTRY),
+        }
+    }
+}
+
 /// Pre-computes heap offsets and resolves ChangeRefs without writing.
 ///
 /// This follows dnlib's approach: calculate all heap offsets first, so that when
@@ -187,12 +239,7 @@ pub fn precompute_heap_offsets(
     ctx: &mut WriteContext,
     changes: &AssemblyChanges,
 ) -> Result<()> {
-    // Get source heap data
-    let empty: &[u8] = &[];
-    let strings_data = view.strings().map_or(empty, crate::Strings::data);
-    let blob_data = view.blobs().map_or(empty, crate::Blob::data);
-    let guid_data = view.guids().map_or(empty, crate::Guid::data);
-    let us_data = view.userstrings().map_or(empty, crate::UserStrings::data);
+    let source = SourceHeaps::new(view, changes);
 
     // Pre-compute offsets for each heap (this resolves ChangeRefs).
     //
@@ -207,12 +254,12 @@ pub fn precompute_heap_offsets(
     // The tables are serialised from the pre-pass values, so any disagreement is baked into the
     // emitted file — silently, since generation still returns `Ok`.
     let strings_result = compute_strings_heap_offsets(
-        strings_data,
+        source.strings,
         &changes.string_heap_changes,
         &ctx.referenced_string_offsets,
     )?;
     let blob_result = compute_blob_heap_offsets(
-        blob_data,
+        source.blobs,
         &changes.blob_heap_changes,
         &BlobRemap {
             blobs: &ctx.typed_blobs,
@@ -221,9 +268,9 @@ pub fn precompute_heap_offsets(
         },
         &ctx.referenced_blob_offsets,
     )?;
-    let guid_result = compute_guid_heap_offsets(guid_data, &changes.guid_heap_changes)?;
+    let guid_result = compute_guid_heap_offsets(source.guids, &changes.guid_heap_changes)?;
     let us_result = compute_userstring_heap_offsets(
-        us_data,
+        source.userstrings,
         &changes.userstring_heap_changes,
         &ctx.referenced_userstring_offsets,
     )?;

@@ -28,7 +28,7 @@
 //! # IL Token Patching
 //!
 //! When heaps or tables are rebuilt, IL instructions containing tokens must be patched
-//! to reference the new offsets. This module provides [`patch_il_tokens`] which handles:
+//! to reference the new offsets. This module provides [`remap_il_tokens`] which handles:
 //!
 //! - `ldstr` (0x72): UserString heap references
 //! - `call`, `callvirt`, `newobj`, etc.: Metadata table tokens
@@ -205,7 +205,7 @@ pub fn remap_il_tokens(
 ///
 /// # Process
 ///
-/// 1. Parse the method body header (with lenient fallback for malformed EH)
+/// 1. Parse the method body header, keeping every exception clause as the image has it
 /// 2. Extract IL bytecode
 /// 3. Remap IL tokens (metadata tokens, UserString references, placeholders)
 /// 4. Remap `local_var_sig_token` (placeholder resolution + token remapping)
@@ -235,11 +235,10 @@ pub fn rebuild_method_body(
     userstring_map: &HashMap<u32, u32>,
     changes: Option<&AssemblyChanges>,
 ) -> Result<Vec<u8>> {
-    // Parse method body with lenient
-    let mut body = match MethodBody::from_lenient(body_data) {
-        Ok((b, _)) => b,
-        Err(e) => return Err(e),
-    };
+    // Keep every exception clause, one whose regions lie outside the code included: the
+    // runtime loads such a method and refuses it only when compiling it, so the body is
+    // written back as the image has it rather than with clauses left out.
+    let mut body = MethodBody::from_raw(body_data)?;
 
     // Extract IL code from the body data
     let il_end = body
@@ -494,5 +493,77 @@ mod tests {
         // Check token at offset 3 (after 0xFE 0x1C)
         let new_token = read_token_at(&il_bytes, 3);
         assert_eq!(new_token, 0x02000005);
+    }
+
+    /// A fat body of `code_size` bytes (nops, then `ret`) with a small exception section of
+    /// `clauses`: (flags, try offset, try length, handler offset, handler length, class).
+    fn fat_body_with_small_eh(code_size: u32, clauses: &[(u16, u16, u8, u16, u8, u32)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x300Bu16.to_le_bytes()); // fat, MoreSects, 3 dwords
+        data.extend_from_slice(&8u16.to_le_bytes());
+        data.extend_from_slice(&code_size.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend(std::iter::repeat_n(0x00u8, code_size as usize - 1));
+        data.push(0x2A);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.push(0x01); // EHTable, small
+        data.push(u8::try_from(4 + 12 * clauses.len()).unwrap());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        for &(flags, try_offset, try_length, handler_offset, handler_length, class) in clauses {
+            data.extend_from_slice(&flags.to_le_bytes());
+            data.extend_from_slice(&try_offset.to_le_bytes());
+            data.push(try_length);
+            data.extend_from_slice(&handler_offset.to_le_bytes());
+            data.push(handler_length);
+            data.extend_from_slice(&class.to_le_bytes());
+        }
+        data
+    }
+
+    /// A body is written back with every exception clause it has, one whose regions lie
+    /// outside the code included, rather than with such clauses left out.
+    #[test]
+    fn a_rebuilt_body_keeps_every_exception_clause() {
+        let clauses = [
+            (0x0000u16, 0u16, 10u8, 10u16, 10u8, 0x0100_0001u32),
+            (0x0000, 0xFFFF, 0xFF, 0xFFFF, 0xFF, 0x0100_0001),
+            (0x0000, 0, 5, 0xAAAA, 0xBB, 0x0100_0001),
+        ];
+        let data = fat_body_with_small_eh(100, &clauses);
+        assert!(
+            MethodBody::from(&data).is_err(),
+            "two clauses lie outside the code"
+        );
+
+        let rebuilt =
+            rebuild_method_body(&data, METHOD, &TokenRemap::default(), &HashMap::new(), None)
+                .unwrap();
+        let handlers = MethodBody::from_raw(&rebuilt).unwrap().exception_handlers;
+        assert_eq!(handlers.len(), 3);
+        let offsets: Vec<(u32, u32, u32, u32)> = handlers
+            .iter()
+            .map(|h| {
+                (
+                    h.try_offset,
+                    h.try_length,
+                    h.handler_offset,
+                    h.handler_length,
+                )
+            })
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                (0, 10, 10, 10),
+                (0xFFFF, 0xFF, 0xFFFF, 0xFF),
+                (0, 5, 0xAAAA, 0xBB)
+            ]
+        );
+        assert_eq!(
+            rebuilt, data,
+            "an unchanged body is written back byte for byte"
+        );
     }
 }

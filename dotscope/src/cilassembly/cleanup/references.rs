@@ -68,13 +68,13 @@ use crate::{
 /// This approach is fundamentally safer than garbage-collection-style orphan
 /// removal because it never removes pre-existing orphans (which may be used
 /// via reflection or dynamic code generation).
-pub(super) struct PreDeletionRefs {
+pub struct PreDeletionRefs {
     /// Token operands found in method bodies of entities being deleted.
-    pub(super) il_tokens: HashSet<Token>,
+    pub il_tokens: HashSet<Token>,
     /// TypeRef RIDs referenced by signatures and extends clauses of entities being deleted.
-    pub(super) typeref_rids: HashSet<u32>,
+    pub typeref_rids: HashSet<u32>,
     /// StandAloneSig RIDs referenced by method bodies of methods being deleted.
-    pub(super) standalonesig_rids: BTreeSet<u32>,
+    pub standalonesig_rids: BTreeSet<u32>,
 }
 
 /// Collects all token references from entities that are about to be deleted.
@@ -92,7 +92,7 @@ pub(super) struct PreDeletionRefs {
 /// # Returns
 ///
 /// A [`PreDeletionRefs`] containing all tokens referenced by the entities.
-pub(super) fn collect_pre_deletion_references(
+pub fn collect_pre_deletion_references(
     assembly: &CilAssembly,
     methods: &BTreeSet<Token>,
     fields: &BTreeSet<Token>,
@@ -353,7 +353,7 @@ fn scan_method_body_bytes(data: &[u8], base_rva: usize, referenced: &mut HashSet
 /// This protects types like `__StaticArrayInitTypeSize=N` (which have no
 /// methods, no fields, and are referenced only via field signature blobs)
 /// from being incorrectly removed as "empty types".
-pub(super) fn collect_typedefs_from_field_signatures(assembly: &CilAssembly) -> HashSet<Token> {
+pub fn collect_typedefs_from_field_signatures(assembly: &CilAssembly) -> HashSet<Token> {
     let mut referenced = HashSet::new();
 
     let view = assembly.view();
@@ -403,7 +403,7 @@ pub(super) fn collect_typedefs_from_field_signatures(assembly: &CilAssembly) -> 
 ///
 /// This is the same protection [`collect_typedefs_from_field_signatures`]
 /// gives to types named only by a field signature.
-pub(super) fn collect_typedefs_from_typespec_signatures(assembly: &CilAssembly) -> HashSet<Token> {
+pub fn collect_typedefs_from_typespec_signatures(assembly: &CilAssembly) -> HashSet<Token> {
     let mut referenced = HashSet::new();
 
     let view = assembly.view();
@@ -444,7 +444,7 @@ pub(super) fn collect_typedefs_from_typespec_signatures(assembly: &CilAssembly) 
 /// Collects the StandAloneSig RIDs surviving method bodies use: the LocalVarSigTok of each
 /// fat header (original and regenerated bodies), and the `calli` operands among
 /// `body_tokens`, whose StandAloneSig is a method signature.
-pub(super) fn collect_referenced_standalonesig_rids(
+pub fn collect_referenced_standalonesig_rids(
     assembly: &CilAssembly,
     body_tokens: &HashSet<Token>,
 ) -> HashSet<u32> {
@@ -491,7 +491,13 @@ pub(super) fn collect_referenced_standalonesig_rids(
 ///
 /// Returns a set of all referenced tokens (TypeRef, TypeDef, MemberRef, MethodDef,
 /// MethodSpec, TypeSpec, Field, etc.)
-pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> {
+///
+/// # Arguments
+///
+/// * `assembly` - The assembly whose method bodies are scanned
+/// * `gone` - MethodDefs to treat as deleted besides the rows already deleted: the methods a
+///   cleanup is deciding to delete, whose bodies keep nothing alive
+pub fn scan_method_body_tokens(assembly: &CilAssembly, gone: &HashSet<Token>) -> HashSet<Token> {
     let mut referenced = HashSet::new();
 
     // Collect (rid, effective_rva) pairs while holding view borrow
@@ -509,6 +515,7 @@ pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> 
             .into_iter()
             .filter_map(skip_unreadable)
             .filter(|m| !assembly.changes().is_row_deleted(TableId::MethodDef, m.rid))
+            .filter(|m| !gone.contains(&Token::from_parts(TableId::MethodDef, m.rid)))
             .map(|m| get_effective_method_rva(assembly, m.rid, m.rva))
             .filter(|&rva| rva != 0)
             .collect()
@@ -521,10 +528,11 @@ pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> 
             scan_method_body_bytes(data, base_rva, &mut referenced);
             // Also collect StandAloneSig RIDs from method body headers so we can
             // scan their blobs for embedded TypeDef/TypeRef tokens below.
-            if let Ok(body) = MethodBody::from(data) {
-                if body.local_var_sig_token != 0 {
-                    local_sig_rids.insert(body.local_var_sig_token & 0x00FF_FFFF);
-                }
+            if let Some(sig_rid) = MethodBody::from(data)
+                .ok()
+                .and_then(|body| body.local_var_sig_rid())
+            {
+                local_sig_rids.insert(sig_rid);
             }
         });
     }
@@ -559,7 +567,7 @@ pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> 
 /// types, return types) are not captured by the `.class` cascade. This function
 /// fills that gap by scanning the signatures of deleted MemberRefs and returning
 /// any TypeRef RIDs found within.
-pub(super) fn collect_typerefs_from_deleted_memberref_sigs(
+pub fn collect_typerefs_from_deleted_memberref_sigs(
     assembly: &CilAssembly,
     memberref_rids: &HashSet<u32>,
 ) -> HashSet<u32> {
@@ -610,7 +618,7 @@ pub(super) fn collect_typerefs_from_deleted_memberref_sigs(
 /// target owns, which go with it. A TypeRef's `ResolutionScope` naming another TypeRef is
 /// nesting: [`close_over_typeref_nesting`] applies it once the live set is complete, so a
 /// nested TypeRef on its way out does not keep its parent.
-pub(super) fn scan_metadata_keepers(assembly: &CilAssembly) -> HashSet<Token> {
+pub fn scan_metadata_keepers(assembly: &CilAssembly) -> HashSet<Token> {
     let mut keepers = HashSet::new();
     let view = assembly.view();
     let Some(tables) = view.tables() else {
@@ -710,7 +718,7 @@ pub(super) fn scan_metadata_keepers(assembly: &CilAssembly) -> HashSet<Token> {
 }
 
 /// The rows of `table` among `tokens`.
-pub(super) fn rows_of(tokens: &HashSet<Token>, table: TableId) -> impl Iterator<Item = u32> + '_ {
+pub fn rows_of(tokens: &HashSet<Token>, table: TableId) -> impl Iterator<Item = u32> + '_ {
     tokens
         .iter()
         .filter(move |token| token.is_table(table))
@@ -799,7 +807,7 @@ impl Extend<Token> for TypeRefRows<'_> {
 /// - TypeSpec.signature (type specification signatures)
 /// - Property.type (property signatures)
 /// - MethodSpec.instantiation (the type arguments of a generic method instantiation)
-pub(super) fn scan_signature_type_refs(
+pub fn scan_signature_type_refs(
     assembly: &CilAssembly,
     body_tokens: &HashSet<Token>,
 ) -> HashSet<Token> {
@@ -1052,7 +1060,7 @@ fn scan_property_signature_blob(
 /// # Returns
 ///
 /// A tuple of (count_removed, set_of_deleted_rids).
-pub(super) fn remove_unreferenced_typerefs(
+pub fn remove_unreferenced_typerefs(
     assembly: &mut CilAssembly,
     candidates: &BTreeSet<u32>,
     body_tokens: &HashSet<Token>,
@@ -1097,7 +1105,7 @@ pub(super) fn remove_unreferenced_typerefs(
 /// # Returns
 ///
 /// A tuple of (count_removed, set_of_deleted_rids).
-pub(super) fn remove_unreferenced_memberrefs(
+pub fn remove_unreferenced_memberrefs(
     assembly: &mut CilAssembly,
     candidates: &BTreeSet<u32>,
     body_tokens: &HashSet<Token>,
@@ -1134,7 +1142,7 @@ pub(super) fn remove_unreferenced_memberrefs(
 /// # Returns
 ///
 /// A tuple of (count_removed, set_of_deleted_rids).
-pub(super) fn remove_unreferenced_typespecs(
+pub fn remove_unreferenced_typespecs(
     assembly: &mut CilAssembly,
     candidates: &BTreeSet<u32>,
     body_tokens: &HashSet<Token>,

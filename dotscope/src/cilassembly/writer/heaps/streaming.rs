@@ -72,9 +72,8 @@ impl Default for StreamResult {
 /// Streams the #Strings heap to output with deduplication and modifications.
 ///
 /// Processes the source string heap data, applying any modifications from the changes,
-/// and writes the result to the output file with deduplication. When `referenced_offsets`
-/// is provided, substring remappings are generated for any referenced offset that falls
-/// within a string entry's byte range.
+/// and writes the result to the output file with deduplication. Substring remappings are
+/// generated for every referenced offset that falls inside a string entry's byte range.
 ///
 /// # Arguments
 ///
@@ -82,7 +81,8 @@ impl Default for StreamResult {
 /// * `start_offset` - The file offset where the heap should start
 /// * `source_data` - The original #Strings heap data
 /// * `changes` - Heap modifications (additions, removals, modifications)
-/// * `referenced_offsets` - Set of all offsets referenced by metadata tables (for substring remapping)
+/// * `referenced_offsets` - Every offset the metadata tables name, sorted ascending without
+///   duplicates (for substring remapping)
 ///
 /// # Returns
 ///
@@ -96,7 +96,7 @@ pub fn stream_strings_heap(
     start_offset: u64,
     source_data: &[u8],
     changes: &HeapChanges<String>,
-    referenced_offsets: &HashSet<u32>,
+    referenced_offsets: &[u32],
 ) -> Result<StreamResult> {
     process_strings_heap(
         Some(output),
@@ -117,6 +117,8 @@ pub fn stream_strings_heap(
 ///
 /// * `source_data` - The original #Strings heap data
 /// * `changes` - Heap modifications (additions, removals, modifications)
+/// * `referenced_offsets` - Every offset the metadata tables name, sorted ascending without
+///   duplicates (for substring remapping)
 ///
 /// # Returns
 ///
@@ -128,9 +130,21 @@ pub fn stream_strings_heap(
 pub fn compute_strings_heap_offsets(
     source_data: &[u8],
     changes: &HeapChanges<String>,
-    referenced_offsets: &HashSet<u32>,
+    referenced_offsets: &[u32],
 ) -> Result<StreamResult> {
     process_strings_heap(None, 0, source_data, changes, referenced_offsets)
+}
+
+/// The referenced offsets strictly inside the entry at `start` whose bytes, terminator
+/// included, end before `end`: the substrings tables name inside it.
+///
+/// `referenced` is sorted, so the offsets are found by binary search: rebuilding a heap of S
+/// entries with R references costs O(S log R + R) instead of comparing every reference with
+/// every entry.
+fn interior_references(referenced: &[u32], start: u32, end: u32) -> &[u32] {
+    let first = referenced.partition_point(|&offset| offset <= start);
+    let past = referenced.partition_point(|&offset| offset < end);
+    referenced.get(first..past).unwrap_or(&[])
 }
 
 /// Emits original substrings as standalone entries when their parent string was
@@ -141,6 +155,9 @@ pub fn compute_strings_heap_offsets(
 /// string's byte range. Those substrings must be preserved as standalone entries
 /// in the new heap so the references remain valid.
 ///
+/// `interior` holds the referenced offsets inside the original entry at `old_offset_u32`, in
+/// ascending order, so the substrings are emitted in the same order on every write.
+///
 /// Uses deduplication: if the substring content already exists in the heap
 /// (from a prior entry or another substring), it reuses the existing offset.
 #[allow(clippy::too_many_arguments)]
@@ -148,63 +165,57 @@ fn emit_orphaned_substrings(
     output: &mut Option<&mut Output>,
     start_offset: u64,
     old_offset_u32: u32,
-    original_end: u32,
     original_bytes: &[u8],
-    referenced_offsets: &HashSet<u32>,
+    interior: &[u32],
     dedup_map: &mut FxHashMap<Vec<u8>, u32>,
     pos: &mut u64,
     result: &mut StreamResult,
 ) -> Result<()> {
-    for &ref_offset in referenced_offsets {
-        if ref_offset > old_offset_u32 && ref_offset < original_end {
-            // Already mapped by a prior entry — skip
-            if result.remapping.contains_key(&ref_offset) {
-                continue;
-            }
-
-            let delta = ref_offset
-                .checked_sub(old_offset_u32)
-                .ok_or_else(|| writer_overflow("substring_delta"))?
-                as usize;
-            if delta >= original_bytes.len() {
-                continue;
-            }
-
-            // The substring runs from the referenced byte to the entry's terminator; its bytes
-            // are copied as they are, UTF-8 or not
-            let sub_bytes = original_bytes.get(delta..).ok_or(out_of_bounds_error!())?;
-            if sub_bytes.is_empty() {
-                result.remapping.insert(ref_offset, 0);
-                continue;
-            }
-
-            if let Some(&existing) = dedup_map.get(sub_bytes) {
-                result.remapping.insert(ref_offset, existing);
-                continue;
-            }
-
-            let new_sub_offset = u32::try_from(*pos).map_err(|_| {
-                Error::LayoutFailed(format!("Heap position {} exceeds u32 range", *pos))
-            })?;
-
-            let sub_pos = start_offset
-                .checked_add(*pos)
-                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-            let sub_end = sub_pos
-                .checked_add(sub_bytes.len() as u64)
-                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-            if let Some(out) = output.as_mut() {
-                out.write_at(sub_pos, sub_bytes)?;
-                out.write_at(sub_end, &[0u8])?;
-            }
-
-            *pos = pos
-                .checked_add(sub_bytes.len() as u64)
-                .and_then(|p| p.checked_add(1))
-                .ok_or_else(|| writer_overflow("heap_position"))?;
-            dedup_map.insert(sub_bytes.to_vec(), new_sub_offset);
-            result.remapping.insert(ref_offset, new_sub_offset);
+    for &ref_offset in interior {
+        // Already mapped by a prior entry
+        if result.remapping.contains_key(&ref_offset) {
+            continue;
         }
+
+        let delta = ref_offset
+            .checked_sub(old_offset_u32)
+            .ok_or_else(|| writer_overflow("substring_delta"))? as usize;
+
+        // The substring runs from the referenced byte to the entry's terminator; its bytes
+        // are copied as they are, UTF-8 or not. A reference to the terminator itself names
+        // the empty string, which is offset 0.
+        let sub_bytes = original_bytes.get(delta..).ok_or(out_of_bounds_error!())?;
+        if sub_bytes.is_empty() {
+            result.remapping.insert(ref_offset, 0);
+            continue;
+        }
+
+        if let Some(&existing) = dedup_map.get(sub_bytes) {
+            result.remapping.insert(ref_offset, existing);
+            continue;
+        }
+
+        let new_sub_offset = u32::try_from(*pos).map_err(|_| {
+            Error::LayoutFailed(format!("Heap position {} exceeds u32 range", *pos))
+        })?;
+
+        let sub_pos = start_offset
+            .checked_add(*pos)
+            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+        let sub_end = sub_pos
+            .checked_add(sub_bytes.len() as u64)
+            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+        if let Some(out) = output.as_mut() {
+            out.write_at(sub_pos, sub_bytes)?;
+            out.write_at(sub_end, &[0u8])?;
+        }
+
+        *pos = pos
+            .checked_add(sub_bytes.len() as u64)
+            .and_then(|p| p.checked_add(1))
+            .ok_or_else(|| writer_overflow("heap_position"))?;
+        dedup_map.insert(sub_bytes.to_vec(), new_sub_offset);
+        result.remapping.insert(ref_offset, new_sub_offset);
     }
     Ok(())
 }
@@ -213,14 +224,14 @@ fn emit_orphaned_substrings(
 ///
 /// When `output` is `Some(output)`, writes to output at `start_offset`.
 /// When `output` is `None`, only computes offsets (for pre-computation).
-/// When `referenced_offsets` is non-empty, substring remappings are added
-/// for any referenced offset that falls within a written string's byte range.
+/// Substring remappings are added for every one of `referenced_offsets` (sorted ascending,
+/// without duplicates) that falls within a written string's byte range.
 fn process_strings_heap(
     mut output: Option<&mut Output>,
     start_offset: u64,
     source_data: &[u8],
     changes: &HeapChanges<String>,
-    referenced_offsets: &HashSet<u32>,
+    referenced_offsets: &[u32],
 ) -> Result<StreamResult> {
     let mut result = StreamResult::new();
 
@@ -272,6 +283,7 @@ fn process_strings_heap(
             .checked_add(to_u32(original_bytes.len())?)
             .and_then(|v| v.checked_add(1))
             .ok_or_else(|| writer_overflow("string_range"))?; // +1 for null
+        let interior = interior_references(referenced_offsets, old_offset_u32, original_end);
 
         if changes.is_removed(old_offset_u32) {
             // Even though this entry is removed, emit any referenced substrings
@@ -280,9 +292,8 @@ fn process_strings_heap(
                 &mut output,
                 start_offset,
                 old_offset_u32,
-                original_end,
                 original_bytes,
-                referenced_offsets,
+                interior,
                 &mut dedup_map,
                 &mut pos,
                 &mut result,
@@ -293,50 +304,36 @@ fn process_strings_heap(
         let modification = changes.get_modification(old_offset_u32);
         let final_bytes = modification.map_or(original_bytes, |s| s.as_bytes());
 
-        if let Some(&existing_offset) = dedup_map.get(final_bytes) {
-            if old_offset_u32 != existing_offset {
-                result.remapping.insert(old_offset_u32, existing_offset);
+        // The entry's offset in the rebuilt heap: an entry already written with the same bytes,
+        // or a new one written here
+        let new_offset = if let Some(&existing_offset) = dedup_map.get(final_bytes) {
+            existing_offset
+        } else {
+            let new_offset = u32::try_from(pos).map_err(|_| {
+                Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range"))
+            })?;
+            let entry_size = (final_bytes.len() as u64)
+                .checked_add(1)
+                .ok_or_else(|| writer_overflow("heap_entry_size"))?; // +1 for null terminator
+
+            // Write if in write mode
+            let write_pos = start_offset
+                .checked_add(pos)
+                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+            let null_pos = write_pos
+                .checked_add(final_bytes.len() as u64)
+                .ok_or_else(|| writer_overflow("heap_write_offset"))?;
+            if let Some(out) = output.as_mut() {
+                out.write_at(write_pos, final_bytes)?;
+                out.write_at(null_pos, &[0u8])?;
             }
-            // Even when deduplicated, emit orphaned substrings if the string was modified
-            if modification.is_some() {
-                emit_orphaned_substrings(
-                    &mut output,
-                    start_offset,
-                    old_offset_u32,
-                    original_end,
-                    original_bytes,
-                    referenced_offsets,
-                    &mut dedup_map,
-                    &mut pos,
-                    &mut result,
-                )?;
-            }
-            continue;
-        }
 
-        let new_offset = u32::try_from(pos)
-            .map_err(|_| Error::LayoutFailed(format!("Heap position {pos} exceeds u32 range")))?;
-        let str_bytes = final_bytes;
-        let entry_size = (str_bytes.len() as u64)
-            .checked_add(1)
-            .ok_or_else(|| writer_overflow("heap_entry_size"))?; // +1 for null terminator
-
-        // Write if in write mode
-        let write_pos = start_offset
-            .checked_add(pos)
-            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-        let null_pos = write_pos
-            .checked_add(str_bytes.len() as u64)
-            .ok_or_else(|| writer_overflow("heap_write_offset"))?;
-        if let Some(out) = output.as_mut() {
-            out.write_at(write_pos, str_bytes)?;
-            out.write_at(null_pos, &[0u8])?;
-        }
-
-        pos = pos
-            .checked_add(entry_size)
-            .ok_or_else(|| writer_overflow("heap_position"))?;
-        dedup_map.insert(final_bytes.to_vec(), new_offset);
+            pos = pos
+                .checked_add(entry_size)
+                .ok_or_else(|| writer_overflow("heap_position"))?;
+            dedup_map.insert(final_bytes.to_vec(), new_offset);
+            new_offset
+        };
 
         // Add primary offset remapping if changed
         if old_offset_u32 != new_offset {
@@ -345,31 +342,29 @@ fn process_strings_heap(
 
         // Add substring remappings for any referenced offset within the ORIGINAL range.
         if modification.is_some() {
-            // Parent string was modified — substrings at the original deltas may no
-            // longer exist in the new entry. Emit them as standalone entries.
+            // Parent string was modified: substrings at the original deltas may no longer
+            // exist in the new entry. Emit them as standalone entries.
             emit_orphaned_substrings(
                 &mut output,
                 start_offset,
                 old_offset_u32,
-                original_end,
                 original_bytes,
-                referenced_offsets,
+                interior,
                 &mut dedup_map,
                 &mut pos,
                 &mut result,
             )?;
         } else {
-            // Unmodified: substrings are at the same delta in the new entry
-            for &ref_offset in referenced_offsets {
-                if ref_offset > old_offset_u32 && ref_offset < original_end {
-                    let substring_delta = ref_offset
-                        .checked_sub(old_offset_u32)
-                        .ok_or_else(|| writer_overflow("substring_delta"))?;
-                    let new_substring_offset = new_offset
-                        .checked_add(substring_delta)
-                        .ok_or_else(|| writer_overflow("substring_offset"))?;
-                    result.remapping.insert(ref_offset, new_substring_offset);
-                }
+            // Unmodified: substrings are at the same delta in the entry holding its bytes, the
+            // entry written for it or the earlier one it is a duplicate of
+            for &ref_offset in interior {
+                let substring_delta = ref_offset
+                    .checked_sub(old_offset_u32)
+                    .ok_or_else(|| writer_overflow("substring_delta"))?;
+                let new_substring_offset = new_offset
+                    .checked_add(substring_delta)
+                    .ok_or_else(|| writer_overflow("substring_offset"))?;
+                result.remapping.insert(ref_offset, new_substring_offset);
             }
         }
     }
@@ -1269,8 +1264,7 @@ mod tests {
         let mut output = Output::create(temp_file.path(), 4096).unwrap();
 
         let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
-        let empty_refs = HashSet::new();
-        let result = stream_strings_heap(&mut output, 0, &[0u8], &changes, &empty_refs).unwrap();
+        let result = stream_strings_heap(&mut output, 0, &[0u8], &changes, &[]).unwrap();
 
         assert_eq!(result.bytes_written, 1); // Just null byte
         assert!(result.remapping.is_empty());
@@ -1289,8 +1283,7 @@ mod tests {
         ];
 
         let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
-        let empty_refs = HashSet::new();
-        let result = stream_strings_heap(&mut output, 0, &source, &changes, &empty_refs).unwrap();
+        let result = stream_strings_heap(&mut output, 0, &source, &changes, &[]).unwrap();
 
         // Should write: null + Hello\0 + World\0 = 1 + 6 + 6 = 13
         assert_eq!(result.bytes_written, 13);
@@ -1308,8 +1301,7 @@ mod tests {
         ];
 
         let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
-        let empty_refs = HashSet::new();
-        let result = stream_strings_heap(&mut output, 0, &source, &changes, &empty_refs).unwrap();
+        let result = stream_strings_heap(&mut output, 0, &source, &changes, &[]).unwrap();
 
         // Should write only one "Hello": null + Hello\0 = 1 + 6 = 7
         assert_eq!(result.bytes_written, 7);
@@ -1322,8 +1314,7 @@ mod tests {
     fn written_strings(source: &[u8], referenced: &[u32]) -> (Vec<u8>, StreamResult) {
         let mut output = Output::create_in_memory(4096).unwrap();
         let changes = HeapChanges::<String>::new_strings(ChangeIds::new());
-        let referenced: HashSet<u32> = referenced.iter().copied().collect();
-        let result = stream_strings_heap(&mut output, 0, source, &changes, &referenced).unwrap();
+        let result = stream_strings_heap(&mut output, 0, source, &changes, referenced).unwrap();
         let len = usize::try_from(result.bytes_written).unwrap();
         (output.as_slice()[..len].to_vec(), result)
     }
@@ -1344,12 +1335,52 @@ mod tests {
         let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         changes.add_removal(1);
         let mut output = Output::create_in_memory(4096).unwrap();
-        let referenced = HashSet::from([2u32]);
-        let result = stream_strings_heap(&mut output, 0, &source, &changes, &referenced).unwrap();
+        let result = stream_strings_heap(&mut output, 0, &source, &changes, &[2]).unwrap();
         let tail = *result.remapping.get(&2).expect("the tail is kept");
         assert_ne!(tail, 0, "the tail is not the empty string");
         let start = usize::try_from(tail).unwrap();
         assert_eq!(&output.as_slice()[start..start + 3], b"xy\0");
+    }
+
+    /// The tails tables name inside a renamed string are written after it, in offset order,
+    /// so every write of the same changes gives the same bytes.
+    #[test]
+    fn the_tails_of_a_renamed_string_are_written_in_offset_order() {
+        // "AlphaBetaGamma" at 1, "Other" at 16; tables name the whole string, its tails
+        // "BetaGamma" at 6 and "Gamma" at 10, its terminator at 15 (the empty string) and
+        // "Other"
+        let source = b"\0AlphaBetaGamma\0Other\0";
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
+        changes.add_modification(1, "X".to_string());
+        let mut output = Output::create_in_memory(4096).unwrap();
+        let result =
+            stream_strings_heap(&mut output, 0, source, &changes, &[1, 6, 10, 15, 16]).unwrap();
+        let len = usize::try_from(result.bytes_written).unwrap();
+        assert_eq!(&output.as_slice()[..len], b"\0X\0BetaGamma\0Gamma\0Other\0");
+        assert_eq!(
+            result.remapping,
+            HashMap::from([(6, 3), (10, 13), (15, 0), (16, 19)])
+        );
+    }
+
+    /// The tails tables name inside a duplicate string follow it to the copy it is merged into.
+    #[test]
+    fn the_tails_of_a_duplicate_string_follow_it() {
+        // "HelloWorld" at 1 and again at 12; tables name both, and "World" in each
+        let (heap, result) = written_strings(b"\0HelloWorld\0HelloWorld\0", &[1, 6, 12, 17]);
+        assert_eq!(heap, b"\0HelloWorld\0");
+        assert_eq!(result.remapping, HashMap::from([(6, 6), (12, 1), (17, 6)]));
+    }
+
+    /// Only the referenced offsets strictly inside an entry, its terminator included, are its
+    /// tails: neither its own start nor the next entry's.
+    #[test]
+    fn interior_references_stop_at_the_entry_bounds() {
+        let referenced = [0, 1, 2, 4, 5, 9];
+        assert_eq!(interior_references(&referenced, 1, 5), [2, 4]);
+        assert_eq!(interior_references(&referenced, 5, 9), [] as [u32; 0]);
+        assert_eq!(interior_references(&referenced, 9, 12), [] as [u32; 0]);
+        assert_eq!(interior_references(&[], 1, 5), [] as [u32; 0]);
     }
 
     #[test]
@@ -1609,7 +1640,7 @@ mod tests {
             0,
             &unreadable,
             &HeapChanges::new_strings(ids.clone()),
-            &none
+            &[]
         )
         .is_err());
         assert!(stream_userstring_heap(

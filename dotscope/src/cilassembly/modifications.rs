@@ -338,7 +338,7 @@ impl TableModifications {
     /// recorded and the next row an insert takes, or `None` for a replaced
     /// table.
     #[cfg(feature = "compiler")]
-    pub(crate) fn extent(&self) -> Option<(usize, u32)> {
+    pub fn extent(&self) -> Option<(usize, u32)> {
         match self {
             Self::Sparse {
                 operations,
@@ -351,7 +351,7 @@ impl TableModifications {
 
     /// The number of rows inserted at `rid` or after, as recorded operations.
     #[cfg(feature = "compiler")]
-    pub(crate) fn inserted_since(&self, rid: u32) -> usize {
+    pub fn inserted_since(&self, rid: u32) -> usize {
         match self {
             Self::Sparse { operations, .. } => operations
                 .iter()
@@ -371,7 +371,7 @@ impl TableModifications {
     /// way since: it was replaced, or a row was updated or deleted, which only
     /// the operation's own inverse could undo.
     #[cfg(feature = "compiler")]
-    pub(crate) fn rollback_inserts(&mut self, extent: (usize, u32)) -> Result<()> {
+    pub fn rollback_inserts(&mut self, extent: (usize, u32)) -> Result<()> {
         let (operations_before, rid_before) = extent;
         let undone = self.inserted_since(rid_before);
         let Self::Sparse {

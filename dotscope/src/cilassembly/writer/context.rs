@@ -33,7 +33,12 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     cilassembly::{
         changes::AssemblyChanges,
-        writer::{blobs::TypedBlob, heaps::HeapRemapping, output::Output, remapper::TokenRemap},
+        writer::{
+            blobs::TypedBlob,
+            heaps::HeapRemapping,
+            output::Output,
+            remapper::{RidRemapper, TokenRemap},
+        },
         CilAssembly,
     },
     file::pe::{OptionalHeader, SectionTable},
@@ -321,6 +326,15 @@ pub struct WriteContext<'a> {
     /// types, the entry point) are renumbered once rows are deleted or deduplicated.
     pub tokens: TokenRemap,
 
+    /// How the tables stream renumbers rows: deletions, then the order of every table the
+    /// format requires sorted. Set when the tables stream is written, for what is written
+    /// after it and names rows by number (the Portable PDB an image embeds).
+    pub rows: RidRemapper,
+
+    /// The row count of every table in the written tables stream, by
+    /// [`TableId`](crate::metadata::tables::TableId); set with [`rows`](Self::rows).
+    pub output_rows: [u32; 64],
+
     /// The blobs whose content names rows or blobs (signatures, and the Portable PDB blobs),
     /// by the index the blob heap writer meets them at: the rows they name are renumbered
     /// with [`tokens`](Self::tokens), and the blobs they name follow the rebuilt heap.
@@ -328,8 +342,9 @@ pub struct WriteContext<'a> {
 
     /// Every `#Strings` offset a row of the written tables names, an offset inside another
     /// string's bytes (a shared tail) among them: the heap writer keeps each one pointing at
-    /// the same string when the heap is rebuilt.
-    pub referenced_string_offsets: HashSet<u32>,
+    /// the same string when the heap is rebuilt. Sorted ascending without duplicates, so the
+    /// writer finds the offsets inside each entry by binary search.
+    pub referenced_string_offsets: Vec<u32>,
 
     /// Every `#Blob` offset a row of the written tables names: the heap writer writes each one
     /// that is not an entry of the heap's own walk (an offset inside another blob) as an entry
@@ -521,8 +536,10 @@ impl<'a> WriteContext<'a> {
             resource_offset_remap: HashMap::new(),
             heap_remapping: HeapRemapping::default(),
             tokens: TokenRemap::default(),
+            rows: RidRemapper::default(),
+            output_rows: [0; 64],
             typed_blobs: HashMap::new(),
-            referenced_string_offsets: HashSet::new(),
+            referenced_string_offsets: Vec::new(),
             referenced_blob_offsets: HashSet::new(),
             referenced_userstring_offsets: HashSet::new(),
             standalonesig_skip: HashSet::new(),

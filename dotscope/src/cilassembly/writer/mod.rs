@@ -51,11 +51,12 @@ mod context;
 mod fields;
 mod fixups;
 mod generator;
-mod heaps;
+pub mod heaps;
 mod methods;
 mod output;
+mod pdb;
 mod relocations;
-mod remapper;
+pub mod remapper;
 mod sizes;
 mod tables;
 
@@ -63,12 +64,12 @@ mod tables;
 // Public re-exports
 // Internal use by CilAssembly
 #[cfg(any(test, feature = "testkit"))]
-pub(crate) use blobs::{debug_blobs, signature_blobs, BlobKind};
+pub use blobs::signature_blobs;
+pub use blobs::{debug_blobs, BlobKind};
 #[cfg(any(test, feature = "testkit"))]
-pub(crate) use fields::calculate_field_size;
-pub(super) use generator::PeGenerator;
-pub use generator::{DanglingPolicy, GeneratorConfig};
-pub(crate) use tables::ResolvePlaceholders;
+pub use fields::calculate_field_size;
+pub use generator::{DanglingPolicy, GeneratorConfig, PeGenerator};
+pub use tables::ResolvePlaceholders;
 
 #[cfg(test)]
 mod tests {

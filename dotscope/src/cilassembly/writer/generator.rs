@@ -47,6 +47,7 @@ use crate::{
     cilassembly::{
         changes::{AssemblyChanges, ChangeRef, METHOD_BODY_PLACEHOLDER_BASE},
         cleanup::collect_referenced_heap_entries,
+        debugtables::replaced_method_bodies,
         writer::{
             blobs::{debug_blobs, signature_blobs, BlobRemap},
             context::{SectionWriteInfo, WriteContext, FILE_ALIGNMENT_DEFAULT},
@@ -54,10 +55,11 @@ use crate::{
             fixups::{apply_all_fixups, fixup_metadata_stream_headers},
             heaps::{
                 patch_row_heap_refs, precompute_heap_offsets, stream_blob_heap, stream_guid_heap,
-                stream_strings_heap, stream_userstring_heap,
+                stream_strings_heap, stream_userstring_heap, SourceHeaps,
             },
             methods::rebuild_method_body,
             output::Output,
+            pdb::{rebuild_embedded_pdb, ImageChanges},
             relocations::{generate_relocations, RelocationConfig},
             remapper::{RemapReferences, RidRemapper},
         },
@@ -65,6 +67,7 @@ use crate::{
     },
     dispatch_table_type,
     file::{
+        debug::{debug_type, DebugDirectoryEntry},
         pe::{
             relocate_resource_section, DataDirectoryType, DosHeader, Import, PeCharacteristics,
             SectionTable,
@@ -76,8 +79,9 @@ use crate::{
         exports::NativeExports,
         imports::NativeImports,
         method::{MethodBody, MethodImplCodeType},
+        pdb::{embedded_portable_pdb, PORTABLE_CODEVIEW_MINOR_VERSION},
         root::Root,
-        streams::{Blob, Guid, StreamHeader, Strings, UserStrings},
+        streams::StreamHeader,
         tablefields::get_heap_fields,
         tables::{
             skip_unreadable, ManifestResourceRaw, MethodDefRaw, RowWritable, StandAloneSigRaw,
@@ -147,7 +151,7 @@ pub struct GeneratorConfig {
 /// to go: the writer never retargets it to a neighbour.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DanglingPolicy {
-    /// Fail the write with [`Error::DanglingReference`](crate::Error::DanglingReference).
+    /// Fail the write with [`Error::DanglingReference`].
     #[default]
     Error,
     /// Write a null reference in its place, and log a warning naming both rows.
@@ -613,11 +617,10 @@ impl<'a> PeGenerator<'a> {
         // in .text (no .rsrc section). These must be carried over to the new .text.
         self.write_embedded_pe_resources(&mut ctx)?;
 
-        // Keep the debug directory when the write changes nothing: its data still
-        // describes the code
-        if !changes.has_changes() {
-            self.write_debug_data(&mut ctx)?;
-        }
+        // The debug directory: kept as it is when the write changes nothing, and with the
+        // PDB it embeds regenerated (and every entry that names that PDB following it) when
+        // the write moves what the PDB describes
+        self.write_debug_data(&mut ctx, changes)?;
 
         // Calculate .text section size and update sections vector
         ctx.text_section_size = ctx
@@ -723,14 +726,40 @@ impl<'a> PeGenerator<'a> {
     /// Estimates additional heap space needed for modifications.
     ///
     /// Calculates the total bytes needed for all appended heap entries including
-    /// strings, blobs, GUIDs, and user strings.
+    /// strings, blobs, GUIDs, and user strings, plus what a replacement heap holds past the
+    /// heap it replaces (the original file's size already counts the original heaps).
     ///
     /// # Returns
     ///
     /// The estimated additional heap space in bytes.
     fn estimate_heap_expansion(&self) -> u64 {
+        let view = self.assembly.view();
         let changes = self.assembly.changes();
         let mut expansion = 0u64;
+
+        // A replacement heap's growth over the heap it replaces, read through the selector
+        // the write uses
+        let source = SourceHeaps::new(view, changes);
+        for (source, original) in [
+            (
+                source.strings,
+                view.strings().map_or(0, |heap| heap.data().len()),
+            ),
+            (
+                source.blobs,
+                view.blobs().map_or(0, |heap| heap.data().len()),
+            ),
+            (
+                source.guids,
+                view.guids().map_or(0, |heap| heap.data().len()),
+            ),
+            (
+                source.userstrings,
+                view.userstrings().map_or(0, |heap| heap.data().len()),
+            ),
+        ] {
+            expansion = expansion.saturating_add(source.len().saturating_sub(original) as u64);
+        }
 
         // Add space for appended strings
         for (data, _) in changes.string_heap_changes.appended_iter() {
@@ -748,10 +777,11 @@ impl<'a> PeGenerator<'a> {
         let guid_count = changes.guid_heap_changes.appended_iter().count() as u64;
         expansion = expansion.saturating_add(guid_count.saturating_mul(16));
 
-        // Add space for appended user strings
+        // Add space for appended user strings: UTF-16, at most two bytes per UTF-8 byte, a
+        // compressed length of up to 4 bytes and the terminal byte
         for (data, _) in changes.userstring_heap_changes.appended_iter() {
-            // +5 for max compressed length prefix
-            expansion = expansion.saturating_add((data.len() as u64).saturating_add(5));
+            expansion =
+                expansion.saturating_add((data.len() as u64).saturating_mul(2).saturating_add(5));
         }
 
         expansion
@@ -1027,8 +1057,9 @@ impl<'a> PeGenerator<'a> {
     /// # Errors
     ///
     /// When the original import table cannot be read in full, or an import cannot be held
-    /// (an empty name, ordinal 0, the same function imported twice): the table written would
-    /// lack it.
+    /// (an empty name, ordinal 0, neither a name nor an ordinal): the table written would
+    /// lack it. A function the image imports twice from one DLL keeps both entries, each with
+    /// its own IAT slot.
     fn build_import_list(&self, ctx: &WriteContext) -> Result<NativeImports> {
         let view = self.assembly.view();
         let pe = view.file().pe();
@@ -1053,12 +1084,13 @@ impl<'a> PeGenerator<'a> {
             }
         };
 
-        // Collect the original imports, but mscoree.dll's entry point, which is written first
+        // Collect the original imports as they are, a function imported twice included, but
+        // mscoree.dll's entry point, which is written first
         let mut other_imports = NativeImports::new();
         other_imports.set_pe_format(ctx.is_pe32_plus);
         for import in &pe.imports {
             if !is_entry_point(&import.dll, import.name.as_deref()) {
-                add(&mut other_imports, &import.dll, import)?;
+                other_imports.add_entry(&import.dll, import)?;
             }
         }
 
@@ -1098,7 +1130,7 @@ impl<'a> PeGenerator<'a> {
         // Add all other imports after mscoree.dll
         for desc in other_imports.descriptors() {
             for func in &desc.functions {
-                add(&mut final_imports, &desc.dll_name, func)?;
+                final_imports.add_entry(&desc.dll_name, func)?;
             }
         }
 
@@ -1263,9 +1295,9 @@ impl<'a> PeGenerator<'a> {
                         written_rvas.insert(original_rva);
 
                         let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
-                        let is_native = code_type.contains(MethodImplCodeType::NATIVE);
+                        let is_native = code_type == MethodImplCodeType::NATIVE;
 
-                        if is_native || code_type.contains(MethodImplCodeType::RUNTIME) {
+                        if is_native || code_type == MethodImplCodeType::RUNTIME {
                             // Native/runtime methods contain x86/x64 machine code, not CIL.
                             // Copy the raw bytes as-is. Size is determined by decoding
                             // x86 instructions to find the function's RET instruction.
@@ -1980,40 +2012,7 @@ impl<'a> PeGenerator<'a> {
     fn write_heaps(&self, ctx: &mut WriteContext, changes: &AssemblyChanges) -> Result<()> {
         let view = self.assembly.view();
 
-        // Default empty heap data
-        let empty_strings: &[u8] = &[0u8];
-        let empty_blob: &[u8] = &[0u8];
-        let empty_guid: &[u8] = &[];
-        let empty_us: &[u8] = &[0u8];
-
-        // Get source heap data
-        let strings_data: &[u8] = changes
-            .string_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.strings().map(Strings::data))
-            .unwrap_or(empty_strings);
-
-        let blob_data: &[u8] = changes
-            .blob_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.blobs().map(Blob::data))
-            .unwrap_or(empty_blob);
-
-        let guid_data: &[u8] = changes
-            .guid_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.guids().map(Guid::data))
-            .unwrap_or(empty_guid);
-
-        let us_data: &[u8] = changes
-            .userstring_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.userstrings().map(UserStrings::data))
-            .unwrap_or(empty_us);
+        let source = SourceHeaps::new(view, changes);
 
         // Write #Strings heap
         ctx.align_to_4();
@@ -2021,7 +2020,7 @@ impl<'a> PeGenerator<'a> {
         let strings_result = stream_strings_heap(
             &mut ctx.output,
             ctx.strings_heap_offset,
-            strings_data,
+            source.strings,
             &changes.string_heap_changes,
             &ctx.referenced_string_offsets,
         )?;
@@ -2035,7 +2034,7 @@ impl<'a> PeGenerator<'a> {
         let us_result = stream_userstring_heap(
             &mut ctx.output,
             ctx.us_heap_offset,
-            us_data,
+            source.userstrings,
             &changes.userstring_heap_changes,
             &ctx.referenced_userstring_offsets,
         )?;
@@ -2049,7 +2048,7 @@ impl<'a> PeGenerator<'a> {
         let guid_result = stream_guid_heap(
             &mut ctx.output,
             ctx.guid_heap_offset,
-            guid_data,
+            source.guids,
             &changes.guid_heap_changes,
         )?;
         ctx.guid_heap_size = guid_result.bytes_written;
@@ -2062,7 +2061,7 @@ impl<'a> PeGenerator<'a> {
         let blob_result = stream_blob_heap(
             &mut ctx.output,
             ctx.blob_heap_offset,
-            blob_data,
+            source.blobs,
             &changes.blob_heap_changes,
             &BlobRemap {
                 blobs: &ctx.typed_blobs,
@@ -2264,6 +2263,13 @@ impl<'a> PeGenerator<'a> {
             .pos()
             .checked_sub(ctx.tables_stream_offset)
             .ok_or_else(|| Error::LayoutFailed("Tables stream size underflow".to_string()))?;
+
+        for (table_id, count) in &new_row_counts {
+            if let Some(slot) = ctx.output_rows.get_mut(*table_id as usize) {
+                *slot = *count;
+            }
+        }
+        ctx.rows = remapper;
 
         Ok(())
     }
@@ -2862,7 +2868,7 @@ impl<'a> PeGenerator<'a> {
     /// loader jumps to this entry point, which then transfers control to the CLR.
     ///
     /// The stub format is:
-    /// - For PE32: `ff 25 xx xx xx xx` (jmp dword ptr [VA]) - 6 bytes
+    /// - For PE32: `ff 25 xx xx xx xx` (jmp dword ptr \[VA\]) - 6 bytes
     /// - For PE32+: `ff 25 00 00 00 00` (jmp qword ptr [rip+0]) followed by 8-byte address
     ///
     /// # Arguments
@@ -3269,65 +3275,203 @@ impl<'a> PeGenerator<'a> {
         Ok(Some(size))
     }
 
-    /// Copies the debug directory, and the data each of its entries points at, into `.text`,
+    /// Writes the debug directory, and the data each of its entries points at, into `.text`,
     /// pointing the entries at the copies (the PE format's `IMAGE_DEBUG_DIRECTORY`, 28 bytes
     /// an entry).
     ///
+    /// A write that changes nothing copies every entry as it is. Otherwise each entry is
+    /// kept only while it still describes the output:
+    ///
+    /// - an embedded Portable PDB is regenerated for the rows and bodies the write moved
+    ///   ([`rebuild_embedded_pdb`]); the Portable PDB CodeView entry then names the new
+    ///   PDB's id (GUID and time stamp), and a PDB checksum entry is recomputed over it;
+    /// - a CodeView or checksum entry for a PDB this write does not produce (a standalone
+    ///   `.pdb`, or a Windows PDB) is kept only when no type-system row moved, no table's row
+    ///   count changed and no method body was replaced: that PDB still matches the output
+    ///   exactly then, and names rows that are not there otherwise;
+    /// - every other entry (the deterministic build marker among them) is kept as it is.
+    ///
+    /// An embedded PDB that does not regenerate (it does not read) is dropped with the
+    /// entries naming it, and logged: a PDB describing rows the output does not have would
+    /// be worse than none.
+    ///
     /// # Errors
     ///
-    /// When the directory or an entry's data lies outside the input.
-    fn write_debug_data(&self, ctx: &mut WriteContext) -> Result<()> {
+    /// When the directory or an entry's data lies outside the input, or the regenerated PDB
+    /// cannot be written.
+    fn write_debug_data(&self, ctx: &mut WriteContext, changes: &AssemblyChanges) -> Result<()> {
         const ENTRY: usize = 28;
-        let Some((rva, size)) = ctx.original_debug_dir else {
+        if ctx.original_debug_dir.is_none() {
             return Ok(());
-        };
-        let file = self.assembly.view().file();
-        let directory = file.rva_slice(rva as usize, size as usize)?.into_owned();
-        let mut copied = directory.clone();
-        let field = |entry: &[u8], at: usize| -> u32 {
-            entry
-                .get(at..at.saturating_add(4))
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                .map_or(0, u32::from_le_bytes)
-        };
-        for (index, entry) in directory.as_chunks::<ENTRY>().0.iter().enumerate() {
-            let (data_size, data_rva, data_pointer) =
-                (field(entry, 16), field(entry, 20), field(entry, 24));
-            if data_size == 0 {
-                continue;
+        }
+        let view = self.assembly.view();
+        let file = view.file();
+        let entries = file.debug_directory()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut output: Vec<(DebugDirectoryEntry, Vec<u8>)> = Vec::with_capacity(entries.len());
+        if !changes.has_changes() {
+            for entry in entries {
+                let data = if entry.size == 0 {
+                    Vec::new()
+                } else {
+                    file.debug_data(&entry)?
+                };
+                output.push((entry, data));
             }
-            // The file pointer is where the bytes are; an entry whose data is not mapped
-            // has no RVA
-            let data = if data_pointer != 0 {
-                file.data_slice(data_pointer as usize, data_size as usize)?
-                    .to_vec()
-            } else {
-                file.rva_slice(data_rva as usize, data_size as usize)?
-                    .into_owned()
+        } else {
+            let replaced = replaced_method_bodies(self.assembly, changes);
+            let original = view.tables();
+            let rows_unchanged = TableId::iter()
+                .filter(|table| (*table as u8) < TableId::Document as u8)
+                .all(|table| {
+                    original.map_or(0, |tables| tables.table_row_count(table))
+                        == ctx.output_rows.get(table as usize).copied().unwrap_or(0)
+                });
+            let layout_unchanged = rows_unchanged
+                && ctx.tokens.is_empty()
+                && ctx.rows.is_empty()
+                && replaced.is_empty();
+
+            let tokens = &ctx.tokens;
+            let rows = &ctx.rows;
+            let token = |token: Token| -> Option<Token> {
+                if token.row() == 0 {
+                    return Some(token);
+                }
+                let table = TableId::from_token_type(token.table())?;
+                if rows.is_reordered(table) {
+                    rows.surviving(table, token.row())
+                        .map(|row| Token::from_parts(table, row))
+                } else {
+                    tokens.surviving(token.value()).map(Token::new)
+                }
             };
-            ctx.align_to_4_with_padding()?;
-            let (new_rva, new_pointer) = (ctx.current_rva(), ctx.pos());
-            ctx.write(&data)?;
-            let base = index.saturating_mul(ENTRY);
-            if data_rva != 0 {
-                if let Some(slot) = copied.get_mut(base.saturating_add(20)..base.saturating_add(24))
-                {
-                    slot.copy_from_slice(&new_rva.to_le_bytes());
+            let rebuilt = match embedded_portable_pdb(file) {
+                Ok(Some(pdb)) => {
+                    let image = ImageChanges {
+                        token: &token,
+                        replaced_bodies: &replaced,
+                        rows: ctx.output_rows,
+                    };
+                    match rebuild_embedded_pdb(&pdb, &image) {
+                        Ok(rebuilt) => Some(rebuilt),
+                        Err(e) => {
+                            log::warn!(
+                                "the embedded Portable PDB does not regenerate ({e}); the \
+                                 output drops it and the entries naming it"
+                            );
+                            None
+                        }
+                    }
                 }
-            }
-            if data_pointer != 0 {
-                let pointer = u32::try_from(new_pointer).map_err(|_| {
-                    Error::LayoutFailed("Debug data offset exceeds u32 range".to_string())
+                Ok(None) => None,
+                Err(e) => {
+                    log::warn!(
+                        "the embedded Portable PDB does not read ({e}); the output drops it \
+                         and the entries naming it"
+                    );
+                    None
+                }
+            };
+            let embeds = entries
+                .iter()
+                .any(|entry| entry.kind == debug_type::EMBEDDED_PORTABLE_PDB);
+
+            for mut entry in entries {
+                let portable_codeview = entry.kind == debug_type::CODEVIEW
+                    && entry.minor_version == PORTABLE_CODEVIEW_MINOR_VERSION;
+                // An entry naming the embedded PDB: its CodeView record and its checksum.
+                let names_embedded =
+                    embeds && (portable_codeview || entry.kind == debug_type::PDB_CHECKSUM);
+                let data = match entry.kind {
+                    debug_type::EMBEDDED_PORTABLE_PDB => match &rebuilt {
+                        Some(pdb) => pdb.embedded_entry()?,
+                        None => continue,
+                    },
+                    _ if names_embedded => {
+                        let Some(pdb) = &rebuilt else {
+                            continue;
+                        };
+                        let mut data = file.debug_data(&entry)?;
+                        if entry.kind == debug_type::CODEVIEW {
+                            // `RSDS`, the GUID, the age, the path: the GUID and the entry's
+                            // time stamp are the PDB's id.
+                            let Some(guid) = data.get_mut(4..20) else {
+                                continue;
+                            };
+                            guid.copy_from_slice(&pdb.id[..16]);
+                            entry.timestamp = u32::from_le_bytes([
+                                pdb.id[16], pdb.id[17], pdb.id[18], pdb.id[19],
+                            ]);
+                            data
+                        } else {
+                            // The algorithm's name, NUL-terminated, then the checksum.
+                            let Some(end) = data.iter().position(|&byte| byte == 0) else {
+                                continue;
+                            };
+                            let name = String::from_utf8_lossy(data.get(..end).unwrap_or_default())
+                                .into_owned();
+                            let Some(checksum) = pdb.checksum(&name) else {
+                                continue;
+                            };
+                            data.truncate(end.saturating_add(1));
+                            data.extend_from_slice(&checksum);
+                            data
+                        }
+                    }
+                    debug_type::CODEVIEW | debug_type::PDB_CHECKSUM => {
+                        if !layout_unchanged {
+                            continue;
+                        }
+                        file.debug_data(&entry)?
+                    }
+                    _ if entry.size == 0 => Vec::new(),
+                    _ => file.debug_data(&entry)?,
+                };
+                entry.size = u32::try_from(data.len()).map_err(|_| {
+                    Error::LayoutFailed("Debug entry data exceeds u32 range".to_string())
                 })?;
-                if let Some(slot) = copied.get_mut(base.saturating_add(24)..base.saturating_add(28))
-                {
-                    slot.copy_from_slice(&pointer.to_le_bytes());
-                }
+                output.push((entry, data));
             }
         }
+        if output.is_empty() {
+            return Ok(());
+        }
+
+        let mut directory = Vec::with_capacity(output.len().saturating_mul(ENTRY));
+        for (entry, data) in &output {
+            let (mut rva, mut pointer) = (0u32, 0u32);
+            if !data.is_empty() {
+                ctx.align_to_4_with_padding()?;
+                // An entry whose data was not mapped keeps having no RVA, and one the input
+                // had no file pointer for keeps having none
+                if entry.rva != 0 {
+                    rva = ctx.current_rva();
+                }
+                if entry.file_offset != 0 {
+                    pointer = u32::try_from(ctx.pos()).map_err(|_| {
+                        Error::LayoutFailed("Debug data offset exceeds u32 range".to_string())
+                    })?;
+                }
+                ctx.write(data)?;
+            }
+            directory.extend_from_slice(&entry.characteristics.to_le_bytes());
+            directory.extend_from_slice(&entry.timestamp.to_le_bytes());
+            directory.extend_from_slice(&entry.major_version.to_le_bytes());
+            directory.extend_from_slice(&entry.minor_version.to_le_bytes());
+            directory.extend_from_slice(&entry.kind.to_le_bytes());
+            directory.extend_from_slice(&entry.size.to_le_bytes());
+            directory.extend_from_slice(&rva.to_le_bytes());
+            directory.extend_from_slice(&pointer.to_le_bytes());
+        }
         ctx.align_to_4_with_padding()?;
+        let size = u32::try_from(directory.len())
+            .map_err(|_| Error::LayoutFailed("Debug directory exceeds u32 range".to_string()))?;
         ctx.debug_dir = Some((ctx.current_rva(), size));
-        ctx.write(&copied)?;
+        ctx.write(&directory)?;
         Ok(())
     }
 
@@ -3394,8 +3538,10 @@ fn collect_referenced_userstring_offsets(assembly: &CilAssembly) -> HashSet<u32>
             let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
             if row.rva == 0
                 || row.rva >= METHOD_BODY_PLACEHOLDER_BASE
-                || code_type.contains(MethodImplCodeType::NATIVE)
-                || code_type.contains(MethodImplCodeType::RUNTIME)
+                || matches!(
+                    code_type,
+                    MethodImplCodeType::NATIVE | MethodImplCodeType::RUNTIME
+                )
             {
                 continue;
             }

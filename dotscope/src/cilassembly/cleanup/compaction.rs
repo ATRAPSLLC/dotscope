@@ -21,32 +21,38 @@
 //! This approach reuses the existing `HeapChanges::remove()` mechanism rather
 //! than adding new parameters to streaming functions.
 //!
-//! # Known Limitations
+//! Compaction runs only as that cleanup phase: a write without a cleanup request removes no
+//! heap entry, whatever it renames.
 //!
-//! **Currently disabled** due to substring reference handling:
+//! # What counts as referenced
 //!
-//! .NET metadata allows string references to point to ANY offset within the
-//! #Strings heap, not just to the start of entries. For example, if "HelloWorld\0"
-//! is stored at offset 100, a TypeRef might reference offset 105 to get "World\0".
+//! - **#Strings**: .NET metadata lets a string column point at ANY offset within an entry,
+//!   not just its start: if "HelloWorld\0" is stored at offset 100, a TypeRef may name offset
+//!   105 to get "World\0". An entry is kept while any referenced offset falls within its byte
+//!   range; the writer keeps each such offset naming the same bytes when the heap is rebuilt.
+//!   The referenced offsets are sorted, so each entry's check is a binary search.
+//! - **#Blob**: the offsets the blob columns hold, and the blobs other blobs name: a Portable
+//!   PDB document name's parts and an imports blob's aliases and namespaces are #Blob offsets
+//!   inside those blobs, which the writer re-encodes with the offsets the named blobs get.
+//! - **#GUID**: the indices the GUID columns hold.
 //!
-//! The current implementation iterates the strings heap by walking null-terminated
-//! boundaries, which means it only sees "primary" entry offsets. When strings are
-//! removed and others shift, the remapping only covers these primary offsets -
-//! substring references (like offset 105 in the example) are not remapped.
-//!
-//! To fix this, we would need to:
-//! 1. Track ALL referenced offsets (not just primary entry offsets)
-//! 2. Ensure substring references get proper remapping when entries shift
-//! 3. Potentially preserve substring relationships in the output heap
-
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use strum::IntoEnumIterator;
 
 use crate::{
-    cilassembly::{changes::ChangeRef, CilAssembly, Operation, TableModifications},
+    cilassembly::{
+        changes::ChangeRef,
+        writer::{debug_blobs, BlobKind},
+        CilAssembly, Operation, TableModifications,
+    },
     dispatch_table_type,
     metadata::{
+        importscope::parse_import_records,
+        pdb::DocumentNameBlob,
         tablefields::{get_heap_fields, HeapFieldDescriptor, HeapType},
         tables::{RowWritable, TableDataOwned, TableId, TableInfoRef},
     },
@@ -102,19 +108,11 @@ impl CompactionStats {
 /// # Returns
 ///
 /// Statistics about entries marked for removal.
-pub(crate) fn mark_unreferenced_heap_entries(
-    assembly: &mut CilAssembly,
-) -> Result<CompactionStats> {
+pub fn mark_unreferenced_heap_entries(assembly: &mut CilAssembly) -> Result<CompactionStats> {
     let mut stats = CompactionStats::default();
 
     // Collect all referenced heap offsets/indices from tables
     let (ref_strings, ref_blobs, ref_guids) = collect_referenced_heap_entries(assembly);
-
-    // Store referenced string offsets for use during streaming (substring remapping)
-    assembly
-        .changes_mut()
-        .referenced_string_offsets
-        .clone_from(&ref_strings);
 
     // Collect unreferenced entries first (to avoid borrow conflicts)
     let unreferenced_strings: Vec<u32>;
@@ -146,10 +144,12 @@ pub(crate) fn mark_unreferenced_heap_entries(
                     // +1 for null terminator. Saturate on overflow (unreachable in practice).
                     let str_end = offset_u32.saturating_add(content_len).saturating_add(1);
 
-                    // Check if ANY referenced offset falls within this string's range
+                    // Check if ANY referenced offset falls within this string's range: the
+                    // first referenced offset at or past its start is before its end
+                    let first = ref_strings.partition_point(|&ref_off| ref_off < offset_u32);
                     let has_reference = ref_strings
-                        .iter()
-                        .any(|&ref_off| ref_off >= offset_u32 && ref_off < str_end);
+                        .get(first)
+                        .is_some_and(|&ref_off| ref_off < str_end);
 
                     if has_reference {
                         None
@@ -231,10 +231,12 @@ pub(crate) fn mark_unreferenced_heap_entries(
 /// - Inserted rows (from modifications)
 /// - Replaced tables (all rows from the replacement)
 ///
-/// Returns sets of referenced offsets/indices for each heap type.
-pub(crate) fn collect_referenced_heap_entries(
+/// Returns the referenced offsets/indices for each heap type: the #Strings offsets sorted
+/// ascending without duplicates, so that the substrings inside an entry are found by binary
+/// search, and the #Blob offsets and #GUID indices as sets.
+pub fn collect_referenced_heap_entries(
     assembly: &CilAssembly,
-) -> (HashSet<u32>, HashSet<u32>, HashSet<u32>) {
+) -> (Vec<u32>, HashSet<u32>, HashSet<u32>) {
     let mut ref_strings: HashSet<u32> = HashSet::new();
     let mut ref_blobs: HashSet<u32> = HashSet::new();
     let mut ref_guids: HashSet<u32> = HashSet::new();
@@ -245,7 +247,7 @@ pub(crate) fn collect_referenced_heap_entries(
 
     let view = assembly.view();
     let Some(tables) = view.tables() else {
-        return (ref_strings, ref_blobs, ref_guids);
+        return (vec![0], ref_blobs, ref_guids);
     };
 
     // Rows are read back through a layout whose heap indices are all four bytes wide: a new
@@ -405,6 +407,52 @@ pub(crate) fn collect_referenced_heap_entries(
         }
     }
 
+    // Blobs other blobs name: a document name's parts and an imports blob's aliases and
+    // namespaces are #Blob offsets inside those blobs, which no column holds. The writer
+    // encodes the naming blobs with the offsets the named ones get, so these must stay.
+    let heap = view.blobs();
+    let appended: HashMap<u32, &[u8]> = changes
+        .blob_heap_changes
+        .appended_iter()
+        .map(|(bytes, change_ref)| (change_ref.placeholder(), bytes.as_slice()))
+        .collect();
+    for (index, typed) in debug_blobs(assembly) {
+        if !typed.kind.names_blobs() {
+            continue;
+        }
+        let bytes = if ChangeRef::is_heap_placeholder(index) {
+            appended.get(&index).copied()
+        } else {
+            changes
+                .blob_heap_changes
+                .get_modification(index)
+                .map(Vec::as_slice)
+                .or_else(|| heap.and_then(|heap| heap.get(index as usize).ok()))
+        };
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        // A naming blob that does not parse is written as it is, naming nothing the writer
+        // looks up
+        match typed.kind {
+            BlobKind::DocumentName => {
+                if let Ok(name) = DocumentNameBlob::parse(bytes) {
+                    ref_blobs.extend(name.parts);
+                }
+            }
+            BlobKind::Imports => {
+                if let Ok(records) = parse_import_records(bytes) {
+                    for record in records {
+                        ref_blobs.extend([record.alias, record.namespace]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut ref_strings: Vec<u32> = ref_strings.into_iter().collect();
+    ref_strings.sort_unstable();
     (ref_strings, ref_blobs, ref_guids)
 }
 
@@ -528,7 +576,10 @@ mod tests {
         // Take ids until the next two (the new row's name and namespace) are offsets no row
         // references, so a truncated placeholder would show
         let mut taken = 0u32;
-        while before.contains(&(taken + 1)) || before.contains(&(taken + 2)) || taken < 16 {
+        while before.binary_search(&(taken + 1)).is_ok()
+            || before.binary_search(&(taken + 2)).is_ok()
+            || taken < 16
+        {
             assembly
                 .string_add(&format!("unreferenced{taken}"))
                 .unwrap();

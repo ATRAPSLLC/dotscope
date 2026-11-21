@@ -49,7 +49,7 @@ impl CleanupStats {
     }
 
     /// Sets the removal count of each table to `removals`, replacing what the passes added.
-    pub(super) fn set_removals(&mut self, removals: HashMap<TableId, usize>) {
+    pub fn set_removals(&mut self, removals: HashMap<TableId, usize>) {
         self.removals = removals;
     }
 

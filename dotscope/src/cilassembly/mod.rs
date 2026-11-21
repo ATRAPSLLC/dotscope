@@ -102,7 +102,7 @@
 //! ## **Core Types**
 //! - [`crate::cilassembly::CilAssembly`] - Main mutable assembly (this file)
 //! - [`crate::cilassembly::changes::AssemblyChanges`] - Central change tracking
-//! - [`crate::cilassembly::changes::heap::HeapChanges`] - Heap modification tracking
+//! - [`crate::cilassembly::HeapChanges`] - Heap modification tracking
 //! - [`crate::cilassembly::modifications::TableModifications`] - Table change strategies
 //! - [`crate::cilassembly::operation::TableOperation`] - Timestamped operations
 //! - [`crate::cilassembly::operation::Operation`] - Operation variants
@@ -154,21 +154,26 @@ use crate::{
 
 mod builders;
 mod changes;
-mod cleanup;
+pub mod cleanup;
+mod debugtables;
 mod modifications;
 mod operation;
 mod resolver;
-mod writer;
+pub mod writer;
 
 pub use builders::{
     ClassBuilder, EnumBuilder, EventBuilder, InterfaceBuilder, MethodBodyBuilder, MethodBuilder,
     PropertyBuilder,
 };
-pub use changes::{AssemblyChanges, ChangeIds, ChangeRef, ChangeRefKind, ChangeRefRc, HeapChanges};
-pub(crate) use changes::{BlobComposite, CompositeImport};
+#[cfg(feature = "compiler")]
+pub use changes::Savepoint;
+pub use changes::{
+    AssemblyChanges, BlobComposite, ChangeIds, ChangeRef, ChangeRefKind, ChangeRefRc,
+    CompositeImport, HeapChanges,
+};
 pub use cleanup::CleanupRequest;
 #[cfg(feature = "deobfuscation")]
-pub(crate) use cleanup::{
+pub use cleanup::{
     compute_entry_points, execute_cleanup, expand_type_tokens, extract_local_var_sig_rid,
     find_unreferenced_types, with_method_body, TypeNames,
 };
@@ -178,10 +183,9 @@ pub use resolver::{
     Conflict, ConflictResolver, LastWriteWinsResolver, OperationResolution, Resolution,
 };
 use writer::PeGenerator;
-pub(crate) use writer::ResolvePlaceholders;
 #[cfg(any(test, feature = "testkit"))]
-pub(crate) use writer::{calculate_field_size, debug_blobs, signature_blobs, BlobKind};
-pub use writer::{DanglingPolicy, GeneratorConfig};
+pub use writer::{calculate_field_size, debug_blobs, signature_blobs, BlobKind};
+pub use writer::{DanglingPolicy, GeneratorConfig, ResolvePlaceholders};
 
 /// A mutable view of a .NET assembly that tracks changes for editing operations.
 ///
@@ -353,10 +357,29 @@ impl CilAssembly {
         &self.pending_cleanup
     }
 
-    /// Executes pending cleanup, adding deletions to AssemblyChanges.
+    /// Writes this assembly with `write`: finalized for generation first, its placeholders
+    /// indexed while the writer resolves them, and the index dropped when it is done, whether
+    /// the write succeeds or fails. Every way of writing an assembly goes through here.
     ///
-    /// This is called internally before PE generation. It can only be called
-    /// once because row deletions cause RID shifting.
+    /// # Errors
+    ///
+    /// Returns an error if finalizing (cleanup) or the write fails.
+    fn generate<R>(&mut self, write: impl FnOnce(&CilAssembly) -> Result<R>) -> Result<R> {
+        self.finalize_for_generation()?;
+        self.changes.index_placeholders();
+        let written = write(self);
+        self.changes.drop_placeholder_index();
+        written
+    }
+
+    /// Prepares the changes for PE generation: executes pending cleanup, adding its
+    /// deletions to AssemblyChanges, then keeps the assembly's own Portable PDB tables true
+    /// to the methods the changes delete, replace the bodies of and add
+    /// ([`debugtables::follow_method_changes`]).
+    ///
+    /// This is called internally before PE generation. Cleanup runs once because row
+    /// deletions cause RID shifting; following the debug tables again removes and adds
+    /// nothing more.
     ///
     /// # Returns
     ///
@@ -366,24 +389,22 @@ impl CilAssembly {
     ///
     /// Returns an error if cleanup execution fails.
     fn finalize_for_generation(&mut self) -> Result<cleanup::CleanupStats> {
-        if self.pending_cleanup.is_empty() {
-            // Even without cleanup deletions, string heap modifications require
-            // referenced_string_offsets to be populated for correct substring remapping.
-            // The .NET string heap uses substring sharing (e.g., "Console" as a suffix
-            // of "writeToConsole"). When the heap is rebuilt after modifications, all
-            // table references (including TypeRef) need correct offset remapping.
-            if self.changes.string_heap_changes.modifications_count() > 0 {
-                let _ = cleanup::mark_unreferenced_heap_entries(self)?;
-            }
-            return Ok(cleanup::CleanupStats::new());
-        }
+        // Without a cleanup request no heap entry is removed: the writer collects the offsets
+        // the tables name on every write, so a string named inside another one keeps its
+        // bytes whatever else changes in the heap
+        let stats = if self.pending_cleanup.is_empty() {
+            cleanup::CleanupStats::new()
+        } else {
+            // Take ownership of the request (clears pending_cleanup and avoids borrow conflict)
+            let request = std::mem::take(&mut self.pending_cleanup);
+            self.cleanup_added = false;
 
-        // Take ownership of the request (clears pending_cleanup and avoids borrow conflict)
-        let request = std::mem::take(&mut self.pending_cleanup);
-        self.cleanup_added = false;
+            // Execute cleanup ONCE - this adds all deletions to self.changes
+            cleanup::execute_cleanup(self, &request)?
+        };
 
-        // Execute cleanup ONCE - this adds all deletions to self.changes
-        let stats = cleanup::execute_cleanup(self, &request)?;
+        // After cleanup, whose deletions are method changes the debug tables follow too
+        debugtables::follow_method_changes(self)?;
         Ok(stats)
     }
 
@@ -459,7 +480,7 @@ impl CilAssembly {
     ///
     /// The blob takes an entry of the heap like any other, and its reference resolves to its
     /// offset when the assembly is written.
-    pub(crate) fn blob_add_composite(&mut self, composite: BlobComposite) -> ChangeRefRc {
+    pub fn blob_add_composite(&mut self, composite: BlobComposite) -> ChangeRefRc {
         let change_ref = self.changes.blob_heap_changes.append(Vec::new());
         self.changes
             .blob_composites
@@ -1064,8 +1085,7 @@ impl CilAssembly {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_file<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
-        self.finalize_for_generation()?;
-        PeGenerator::new(self).to_file(path)
+        self.generate(|assembly| PeGenerator::new(assembly).to_file(path))
     }
 
     /// Writes the assembly to a file with custom configuration.
@@ -1100,8 +1120,7 @@ impl CilAssembly {
         path: P,
         config: GeneratorConfig,
     ) -> Result<()> {
-        self.finalize_for_generation()?;
-        PeGenerator::with_config(self, config).to_file(path)
+        self.generate(|assembly| PeGenerator::with_config(assembly, config).to_file(path))
     }
 
     /// Generates the assembly to memory as a byte vector.
@@ -1131,8 +1150,7 @@ impl CilAssembly {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_memory(&mut self) -> Result<Vec<u8>> {
-        self.finalize_for_generation()?;
-        PeGenerator::new(self).to_memory()
+        self.generate(|assembly| PeGenerator::new(assembly).to_memory())
     }
 
     /// Generates the assembly to memory with custom configuration.
@@ -1165,11 +1183,10 @@ impl CilAssembly {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_memory_with_config(&mut self, config: GeneratorConfig) -> Result<Vec<u8>> {
-        self.finalize_for_generation()?;
-        PeGenerator::with_config(self, config).to_memory()
+        self.generate(|assembly| PeGenerator::with_config(assembly, config).to_memory())
     }
 
-    /// Converts this `CilAssembly` into a [`CilObject`](crate::CilObject) for analysis.
+    /// Converts this `CilAssembly` into a [`CilObject`] for analysis.
     ///
     /// This method writes all modifications to memory, then parses the result
     /// as a `CilObject`. Use this after making modifications to obtain a
@@ -1177,7 +1194,7 @@ impl CilAssembly {
     ///
     /// # Returns
     ///
-    /// A [`CilObject`](crate::CilObject) containing the modified assembly.
+    /// A [`CilObject`] containing the modified assembly.
     ///
     /// # Usage Examples
     ///
@@ -1203,12 +1220,11 @@ impl CilAssembly {
     /// Returns an error if writing modifications fails or if the result
     /// cannot be parsed as a valid .NET assembly.
     pub fn into_cilobject(mut self) -> Result<CilObject> {
-        self.finalize_for_generation()?;
-        let bytes = PeGenerator::new(&self).to_memory()?;
+        let bytes = self.generate(|assembly| PeGenerator::new(assembly).to_memory())?;
         CilObject::from_mem_with_validation(bytes, ValidationConfig::production())
     }
 
-    /// Converts this `CilAssembly` into a [`CilObject`](crate::CilObject) with custom options.
+    /// Converts this `CilAssembly` into a [`CilObject`] with custom options.
     ///
     /// Like [`into_cilobject`](Self::into_cilobject) but allows specifying both
     /// the validation configuration and generator configuration for the resulting assembly.
@@ -1221,7 +1237,7 @@ impl CilAssembly {
     ///
     /// # Returns
     ///
-    /// A [`CilObject`](crate::CilObject) containing the modified assembly.
+    /// A [`CilObject`] containing the modified assembly.
     ///
     /// # Errors
     ///
@@ -1232,8 +1248,9 @@ impl CilAssembly {
         validation_config: ValidationConfig,
         generator_config: GeneratorConfig,
     ) -> Result<CilObject> {
-        self.finalize_for_generation()?;
-        let bytes = PeGenerator::with_config(&self, generator_config).to_memory()?;
+        let bytes = self.generate(|assembly| {
+            PeGenerator::with_config(assembly, generator_config).to_memory()
+        })?;
         CilObject::from_mem_with_validation(bytes, validation_config)
     }
 
@@ -1708,24 +1725,11 @@ impl CilAssembly {
     ///
     /// Returns an error if the string cannot be added to the heap.
     pub fn string_get_or_add(&mut self, value: &str) -> Result<ChangeRefRc> {
-        if let Some(existing_ref) = self.string_find(value) {
-            return Ok(existing_ref);
+        // A string this session appended already: found through the heap's content index
+        if let Some(existing_ref) = self.changes.string_heap_changes.find_appended(value) {
+            return Ok(existing_ref.clone());
         }
         self.string_add(value)
-    }
-
-    /// Helper method to find an existing string in the current heap changes.
-    ///
-    /// This searches through the strings added in the current session
-    /// to avoid duplicates within the same session.
-    fn string_find(&self, value: &str) -> Option<ChangeRefRc> {
-        let heap_changes = &self.changes.string_heap_changes;
-        for (existing_string, change_ref) in heap_changes.appended_iter() {
-            if existing_string == value {
-                return Some(change_ref.clone());
-            }
-        }
-        None
     }
 
     /// Finds an AssemblyRef by its name.
@@ -2050,6 +2054,57 @@ mod tests {
         CilObject, Error,
     };
 
+    /// The index a write builds answers every placeholder as the scan of the change sets
+    /// does (heap entries of all four heaps and table rows), misses what the scan misses, and
+    /// is gone once the write ends: a row added after a write is found by its placeholder.
+    #[test]
+    fn placeholders_are_found_the_same_with_and_without_the_index() {
+        let mut assembly = load_sample("packers/confuserex/1.6.0/original.exe").into_assembly();
+        let mut placeholders = Vec::new();
+        for i in 0..50u8 {
+            placeholders.push(assembly.string_add(&format!("s{i}")).unwrap().placeholder());
+            placeholders.push(assembly.blob_add(&[i, 1, 2]).unwrap().placeholder());
+            placeholders.push(assembly.guid_add(&[i; 16]).unwrap().placeholder());
+            placeholders.push(
+                assembly
+                    .userstring_add(&format!("u{i}"))
+                    .unwrap()
+                    .placeholder(),
+            );
+            let row = TypeDefBuilder::new()
+                .name(format!("T{i}"))
+                .namespace("Index")
+                .build(&mut assembly)
+                .unwrap();
+            placeholders.push(row.placeholder());
+        }
+        // A placeholder no change carries
+        placeholders.push(0x8000_0000 | 0x00FF_FFFF);
+
+        let scanned: Vec<Option<u64>> = placeholders
+            .iter()
+            .map(|p| assembly.changes().lookup_by_placeholder(*p).map(|r| r.id()))
+            .collect();
+        assert!(scanned.iter().take(250).all(Option::is_some));
+        assembly.changes_mut().index_placeholders();
+        let indexed: Vec<Option<u64>> = placeholders
+            .iter()
+            .map(|p| assembly.changes().lookup_by_placeholder(*p).map(|r| r.id()))
+            .collect();
+        assembly.changes_mut().drop_placeholder_index();
+        assert_eq!(indexed, scanned);
+
+        assembly.to_memory().unwrap();
+        let later = assembly.string_add("after the write").unwrap();
+        assert_eq!(
+            assembly
+                .changes()
+                .lookup_by_placeholder(later.placeholder())
+                .map(|r| r.id()),
+            Some(later.id())
+        );
+    }
+
     /// A cleanup request's settings are the cleanup's: a request that keeps empty types keeps
     /// them, where merging it into the default pending request removed them anyway (the
     /// deobfuscator's `remove_empty_types: false` did nothing). A later request narrows them.
@@ -2090,7 +2145,7 @@ mod tests {
                 .types()
                 .iter()
                 .filter(|entry| entry.value().namespace == "Cleanup")
-                .map(|entry| entry.value().name.clone())
+                .map(|entry| entry.value().name.to_string())
                 .collect()
         };
         let keeps_empty = CleanupRequest::with_settings(true, false);

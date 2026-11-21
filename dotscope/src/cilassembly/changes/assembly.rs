@@ -42,7 +42,9 @@
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "compiler")]
+use std::collections::HashSet;
 
 use crate::{
     cilassembly::{
@@ -57,11 +59,11 @@ use crate::{Error, Result};
 /// The first placeholder RVA a new method body is stored under. A MethodDef row's RVA at or
 /// above it names a body in [`AssemblyChanges`], which the writer lays out; one below it is
 /// the RVA of a body in the input file, wherever in the file that is.
-pub(crate) const METHOD_BODY_PLACEHOLDER_BASE: u32 = 0xF000_0000;
+pub const METHOD_BODY_PLACEHOLDER_BASE: u32 = 0xF000_0000;
 
 /// The first placeholder RVA new field data is stored under, below
 /// [`METHOD_BODY_PLACEHOLDER_BASE`].
-pub(crate) const FIELD_DATA_PLACEHOLDER_BASE: u32 = 0xE000_0000;
+pub const FIELD_DATA_PLACEHOLDER_BASE: u32 = 0xE000_0000;
 
 /// Internal structure for tracking all modifications to an assembly.
 ///
@@ -131,26 +133,19 @@ pub struct AssemblyChanges {
     pub userstring_heap_changes: HeapChanges<String>,
 
     /// The ids the assembly's changes take: its heaps' and its new rows'
-    pub(crate) change_ids: ChangeIds,
+    pub change_ids: ChangeIds,
 
     /// The appended blobs whose content names other blobs, by the change id of their
     /// placeholder blob: the writer encodes each once the blobs it names have offsets
-    pub(crate) blob_composites: HashMap<u64, BlobComposite>,
-
-    /// Referenced string heap offsets for substring remapping.
-    ///
-    /// When heap compaction is enabled, this stores all string offsets that are
-    /// actually referenced by metadata tables. This is needed because .NET allows
-    /// "substring references" - pointing to any offset within a string entry.
-    /// During streaming, these offsets are used to build proper remappings for
-    /// substring references when strings shift positions.
-    pub referenced_string_offsets: HashSet<u32>,
+    pub blob_composites: HashMap<u64, BlobComposite>,
 
     /// Native import/export containers for PE import/export tables
     ///
     /// Contains unified containers that manage user modifications to native imports/exports.
     /// These always exist but start empty, following pure copy-on-write semantics.
     pub native_imports: UnifiedImportContainer,
+    /// Native export container for the PE export table, which starts empty like
+    /// [`Self::native_imports`].
     pub native_exports: UnifiedExportContainer,
 
     /// Method body storage for new and modified method implementations
@@ -188,6 +183,11 @@ pub struct AssemblyChanges {
     /// will be resolved to real RVAs during PE writing based on actual section layout.
     /// Uses a different range than method bodies to avoid conflicts.
     pub next_field_placeholder: u32,
+
+    /// Every ChangeRef by its id, built for one write and dropped after it: the writer looks
+    /// up each placeholder it resolves, and the changes cannot move while it writes. `None`
+    /// outside a write, where [`Self::lookup_by_placeholder`] scans the change sets instead.
+    placeholder_index: Option<HashMap<u64, super::ChangeRefRc>>,
 }
 
 /// How far every change set reached at one moment, which
@@ -197,7 +197,7 @@ pub struct AssemblyChanges {
 /// and stored data, and refuses a table changed in any other way.
 #[cfg(feature = "compiler")]
 #[derive(Debug, Clone)]
-pub(crate) struct Savepoint {
+pub struct Savepoint {
     /// Each changed table's extent; `None` for a replaced table.
     tables: HashMap<TableId, Option<(usize, u32)>>,
     /// Items appended to the #Strings, #Blob, #GUID and #US heaps.
@@ -224,7 +224,6 @@ impl AssemblyChanges {
             userstring_heap_changes: HeapChanges::new_userstrings(change_ids.clone()),
             change_ids,
             blob_composites: HashMap::new(),
-            referenced_string_offsets: HashSet::new(),
             native_imports: UnifiedImportContainer::new(),
             native_exports: UnifiedExportContainer::new(),
             method_bodies: HashMap::new(),
@@ -232,6 +231,7 @@ impl AssemblyChanges {
             resource_data: Vec::new(),
             field_data: HashMap::new(),
             next_field_placeholder: FIELD_DATA_PLACEHOLDER_BASE,
+            placeholder_index: None,
         }
     }
 
@@ -439,10 +439,45 @@ impl AssemblyChanges {
         })
     }
 
+    /// Indexes every ChangeRef by its id for the write about to run, so that each placeholder
+    /// the writer resolves is one lookup instead of a scan of every change set: the scan made
+    /// a write quadratic in the rows and heap entries a deobfuscation adds.
+    ///
+    /// The index holds exactly what [`Self::lookup_by_placeholder`] scans (the appended
+    /// entries of the four heaps and the ChangeRefs of every table), and stays right only
+    /// while the changes do not move: [`Self::drop_placeholder_index`] removes it when the
+    /// write ends.
+    pub fn index_placeholders(&mut self) {
+        let mut index = HashMap::new();
+        let heaps = self
+            .string_heap_changes
+            .appended_iter()
+            .map(|(_, change_ref)| change_ref)
+            .chain(self.blob_heap_changes.appended_iter().map(|(_, r)| r))
+            .chain(self.guid_heap_changes.appended_iter().map(|(_, r)| r))
+            .chain(self.userstring_heap_changes.appended_iter().map(|(_, r)| r));
+        let tables = self
+            .table_changes
+            .values()
+            .flat_map(|mods| mods.change_refs().map(|(_, change_ref)| change_ref));
+        for change_ref in heaps.chain(tables) {
+            index
+                .entry(change_ref.id())
+                .or_insert_with(|| change_ref.clone());
+        }
+        self.placeholder_index = Some(index);
+    }
+
+    /// Drops the index [`Self::index_placeholders`] built for a write.
+    pub fn drop_placeholder_index(&mut self) {
+        self.placeholder_index = None;
+    }
+
     /// Looks up a ChangeRef by its placeholder value.
     ///
     /// This searches through all heap and table changes to find the ChangeRef
-    /// that corresponds to the given placeholder.
+    /// that corresponds to the given placeholder: during a write through the index the
+    /// writer built for it, otherwise by scanning the change sets.
     ///
     /// # Arguments
     ///
@@ -457,6 +492,9 @@ impl AssemblyChanges {
         }
 
         let id = ChangeRef::id_from_placeholder(placeholder)?;
+        if let Some(index) = &self.placeholder_index {
+            return index.get(&id);
+        }
 
         // Search heap changes
         for (_, change_ref) in self.string_heap_changes.appended_iter() {
@@ -494,7 +532,7 @@ impl AssemblyChanges {
 
     /// Where every change set stands now; see [`Savepoint`].
     #[cfg(feature = "compiler")]
-    pub(crate) fn savepoint(&self) -> Savepoint {
+    pub fn savepoint(&self) -> Savepoint {
         Savepoint {
             tables: self
                 .table_changes
@@ -521,7 +559,7 @@ impl AssemblyChanges {
     /// inserted rows, which a rollback cannot undo. Nothing is rolled back
     /// then.
     #[cfg(feature = "compiler")]
-    pub(crate) fn rollback_to(&mut self, savepoint: &Savepoint) -> Result<()> {
+    pub fn rollback_to(&mut self, savepoint: &Savepoint) -> Result<()> {
         // Checked before anything changes, so a refusal leaves every set as
         // it was.
         for (table, changes) in &self.table_changes {

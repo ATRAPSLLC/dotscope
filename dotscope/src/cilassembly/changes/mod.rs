@@ -62,7 +62,7 @@
 //!
 //! This module integrates with:
 //! - [`crate::cilassembly::CilAssembly`] - Primary assembly modification interface
-//! - [`crate::cilassembly::write`] - Binary output generation system
+//! - [`crate::cilassembly::writer`] - Binary output generation system
 
 mod assembly;
 mod changeref;
@@ -71,5 +71,5 @@ mod heap;
 
 pub use assembly::*;
 pub use changeref::*;
-pub(crate) use composite::{BlobComposite, CompositeImport};
+pub use composite::{BlobComposite, CompositeImport};
 pub use heap::*;

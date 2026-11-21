@@ -20,7 +20,7 @@ use crate::{
 
 /// A blob the writer encodes from the offsets of the blobs it names.
 #[derive(Debug, Clone)]
-pub(crate) enum BlobComposite {
+pub enum BlobComposite {
     /// A DocumentNameBlob: the separator and each part, `None` for an empty part (index 0)
     DocumentName {
         /// The separator: an ASCII character, or 0 for none
@@ -34,7 +34,7 @@ pub(crate) enum BlobComposite {
 
 /// An import declaration whose alias and namespace are blobs a change adds.
 #[derive(Debug, Clone)]
-pub(crate) struct CompositeImport {
+pub struct CompositeImport {
     /// The declaration's kind
     pub kind: ImportKind,
     /// The alias's blob, for the kinds that have one; `None` for the empty alias (index 0)

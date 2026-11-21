@@ -379,6 +379,33 @@ impl RidRemapper {
             .unwrap_or(shifted))
     }
 
+    /// The row's RID once deletions and reordering are made, or `None` for a row the write
+    /// deletes; 0 stays 0.
+    ///
+    /// The query [`RidRemapper::reference`] answers, for a reader that keeps what survives
+    /// and drops what does not instead of applying a [`DanglingPolicy`].
+    #[must_use]
+    pub fn surviving(&self, table: TableId, old_rid: u32) -> Option<u32> {
+        if old_rid == 0 {
+            return Some(0);
+        }
+        if self
+            .deleted_rids
+            .get(&table)
+            .is_some_and(|deleted| deleted.contains(&old_rid))
+        {
+            return None;
+        }
+        let shifted = self.shift(table, old_rid);
+        Some(
+            self.sort_orders
+                .get(&table)
+                .and_then(|map| map.get(&shifted))
+                .copied()
+                .unwrap_or(shifted),
+        )
+    }
+
     /// The RID a list column starting at row `old_rid` of `target_table` has in the output.
     ///
     /// A list that started at a deleted row, or one past the last row, starts at the next
@@ -489,12 +516,24 @@ pub struct TokenRemap {
 impl TokenRemap {
     /// A remap that renumbers `map`'s tokens and deletes `deleted`'s rows, for tests.
     #[cfg(test)]
-    pub(crate) fn for_tests(map: &[(u32, u32)], deleted: &[u32], dangling: DanglingPolicy) -> Self {
+    pub fn for_tests(map: &[(u32, u32)], deleted: &[u32], dangling: DanglingPolicy) -> Self {
         Self {
             map: map.iter().copied().collect(),
             deleted: deleted.iter().copied().collect(),
             dangling,
         }
+    }
+
+    /// The token `token` is written as, or `None` when it names a row the write deletes.
+    ///
+    /// The query [`TokenRemap::remap`] answers, for a reader that drops what names a deleted
+    /// row instead of applying a [`DanglingPolicy`].
+    #[must_use]
+    pub fn surviving(&self, token: u32) -> Option<u32> {
+        if self.deleted.contains(&token) {
+            return None;
+        }
+        Some(self.map.get(&token).copied().unwrap_or(token))
     }
 
     /// Records that `old` is written as `new`, overriding the deletion shift.

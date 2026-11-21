@@ -608,7 +608,7 @@ impl BlobRemap<'_> {
 /// # Errors
 ///
 /// As `token`, and an encoding error for a blob that cannot be written back.
-fn remap_debug_tokens(
+pub fn remap_debug_tokens(
     blob: &[u8],
     kind: BlobKind,
     token: &mut dyn FnMut(u32) -> Result<u32>,

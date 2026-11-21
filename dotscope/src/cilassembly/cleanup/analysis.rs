@@ -482,7 +482,7 @@ pub fn compute_entry_points(assembly: &CilObject, aggressive: bool) -> HashSet<T
 /// Returns a [`HashMap`] mapping each method token to the TypeDef token of
 /// the type that declares it. This is useful for determining whether two
 /// methods belong to the same type.
-pub(super) fn build_method_type_map(assembly: &CilObject) -> HashMap<Token, Token> {
+pub fn build_method_type_map(assembly: &CilObject) -> HashMap<Token, Token> {
     let registry = assembly.types();
     let mut map = HashMap::new();
 

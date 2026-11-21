@@ -49,8 +49,8 @@
 //! # Integration
 //!
 //! This module integrates with:
-//! - [`crate::cilassembly::writer::layout`] - Layout planning for file size calculation
-//! - [`crate::cilassembly::writer::executor`] - Execution engine that uses output files
+//! - [`crate::cilassembly::writer::sizes`] - Table size calculation for the file layout
+//! - [`crate::cilassembly::writer::generator`] - The generator that writes the file through [`Output`]
 //! - [`crate::cilassembly::writer`] - Main write pipeline coordination
 
 use std::{

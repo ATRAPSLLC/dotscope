@@ -634,7 +634,7 @@ impl CleanupRequest {
     /// Narrows this request's settings to what `other` allows as well: a cleanup gathered
     /// from several requests removes orphans, or empty types, only when every one of them
     /// asks for it.
-    pub(crate) fn narrow_settings(&mut self, other: &CleanupRequest) {
+    pub fn narrow_settings(&mut self, other: &CleanupRequest) {
         self.remove_orphans &= other.remove_orphans;
         self.remove_empty_types &= other.remove_empty_types;
     }

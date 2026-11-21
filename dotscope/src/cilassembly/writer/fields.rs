@@ -73,7 +73,7 @@ fn collect_field_data(
 ///
 /// Uses the signature parser and ClassLayout table to find explicit sizes for value types.
 /// Returns an error if the size cannot be determined.
-pub(crate) fn calculate_field_size(
+pub fn calculate_field_size(
     view: &CilAssemblyView,
     field_index: u32,
     ptr_size: PointerSize,
