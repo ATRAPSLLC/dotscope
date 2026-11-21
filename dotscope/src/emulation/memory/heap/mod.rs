@@ -26,11 +26,11 @@
 //! # Memory Limits
 //!
 //! The heap enforces a configurable maximum size. Allocation attempts that
-//! would exceed this limit return [`EmulationError::HeapMemoryLimitExceeded`](crate::emulation::EmulationError::HeapMemoryLimitExceeded).
+//! would exceed this limit return [`EmulationError::HeapMemoryLimitExceeded`].
 //!
 //! # Object References
 //!
-//! Objects are referenced via [`HeapRef`](crate::emulation::HeapRef), an opaque handle
+//! Objects are referenced via [`HeapRef`], an opaque handle
 //! that contains an internal ID. References remain valid for the lifetime of the
 //! heap (no garbage collection is simulated).
 
@@ -39,6 +39,7 @@ mod collections;
 mod crypto;
 mod reflection;
 mod streams;
+mod string;
 
 use std::{
     collections::{HashMap, HashSet as StdHashSet, VecDeque},
@@ -50,6 +51,7 @@ use std::{
 };
 
 use imbl::HashMap as ImHashMap;
+pub use string::ManagedString;
 
 use crate::{
     assembly::InstructionAssembler,
@@ -65,7 +67,7 @@ use crate::{
 /// changes width. A fixed per-element figure is easy to get badly wrong: `EmValue` is
 /// currently on the order of a couple of hundred bytes, so under-charging it would let an
 /// array sit nominally inside a 256 MB cap while really costing gigabytes.
-pub(crate) const EMVALUE_SIZE: usize = std::mem::size_of::<EmValue>();
+pub const EMVALUE_SIZE: usize = std::mem::size_of::<EmValue>();
 
 /// Object-header overhead charged for a single-dimensional array.
 const ARRAY_HEADER_BYTES: usize = 24;
@@ -128,11 +130,11 @@ pub type ReflectionPropertyInfo = (Arc<str>, Token, Option<Token>, Option<Token>
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct HeapIter {
-    items: std::vec::IntoIter<(HeapRef, HeapObject)>,
+    items: std::vec::IntoIter<(HeapRef, Arc<HeapObject>)>,
 }
 
 impl Iterator for HeapIter {
-    type Item = (HeapRef, HeapObject);
+    type Item = (HeapRef, Arc<HeapObject>);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.items.next()
@@ -273,9 +275,10 @@ pub struct DelegateEntry {
 pub enum HeapObject {
     /// A .NET string (immutable sequence of UTF-16 chars).
     ///
-    /// Stored internally as `Arc<str>` (UTF-8) for efficient, borrow-free access.
-    /// Conversion to/from UTF-16 is handled at the API boundary.
-    String(Arc<str>),
+    /// Its text is kept as `Arc<str>` (UTF-8) for efficient, borrow-free access; its length
+    /// and its characters by index are UTF-16 code units, as .NET counts them (see
+    /// [`ManagedString`]).
+    String(ManagedString),
 
     /// A single-dimensional array (SZArray).
     ///
@@ -401,8 +404,15 @@ pub enum HeapObject {
         is_encryptor: bool,
         /// Cipher mode: 1=CBC (default), 2=ECB, 4=CFB.
         mode: u8,
-        /// Padding mode: 1=None, 2=PKCS7 (default), 3=Zeros.
+        /// Padding mode: 1=None, 2=PKCS7 (default), 3=Zeros, 4=ANSIX923, 5=ISO10126.
         padding: u8,
+        /// The IV the transform was created with, which `TransformFinalBlock` restores so
+        /// that the transform can be used again, as the runtime's transforms can.
+        initial_iv: Vec<u8>,
+        /// Input a decryptor kept back from its last `TransformBlock`: one whose padding is
+        /// removed (PKCS7, ANSIX923, ISO10126) cannot tell which block is the last, so it
+        /// holds the latest one until the next call or `TransformFinalBlock`.
+        held_back: Vec<u8>,
     },
 
     /// A reflection method info object.
@@ -602,6 +612,10 @@ pub enum HeapObject {
         transformed_pos: usize,
         /// Write buffer accumulating data before transformation (Write mode only).
         write_buffer: Vec<u8>,
+        /// Whether the final block is done: set by `FlushFinalBlock`, and by `Dispose` or
+        /// `Close`, which flush it unless it is. A second `FlushFinalBlock` is the
+        /// `NotSupportedException` the runtime throws, and a second `Dispose` does nothing.
+        final_block_transformed: bool,
     },
 
     /// A compressed stream (DeflateStream or GZipStream).
@@ -671,7 +685,7 @@ impl HeapObject {
         // is correct here — overflow only matters for pathological inputs and
         // saturated `usize::MAX` correctly signals "huge" for limit checks.
         match self {
-            HeapObject::String(s) => s.len().saturating_mul(2).saturating_add(24), // Object header + UTF-16
+            HeapObject::String(s) => s.text().len().saturating_mul(2).saturating_add(24), // Object header + UTF-16
             HeapObject::Array { elements, .. } => elements
                 .len()
                 .saturating_mul(EMVALUE_SIZE)
@@ -691,9 +705,17 @@ impl HeapObject {
             | HeapObject::ReflectionParameter { .. }
             | HeapObject::DynamicMethod { .. } => 32,
             HeapObject::ILGenerator { .. } => 128,
-            HeapObject::CryptoTransform { key, iv, .. } => {
-                48usize.saturating_add(key.len()).saturating_add(iv.len())
-            }
+            HeapObject::CryptoTransform {
+                key,
+                iv,
+                initial_iv,
+                held_back,
+                ..
+            } => 48usize
+                .saturating_add(key.len())
+                .saturating_add(iv.len())
+                .saturating_add(initial_iv.len())
+                .saturating_add(held_back.len()),
             // Charged by content, like every other variadic variant. A flat constant here was a
             // hole in the memory limit rather than an inaccuracy: `Delegate.Combine(d, d)` is
             // legal and doubles the invocation list, so ~30 emulated calls reach a billion
@@ -743,6 +765,7 @@ impl fmt::Display for HeapObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HeapObject::String(s) => {
+                let s = s.text();
                 if s.chars().count() > 50 {
                     write!(f, "\"{}...\"", truncate_chars(s, 47))
                 } else {
@@ -951,20 +974,24 @@ impl fmt::Display for HeapObject {
 ///
 /// Uses `imbl::HashMap` for O(1) fork via structural sharing.
 #[derive(Clone, Debug)]
-pub(crate) struct HeapState {
+pub struct HeapState {
     /// Object storage indexed by reference ID.
     ///
     /// Uses `imbl::HashMap` for O(1) cloning via structural sharing.
     /// This enables efficient `fork()` operations where parent and child
-    /// share unmodified entries.
-    pub(crate) objects: ImHashMap<u64, HeapObject>,
+    /// share unmodified entries. Each object sits behind an `Arc`: the first write
+    /// after a fork copies the map node it lies in, and with the objects inline that
+    /// copied every object of the node (a megabyte array beside the one written to
+    /// among them). A write reaches its object through `Arc::make_mut`, which copies
+    /// that object alone, and only while a fork still shares it.
+    pub objects: ImHashMap<u64, Arc<HeapObject>>,
 
     /// Preserves the original .NET type token when a heap object is replaced
     /// by a BCL wrapper type (e.g., `Object` → `KeyDerivation`).
     ///
     /// Without this, virtual dispatch fails for replaced objects because the
     /// synthetic BCL type tokens (0x7F00_xxxx) have no metadata type hierarchy.
-    pub(crate) original_types: ImHashMap<u64, Token>,
+    pub original_types: ImHashMap<u64, Token>,
 }
 
 /// Simulated managed heap for CIL emulation.
@@ -1011,20 +1038,20 @@ pub(crate) struct HeapState {
 pub struct ManagedHeap {
     /// Internal state protected by RwLock.
     /// Contains the imbl::HashMap for O(1) fork.
-    pub(crate) state: RwLock<HeapState>,
+    pub state: RwLock<HeapState>,
     /// Next reference ID to allocate (atomic for lock-free allocation IDs).
-    pub(crate) next_id: AtomicU64,
+    pub next_id: AtomicU64,
     /// Current estimated heap size in bytes (atomic for lock-free reads).
-    pub(crate) current_size: AtomicUsize,
+    pub current_size: AtomicUsize,
     /// Maximum allowed heap size in bytes.
-    pub(crate) max_size: usize,
+    pub max_size: usize,
     /// Maximum number of live heap objects, independent of their total size.
     ///
     /// A byte ceiling alone does not bound object *count*: a flood of tiny objects is charged
     /// only its header estimate each while really costing an `imbl::HashMap` node plus an
     /// `original_types` entry per object. Set from `EmulationLimits::max_heap_objects`;
     /// `usize::MAX` means unlimited.
-    pub(crate) max_objects: AtomicUsize,
+    pub max_objects: AtomicUsize,
 }
 
 impl ManagedHeap {
@@ -1067,7 +1094,7 @@ impl ManagedHeap {
     ///
     /// Returns `Ok(())` if the allocation can proceed, or an error if the
     /// allocation would exceed [`max_size`](Self::max_size).
-    pub(crate) fn check_allocation(&self, size: usize) -> Result<()> {
+    pub fn check_allocation(&self, size: usize) -> Result<()> {
         let current = self.current_size.load(Ordering::Relaxed);
         if current.saturating_add(size) > self.max_size {
             return Err(EmulationError::HeapMemoryLimitExceeded {
@@ -1106,7 +1133,7 @@ impl ManagedHeap {
     /// # Errors
     ///
     /// Returns [`EmulationError::HeapMemoryLimitExceeded`] if the array would exceed the budget.
-    pub(crate) fn reserve_elements(&self, count: usize) -> Result<()> {
+    pub fn reserve_elements(&self, count: usize) -> Result<()> {
         self.check_allocation(
             count
                 .saturating_mul(EMVALUE_SIZE)
@@ -1119,10 +1146,10 @@ impl ManagedHeap {
     /// This consolidates the common allocation pattern: check size limits,
     /// generate ID, insert object, update size tracking. When `type_token`
     /// is `Some`, the token is recorded in `original_types` so that
-    /// [`get_type_token`] returns the real .NET type instead of a synthetic
+    /// [`get_type_token`](Self::get_type_token) returns the real .NET type instead of a synthetic
     /// placeholder. This enables virtual dispatch on BCL wrapper objects
     /// created via factory methods (not just the `replace_with_*` path).
-    pub(crate) fn alloc_object_internal(
+    pub fn alloc_object_internal(
         &self,
         obj: HeapObject,
         type_token: Option<Token>,
@@ -1161,7 +1188,7 @@ impl ManagedHeap {
             .into());
         }
 
-        state.objects.insert(heap_ref.id(), obj);
+        state.objects.insert(heap_ref.id(), Arc::new(obj));
         if let Some(token) = original_type {
             state.original_types.insert(heap_ref.id(), token);
         }
@@ -1257,7 +1284,7 @@ impl ManagedHeap {
     /// Returns [`EmulationError::HeapMemoryLimitExceeded`] if heap is out of memory.
     pub fn alloc_string(&self, value: &str) -> Result<HeapRef> {
         let arc_str: Arc<str> = value.into();
-        self.alloc_object_internal(HeapObject::String(arc_str), None)
+        self.alloc_object_internal(HeapObject::String(ManagedString::new(arc_str)), None)
     }
 
     /// Allocates an object instance on the heap.
@@ -1347,7 +1374,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::TypedReference { type_token, .. }) => Ok(*type_token),
             Some(other) => Err(EmulationError::TypeMismatch {
                 operation: "refanytype",
@@ -1382,7 +1409,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::TypedReference {
                 type_token,
                 address,
@@ -1470,7 +1497,8 @@ impl ManagedHeap {
     ///
     /// Returns a cloned `HeapObject` to avoid borrow conflicts. For strings
     /// and other Arc-backed data, cloning is cheap (just incrementing a
-    /// reference count).
+    /// reference count); an array or an object with fields is copied whole.
+    /// [`get_shared`](Self::get_shared) returns the object without copying it.
     ///
     /// # Panics
     ///
@@ -1480,6 +1508,34 @@ impl ManagedHeap {
     ///
     /// Returns [`EmulationError::InvalidHeapReference`] if the reference is invalid.
     pub fn get(&self, heap_ref: HeapRef) -> Result<HeapObject> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "managed heap",
+            })?;
+        state
+            .objects
+            .get(&heap_ref.id())
+            .map(Arc::as_ref)
+            .cloned()
+            .ok_or(
+                EmulationError::InvalidHeapReference {
+                    reference_id: heap_ref.id(),
+                }
+                .into(),
+            )
+    }
+
+    /// Returns the object `heap_ref` names, shared with the heap: the same object, held by a
+    /// reference count, with no copy of it made. A write to the heap afterwards copies the
+    /// object it writes ([`Arc::make_mut`]), so what this returns keeps the contents it had
+    /// when it was read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmulationError::InvalidHeapReference`] if the reference is invalid.
+    pub fn get_shared(&self, heap_ref: HeapRef) -> Result<Arc<HeapObject>> {
         let state = self
             .state
             .read()
@@ -1511,13 +1567,11 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        let obj =
-            state
-                .objects
-                .get(&heap_ref.id())
-                .ok_or(EmulationError::InvalidHeapReference {
-                    reference_id: heap_ref.id(),
-                })?;
+        let obj = state.objects.get(&heap_ref.id()).map(Arc::as_ref).ok_or(
+            EmulationError::InvalidHeapReference {
+                reference_id: heap_ref.id(),
+            },
+        )?;
         f(obj)
     }
 
@@ -1543,13 +1597,13 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        let obj =
-            state
-                .objects
-                .get_mut(&heap_ref.id())
-                .ok_or(EmulationError::InvalidHeapReference {
-                    reference_id: heap_ref.id(),
-                })?;
+        let obj = state
+            .objects
+            .get_mut(&heap_ref.id())
+            .map(Arc::make_mut)
+            .ok_or(EmulationError::InvalidHeapReference {
+                reference_id: heap_ref.id(),
+            })?;
         f(obj)
     }
 
@@ -1572,8 +1626,36 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
-            Some(HeapObject::String(s)) => Ok(Arc::clone(s)),
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
+            Some(HeapObject::String(s)) => Ok(Arc::clone(s.text())),
+            Some(other) => Err(EmulationError::HeapTypeMismatch {
+                expected: "string",
+                found: other.kind(),
+            }
+            .into()),
+            None => Err(EmulationError::InvalidHeapReference {
+                reference_id: heap_ref.id(),
+            }
+            .into()),
+        }
+    }
+
+    /// Gets a string from the heap with its UTF-16 view: its length and its characters by
+    /// index as .NET counts them (`String.Length`, `String.Chars`), each in O(1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmulationError::HeapTypeMismatch`] if the object is not a string, or
+    /// [`EmulationError::InvalidHeapReference`] if the reference names no object.
+    pub fn get_managed_string(&self, heap_ref: HeapRef) -> Result<ManagedString> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "managed heap",
+            })?;
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
+            Some(HeapObject::String(s)) => Ok(s.clone()),
             Some(other) => Err(EmulationError::HeapTypeMismatch {
                 expected: "string",
                 found: other.kind(),
@@ -1602,7 +1684,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::Object { fields, .. }) => fields
                 .get(&field_token)
                 .cloned()
@@ -1635,7 +1717,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get_mut(&heap_ref.id()) {
+        match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
             Some(HeapObject::Object { fields, .. }) => {
                 fields.insert(field_token, value);
                 Ok(())
@@ -1676,7 +1758,7 @@ impl ManagedHeap {
             return Ok(*original_token);
         }
 
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(
                 HeapObject::Object { type_token, .. }
                 | HeapObject::BoxedValue { type_token, .. }
@@ -1731,7 +1813,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::BoxedValue { value, .. }) => Ok((**value).clone()),
             Some(other) => Err(EmulationError::HeapTypeMismatch {
                 expected: "boxed value",
@@ -1832,13 +1914,15 @@ impl ManagedHeap {
         Ok(state
             .objects
             .iter()
-            .map(|(&id, obj)| (HeapRef::new(id), obj.clone()))
+            .map(|(&id, obj)| (HeapRef::new(id), HeapObject::clone(obj)))
             .collect())
     }
 
     /// Returns an iterator over all heap objects.
     ///
-    /// Snapshots all objects upfront so no lock is held during iteration.
+    /// Snapshots all objects upfront so no lock is held during iteration. The
+    /// snapshot shares each object with the heap rather than copying it, so a scan
+    /// of a heap holding large arrays costs a reference per object.
     ///
     /// # Errors
     ///
@@ -1853,7 +1937,7 @@ impl ManagedHeap {
         let items: Vec<_> = state
             .objects
             .iter()
-            .map(|(&id, obj)| (HeapRef::new(id), obj.clone()))
+            .map(|(&id, obj)| (HeapRef::new(id), Arc::clone(obj)))
             .collect();
         Ok(HeapIter {
             items: items.into_iter(),
@@ -1910,7 +1994,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::Encoding { encoding_type }) => Some(*encoding_type),
             _ => None,
         })
@@ -1918,13 +2002,13 @@ impl ManagedHeap {
 
     /// Preserves the original .NET type token when a heap object is about to be
     /// replaced by a BCL wrapper. Must be called while holding `state` write lock.
-    pub(crate) fn preserve_original_type(state: &mut HeapState, id: u64) {
+    pub fn preserve_original_type(state: &mut HeapState, id: u64) {
         if state.original_types.contains_key(&id) {
             return;
         }
         if let Some(
             HeapObject::Object { type_token, .. } | HeapObject::BoxedValue { type_token, .. },
-        ) = state.objects.get(&id)
+        ) = state.objects.get(&id).map(Arc::as_ref)
         {
             state.original_types.insert(id, *type_token);
         }
@@ -1957,7 +2041,7 @@ impl ManagedHeap {
         let id = heap_ref.id();
         Self::preserve_original_type(&mut state, id);
 
-        let Some(existing) = state.objects.get(&id) else {
+        let Some(existing) = state.objects.get(&id).map(Arc::as_ref) else {
             return Ok(());
         };
 
@@ -1974,7 +2058,7 @@ impl ManagedHeap {
                 .fetch_sub(old_size.saturating_sub(new_size), Ordering::Relaxed);
         }
 
-        state.objects.insert(id, obj);
+        state.objects.insert(id, Arc::new(obj));
         Ok(())
     }
 }

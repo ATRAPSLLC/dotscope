@@ -43,6 +43,8 @@ use crate::metadata::{token::Token, typesystem::CilFlavor};
 /// | 0x7F01_0017  | System.MissingFieldException                      |
 /// | 0x7F01_0018  | System.NotImplementedException                    |
 /// | 0x7F01_001B  | System.AccessViolationException                   |
+/// | 0x7F01_001C  | System.Security.Cryptography.CryptographicException |
+/// | 0x7F01_001D  | System.IO.InvalidDataException                    |
 pub mod synthetic_exception {
     use crate::metadata::token::Token;
 
@@ -115,6 +117,18 @@ pub mod synthetic_exception {
     /// touches a guard page. Obfuscators probe for an emulator by writing where a real
     /// process would fault, so silently permitting the access is itself a detection signal.
     pub const ACCESS_VIOLATION: Token = Token::new(0x7F01_001B);
+    /// System.Security.Cryptography.CryptographicException
+    ///
+    /// Thrown by the cryptography hooks where the runtime throws it: a key or IV of a size the
+    /// algorithm does not take, input that is not whole blocks, padding that does not check
+    /// out, a malformed key. Decrypting with the wrong key is the case obfuscated code relies
+    /// on: it catches the exception rather than reading garbage.
+    pub const CRYPTOGRAPHIC: Token = Token::new(0x7F01_001C);
+    /// System.IO.InvalidDataException
+    ///
+    /// Thrown by `DeflateStream`/`GZipStream` reads whose compressed data does not inflate,
+    /// as the runtime throws it.
+    pub const INVALID_DATA: Token = Token::new(0x7F01_001D);
 }
 
 /// Errors that can occur during CIL emulation.

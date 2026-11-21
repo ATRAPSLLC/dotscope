@@ -19,8 +19,9 @@
 
 use crate::{
     emulation::{
+        engine::synthetic_exception,
         runtime::{
-            bcl::io::stream::{stream_close_pre, stream_dispose_pre},
+            bcl::{io::stream::stream_dispose_pre, limits::buffer_range},
             hook::{Hook, HookContext, HookManager, PreHookResult},
         },
         thread::EmulationThread,
@@ -48,7 +49,7 @@ pub fn register(manager: &HookManager) -> Result<()> {
     manager.register(
         Hook::new("System.IO.Compression.DeflateStream.Close")
             .match_name("System.IO.Compression", "DeflateStream", "Close")
-            .pre(stream_close_pre),
+            .pre(stream_dispose_pre),
     )?;
 
     manager.register(
@@ -73,7 +74,7 @@ pub fn register(manager: &HookManager) -> Result<()> {
     manager.register(
         Hook::new("System.IO.Compression.GZipStream.Close")
             .match_name("System.IO.Compression", "GZipStream", "Close")
-            .pre(stream_close_pre),
+            .pre(stream_dispose_pre),
     )?;
 
     manager.register(
@@ -172,42 +173,54 @@ fn compressed_stream_read_pre(
 ) -> PreHookResult {
     let stream_ref = match ctx.this {
         Some(EmValue::ObjectRef(r)) => *r,
-        _ => return PreHookResult::Bypass(Some(EmValue::I32(0))),
+        Some(EmValue::Null) => return PreHookResult::throw_null_reference(),
+        _ => return PreHookResult::Error(format!("{}.Read without a stream", ctx.type_name)),
     };
 
-    // Parse buffer, offset, count
-    #[allow(clippy::cast_sign_loss)]
-    let (buffer_ref, offset, count) = match (ctx.args.first(), ctx.args.get(1), ctx.args.get(2)) {
-        (Some(EmValue::ObjectRef(b)), Some(EmValue::I32(o)), Some(EmValue::I32(c))) => {
-            (*b, *o as usize, *c as usize)
-        }
-        _ => return PreHookResult::Bypass(Some(EmValue::I32(0))),
-    };
+    let (buffer_ref, offset, count) =
+        match buffer_range(ctx, thread, synthetic_exception::ARGUMENT_OUT_OF_RANGE) {
+            Ok(range) => range,
+            Err(result) => return result,
+        };
 
     // On first read, decompress the underlying stream data
     if !try_hook!(thread.heap().has_compressed_stream_data(stream_ref)) {
         let Some((underlying, compression_type, _mode)) =
             try_hook!(thread.heap().get_compressed_stream_info(stream_ref))
         else {
-            return PreHookResult::Bypass(Some(EmValue::I32(0)));
+            return PreHookResult::Error(format!(
+                "{}.Read on no emulated compressed stream",
+                ctx.type_name
+            ));
         };
 
         let Some((compressed_data, underlying_pos)) =
             try_hook!(thread.heap().get_stream_data(underlying))
         else {
-            return PreHookResult::Bypass(Some(EmValue::I32(0)));
+            return PreHookResult::Error(format!("{}.Read over no emulated stream", ctx.type_name));
         };
 
         // Use data from the underlying stream's current position, not from offset 0
         let effective_data = compressed_data.get(underlying_pos..).unwrap_or(&[]);
 
+        // Data that does not inflate is the InvalidDataException the runtime throws, not an
+        // empty stream
         let decompressed = match compression_type {
-            0 => decompress_deflate(effective_data).ok(),
-            1 => decompress_gzip(effective_data).ok(),
-            _ => None,
+            0 => decompress_deflate(effective_data),
+            1 => decompress_gzip(effective_data),
+            other => {
+                return PreHookResult::Error(format!("compression type {other} is not emulated"))
+            }
         };
-
-        let data = decompressed.unwrap_or_default();
+        let data = match decompressed {
+            Ok(data) => data,
+            Err(e) => {
+                return PreHookResult::Throw {
+                    exception_type: synthetic_exception::INVALID_DATA,
+                    message: format!("the compressed data is not valid: {e}"),
+                }
+            }
+        };
         try_hook!(thread.heap().set_compressed_stream_data(stream_ref, data));
     }
 
@@ -227,4 +240,71 @@ fn compressed_stream_read_pre(
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     PreHookResult::Bypass(Some(EmValue::I32(bytes.len() as i32)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        metadata::{token::Token, typesystem::PointerSize},
+        testkit::emulation::create_test_thread,
+    };
+
+    /// `DeflateStream.Read` of `buffer` with `offset` and `count` over a stream of `data`.
+    fn read_deflate(data: &[u8], offset: i32, count: i32) -> PreHookResult {
+        let mut thread = create_test_thread();
+        let underlying = thread.heap().alloc_stream(data.to_vec(), None).unwrap();
+        let stream = thread.heap().alloc_stream(Vec::new(), None).unwrap();
+        assert!(thread
+            .heap()
+            .replace_with_compressed_stream(stream, underlying, 0, 0)
+            .unwrap());
+        let buffer = thread.heap().alloc_byte_array(&[0u8; 16]).unwrap();
+        let this = EmValue::ObjectRef(stream);
+        let args = [
+            EmValue::ObjectRef(buffer),
+            EmValue::I32(offset),
+            EmValue::I32(count),
+        ];
+        let ctx = HookContext::new(
+            Token::new(0x0A000001),
+            "System.IO.Compression",
+            "DeflateStream",
+            "Read",
+            PointerSize::Bit64,
+        )
+        .with_this(Some(&this))
+        .with_args(&args);
+        compressed_stream_read_pre(&ctx, &mut thread)
+    }
+
+    /// Data that does not inflate is the `InvalidDataException` the runtime throws, not an
+    /// empty stream; a negative offset or count, or a range past the buffer, the argument
+    /// exceptions it throws before reading.
+    #[test]
+    fn a_read_the_runtime_refuses_throws() {
+        let thrown = |result: PreHookResult, expected: Token| matches!(result, PreHookResult::Throw { exception_type, .. } if exception_type == expected);
+        // Block type 3 is reserved: no deflate stream starts with it
+        assert!(thrown(
+            read_deflate(&[0xFF, 0xFF, 0xFF], 0, 16),
+            synthetic_exception::INVALID_DATA
+        ));
+        assert!(thrown(
+            read_deflate(&[0x03, 0x00], -1, 4),
+            synthetic_exception::ARGUMENT_OUT_OF_RANGE
+        ));
+        assert!(thrown(
+            read_deflate(&[0x03, 0x00], 8, 16),
+            synthetic_exception::ARGUMENT_OUT_OF_RANGE
+        ));
+        assert!(thrown(
+            read_deflate(&[0x03, 0x00], 17, 0),
+            synthetic_exception::ARGUMENT_OUT_OF_RANGE
+        ));
+        // An empty final stored block inflates to nothing: a read of zero bytes
+        assert!(matches!(
+            read_deflate(&[0x03, 0x00], 0, 16),
+            PreHookResult::Bypass(Some(EmValue::I32(0)))
+        ));
+    }
 }

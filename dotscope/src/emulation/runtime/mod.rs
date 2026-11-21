@@ -50,7 +50,7 @@
 //! 2. **Pre-Hook**: Execute pre-hook (can bypass original method)
 //! 3. **Original Method**: Execute if not bypassed
 //! 4. **Post-Hook**: Execute post-hook (can modify return value)
-//! 5. **Default Behavior**: Apply [`UnknownMethodBehavior`] if no hook matches
+//! 5. **Default Behavior**: Apply [`UnknownMethodBehavior`](crate::emulation::UnknownMethodBehavior) if no hook matches
 //!
 //! # Examples
 //!
@@ -128,4 +128,5 @@ pub use hook::{
     NameMatcher, NativeMethodMatcher, PostHookFn, PostHookResult, PreHookFn, PreHookResult,
     RuntimeMatcher, SignatureMatcher,
 };
+pub use native::{NativeFunction, NativeFunctionRegistry};
 pub use state::{RuntimeState, RuntimeStateBuilder};

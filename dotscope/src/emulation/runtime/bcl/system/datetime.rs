@@ -50,6 +50,7 @@ use crate::{
         thread::EmulationThread,
         EmValue,
     },
+    file::debug::debug_type,
     Result,
 };
 
@@ -281,13 +282,26 @@ fn extract_ticks(value: &EmValue) -> Option<i64> {
 /// Extracts ticks from the `this` receiver of an instance property call.
 ///
 /// `DateTime` and `TimeSpan` are value types, so `this` may be either the
-/// value itself or a managed pointer to it. Falls back to `args[0]` since
-/// some calling conventions pass value-type receivers as the first argument.
-fn extract_ticks_from_this(ctx: &HookContext<'_>, _thread: &EmulationThread) -> Option<i64> {
-    if let Some(this) = ctx.this {
-        if let Some(ticks) = extract_ticks(this) {
-            return Some(ticks);
+/// value itself or a managed pointer to it (`ldloca; call get_Ticks`), which is read
+/// through. Falls back to `args[0]` since some calling conventions pass value-type
+/// receivers as the first argument.
+fn extract_ticks_from_this(ctx: &HookContext<'_>, thread: &EmulationThread) -> Option<i64> {
+    match ctx.this {
+        Some(EmValue::ManagedPtr(ptr)) => {
+            if let Some(ticks) = thread
+                .deref_pointer(ptr)
+                .ok()
+                .and_then(|value| extract_ticks(&value))
+            {
+                return Some(ticks);
+            }
         }
+        Some(this) => {
+            if let Some(ticks) = extract_ticks(this) {
+                return Some(ticks);
+            }
+        }
+        None => {}
     }
     // Fall back to first arg (instance methods on value types may pass this as arg[0])
     ctx.args.first().and_then(extract_ticks)
@@ -310,12 +324,21 @@ fn unix_to_ticks(unix_timestamp: u32) -> i64 {
 /// Reads `TimeDateStamp` from the COFF header of the loaded assembly. If no
 /// assembly is loaded or the timestamp is zero, returns [`FALLBACK_TICKS`]
 /// (2024-01-01) to provide a safe date that won't trigger trial expiration.
+///
+/// A deterministic build (one whose debug directory has a `Repro` entry) stores a hash of
+/// its content in `TimeDateStamp`, not a time: read as one it lands anywhere up to 2106,
+/// and a protector's expiry check against "now" then fails. Such a build gets
+/// [`FALLBACK_TICKS`] too.
 fn pe_build_ticks(thread: &EmulationThread) -> i64 {
     thread
         .assembly()
         .map(|asm| {
             let ts = asm.file().pe().coff_header.time_date_stamp;
-            if ts > 0 {
+            let deterministic = asm
+                .file()
+                .debug_directory()
+                .is_ok_and(|entries| entries.iter().any(|entry| entry.kind == debug_type::REPRO));
+            if ts > 0 && !deterministic {
                 unix_to_ticks(ts)
             } else {
                 FALLBACK_TICKS
@@ -446,53 +469,41 @@ fn ticks_to_date(ticks: i64) -> (i32, i32, i32) {
 
 /// Hook for `DateTime..ctor` — constructs a DateTime from ticks or date components.
 ///
-/// Handles three overload families:
+/// The emulator represents a `DateTime` as its ticks. Handles three overload families:
 /// - `.ctor(long ticks)` — raw ticks passthrough
 /// - `.ctor(long ticks, DateTimeKind)` — ticks with kind (kind is ignored)
 /// - `.ctor(int year, int month, int day)` — converts date components to ticks
-fn datetime_ctor_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread) -> PreHookResult {
-    match ctx.args.len() {
-        // .ctor(long ticks) — `this` is arg[0] for value type ctors, ticks is arg[1]
-        // or ticks is the only arg if this is passed separately
-        1 => {
-            if let Some(ticks) = ctx.args.first().and_then(extract_ticks) {
-                return PreHookResult::Bypass(Some(EmValue::I64(ticks)));
-            }
-            PreHookResult::Continue
-        }
-        2 => {
-            // Could be .ctor(this, ticks) or .ctor(ticks, DateTimeKind)
-            if let Some(ticks) = ctx.args.first().and_then(extract_ticks) {
-                return PreHookResult::Bypass(Some(EmValue::I64(ticks)));
-            }
-            if let Some(ticks) = ctx.args.get(1).and_then(extract_ticks) {
-                return PreHookResult::Bypass(Some(EmValue::I64(ticks)));
-            }
-            PreHookResult::Continue
-        }
+///
+/// A constructor called on a local or field (`ldloca; call .ctor`) gets `this` as a pointer
+/// to the value and stores the ticks through it, returning nothing as a constructor does.
+/// Under `newobj` the hook returns the ticks, which `newobj` pushes as the new value.
+fn datetime_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
+    let ticks = match ctx.args.len() {
+        1 => ctx.args.first().and_then(extract_ticks),
+        // .ctor(long ticks, DateTimeKind)
+        2 => ctx.args.first().and_then(extract_ticks),
+        // .ctor(int year, int month, int day), the rest of a longer overload ignored
         n if n >= 3 => {
-            // .ctor(int year, int month, int day) or .ctor(this, year, month, day)
-            let (y, m, d) = if n >= 4 {
-                // this, year, month, day
-                (
-                    ctx.args.get(1).and_then(extract_i32),
-                    ctx.args.get(2).and_then(extract_i32),
-                    ctx.args.get(3).and_then(extract_i32),
-                )
-            } else {
-                (
-                    ctx.args.first().and_then(extract_i32),
-                    ctx.args.get(1).and_then(extract_i32),
-                    ctx.args.get(2).and_then(extract_i32),
-                )
-            };
-            if let (Some(year), Some(month), Some(day)) = (y, m, d) {
-                let ticks = date_to_ticks(year, month, day);
-                return PreHookResult::Bypass(Some(EmValue::I64(ticks)));
+            match (
+                ctx.args.first().and_then(extract_i32),
+                ctx.args.get(1).and_then(extract_i32),
+                ctx.args.get(2).and_then(extract_i32),
+            ) {
+                (Some(year), Some(month), Some(day)) => Some(date_to_ticks(year, month, day)),
+                _ => None,
             }
-            PreHookResult::Continue
         }
-        _ => PreHookResult::Continue,
+        _ => None,
+    };
+    let Some(ticks) = ticks else {
+        return PreHookResult::Continue;
+    };
+    match ctx.this {
+        Some(EmValue::ManagedPtr(ptr)) => {
+            try_hook!(thread.store_through_pointer(ptr, EmValue::I64(ticks)));
+            PreHookResult::Bypass(None)
+        }
+        _ => PreHookResult::Bypass(Some(EmValue::I64(ticks))),
     }
 }
 
@@ -792,7 +803,20 @@ fn timespan_from_ticks_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread)
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::{
+        emulation::{ManagedPointer, ThreadId},
+        metadata::{
+            token::Token,
+            typesystem::{CilFlavor, PointerSize},
+        },
+        testkit::{
+            emulation::{create_test_context_with, create_test_thread},
+            load_sample,
+        },
+    };
 
     #[test]
     fn test_date_to_ticks_known_dates() {
@@ -849,5 +873,105 @@ mod tests {
         assert_eq!(extract_ticks(&EmValue::I64(12345)), Some(12345));
         assert_eq!(extract_ticks(&EmValue::I32(42)), Some(42));
         assert_eq!(extract_ticks(&EmValue::Null), None);
+    }
+
+    /// `ldloca d; ldc.i8 ticks; call DateTime::.ctor(long)` stores the ticks in the local and
+    /// returns nothing, as a constructor does; `d.Ticks` through the pointer reads them back.
+    /// The hook returned the ticks, which the call left on the caller's stack, and the
+    /// local stayed unset; `get_Ticks` did not read through a pointer.
+    #[test]
+    fn a_constructor_on_a_local_stores_the_value() {
+        let mut thread = create_test_thread();
+        thread.start_method(Token::new(0x0600_0001), vec![CilFlavor::I8], vec![], false);
+        let local = EmValue::ManagedPtr(ManagedPointer::to_local(0, 0));
+        let args = [EmValue::I64(FALLBACK_TICKS)];
+        let ctor = HookContext::new(
+            Token::new(0x0A00_0001),
+            "System",
+            "DateTime",
+            ".ctor",
+            PointerSize::Bit64,
+        )
+        .with_this(Some(&local))
+        .with_args(&args);
+
+        assert!(matches!(
+            datetime_ctor_pre(&ctor, &mut thread),
+            PreHookResult::Bypass(None)
+        ));
+        let EmValue::ManagedPtr(pointer) = &local else {
+            unreachable!()
+        };
+        assert_eq!(
+            thread.deref_pointer(pointer).unwrap(),
+            EmValue::I64(FALLBACK_TICKS)
+        );
+
+        let get_ticks = HookContext::new(
+            Token::new(0x0A00_0002),
+            "System",
+            "DateTime",
+            "get_Ticks",
+            PointerSize::Bit64,
+        )
+        .with_this(Some(&local));
+        assert_eq!(
+            extract_ticks_from_this(&get_ticks, &thread),
+            Some(FALLBACK_TICKS)
+        );
+    }
+
+    /// Under `newobj` (no pointer to store through) the hook returns the ticks, which
+    /// `newobj` pushes as the new value.
+    #[test]
+    fn a_constructor_under_newobj_returns_the_value() {
+        let mut thread = create_test_thread();
+        let args = [EmValue::I32(2024), EmValue::I32(1), EmValue::I32(1)];
+        let ctor = HookContext::new(
+            Token::new(0x0A00_0001),
+            "System",
+            "DateTime",
+            ".ctor",
+            PointerSize::Bit64,
+        )
+        .with_args(&args);
+
+        assert!(matches!(
+            datetime_ctor_pre(&ctor, &mut thread),
+            PreHookResult::Bypass(Some(EmValue::I64(FALLBACK_TICKS)))
+        ));
+    }
+
+    /// `DateTime.Now` in the emulator is the build time from the PE header, except in a
+    /// deterministic build, whose debug directory has a `Repro` entry: there the header's
+    /// `TimeDateStamp` is a hash of the content. `original.exe`'s hash reads as 2065, and a
+    /// protector's expiry check against it fails.
+    #[test]
+    fn a_deterministic_build_has_no_build_time() {
+        let now = |sample: &str| {
+            let assembly = Arc::new(load_sample(sample));
+            let mut thread =
+                EmulationThread::new(ThreadId::MAIN, create_test_context_with(Some(assembly)));
+            let ctx = HookContext::new(
+                Token::new(0x0A00_0001),
+                "System",
+                "DateTime",
+                "get_Now",
+                PointerSize::Bit64,
+            );
+            match datetime_get_now_pre(&ctx, &mut thread) {
+                PreHookResult::Bypass(Some(EmValue::I64(ticks))) => ticks,
+                other => panic!("get_Now answers ticks: {other:?}"),
+            }
+        };
+
+        // Repro entry: the stamp 0xB2CAC1EF is a hash
+        assert_eq!(now("packers/netreactor/7.5.0/original.exe"), FALLBACK_TICKS);
+        // The same stamp without a Repro entry (the protector rewrote the debug directory)
+        // reads as the time it encodes
+        assert_eq!(
+            now("packers/netreactor/7.5.0/reactor_full.exe"),
+            unix_to_ticks(0xB2CA_C1EF)
+        );
     }
 }

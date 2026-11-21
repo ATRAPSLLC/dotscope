@@ -11,7 +11,9 @@
 //! - Enumerate type members (`GetMethods`, `GetFields`, `GetProperties`) to locate
 //!   decryption routines or build delegate dispatch tables
 //! - Create instances via `Activator.CreateInstance` for runtime object construction
-//! - Build and invoke delegates through `Delegate.CreateDelegate` and `Delegate.Invoke`
+//! - Build delegates through `Delegate.CreateDelegate` and combine them with
+//!   `Delegate.Combine`; a delegate's `Invoke`, whatever type declares it, is dispatched
+//!   by the call resolver to the methods of its invocation list
 //! - Check custom attributes via `GetCustomAttributes` and `IsDefined` for licensing
 //!   or anti-tamper verification
 //!
@@ -38,7 +40,6 @@ use crate::{
     },
     metadata::{
         method::Method,
-        tables::TableId,
         token::Token,
         typesystem::{
             wellknown, CilFlavor, CilPrimitiveData, CilPrimitiveKind, CilType, CilTypeReference,
@@ -141,18 +142,6 @@ pub fn register(manager: &HookManager) -> Result<()> {
         Hook::new("System.Type.MakeByRefType")
             .match_name("System", "Type", "MakeByRefType")
             .pre(type_make_by_ref_type_pre),
-    )?;
-
-    manager.register(
-        Hook::new("System.Delegate.Invoke")
-            .match_name("System", "Delegate", "Invoke")
-            .pre(delegate_invoke_pre),
-    )?;
-
-    manager.register(
-        Hook::new("System.MulticastDelegate.Invoke")
-            .match_name("System", "MulticastDelegate", "Invoke")
-            .pre(delegate_invoke_pre),
     )?;
 
     manager.register(
@@ -562,7 +551,7 @@ fn type_get_module_pre(_ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
 ///
 /// Gets the assembly in which the type is defined.
 ///
-/// Returns the pre-allocated fake Assembly object from [`FakeObjects`], ensuring
+/// Returns the pre-allocated fake Assembly object from [`FakeObjects`](crate::emulation::FakeObjects), ensuring
 /// consistency with `Module.get_Assembly`.
 fn type_get_assembly_pre(_ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(asm_ref) = thread.fake_objects().assembly() {
@@ -860,7 +849,7 @@ fn type_get_constructor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread)
                     .find_map(|arg| {
                         if let EmValue::ObjectRef(arr_ref) = arg {
                             if let Ok(HeapObject::Array { elements, .. }) =
-                                thread.heap().get(*arr_ref)
+                                thread.heap().get_shared(*arr_ref).as_deref()
                             {
                                 return Some(elements.len());
                             }
@@ -1634,7 +1623,7 @@ fn type_get_full_name_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
             if let Some(asm) = thread.assembly().cloned() {
                 if let Some(cil_type) = asm.types().resolve(&type_token) {
                     let full_name = if cil_type.namespace.is_empty() {
-                        cil_type.name.clone()
+                        cil_type.name.to_string()
                     } else {
                         format!("{}.{}", cil_type.namespace, cil_type.name)
                     };
@@ -2077,9 +2066,9 @@ fn activator_create_instance_pre(
                         .find_map(|arg| {
                             if let EmValue::ObjectRef(arr_ref) = arg {
                                 if let Ok(HeapObject::Array { elements, .. }) =
-                                    thread.heap().get(*arr_ref)
+                                    thread.heap().get_shared(*arr_ref).as_deref()
                                 {
-                                    return Some(elements);
+                                    return Some(elements.clone());
                                 }
                             }
                             None
@@ -2139,8 +2128,8 @@ fn delegate_create_delegate_pre(
 
     for arg in ctx.args.iter() {
         if let EmValue::ObjectRef(href) = arg {
-            if let Ok(obj) = thread.heap().get(*href) {
-                match &obj {
+            if let Ok(obj) = thread.heap().get_shared(*href).as_deref() {
+                match obj {
                     HeapObject::ReflectionMethod {
                         method_token: mt, ..
                     } => {
@@ -2174,59 +2163,6 @@ fn delegate_create_delegate_pre(
     PreHookResult::throw_argument_null("method")
 }
 
-/// Hook for `Delegate.Invoke` and `MulticastDelegate.Invoke`.
-///
-/// When the `this` object is a `HeapObject::Delegate` with a valid MethodDef target,
-/// sets up a `ReflectionInvokeRequest` to redirect execution to the target method.
-fn delegate_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    if let Some(EmValue::ObjectRef(href)) = ctx.this {
-        if let Ok(HeapObject::Delegate {
-            invocation_list, ..
-        }) = thread.heap().get(*href)
-        {
-            // Use last entry for dispatch (single-cast or last entry in multicast)
-            if let Some(entry) = invocation_list.last() {
-                let target_token = entry.method_token;
-                let delegate_target = entry.target;
-
-                // Resolve MemberRef -> MethodDef if possible
-                let resolved_token = if target_token.is_table(TableId::MemberRef) {
-                    if let Some(asm) = thread.assembly().cloned() {
-                        asm.resolver()
-                            .resolve_method(target_token)
-                            .filter(|t| t.is_table(TableId::MethodDef))
-                            .unwrap_or(target_token)
-                    } else {
-                        target_token
-                    }
-                } else {
-                    target_token
-                };
-
-                if resolved_token.is_table(TableId::MethodDef) {
-                    let this_ref = delegate_target.map(EmValue::ObjectRef);
-
-                    return PreHookResult::ReflectionInvoke {
-                        request: Box::new(ReflectionInvokeRequest {
-                            method_token: resolved_token,
-                            this_ref,
-                            args: ctx.args.to_vec(),
-                            method_type_args: None,
-                        }),
-                        bypass_value: Some(EmValue::Null),
-                    };
-                }
-                warn!(
-                    "Delegate.Invoke: target token 0x{:08X} is not resolvable MethodDef, skipping dispatch",
-                    target_token.value()
-                );
-            }
-        }
-    }
-    // Fallback: no valid delegate target
-    PreHookResult::Bypass(Some(EmValue::Null))
-}
-
 /// Hook for `Delegate.Combine(Delegate, Delegate)` static method.
 ///
 /// Concatenates the invocation lists of two delegates into a new multicast delegate.
@@ -2249,23 +2185,21 @@ fn delegate_combine_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
     };
 
     // Get invocation lists from both delegates
-    let (type_token, mut entries) = match thread.heap().get(a_ref) {
+    let (type_token, mut entries) = match thread.heap().get_shared(a_ref).as_deref() {
         Ok(HeapObject::Delegate {
             type_token,
             invocation_list,
-        }) => (type_token, invocation_list),
-        _ => return PreHookResult::Bypass(Some(arg0.clone())),
-    };
-
-    let b_entries = match thread.heap().get(b_ref) {
-        Ok(HeapObject::Delegate {
-            invocation_list, ..
-        }) => invocation_list,
+        }) => (*type_token, invocation_list.clone()),
         _ => return PreHookResult::Bypass(Some(arg0.clone())),
     };
 
     // Concatenate: a's entries followed by b's entries
-    entries.extend(b_entries);
+    match thread.heap().get_shared(b_ref).as_deref() {
+        Ok(HeapObject::Delegate {
+            invocation_list, ..
+        }) => entries.extend(invocation_list.iter().cloned()),
+        _ => return PreHookResult::Bypass(Some(arg0.clone())),
+    }
 
     match thread
         .heap_mut()
@@ -2300,15 +2234,15 @@ fn delegate_remove_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
         return PreHookResult::Bypass(Some(arg0.clone()));
     };
 
-    let (type_token, mut entries) = match thread.heap().get(source_ref) {
+    let (type_token, mut entries) = match thread.heap().get_shared(source_ref).as_deref() {
         Ok(HeapObject::Delegate {
             type_token,
             invocation_list,
-        }) => (type_token, invocation_list),
+        }) => (*type_token, invocation_list.clone()),
         _ => return PreHookResult::Bypass(Some(arg0.clone())),
     };
 
-    let remove_token = match thread.heap().get(value_ref) {
+    let remove_token = match thread.heap().get_shared(value_ref).as_deref() {
         Ok(HeapObject::Delegate {
             invocation_list, ..
         }) => {
@@ -2346,7 +2280,7 @@ fn delegate_get_method_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) 
     if let Some(EmValue::ObjectRef(href)) = ctx.this {
         if let Ok(HeapObject::Delegate {
             invocation_list, ..
-        }) = thread.heap().get(*href)
+        }) = thread.heap().get_shared(*href).as_deref()
         {
             if let Some(entry) = invocation_list.last() {
                 match thread
@@ -2375,7 +2309,7 @@ fn delegate_get_target_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) 
     if let Some(EmValue::ObjectRef(href)) = ctx.this {
         if let Ok(HeapObject::Delegate {
             invocation_list, ..
-        }) = thread.heap().get(*href)
+        }) = thread.heap().get_shared(*href).as_deref()
         {
             if let Some(entry) = invocation_list.last() {
                 return PreHookResult::Bypass(Some(
@@ -2400,9 +2334,12 @@ fn delegate_dynamic_invoke_pre(
         return PreHookResult::Bypass(Some(EmValue::Null));
     };
 
-    let Ok(HeapObject::Delegate {
+    let Ok(delegate) = thread.heap().get_shared(*delegate_ref) else {
+        return PreHookResult::Bypass(Some(EmValue::Null));
+    };
+    let HeapObject::Delegate {
         invocation_list, ..
-    }) = thread.heap().get(*delegate_ref)
+    } = &*delegate
     else {
         return PreHookResult::Bypass(Some(EmValue::Null));
     };
@@ -2416,11 +2353,10 @@ fn delegate_dynamic_invoke_pre(
 
     // Extract arguments from the object[] array (first argument to DynamicInvoke)
     let method_args = if let Some(EmValue::ObjectRef(arr_ref)) = ctx.args.first() {
-        if let Ok(HeapObject::Array { elements, .. }) = thread.heap().get(*arr_ref) {
-            elements
-                .into_iter()
-                .map(|v| unbox_value(thread, &v))
-                .collect()
+        if let Ok(HeapObject::Array { elements, .. }) =
+            thread.heap().get_shared(*arr_ref).as_deref()
+        {
+            elements.iter().map(|v| unbox_value(thread, v)).collect()
         } else {
             Vec::new()
         }
@@ -2625,7 +2561,7 @@ fn type_get_type_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
             for type_entry in types.iter() {
                 let ty = type_entry.value();
                 let full_name = if ty.namespace.is_empty() {
-                    ty.name.clone()
+                    ty.name.to_string()
                 } else {
                     format!("{}.{}", ty.namespace, ty.name)
                 };

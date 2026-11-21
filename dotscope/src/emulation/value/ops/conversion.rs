@@ -395,7 +395,7 @@ impl EmValue {
     /// For signed types, interprets the bit pattern as unsigned.
     /// For floating point values, truncates toward zero (negative values become 0).
     ///
-    /// Pointer types are also supported (see [`to_i64`] for details).
+    /// Pointer types are also supported (see [`to_i64`](Self::to_i64) for details).
     ///
     /// # Errors
     ///

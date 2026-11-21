@@ -21,7 +21,7 @@
 //!   unwinding
 //! - [`generics`] - Generic type/method instantiation tracking
 //! - [`interpreter`] - Core instruction interpreter with opcode dispatch
-//! - [`pointer`] - Instruction pointer and position tracking
+//! - [`pointer`](mod@pointer) - Instruction pointer and position tracking
 //! - [`resolution`] - Call and newobj resolution result types
 //! - [`result`] - Step and emulation result types
 //! - [`stats`] - Execution statistics and limit tracking
@@ -38,7 +38,7 @@
 //! ## Interpreter
 //!
 //! - [`Interpreter`] - Core instruction dispatch and execution
-//! - [`CallFrame`] - Method call stack frame
+//! - [`ThreadCallFrame`](crate::emulation::ThreadCallFrame) - Method call stack frame
 //!
 //! ## Error Handling
 //!
@@ -92,8 +92,8 @@
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 
-mod callresolver;
-mod cctors;
+pub mod callresolver;
+pub mod cctors;
 mod context;
 mod controller;
 mod dispatch;
@@ -108,13 +108,14 @@ mod result;
 mod stats;
 mod typeops;
 
-pub use context::{EmulationContext, SyntheticMethodBody};
+pub use context::{EmulationContext, MethodCode, SyntheticMethodBody};
 pub use controller::EmulationController;
 pub use error::{synthetic_exception, EmulationError};
+pub use generics::GenericRegistry;
 pub use interpreter::Interpreter;
 pub use pointer::InstructionPointer;
 pub use result::{EmulationOutcome, StepResult};
-pub use stats::LimitExceeded;
+pub use stats::{ExecutionStats, LimitExceeded};
 
 #[cfg(test)]
 mod tests {

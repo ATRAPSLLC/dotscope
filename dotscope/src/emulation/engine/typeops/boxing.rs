@@ -24,7 +24,7 @@ use crate::{
 /// # Arguments
 ///
 /// * `thread` - The emulation thread (for heap/stack access)
-/// * `context` - Optional emulation context for Nullable<T> detection
+/// * `context` - Optional emulation context for `Nullable<T>` detection
 /// * `type_token` - Token of the value type being boxed
 ///
 /// # Errors

@@ -130,7 +130,7 @@ pub struct AppDomainState {
     ///
     /// Each entry is a fully parsed [`CilObject`] that can be used for
     /// metadata resolution and instruction fetching. The index into this
-    /// vector is stored in [`ThreadCallFrame::assembly_index`] to track
+    /// vector is stored in [`ThreadCallFrame::assembly_index`](crate::emulation::ThreadCallFrame::assembly_index) to track
     /// which assembly a frame belongs to.
     loaded_cilobjects: Vec<Arc<CilObject>>,
 }

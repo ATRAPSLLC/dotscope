@@ -24,7 +24,7 @@
 //! |--------|-------------|
 //! | [`types`] | Core types: priorities, results, context |
 //! | [`matcher`] | Matcher trait and implementations |
-//! | [`hook`] | The [`Hook`] builder and executor |
+//! | [`core`] | The [`Hook`] builder and executor |
 //! | [`manager`] | [`HookManager`] for hook registration and lookup |
 //!
 //!

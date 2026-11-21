@@ -142,14 +142,16 @@ mod value;
 // Re-export primary types from value module
 // Re-export primary types from capture module
 pub use capture::{
-    AssemblyLoadMethod, BufferSource, CaptureContext, CaptureSource, CapturedAssembly,
-    CapturedBuffer, CapturedMethodReturn, CapturedString, FileOpKind, FileOperation,
-    MemorySnapshot, NetworkOpKind, NetworkOperation, ResourceRead,
+    AssemblyLoadMethod, BufferSource, CaptureContext, CaptureSource, CaptureStats,
+    CapturedAssembly, CapturedBuffer, CapturedMethodReturn, CapturedString, FileOpKind,
+    FileOperation, MemoryRegionSnapshot, MemorySnapshot, NetworkEndpoint, NetworkOpKind,
+    NetworkOperation, ResourceRead,
 };
 // Re-export primary types from engine module
 pub use engine::{
     synthetic_exception, EmulationContext, EmulationController, EmulationError, EmulationOutcome,
-    InstructionPointer, Interpreter, LimitExceeded, StepResult,
+    ExecutionStats, GenericRegistry, InstructionPointer, Interpreter, LimitExceeded, MethodCode,
+    StepResult, SyntheticMethodBody,
 };
 // Re-export primary types from exception module
 pub use exception::{
@@ -167,9 +169,9 @@ pub use loader::{
 // Re-export primary types from memory module
 pub use memory::{
     AddressSpace, ArgumentStorage, DelegateEntry, DictionaryKey, EncodingType, EvaluationStack,
-    HeapObject, LocalVariables, ManagedHeap, MemoryProtection, MemoryRegion, Page, SectionInfo,
-    SharedHeap, StaticFieldStorage, ThreadId, TypeInitState, TypeWrapper, UnmanagedMemory,
-    UnmanagedRef, PAGE_SIZE,
+    HeapIter, HeapObject, HeapState, LocalVariables, ManagedHeap, ManagedString, MemoryProtection,
+    MemoryRegion, Page, PageDataGuard, SectionInfo, SharedHeap, StaticFieldStorage, ThreadId,
+    TypeInitState, TypeWrapper, UnmanagedMemory, UnmanagedRef, PAGE_SIZE,
 };
 // Re-export primary types from process module
 pub use process::{
@@ -180,15 +182,15 @@ pub use process::{
 // Re-export primary types from runtime module
 pub use runtime::{
     AppDomainState, Hook, HookContext, HookManager, HookMatcher, HookOutcome, HookPriority,
-    InternalMethodMatcher, LoadedAssemblyInfo, NameMatcher, NativeMethodMatcher, PostHookFn,
-    PostHookResult, PreHookFn, PreHookResult, RuntimeMatcher, RuntimeState, RuntimeStateBuilder,
-    SignatureMatcher,
+    InternalMethodMatcher, LoadedAssemblyInfo, NameMatcher, NativeFunction, NativeFunctionRegistry,
+    NativeMethodMatcher, PostHookFn, PostHookResult, PreHookFn, PreHookResult, RuntimeMatcher,
+    RuntimeState, RuntimeStateBuilder, SignatureMatcher,
 };
 // Re-export primary types from thread module
 pub use thread::{
-    EmulationThread, EventState, MonitorState, MutexState, SchedulerOutcome, SemaphoreState,
-    SyncError, SyncState, ThreadCallFrame, ThreadContext, ThreadPriority, ThreadScheduler,
-    ThreadState, WaitReason, WakeCondition,
+    EmulationThread, EventState, MonitorState, MulticastState, MutexState, ReflectionInvokeRequest,
+    SchedulerOutcome, SemaphoreState, SyncError, SyncState, ThreadCallFrame, ThreadContext,
+    ThreadPriority, ThreadScheduler, ThreadState, WaitReason, WakeCondition,
 };
 // Re-export tracing infrastructure
 pub use tracer::{
@@ -199,3 +201,5 @@ pub use value::{
     BinaryOp, CompareOp, ConversionType, EmValue, HeapRef, ManagedPointer, PointerTarget,
     SymbolicValue, TaintSource, UnaryOp,
 };
+
+pub use crate::utils::{LeBytes, LeBytesIter};

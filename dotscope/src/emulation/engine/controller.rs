@@ -9,11 +9,11 @@
 //! [`EmulationProcess`](crate::emulation::process::EmulationProcess). It
 //! delegates to focused sub-modules for specific concerns:
 //!
-//! - **[`callresolver`](super::callresolver)** — Hook dispatch, virtual dispatch,
+//! - **[`callresolver`]** — Hook dispatch, virtual dispatch,
 //!   delegate dispatch, P/Invoke, frame management, and type initialization
-//! - **[`exhandler`](super::exhandler)** — Exception handler search, finally
+//! - **[`exhandler`]** — Exception handler search, finally
 //!   scheduling, and stack unwinding
-//! - **[`typeops`](super::typeops)** — Type operations (box, unbox, cast, sizeof,
+//! - **[`typeops`]** — Type operations (box, unbox, cast, sizeof,
 //!   static fields, newarr, newobj, ldstr)
 //!
 //! The controller itself handles the step-based execution loop: fetching
@@ -58,7 +58,7 @@ use crate::{
         memory::AddressSpace,
         process::{EmulationConfig, EmulationLimits},
         runtime::RuntimeState,
-        thread::{EmulationThread, ThreadCallFrame, ThreadContext},
+        thread::{EmulationThread, MulticastState, ThreadCallFrame, ThreadContext},
         tracer::{TraceEvent, TraceWriter},
         EmValue, SymbolicValue, TaintSource, ThreadId,
     },
@@ -566,7 +566,7 @@ impl EmulationController {
     /// - [`EmulationOutcome::Completed`] - Method finished normally
     /// - [`EmulationOutcome::Stopped`] - Condition triggered early stop
     /// - [`EmulationOutcome::LimitReached`] - Execution limit hit
-    /// - [`EmulationOutcome::Faulted`] - Unhandled exception
+    /// - [`EmulationOutcome::UnhandledException`] - Unhandled exception
     ///
     /// # Errors
     ///
@@ -742,421 +742,39 @@ impl EmulationController {
                 }
             }
 
-            // Handle the step result — dispatch to extracted handler methods
-            // for complex cases, keep simple ones inline.
-            let action = match step_result {
-                StepResult::Continue => LoopAction::Continue,
-
-                StepResult::Branch { target } => {
-                    let method_offset = context.rva_to_method_offset(current_method, target)?;
-                    if self.trace_instructions_enabled() {
-                        self.trace(TraceEvent::Branch {
-                            method: current_method,
-                            from_offset: interpreter.ip().offset(),
-                            to_offset: method_offset,
-                            conditional: true,
-                        });
+            // Errors the controller-side handlers raise belong to the instruction, as the
+            // interpreter's do: a CLR exception among them (an `unbox` of null or of another
+            // type, a failed `castclass`, an `initobj` through null) is thrown at the
+            // instruction and reaches its handlers instead of ending the run.
+            // A handler that already moved to another frame or method when it failed has no
+            // throw point left in this one, and its error stays an error.
+            let instruction_offset = interpreter.ip().offset();
+            let call_depth = thread.call_depth();
+            let action = match self.dispatch_step_result(
+                interpreter,
+                thread,
+                context,
+                current_method,
+                step_result,
+            ) {
+                Ok(action) => action,
+                Err(err) => {
+                    if thread.call_depth() != call_depth
+                        || interpreter.ip().method() != current_method
+                    {
+                        return Err(err);
                     }
-                    interpreter.set_offset(method_offset);
-                    LoopAction::Continue
-                }
-
-                StepResult::Return { value: _ } => {
-                    self.handle_return(interpreter, thread, context, current_method)?
-                }
-
-                StepResult::Call {
-                    method,
-                    args: _,
-                    is_virtual,
-                    constrained_type,
-                } => self.handle_call(
-                    interpreter,
-                    thread,
-                    context,
-                    current_method,
-                    method,
-                    is_virtual,
-                    constrained_type,
-                )?,
-
-                StepResult::CallIndirect {
-                    signature,
-                    function_pointer,
-                } => self.handle_call_indirect(
-                    interpreter,
-                    thread,
-                    context,
-                    current_method,
-                    signature,
-                    function_pointer,
-                )?,
-
-                StepResult::NewObj {
-                    constructor,
-                    args: _,
-                } => {
-                    self.handle_newobj(interpreter, thread, context, current_method, constructor)?
-                }
-
-                StepResult::NewArray {
-                    element_type,
-                    length,
-                } => {
-                    typeops::handle_newarr(thread, context, element_type, length)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::LoadString { token } => {
-                    typeops::handle_ldstr(thread, context, token)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::LoadStaticField { field } => {
-                    if callresolver::maybe_run_type_cctor(
-                        &self.context.address_space,
-                        &self.cctor_tracker,
+                    interpreter.set_offset(instruction_offset);
+                    match self.handle_step_error(
                         interpreter,
                         thread,
                         context,
-                        field,
+                        current_method,
+                        err,
                     )? {
-                        LoopAction::Continue
-                    } else {
-                        typeops::handle_ldsfld(
-                            &self.context.address_space,
-                            thread,
-                            context,
-                            field,
-                        )?;
-                        if self.trace_writer.is_some() {
-                            let value_str = thread
-                                .stack()
-                                .peek()
-                                .map(|v| format!("{v:?}"))
-                                .unwrap_or_default();
-                            self.trace(TraceEvent::StaticFieldValue {
-                                method: current_method,
-                                offset: interpreter.ip().offset(),
-                                field,
-                                is_load: true,
-                                value: value_str,
-                            });
-                        }
-                        interpreter.ip_mut().advance_current();
-                        LoopAction::Continue
+                        LoopAction::Continue => continue,
+                        LoopAction::Return(outcome) => return Ok(*outcome),
                     }
-                }
-
-                StepResult::StoreStaticField { field, value } => {
-                    if self.trace_writer.is_some() {
-                        self.trace(TraceEvent::StaticFieldValue {
-                            method: current_method,
-                            offset: interpreter.ip().offset(),
-                            field,
-                            is_load: false,
-                            value: format!("{value:?}"),
-                        });
-                    }
-                    thread.push(value.clone())?;
-                    if callresolver::maybe_run_type_cctor(
-                        &self.context.address_space,
-                        &self.cctor_tracker,
-                        interpreter,
-                        thread,
-                        context,
-                        field,
-                    )? {
-                        LoopAction::Continue
-                    } else {
-                        let _ = thread.pop()?;
-                        self.context.address_space.set_static(field, value)?;
-                        interpreter.ip_mut().advance_current();
-                        LoopAction::Continue
-                    }
-                }
-
-                StepResult::Throw { exception } => {
-                    self.handle_throw(interpreter, thread, context, current_method, exception)?
-                }
-
-                StepResult::Leave { target } => {
-                    self.handle_leave(interpreter, thread, context, current_method, target)?
-                }
-
-                StepResult::EndFinally => {
-                    self.handle_end_finally(interpreter, thread, context, current_method)?
-                }
-
-                StepResult::EndFilter { value } => {
-                    // ECMA-335 §12.4.2.5: `endfilter` takes an int32. 0 means "continue the
-                    // search", 1 means "this handler runs". Anything else is not a filter
-                    // result — treating a non-int32 as rejection silently mis-routes the
-                    // exception, so it is a program error.
-                    let EmValue::I32(filter_result) = value else {
-                        return Err(EmulationError::InternalError {
-                            description: format!(
-                                "endfilter expects an int32 result, found {}",
-                                value.type_name()
-                            ),
-                        }
-                        .into());
-                    };
-                    let should_handle = filter_result != 0;
-
-                    thread
-                        .exception_state_mut()
-                        .set_filter_result(Some(should_handle));
-
-                    if should_handle {
-                        // Read the filter state *before* clearing it. `set_in_filter(false)`
-                        // also nulls `filter_handler_offset` (see
-                        // `ThreadExceptionState::set_in_filter`), so reading the offset
-                        // afterwards always yields `None` — and the resulting fall-through
-                        // returns `Continue` without advancing the IP, re-executing this same
-                        // `endfilter` forever. The rejecting path below has the same
-                        // constraint: it needs the offset as its skip key.
-                        let handler_offset = thread.exception_state_mut().filter_handler_offset();
-                        let origin_offset = self.exception_origin(thread, interpreter);
-                        thread.exception_state_mut().set_in_filter(false);
-
-                        let Some(handler_offset) = handler_offset else {
-                            // `enter_filter` records the offset on every path that dispatches a
-                            // filter, so its absence here means the filter body was entered
-                            // without going through exception dispatch. Continuing would spin.
-                            return Err(EmulationError::InternalError {
-                                description:
-                                    "endfilter accepted but no filter handler offset was recorded"
-                                        .to_string(),
-                            }
-                            .into());
-                        };
-
-                        {
-                            // `endfilter` consumed the exception object that
-                            // `apply_handler_match` pushed before entering the filter, so the
-                            // handler would otherwise start on whatever the filter left behind
-                            // — typically an underflow on its first `stloc`. Re-push it, as the
-                            // catch path does.
-                            if let Some(exception) =
-                                thread.exception_state_mut().get_exception_value()
-                            {
-                                thread.stack_mut().clear();
-                                thread.push(exception)?;
-                            }
-
-                            thread.exception_state_mut().enter_catch_handler(
-                                current_method,
-                                origin_offset,
-                                handler_offset,
-                            );
-                            interpreter.set_offset(handler_offset);
-                            LoopAction::Continue
-                        }
-                    } else {
-                        // Rejection means "keep searching", not "unhandled". Resume the scan
-                        // after the rejected Filter clause and fall into the normal unwind path
-                        // if nothing else matches; returning `UnhandledException` here reports a
-                        // genuinely-caught exception as unhandled and stops the run, which an
-                        // obfuscator can use to hide everything past a rejecting filter.
-                        self.resume_search_after_filter(
-                            interpreter,
-                            thread,
-                            context,
-                            current_method,
-                        )?
-                    }
-                }
-
-                StepResult::Rethrow => {
-                    self.handle_rethrow(interpreter, thread, context, current_method)?
-                }
-
-                StepResult::Breakpoint => {
-                    LoopAction::Return(Box::new(EmulationOutcome::Breakpoint {
-                        offset: interpreter.ip().offset(),
-                        instructions: interpreter.stats().instructions_executed,
-                    }))
-                }
-
-                StepResult::Jmp { method } => {
-                    self.handle_jmp(interpreter, thread, context, method)?
-                }
-
-                StepResult::TailCall {
-                    method,
-                    is_virtual,
-                    constrained_type,
-                } => self.handle_tail_call(
-                    interpreter,
-                    thread,
-                    context,
-                    current_method,
-                    method,
-                    is_virtual,
-                    constrained_type,
-                )?,
-
-                StepResult::Box { type_token } => {
-                    typeops::handle_box(thread, Some(context), type_token)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::Unbox { type_token } | StepResult::UnboxAny { type_token } => {
-                    typeops::handle_unbox(thread, Some(context), type_token)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::CastClass { type_token } => {
-                    typeops::handle_castclass(thread, context, type_token)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::IsInst { type_token } => {
-                    typeops::handle_isinst(thread, context, type_token)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::SizeOf { type_token } => {
-                    typeops::handle_sizeof(
-                        thread,
-                        context,
-                        type_token,
-                        self.context.config.pointer_size,
-                    )?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::LoadToken { token } => {
-                    // Resolve generic type parameters (!!0, !!1, etc.) in ldtoken.
-                    // TypeSpec tokens encoding ELEMENT_TYPE_MVAR need to be resolved
-                    // to the actual type argument from the current MethodSpec.
-                    let resolved =
-                        Self::resolve_ldtoken_generic(token, thread, context).unwrap_or(token);
-                    thread.push(EmValue::NativeInt(i64::from(resolved.value())))?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::LoadFunctionPointer { method } => {
-                    thread.push(EmValue::UnmanagedPtr(u64::from(method.value())))?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::LoadVirtualFunctionPointer { method } => {
-                    thread.push(EmValue::UnmanagedPtr(u64::from(method.value())))?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::InitObj { type_token } => {
-                    typeops::handle_initobj(thread, Some(context), type_token)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::CopyObject { type_token } => {
-                    typeops::handle_cpobj(
-                        &self.context.address_space,
-                        thread,
-                        Some(context),
-                        type_token,
-                    )?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::LocalAlloc { size } => {
-                    let size_bytes = size.as_size()?;
-                    let ptr = thread.address_space().alloc_unmanaged(size_bytes)?;
-                    thread.push(EmValue::UnmanagedPtr(ptr))?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::CopyBlock { dest, src, size } => {
-                    typeops::handle_cpblk(thread, &dest, &src, &size)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::InitBlock { addr, value, size } => {
-                    typeops::handle_initblk(thread, &addr, &value, &size)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::RefAnyVal { type_token } => {
-                    // ECMA-335 §III.4.22: extract address from typed reference,
-                    // verifying the type matches. Throws InvalidCastException on
-                    // mismatch.
-                    let typed_ref = thread.pop()?;
-                    let address = match typed_ref.as_object_ref() {
-                        Some(href) => self
-                            .context
-                            .address_space
-                            .managed_heap()
-                            .typed_reference_value(href, Some(type_token))?,
-                        None => {
-                            return Err(EmulationError::TypeMismatch {
-                                operation: "refanyval",
-                                expected: "TypedReference (object ref)",
-                                found: "non-reference value",
-                            }
-                            .into());
-                        }
-                    };
-                    thread.push(address)?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::MkRefAny { type_token } => {
-                    // ECMA-335 §III.4.14: package an address and type into a
-                    // TypedReference.
-                    let addr = thread.pop()?;
-                    let href = self
-                        .context
-                        .address_space
-                        .managed_heap()
-                        .alloc_typed_reference(type_token, addr)?;
-                    thread.push(EmValue::ObjectRef(href))?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::RefAnyType => {
-                    // ECMA-335 §III.4.23: extract the type token from a typed
-                    // reference and push it as a RuntimeTypeHandle (NativeInt).
-                    let typed_ref = thread.pop()?;
-                    let type_value = match typed_ref.as_object_ref() {
-                        Some(href) => {
-                            let token = self
-                                .context
-                                .address_space
-                                .managed_heap()
-                                .typed_reference_type(href)?;
-                            i64::from(token.value())
-                        }
-                        None => 0,
-                    };
-                    thread.push(EmValue::NativeInt(type_value))?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
-                }
-
-                StepResult::ArgList => {
-                    thread.push(EmValue::NativeInt(0))?;
-                    interpreter.ip_mut().advance_current();
-                    LoopAction::Continue
                 }
             };
 
@@ -1165,6 +783,426 @@ impl EmulationController {
                 LoopAction::Return(outcome) => return Ok(*outcome),
             }
         }
+    }
+
+    /// Carries out the controller's part of an instruction the interpreter stepped: the
+    /// [`StepResult`] names the work (a call, a branch, an allocation, exception dispatch),
+    /// done here because it needs the call stack, the loaded assemblies or the hooks.
+    ///
+    /// Simple results are handled inline; calls, returns and exception dispatch go to their
+    /// own handlers. The returned [`LoopAction`] tells the run loop whether to go on or stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the handler that failed. The run loop throws one that is a CLR
+    /// exception at the instruction (see [`handle_step_error`](Self::handle_step_error)).
+    fn dispatch_step_result(
+        &self,
+        interpreter: &mut Interpreter,
+        thread: &mut EmulationThread,
+        context: &EmulationContext,
+        current_method: Token,
+        step_result: StepResult,
+    ) -> Result<LoopAction> {
+        let action = match step_result {
+            StepResult::Continue => LoopAction::Continue,
+
+            StepResult::Branch { target } => {
+                let method_offset = context.rva_to_method_offset(current_method, target)?;
+                if self.trace_instructions_enabled() {
+                    self.trace(TraceEvent::Branch {
+                        method: current_method,
+                        from_offset: interpreter.ip().offset(),
+                        to_offset: method_offset,
+                        conditional: true,
+                    });
+                }
+                interpreter.set_offset(method_offset);
+                LoopAction::Continue
+            }
+
+            StepResult::Return { value: _ } => {
+                self.handle_return(interpreter, thread, context, current_method)?
+            }
+
+            StepResult::Call {
+                method,
+                args: _,
+                is_virtual,
+                constrained_type,
+            } => self.handle_call(
+                interpreter,
+                thread,
+                context,
+                current_method,
+                method,
+                is_virtual,
+                constrained_type,
+            )?,
+
+            StepResult::CallIndirect {
+                signature,
+                function_pointer,
+            } => self.handle_call_indirect(
+                interpreter,
+                thread,
+                context,
+                current_method,
+                signature,
+                function_pointer,
+            )?,
+
+            StepResult::NewObj {
+                constructor,
+                args: _,
+            } => self.handle_newobj(interpreter, thread, context, current_method, constructor)?,
+
+            StepResult::NewArray {
+                element_type,
+                length,
+            } => {
+                typeops::handle_newarr(thread, context, element_type, length)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::LoadString { token } => {
+                typeops::handle_ldstr(thread, context, token)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::LoadStaticField { field } => {
+                if callresolver::maybe_run_type_cctor(
+                    &self.context.address_space,
+                    &self.cctor_tracker,
+                    interpreter,
+                    thread,
+                    context,
+                    field,
+                )? {
+                    LoopAction::Continue
+                } else {
+                    typeops::handle_ldsfld(&self.context.address_space, thread, context, field)?;
+                    if self.trace_writer.is_some() {
+                        let value_str = thread
+                            .stack()
+                            .peek()
+                            .map(|v| format!("{v:?}"))
+                            .unwrap_or_default();
+                        self.trace(TraceEvent::StaticFieldValue {
+                            method: current_method,
+                            offset: interpreter.ip().offset(),
+                            field,
+                            is_load: true,
+                            value: value_str,
+                        });
+                    }
+                    interpreter.ip_mut().advance_current();
+                    LoopAction::Continue
+                }
+            }
+
+            StepResult::StoreStaticField { field, value } => {
+                if self.trace_writer.is_some() {
+                    self.trace(TraceEvent::StaticFieldValue {
+                        method: current_method,
+                        offset: interpreter.ip().offset(),
+                        field,
+                        is_load: false,
+                        value: format!("{value:?}"),
+                    });
+                }
+                thread.push(value.clone())?;
+                if callresolver::maybe_run_type_cctor(
+                    &self.context.address_space,
+                    &self.cctor_tracker,
+                    interpreter,
+                    thread,
+                    context,
+                    field,
+                )? {
+                    LoopAction::Continue
+                } else {
+                    let _ = thread.pop()?;
+                    self.context.address_space.set_static(field, value)?;
+                    interpreter.ip_mut().advance_current();
+                    LoopAction::Continue
+                }
+            }
+
+            StepResult::Throw { exception } => {
+                self.handle_throw(interpreter, thread, context, current_method, exception)?
+            }
+
+            StepResult::Leave { target } => {
+                self.handle_leave(interpreter, thread, context, current_method, target)?
+            }
+
+            StepResult::EndFinally => {
+                self.handle_end_finally(interpreter, thread, context, current_method)?
+            }
+
+            StepResult::EndFilter { value } => {
+                // ECMA-335 §12.4.2.5: `endfilter` takes an int32. 0 means "continue the
+                // search", 1 means "this handler runs". Anything else is not a filter
+                // result — treating a non-int32 as rejection silently mis-routes the
+                // exception, so it is a program error.
+                let EmValue::I32(filter_result) = value else {
+                    return Err(EmulationError::InternalError {
+                        description: format!(
+                            "endfilter expects an int32 result, found {}",
+                            value.type_name()
+                        ),
+                    }
+                    .into());
+                };
+                let should_handle = filter_result != 0;
+
+                thread
+                    .exception_state_mut()
+                    .set_filter_result(Some(should_handle));
+
+                if should_handle {
+                    // Read the filter state *before* clearing it. `set_in_filter(false)`
+                    // also nulls `filter_handler_offset` (see
+                    // `ThreadExceptionState::set_in_filter`), so reading the offset
+                    // afterwards always yields `None` — and the resulting fall-through
+                    // returns `Continue` without advancing the IP, re-executing this same
+                    // `endfilter` forever. The rejecting path below has the same
+                    // constraint: it needs the offset as its skip key.
+                    let handler_offset = thread.exception_state_mut().filter_handler_offset();
+                    let origin_offset = self.exception_origin(thread, interpreter);
+                    thread.exception_state_mut().set_in_filter(false);
+
+                    let Some(handler_offset) = handler_offset else {
+                        // `enter_filter` records the offset on every path that dispatches a
+                        // filter, so its absence here means the filter body was entered
+                        // without going through exception dispatch. Continuing would spin.
+                        return Err(EmulationError::InternalError {
+                            description:
+                                "endfilter accepted but no filter handler offset was recorded"
+                                    .to_string(),
+                        }
+                        .into());
+                    };
+
+                    {
+                        // `endfilter` consumed the exception object that
+                        // `apply_handler_match` pushed before entering the filter, so the
+                        // handler would otherwise start on whatever the filter left behind
+                        // — typically an underflow on its first `stloc`. Re-push it, as the
+                        // catch path does.
+                        if let Some(exception) = thread.exception_state_mut().get_exception_value()
+                        {
+                            thread.stack_mut().clear();
+                            thread.push(exception)?;
+                        }
+
+                        thread.exception_state_mut().enter_catch_handler(
+                            current_method,
+                            origin_offset,
+                            handler_offset,
+                        );
+                        interpreter.set_offset(handler_offset);
+                        LoopAction::Continue
+                    }
+                } else {
+                    // Rejection means "keep searching", not "unhandled". Resume the scan
+                    // after the rejected Filter clause and fall into the normal unwind path
+                    // if nothing else matches; returning `UnhandledException` here reports a
+                    // genuinely-caught exception as unhandled and stops the run, which an
+                    // obfuscator can use to hide everything past a rejecting filter.
+                    self.resume_search_after_filter(interpreter, thread, context, current_method)?
+                }
+            }
+
+            StepResult::Rethrow => {
+                self.handle_rethrow(interpreter, thread, context, current_method)?
+            }
+
+            StepResult::Breakpoint => LoopAction::Return(Box::new(EmulationOutcome::Breakpoint {
+                offset: interpreter.ip().offset(),
+                instructions: interpreter.stats().instructions_executed,
+            })),
+
+            StepResult::Jmp { method } => self.handle_jmp(interpreter, thread, context, method)?,
+
+            StepResult::TailCall {
+                method,
+                is_virtual,
+                constrained_type,
+            } => self.handle_tail_call(
+                interpreter,
+                thread,
+                context,
+                current_method,
+                method,
+                is_virtual,
+                constrained_type,
+            )?,
+
+            StepResult::Box { type_token } => {
+                typeops::handle_box(thread, Some(context), type_token)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::Unbox { type_token } | StepResult::UnboxAny { type_token } => {
+                typeops::handle_unbox(thread, Some(context), type_token)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::CastClass { type_token } => {
+                typeops::handle_castclass(thread, context, type_token)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::IsInst { type_token } => {
+                typeops::handle_isinst(thread, context, type_token)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::SizeOf { type_token } => {
+                typeops::handle_sizeof(
+                    thread,
+                    context,
+                    type_token,
+                    self.context.config.pointer_size,
+                )?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::LoadToken { token } => {
+                // Resolve generic type parameters (!!0, !!1, etc.) in ldtoken.
+                // TypeSpec tokens encoding ELEMENT_TYPE_MVAR need to be resolved
+                // to the actual type argument from the current MethodSpec.
+                let resolved =
+                    Self::resolve_ldtoken_generic(token, thread, context).unwrap_or(token);
+                thread.push(EmValue::NativeInt(i64::from(resolved.value())))?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::LoadFunctionPointer { method } => {
+                thread.push(EmValue::UnmanagedPtr(u64::from(method.value())))?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::LoadVirtualFunctionPointer { method } => {
+                thread.push(EmValue::UnmanagedPtr(u64::from(method.value())))?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::InitObj { type_token } => {
+                typeops::handle_initobj(thread, Some(context), type_token)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::CopyObject { type_token } => {
+                typeops::handle_cpobj(
+                    &self.context.address_space,
+                    thread,
+                    Some(context),
+                    type_token,
+                )?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::LocalAlloc { size } => {
+                let size_bytes = size.as_size()?;
+                let ptr = thread.address_space().alloc_unmanaged(size_bytes)?;
+                thread.push(EmValue::UnmanagedPtr(ptr))?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::CopyBlock { dest, src, size } => {
+                typeops::handle_cpblk(thread, &dest, &src, &size)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::InitBlock { addr, value, size } => {
+                typeops::handle_initblk(thread, &addr, &value, &size)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::RefAnyVal { type_token } => {
+                // ECMA-335 §III.4.22: extract address from typed reference,
+                // verifying the type matches. Throws InvalidCastException on
+                // mismatch.
+                let typed_ref = thread.pop()?;
+                let address = match typed_ref.as_object_ref() {
+                    Some(href) => self
+                        .context
+                        .address_space
+                        .managed_heap()
+                        .typed_reference_value(href, Some(type_token))?,
+                    None => {
+                        return Err(EmulationError::TypeMismatch {
+                            operation: "refanyval",
+                            expected: "TypedReference (object ref)",
+                            found: "non-reference value",
+                        }
+                        .into());
+                    }
+                };
+                thread.push(address)?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::MkRefAny { type_token } => {
+                // ECMA-335 §III.4.14: package an address and type into a
+                // TypedReference.
+                let addr = thread.pop()?;
+                let href = self
+                    .context
+                    .address_space
+                    .managed_heap()
+                    .alloc_typed_reference(type_token, addr)?;
+                thread.push(EmValue::ObjectRef(href))?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::RefAnyType => {
+                // ECMA-335 §III.4.23: extract the type token from a typed
+                // reference and push it as a RuntimeTypeHandle (NativeInt).
+                let typed_ref = thread.pop()?;
+                let type_value = match typed_ref.as_object_ref() {
+                    Some(href) => {
+                        let token = self
+                            .context
+                            .address_space
+                            .managed_heap()
+                            .typed_reference_type(href)?;
+                        i64::from(token.value())
+                    }
+                    None => 0,
+                };
+                thread.push(EmValue::NativeInt(type_value))?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+
+            StepResult::ArgList => {
+                thread.push(EmValue::NativeInt(0))?;
+                interpreter.ip_mut().advance_current();
+                LoopAction::Continue
+            }
+        };
+        Ok(action)
     }
 
     /// Unwinds the call stack after a CLR exception originating from an
@@ -1658,7 +1696,7 @@ impl EmulationController {
     /// The IL offset a handler search should resume from.
     ///
     /// `exception_origin_offset` is only ever written by
-    /// [`ThreadExceptionState::enter_catch_handler`], so it is `None` for an exception that has
+    /// [`ThreadExceptionState::enter_catch_handler`](crate::emulation::ThreadExceptionState::enter_catch_handler), so it is `None` for an exception that has
     /// not yet entered a catch — which is precisely the case on the filter paths. Reading it
     /// alone made the post-filter rescan skip the current method's remaining clauses entirely
     /// and jump straight to unwinding the caller.
@@ -1972,6 +2010,11 @@ impl EmulationController {
     /// When `is_tail_call` is `true`, the current frame is replaced instead of
     /// pushing a new one. This implements `tail.` prefix semantics per ECMA-335
     /// §III.2.4: the called method returns directly to the current method's caller.
+    ///
+    /// A redirect into another loaded assembly carries that assembly's index, and its
+    /// token is that assembly's: the rest of the loop resolves it, and sets up the frame
+    /// it enters, in that assembly's context, while an exception the call throws is
+    /// still routed through the calling method's.
     #[allow(clippy::too_many_arguments)]
     fn resolve_and_enter_call(
         &self,
@@ -1991,8 +2034,15 @@ impl EmulationController {
         let mut pending_reflection_invoke = false;
         let mut pending_assembly_index: Option<u32> = None;
         let mut pending_method_type_args: Option<Vec<Token>> = None;
+        // The context the target's token belongs to: the caller's until a redirect names
+        // another assembly
+        let caller_context = context;
+        let mut target_context: Option<Arc<EmulationContext>> = None;
+        // Where a multicast delegate's `Invoke` is reissued for its next entry
+        let call_offset = interpreter.ip().offset();
 
         for _ in 0..MAX_REDIRECT_DEPTH {
+            let context = target_context.as_deref().unwrap_or(caller_context);
             match self.call_resolver.resolve_call(
                 context,
                 token,
@@ -2002,6 +2052,13 @@ impl EmulationController {
                 &self.context.address_space,
             )? {
                 CallResolution::HookedBypass { return_value } => {
+                    // An entry of a multicast delegate with more after it: its result is
+                    // not the call's, and the `Invoke` runs again, still at this
+                    // instruction, for the next entry
+                    if let Some(state) = thread.take_multicast_state() {
+                        Self::reissue_invoke(thread, state)?;
+                        return Ok(LoopAction::Continue);
+                    }
                     if is_tail_call {
                         return self.complete_tail_as_return(interpreter, thread, return_value);
                     }
@@ -2012,6 +2069,10 @@ impl EmulationController {
                     return Ok(LoopAction::Continue);
                 }
                 CallResolution::ReturnSynthetic { value } => {
+                    if let Some(state) = thread.take_multicast_state() {
+                        Self::reissue_invoke(thread, state)?;
+                        return Ok(LoopAction::Continue);
+                    }
                     if is_tail_call {
                         return self.complete_tail_as_return(interpreter, thread, value);
                     }
@@ -2034,6 +2095,12 @@ impl EmulationController {
                     let arg_count = arguments.len();
                     let effective_method_type_args =
                         method_type_args.or(pending_method_type_args.take());
+                    // An entry of a multicast delegate with more after it returns to this
+                    // method, where the `Invoke` runs again: a tail call would leave
+                    // nothing to return to, and the `tail.` prefix is only a hint
+                    // (ECMA-335 §III.2.4)
+                    let multicast = thread.take_multicast_state();
+                    let is_tail_call = is_tail_call && multicast.is_none();
 
                     // For tail calls, capture caller info and trace before replacing
                     // the frame; for normal calls, capture before pushing the new frame.
@@ -2088,6 +2155,10 @@ impl EmulationController {
                     let cid = self.next_call_id.fetch_add(1, Ordering::Relaxed);
                     if let Some(frame) = thread.current_frame_mut() {
                         frame.set_call_id(cid);
+                        if let Some(mut state) = multicast {
+                            state.call_offset = call_offset;
+                            frame.set_multicast(state);
+                        }
                     }
 
                     if self.trace_calls_enabled()
@@ -2109,6 +2180,8 @@ impl EmulationController {
                     exception_type,
                     message,
                 } => {
+                    // The exception leaves the delegate's `Invoke`: its later entries do not run
+                    thread.take_multicast_state();
                     if self.trace_exceptions_enabled() {
                         self.trace(TraceEvent::RuntimeException {
                             method: current_method,
@@ -2126,7 +2199,7 @@ impl EmulationController {
                     )?;
                     if !exhandler::route_clr_exception(
                         &self.context.address_space,
-                        context,
+                        caller_context,
                         interpreter,
                         thread,
                         current_method,
@@ -2164,8 +2237,16 @@ impl EmulationController {
                             target_token.value()
                         );
                     }
-                    if redirect_asm.is_some() {
-                        pending_assembly_index = redirect_asm;
+                    if let Some(index) = redirect_asm {
+                        pending_assembly_index = Some(index);
+                        target_context =
+                            Some(self.loaded_assembly_context(index)?.ok_or_else(|| {
+                                EmulationError::InternalError {
+                                    description: format!(
+                                    "a redirect names loaded assembly {index}, which is not loaded"
+                                ),
+                                }
+                            })?);
                     }
                     if method_type_args.is_some() {
                         pending_method_type_args = method_type_args;
@@ -2216,6 +2297,9 @@ impl EmulationController {
         let return_offset = popped.return_offset();
         let caller_stack = popped.take_caller_stack();
         let saved_leave_target = popped.take_saved_leave_target();
+        // The target was resolved in the replaced frame's assembly; the frame below it may be
+        // in another
+        let assembly_index = popped.assembly_index();
 
         // Restore the caller's evaluation stack
         thread.restore_stack(caller_stack)?;
@@ -2234,6 +2318,7 @@ impl EmulationController {
         let current_stack = thread.take_stack();
         frame.save_caller_stack(current_stack);
         frame.save_leave_target(saved_leave_target);
+        frame.set_assembly_index(assembly_index);
 
         thread.push_frame(frame);
         interpreter.set_method(target);
@@ -2560,8 +2645,12 @@ impl EmulationController {
                     }
                     return Ok(LoopAction::Continue);
                 }
-                NewObjResolution::HookedBypass { obj_ref }
-                | NewObjResolution::DefaultObject { obj_ref } => {
+                NewObjResolution::HookedBypass { value } => {
+                    thread.push(value)?;
+                    interpreter.ip_mut().advance_current();
+                    return Ok(LoopAction::Continue);
+                }
+                NewObjResolution::DefaultObject { obj_ref } => {
                     thread.push(EmValue::ObjectRef(obj_ref))?;
                     interpreter.ip_mut().advance_current();
                     return Ok(LoopAction::Continue);
@@ -2649,10 +2738,12 @@ impl EmulationController {
 
         let local_cil_flavors = context.get_local_types(method)?;
 
-        // Pop current frame (tail call replaces it)
-        thread.pop_frame();
+        // Pop current frame (tail call replaces it); the jump target is in its assembly
+        let assembly_index = thread
+            .pop_frame()
+            .and_then(|popped| popped.assembly_index());
 
-        let frame = ThreadCallFrame::new(
+        let mut frame = ThreadCallFrame::new(
             method,
             None, // No return method - tail call returns directly to caller's caller
             0,
@@ -2660,6 +2751,7 @@ impl EmulationController {
             args_with_types,
             false,
         );
+        frame.set_assembly_index(assembly_index);
         thread.push_frame(frame);
 
         let cid = self.next_call_id.fetch_add(1, Ordering::Relaxed);
@@ -2684,6 +2776,21 @@ impl EmulationController {
         interpreter.set_method(method);
         interpreter.set_offset(0);
         Ok(LoopAction::Continue)
+    }
+
+    /// Reissues a multicast delegate's `Invoke` for its next entry: pushes the arguments the
+    /// `Invoke` was called with, the delegate first, and makes the dispatcher start at the
+    /// entry `state` names. The interpreter is on the `Invoke` instruction, which runs again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the evaluation stack overflows.
+    fn reissue_invoke(thread: &mut EmulationThread, state: MulticastState) -> Result<()> {
+        for arg in state.invoke_args {
+            thread.push(arg)?;
+        }
+        thread.resume_delegate_at(state.delegate, state.next_entry);
+        Ok(())
     }
 
     /// Handles `StepResult::Return` — pops the callee frame, restores caller
@@ -2742,120 +2849,25 @@ impl EmulationController {
             })));
         }
 
-        // Multicast delegate continuation
-        if thread.has_multicast_state() {
-            let depth = thread.call_depth();
-            if let Some(mut mc) = thread.take_multicast_state() {
-                if mc.dispatch_depth == depth && !mc.remaining_entries.is_empty() {
-                    let next_entry = mc.remaining_entries.remove(0);
-                    let delegate_args = mc.delegate_args.clone();
-
-                    if !mc.remaining_entries.is_empty() {
-                        thread.set_multicast_state(mc);
-                    }
-
-                    if let Some(callee_frame) = &mut popped_frame {
-                        let caller_stack = callee_frame.take_caller_stack();
-                        thread.restore_stack(caller_stack)?;
-                    }
-
-                    for arg in &delegate_args {
-                        thread.push(arg.clone())?;
-                    }
-
-                    let target_token = next_entry.method_token;
-                    match self.call_resolver.resolve_call(
-                        context,
-                        target_token,
-                        thread,
-                        false,
-                        None,
-                        &self.context.address_space,
-                    )? {
-                        CallResolution::EnterMethod {
-                            token: t,
-                            arguments,
-                            expects_return,
-                            assembly_index: _,
-                            method_type_args,
-                        } => {
-                            callresolver::push_method_frame(
-                                interpreter,
-                                thread,
-                                context,
-                                t,
-                                arguments,
-                                expects_return,
-                            )?;
-                            if let Some(args) = method_type_args {
-                                if let Some(frame) = thread.current_frame_mut() {
-                                    frame.set_method_type_args(args);
-                                }
-                            }
-                            return Ok(LoopAction::Continue);
-                        }
-                        CallResolution::HookedBypass { return_value: rv }
-                        | CallResolution::ReturnSynthetic { value: rv } => {
-                            if let Some(v) = rv {
-                                if !thread.has_multicast_state() {
-                                    thread.push(v)?;
-                                }
-                            }
-                            if let Some(callee_frame) = &popped_frame {
-                                if let Some(return_method) = callee_frame.return_method() {
-                                    interpreter.set_method(return_method);
-                                    interpreter.set_offset(callee_frame.return_offset());
-                                }
-                            }
-                            return Ok(LoopAction::Continue);
-                        }
-                        CallResolution::Redirect {
-                            target_token: redirect_target,
-                            arguments,
-                            ..
-                        } => {
-                            for arg in arguments {
-                                thread.push(arg)?;
-                            }
-                            match self.call_resolver.resolve_call(
-                                context,
-                                redirect_target,
-                                thread,
-                                false,
-                                None,
-                                &self.context.address_space,
-                            )? {
-                                CallResolution::EnterMethod {
-                                    token: t,
-                                    arguments: args,
-                                    expects_return,
-                                    ..
-                                } => {
-                                    callresolver::push_method_frame(
-                                        interpreter,
-                                        thread,
-                                        context,
-                                        t,
-                                        args,
-                                        expects_return,
-                                    )?;
-                                    return Ok(LoopAction::Continue);
-                                }
-                                _ => {
-                                    return Ok(LoopAction::Continue);
-                                }
-                            }
-                        }
-                        _ => {
-                            // ThrowException or other — abort multicast chain
-                            thread.take_multicast_state();
-                        }
-                    }
-                } else {
-                    if !mc.remaining_entries.is_empty() {
-                        thread.set_multicast_state(mc);
-                    }
+        // An entry of a multicast delegate with more after it returned: its result is not the
+        // call's. The caller's state comes back as on any return, and the `Invoke` runs again
+        // at its call site for the next entry.
+        if let Some(callee_frame) = &mut popped_frame {
+            if let Some(state) = callee_frame.take_multicast() {
+                let caller_stack = callee_frame.take_caller_stack();
+                thread.restore_stack(caller_stack)?;
+                let saved_leave_target = callee_frame.take_saved_leave_target();
+                if saved_leave_target.is_some() {
+                    thread
+                        .exception_state_mut()
+                        .set_leave_target(saved_leave_target);
                 }
+                if let Some(return_method) = callee_frame.return_method() {
+                    interpreter.set_method(return_method);
+                }
+                interpreter.set_offset(state.call_offset);
+                Self::reissue_invoke(thread, state)?;
+                return Ok(LoopAction::Continue);
             }
         }
 
@@ -2916,9 +2928,17 @@ mod tests {
 
     use super::*;
     use crate::{
+        assembly::Operand,
+        cilassembly::{CilAssembly, MethodBuilder},
         emulation::{
             engine::typeops, process::UnknownMethodBehavior, Hook, LimitExceeded, PreHookResult,
             ProcessBuilder,
+        },
+        metadata::{
+            signatures::TypeSignature,
+            tables::{
+                CodedIndex, CodedIndexType, TableId, TypeAttributes, TypeDefBuilder, TypeRefBuilder,
+            },
         },
         testkit::{
             emulation::{create_test_thread, emulation_config},
@@ -2926,6 +2946,92 @@ mod tests {
         },
         CilObject,
     };
+
+    /// `Main` of crafted_2 with `App.Program.Main` added: `try { unbox.any` of null `}` catch
+    /// (`catch_type`) `{ return 2; } return 1;`. The NullReferenceException comes from the
+    /// controller's `unbox.any`, not from the interpreter.
+    fn run_null_unbox_caught_by(namespace: &str, name: &str) -> EmulationOutcome {
+        let mut app = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        let catch_type = TypeRefBuilder::new()
+            .name(name)
+            .namespace(namespace)
+            .resolution_scope(CodedIndex::new(
+                TableId::AssemblyRef,
+                1,
+                CodedIndexType::ResolutionScope,
+            ))
+            .build(&mut app)
+            .unwrap();
+        let catch_type = Token::from_parts(TableId::TypeRef, catch_type.token().unwrap().row());
+        TypeDefBuilder::new()
+            .name("Program")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        let main = MethodBuilder::new("Main")
+            .public()
+            .static_method()
+            .returns(TypeSignature::I4)
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.try_start("guarded")?
+                        .ldnull()?
+                        // unbox.any
+                        .emit_opcode(0xA5, Some(Operand::Token(Token::new(0x0200_0002))))?
+                        .pop()?
+                        .leave("uncaught")?
+                        .try_end("guarded")?
+                        .catch_start("guarded", catch_type)?
+                        .pop()?
+                        .leave("caught")?
+                        .catch_end("guarded")?
+                        .label("uncaught")?
+                        .ldc_i4_1()?
+                        .ret()?
+                        .label("caught")?
+                        .ldc_i4_2()?
+                        .ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+        let main = Token::from_parts(TableId::MethodDef, main.token().unwrap().row());
+        let app = CilObject::from_mem(app.to_memory().unwrap()).unwrap();
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::new(app))
+            .build()
+            .unwrap();
+        process.execute_method(main, Vec::new()).unwrap()
+    }
+
+    /// A CLR exception a controller-side handler raises (`unbox.any` of null) is thrown at the
+    /// instruction and reaches its catch clause. It ended the run as an emulation error.
+    #[test]
+    fn a_controller_side_exception_reaches_its_catch() {
+        let outcome = run_null_unbox_caught_by("System", "NullReferenceException");
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(2)),
+                    ..
+                }
+            ),
+            "the NullReferenceException is caught: {outcome:?}"
+        );
+    }
+
+    /// The exception keeps its type: a catch of another type lets it through, unhandled.
+    #[test]
+    fn a_controller_side_exception_passes_a_catch_of_another_type() {
+        let outcome = run_null_unbox_caught_by("System", "InvalidCastException");
+        assert!(
+            matches!(outcome, EmulationOutcome::UnhandledException { .. }),
+            "the NullReferenceException is not an InvalidCastException: {outcome:?}"
+        );
+    }
 
     /// Runs crafted_2.exe's entry point under a budget of `limit` instructions, with a hook on
     /// `Console.WriteLine` that charges `units` of native work.

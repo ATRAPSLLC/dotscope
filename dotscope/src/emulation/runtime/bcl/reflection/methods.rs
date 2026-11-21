@@ -248,7 +248,7 @@ fn method_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
         if let Ok(HeapObject::ReflectionMethod {
             method_token,
             method_type_args,
-        }) = thread.heap().get(*method_ref)
+        }) = thread.heap().get_shared(*method_ref).as_deref()
         {
             // Extract the target object (first argument to Invoke)
             let this_ref = ctx.args.first().cloned();
@@ -256,16 +256,18 @@ fn method_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
             // Look up method signature to detect ByRef parameters
             let sig_params: Option<Vec<bool>> = thread
                 .assembly()
-                .and_then(|asm| asm.method(&method_token).ok())
+                .and_then(|asm| asm.method(method_token).ok())
                 .map(|m| m.signature.params.iter().map(|p| p.by_ref).collect());
 
             // Extract the method arguments from the object[] array (second argument).
             // For ByRef parameters, pass a ManagedPtr to the array element so writes
             // propagate back. For normal parameters, unbox boxed primitives.
             let method_args = if let Some(EmValue::ObjectRef(arr_ref)) = ctx.args.get(1) {
-                if let Ok(HeapObject::Array { elements, .. }) = thread.heap().get(*arr_ref) {
+                if let Ok(HeapObject::Array { elements, .. }) =
+                    thread.heap().get_shared(*arr_ref).as_deref()
+                {
                     elements
-                        .into_iter()
+                        .iter()
                         .enumerate()
                         .map(|(i, v)| {
                             let is_byref = sig_params
@@ -275,7 +277,7 @@ fn method_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
                             if is_byref {
                                 EmValue::ManagedPtr(ManagedPointer::to_array_element(*arr_ref, i))
                             } else {
-                                unbox_value(thread, &v)
+                                unbox_value(thread, v)
                             }
                         })
                         .collect()
@@ -290,10 +292,10 @@ fn method_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
             // redirect execution to the target method
             return PreHookResult::ReflectionInvoke {
                 request: Box::new(ReflectionInvokeRequest {
-                    method_token,
+                    method_token: *method_token,
                     this_ref,
                     args: method_args,
-                    method_type_args,
+                    method_type_args: method_type_args.clone(),
                 }),
                 bypass_value: Some(EmValue::Null),
             };
@@ -313,11 +315,12 @@ fn method_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
 fn constructor_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     // Get the constructor's method token from 'this' (ReflectionMethod)
     if let Some(EmValue::ObjectRef(ctor_ref)) = ctx.this {
-        if let Ok(HeapObject::ReflectionMethod { method_token, .. }) = thread.heap().get(*ctor_ref)
+        if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
+            thread.heap().get_shared(*ctor_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
                 // Find the declaring type to allocate the right object
-                let declaring_type_token = match asm.resolver().declaring_type(method_token) {
+                let declaring_type_token = match asm.resolver().declaring_type(*method_token) {
                     Some(t) => t.token,
                     None => {
                         return PreHookResult::throw_invalid_operation(
@@ -337,9 +340,9 @@ fn constructor_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
                             .find_map(|arg| {
                                 if let EmValue::ObjectRef(arr_ref) = arg {
                                     if let Ok(HeapObject::Array { elements, .. }) =
-                                        thread.heap().get(*arr_ref)
+                                        thread.heap().get_shared(*arr_ref).as_deref()
                                     {
-                                        return Some(elements);
+                                        return Some(elements.clone());
                                     }
                                 }
                                 None
@@ -353,8 +356,8 @@ fn constructor_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
                         // redirect to the actual constructor body.
                         let resolved_token = asm
                             .resolver()
-                            .resolve_method(method_token)
-                            .unwrap_or(method_token);
+                            .resolve_method(*method_token)
+                            .unwrap_or(*method_token);
 
                         // Return a reflection invoke request for the constructor
                         return PreHookResult::ReflectionInvoke {
@@ -384,11 +387,11 @@ fn constructor_invoke_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
 fn method_get_name_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
                 // Try resolved MethodDef first
-                if let Some(method) = resolve_method_from_token(method_token, &asm) {
+                if let Some(method) = resolve_method_from_token(*method_token, &asm) {
                     match thread.heap_mut().alloc_string(&method.name) {
                         Ok(s_ref) => return PreHookResult::Bypass(Some(EmValue::ObjectRef(s_ref))),
                         Err(e) => {
@@ -397,7 +400,7 @@ fn method_get_name_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
                     }
                 }
                 // Fallback: MemberRef name
-                if let Some(member_ref) = asm.member_ref(&method_token) {
+                if let Some(member_ref) = asm.member_ref(method_token) {
                     match thread.heap_mut().alloc_string(&member_ref.name) {
                         Ok(s_ref) => return PreHookResult::Bypass(Some(EmValue::ObjectRef(s_ref))),
                         Err(e) => {
@@ -418,16 +421,16 @@ fn method_get_name_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 fn method_get_is_static_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(method) = resolve_method_from_token(method_token, &asm) {
+                if let Some(method) = resolve_method_from_token(*method_token, &asm) {
                     return PreHookResult::Bypass(Some(EmValue::I32(i32::from(
                         method.is_static(),
                     ))));
                 }
                 // Fallback: use MemberRef signature calling convention
-                if let Some(member_ref) = asm.member_ref(&method_token) {
+                if let Some(member_ref) = asm.member_ref(method_token) {
                     if let MemberRefSignature::Method(sig) = &member_ref.signature {
                         return PreHookResult::Bypass(Some(EmValue::I32(i32::from(!sig.has_this))));
                     }
@@ -446,10 +449,10 @@ fn method_get_is_static_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread)
 fn method_get_is_virtual_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(method) = resolve_method_from_token(method_token, &asm) {
+                if let Some(method) = resolve_method_from_token(*method_token, &asm) {
                     return PreHookResult::Bypass(Some(EmValue::I32(i32::from(
                         method.is_virtual(),
                     ))));
@@ -458,7 +461,7 @@ fn method_get_is_virtual_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread
                 // The C# compiler emits callvirt for all instance calls, and most BCL
                 // instance methods are virtual. This is critical for CFF state machines
                 // that use IsVirtual to decide dispatch behavior.
-                if let Some(member_ref) = asm.member_ref(&method_token) {
+                if let Some(member_ref) = asm.member_ref(method_token) {
                     if let MemberRefSignature::Method(sig) = &member_ref.signature {
                         return PreHookResult::Bypass(Some(EmValue::I32(i32::from(sig.has_this))));
                     }
@@ -479,10 +482,10 @@ fn method_get_is_abstract_pre(
 ) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(method) = resolve_method_from_token(method_token, &asm) {
+                if let Some(method) = resolve_method_from_token(*method_token, &asm) {
                     return PreHookResult::Bypass(Some(EmValue::I32(i32::from(
                         method.is_abstract(),
                     ))));
@@ -502,10 +505,10 @@ fn method_get_is_abstract_pre(
 fn method_get_is_public_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(method) = resolve_method_from_token(method_token, &asm) {
+                if let Some(method) = resolve_method_from_token(*method_token, &asm) {
                     return PreHookResult::Bypass(Some(EmValue::I32(i32::from(
                         method.is_public(),
                     ))));
@@ -529,13 +532,13 @@ fn method_get_return_type_pre(
 ) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                let ret_sig = resolve_method_from_token(method_token, &asm)
+                let ret_sig = resolve_method_from_token(*method_token, &asm)
                     .map(|m| m.signature.return_type.base.clone())
                     .or_else(|| {
-                        asm.member_ref(&method_token).and_then(|mr| {
+                        asm.member_ref(method_token).and_then(|mr| {
                             if let MemberRefSignature::Method(sig) = &mr.signature {
                                 Some(sig.return_type.base.clone())
                             } else {
@@ -576,15 +579,15 @@ fn method_get_return_type_pre(
 fn method_get_parameters_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(method) = resolve_method_from_token(method_token, &asm) {
+                if let Some(method) = resolve_method_from_token(*method_token, &asm) {
                     let mut param_elements = Vec::new();
                     #[allow(clippy::cast_possible_truncation)]
                     for (i, param) in method.signature.params.iter().enumerate() {
                         match thread.heap_mut().alloc_reflection_parameter(
-                            method_token,
+                            *method_token,
                             i as u32,
                             param.base.clone(),
                         ) {
@@ -607,13 +610,13 @@ fn method_get_parameters_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread
                     }
                 }
                 // Fallback: use MemberRef signature for parameter info
-                if let Some(member_ref) = asm.member_ref(&method_token) {
+                if let Some(member_ref) = asm.member_ref(method_token) {
                     if let MemberRefSignature::Method(sig) = &member_ref.signature {
                         let mut param_elements = Vec::new();
                         #[allow(clippy::cast_possible_truncation)]
                         for (i, param) in sig.params.iter().enumerate() {
                             match thread.heap_mut().alloc_reflection_parameter(
-                                method_token,
+                                *method_token,
                                 i as u32,
                                 param.base.clone(),
                             ) {
@@ -686,10 +689,10 @@ fn method_get_method_body_pre(
 ) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Ok(method) = asm.method(&method_token) {
+                if let Ok(method) = asm.method(method_token) {
                     if method.body.get().is_some() {
                         match thread
                             .heap_mut()
@@ -721,10 +724,10 @@ fn method_get_contains_generic_parameters_pre(
 ) -> PreHookResult {
     if let Some(EmValue::ObjectRef(method_ref)) = ctx.this {
         if let Ok(HeapObject::ReflectionMethod { method_token, .. }) =
-            thread.heap().get(*method_ref)
+            thread.heap().get_shared(*method_ref).as_deref()
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(method) = resolve_method_from_token(method_token, &asm) {
+                if let Some(method) = resolve_method_from_token(*method_token, &asm) {
                     return PreHookResult::Bypass(Some(EmValue::I32(i32::from(
                         !method.generic_params.is_empty(),
                     ))));
@@ -767,7 +770,9 @@ fn dynamic_method_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) 
             .get(2)
             .and_then(|arg| {
                 if let EmValue::ObjectRef(arr_ref) = arg {
-                    if let Ok(HeapObject::Array { elements, .. }) = thread.heap().get(*arr_ref) {
+                    if let Ok(HeapObject::Array { elements, .. }) =
+                        thread.heap().get_shared(*arr_ref).as_deref()
+                    {
                         return Some(
                             elements
                                 .iter()
@@ -867,15 +872,15 @@ fn il_generator_emit_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) ->
         }
         match arg {
             EmValue::ObjectRef(href) => {
-                if let Ok(obj) = thread.heap().get(*href) {
+                if let Ok(obj) = thread.heap().get_shared(*href).as_deref() {
                     match obj {
                         HeapObject::ReflectionMethod {
                             method_token: mt, ..
-                        } => method_token = Some(mt),
+                        } => method_token = Some(*mt),
                         HeapObject::ReflectionField {
                             field_token: ft, ..
-                        } => field_token = Some(ft),
-                        HeapObject::ReflectionType { type_token: tt, .. } => type_token = Some(tt),
+                        } => field_token = Some(*ft),
+                        HeapObject::ReflectionType { type_token: tt, .. } => type_token = Some(*tt),
                         _ => {}
                     }
                 }
@@ -973,7 +978,9 @@ fn extract_opcode_value(ctx: &HookContext<'_>, thread: &EmulationThread) -> u16 
         Some(EmValue::I32(v)) => *v as u16,
         Some(EmValue::ObjectRef(href)) => {
             // Boxed OpCode — try to read the Value field
-            if let Ok(HeapObject::BoxedValue { value, .. }) = thread.heap().get(*href) {
+            if let Ok(HeapObject::BoxedValue { value, .. }) =
+                thread.heap().get_shared(*href).as_deref()
+            {
                 if let EmValue::I32(v) = value.as_ref() {
                     return *v as u16;
                 }
@@ -1222,10 +1229,10 @@ fn method_make_generic_method_pre(
 
     // Extract type arguments from the Type[] parameter
     let type_args = match ctx.args.first() {
-        Some(EmValue::ObjectRef(arr_ref)) => match thread.heap().get(*arr_ref) {
+        Some(EmValue::ObjectRef(arr_ref)) => match thread.heap().get_shared(*arr_ref).as_deref() {
             Ok(HeapObject::Array { elements, .. }) => {
                 let mut args = Vec::with_capacity(elements.len());
-                for elem in &elements {
+                for elem in elements {
                     if let EmValue::ObjectRef(type_ref) = elem {
                         if let Some(tt) =
                             try_hook!(thread.heap().get_reflection_type_token(*type_ref))

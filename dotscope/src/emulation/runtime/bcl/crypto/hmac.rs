@@ -16,9 +16,12 @@
 
 use crate::{
     emulation::{
-        runtime::hook::{Hook, HookContext, HookManager, PreHookResult},
+        runtime::{
+            bcl::crypto::bytes_argument,
+            hook::{Hook, HookContext, HookManager, PreHookResult},
+        },
         thread::EmulationThread,
-        EmValue,
+        EmValue, HeapObject,
     },
     utils::{compute_hmac_sha256, compute_hmac_sha512},
     Result,
@@ -59,7 +62,7 @@ pub fn register(manager: &HookManager) -> Result<()> {
 
 /// Hook for `System.Security.Cryptography.HMACSHA256..ctor(byte[] key)`.
 ///
-/// Creates a new HMAC-SHA256 algorithm instance with the given key.
+/// Initializes the object `newobj` allocated as an HMAC-SHA256 algorithm with the given key.
 ///
 /// # Handled Overloads
 ///
@@ -69,32 +72,32 @@ pub fn register(manager: &HookManager) -> Result<()> {
 ///
 /// - `key`: The HMAC key bytes
 fn hmacsha256_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    // If called as constructor on existing `this`, update the existing object
-    if let Some(EmValue::ObjectRef(_this_ref)) = ctx.this {
-        // Constructor called on pre-allocated instance — allocate a new HMAC object
-        // and return it (the caller will use the return value).
-    }
-
-    let key = match ctx.args.first() {
-        Some(EmValue::ObjectRef(handle)) => {
-            try_hook!(thread.heap().get_byte_array(*handle)).unwrap_or_default()
-        }
-        _ => Vec::new(),
+    // `HMACSHA*()` draws a random key; for emulation a fixed (empty) one is as good a key
+    let key = match bytes_argument(thread, ctx.args.first(), "key", false) {
+        Ok(key) => key.unwrap_or_default(),
+        Err(result) => return result,
     };
 
-    let type_token = thread.resolve_type_token("System.Security.Cryptography", "HMACSHA256");
-    match thread
-        .heap()
-        .alloc_hmac_algorithm("HMACSHA256", key, type_token)
-    {
-        Ok(handle) => PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))),
+    // The constructor initializes `this`, the object `newobj` pushes, and returns nothing
+    let Some(EmValue::ObjectRef(this_ref)) = ctx.this else {
+        return PreHookResult::Error("HMACSHA256..ctor without `this`".into());
+    };
+    let algorithm = HeapObject::CryptoAlgorithm {
+        algorithm_type: "HMACSHA256".into(),
+        accumulated_data: Vec::new(),
+        hash_result: None,
+        rsa_public_key: None,
+        hmac_key: Some(key),
+    };
+    match thread.heap().replace_object(*this_ref, algorithm) {
+        Ok(()) => PreHookResult::Bypass(None),
         Err(e) => PreHookResult::Error(format!("heap allocation failed: {e}")),
     }
 }
 
 /// Hook for `System.Security.Cryptography.HMACSHA512..ctor(byte[] key)`.
 ///
-/// Creates a new HMAC-SHA512 algorithm instance with the given key.
+/// Initializes the object `newobj` allocated as an HMAC-SHA512 algorithm with the given key.
 ///
 /// # Handled Overloads
 ///
@@ -104,19 +107,25 @@ fn hmacsha256_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 ///
 /// - `key`: The HMAC key bytes
 fn hmacsha512_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    let key = match ctx.args.first() {
-        Some(EmValue::ObjectRef(handle)) => {
-            try_hook!(thread.heap().get_byte_array(*handle)).unwrap_or_default()
-        }
-        _ => Vec::new(),
+    // `HMACSHA*()` draws a random key; for emulation a fixed (empty) one is as good a key
+    let key = match bytes_argument(thread, ctx.args.first(), "key", false) {
+        Ok(key) => key.unwrap_or_default(),
+        Err(result) => return result,
     };
 
-    let type_token = thread.resolve_type_token("System.Security.Cryptography", "HMACSHA512");
-    match thread
-        .heap()
-        .alloc_hmac_algorithm("HMACSHA512", key, type_token)
-    {
-        Ok(handle) => PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))),
+    // The constructor initializes `this`, the object `newobj` pushes, and returns nothing
+    let Some(EmValue::ObjectRef(this_ref)) = ctx.this else {
+        return PreHookResult::Error("HMACSHA512..ctor without `this`".into());
+    };
+    let algorithm = HeapObject::CryptoAlgorithm {
+        algorithm_type: "HMACSHA512".into(),
+        accumulated_data: Vec::new(),
+        hash_result: None,
+        rsa_public_key: None,
+        hmac_key: Some(key),
+    };
+    match thread.heap().replace_object(*this_ref, algorithm) {
+        Ok(()) => PreHookResult::Bypass(None),
         Err(e) => PreHookResult::Error(format!("heap allocation failed: {e}")),
     }
 }
@@ -137,9 +146,16 @@ fn hmacsha512_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 fn hmac_compute_hash_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     let (algo_type, hmac_key) = match ctx.this {
         Some(EmValue::ObjectRef(handle)) => {
-            let algo = try_hook!(thread.heap().get_crypto_algorithm_type(*handle))
-                .unwrap_or_else(|| "HMACSHA256".into());
-            let key = try_hook!(thread.heap().get_hmac_key(*handle));
+            // An object no HMAC constructor initialized has no key to hash with: hashing it
+            // with an empty one, as SHA-256, answered for an object the emulation lost
+            let (Some(algo), Some(key)) = (
+                try_hook!(thread.heap().get_crypto_algorithm_type(*handle)),
+                try_hook!(thread.heap().get_hmac_key(*handle)),
+            ) else {
+                return PreHookResult::Error(
+                    "HMAC ComputeHash on an object no HMAC constructor initialized".into(),
+                );
+            };
             (algo, key)
         }
         _ => return PreHookResult::Bypass(Some(EmValue::Null)),
@@ -155,7 +171,7 @@ fn hmac_compute_hash_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) ->
     match arg0 {
         EmValue::ObjectRef(handle) => {
             if let Some(bytes) = try_hook!(thread.heap().get_byte_array(*handle)) {
-                let key = hmac_key.as_deref().unwrap_or(&[]);
+                let key = hmac_key.as_slice();
                 let hash = match algo_type.as_ref() {
                     "HMACSHA512" => compute_hmac_sha512(key, &bytes),
                     _ => compute_hmac_sha256(key, &bytes),
@@ -189,6 +205,8 @@ mod tests {
         let mut thread = create_test_thread();
         let key_data = thread.heap().alloc_byte_array(b"secret-key").unwrap();
         let args = [EmValue::ObjectRef(key_data)];
+        let handle = thread.heap().alloc_object(Token::new(0x0100_0001)).unwrap();
+        let this = EmValue::ObjectRef(handle);
         let ctx = HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
@@ -196,10 +214,12 @@ mod tests {
             ".ctor",
             PointerSize::Bit64,
         )
+        .with_this(Some(&this))
         .with_args(&args);
 
+        // The constructor initializes `this`, the object `newobj` pushes, and returns nothing
         let result = super::hmacsha256_ctor_pre(&ctx, &mut thread);
-        if let PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) = result {
+        if let PreHookResult::Bypass(None) = result {
             let algo_type = thread
                 .heap()
                 .get_crypto_algorithm_type(handle)
@@ -209,7 +229,7 @@ mod tests {
             let stored_key = thread.heap().get_hmac_key(handle).unwrap().unwrap();
             assert_eq!(stored_key, b"secret-key");
         } else {
-            panic!("Expected ObjectRef from HMACSHA256 ctor");
+            panic!("HMACSHA256..ctor initializes `this` and returns nothing");
         }
     }
 
@@ -218,6 +238,8 @@ mod tests {
         let mut thread = create_test_thread();
         let key_data = thread.heap().alloc_byte_array(b"another-key").unwrap();
         let args = [EmValue::ObjectRef(key_data)];
+        let handle = thread.heap().alloc_object(Token::new(0x0100_0001)).unwrap();
+        let this = EmValue::ObjectRef(handle);
         let ctx = HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
@@ -225,10 +247,12 @@ mod tests {
             ".ctor",
             PointerSize::Bit64,
         )
+        .with_this(Some(&this))
         .with_args(&args);
 
+        // The constructor initializes `this`, the object `newobj` pushes, and returns nothing
         let result = super::hmacsha512_ctor_pre(&ctx, &mut thread);
-        if let PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) = result {
+        if let PreHookResult::Bypass(None) = result {
             let algo_type = thread
                 .heap()
                 .get_crypto_algorithm_type(handle)
@@ -238,7 +262,7 @@ mod tests {
             let stored_key = thread.heap().get_hmac_key(handle).unwrap().unwrap();
             assert_eq!(stored_key, b"another-key");
         } else {
-            panic!("Expected ObjectRef from HMACSHA512 ctor");
+            panic!("HMACSHA512..ctor initializes `this` and returns nothing");
         }
     }
 
@@ -251,6 +275,8 @@ mod tests {
         // Create HMAC instance
         let key_ref = thread.heap().alloc_byte_array(key_bytes).unwrap();
         let ctor_args = [EmValue::ObjectRef(key_ref)];
+        let hmac_ref = thread.heap().alloc_object(Token::new(0x0100_0001)).unwrap();
+        let hmac = EmValue::ObjectRef(hmac_ref);
         let ctor_ctx = HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
@@ -258,12 +284,12 @@ mod tests {
             ".ctor",
             PointerSize::Bit64,
         )
+        .with_this(Some(&hmac))
         .with_args(&ctor_args);
-
-        let hmac_ref = match super::hmacsha256_ctor_pre(&ctor_ctx, &mut thread) {
-            PreHookResult::Bypass(Some(EmValue::ObjectRef(h))) => h,
-            _ => panic!("Expected ObjectRef"),
-        };
+        assert!(matches!(
+            super::hmacsha256_ctor_pre(&ctor_ctx, &mut thread),
+            PreHookResult::Bypass(None)
+        ));
 
         // ComputeHash
         let input = thread.heap().alloc_byte_array(data_bytes).unwrap();
@@ -299,6 +325,8 @@ mod tests {
         // Create HMAC instance
         let key_ref = thread.heap().alloc_byte_array(key_bytes).unwrap();
         let ctor_args = [EmValue::ObjectRef(key_ref)];
+        let hmac_ref = thread.heap().alloc_object(Token::new(0x0100_0001)).unwrap();
+        let hmac = EmValue::ObjectRef(hmac_ref);
         let ctor_ctx = HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
@@ -306,12 +334,12 @@ mod tests {
             ".ctor",
             PointerSize::Bit64,
         )
+        .with_this(Some(&hmac))
         .with_args(&ctor_args);
-
-        let hmac_ref = match super::hmacsha512_ctor_pre(&ctor_ctx, &mut thread) {
-            PreHookResult::Bypass(Some(EmValue::ObjectRef(h))) => h,
-            _ => panic!("Expected ObjectRef"),
-        };
+        assert!(matches!(
+            super::hmacsha512_ctor_pre(&ctor_ctx, &mut thread),
+            PreHookResult::Bypass(None)
+        ));
 
         // ComputeHash
         let input = thread.heap().alloc_byte_array(data_bytes).unwrap();

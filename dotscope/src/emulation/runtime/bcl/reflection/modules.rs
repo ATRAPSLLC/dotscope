@@ -277,7 +277,7 @@ fn module_get_fully_qualified_name_pre(
 /// Hook for `System.Reflection.Module.get_Assembly` property.
 ///
 /// Gets the assembly for this module. Returns the pre-allocated fake Assembly
-/// object from [`FakeObjects`], ensuring that multiple calls return the same
+/// object from [`FakeObjects`](crate::emulation::FakeObjects), ensuring that multiple calls return the same
 /// reference. This is critical for anti-tamper checks that compare assembly references.
 fn module_get_assembly_pre(_ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     // Return the pre-allocated fake assembly from FakeObjects.
@@ -643,11 +643,11 @@ fn assembly_get_type_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) ->
             if let Some(asm) = thread.assembly().cloned() {
                 for entry in asm.types().iter() {
                     let cil_type = entry.value();
-                    let full_name = if cil_type.namespace.is_empty() {
-                        &cil_type.name
+                    let full_name: std::borrow::Cow<'_, str> = if cil_type.namespace.is_empty() {
+                        std::borrow::Cow::Borrowed(cil_type.name.as_str())
                     } else {
                         // Check both "Namespace.Name" formats
-                        &format!("{}.{}", cil_type.namespace, cil_type.name)
+                        std::borrow::Cow::Owned(format!("{}.{}", cil_type.namespace, cil_type.name))
                     };
                     if full_name == type_name.as_ref() || cil_type.name == type_name.as_ref() {
                         match thread

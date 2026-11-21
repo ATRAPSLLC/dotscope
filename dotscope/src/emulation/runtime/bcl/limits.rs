@@ -20,29 +20,104 @@
 //!    perfectly valid `usize`. [`checked_len`] also enforces a ceiling.
 //!
 //! Failures are returned as [`PreHookResult::Throw`] rather than
-//! [`PreHookResult::Error`](crate::emulation::runtime::hook::PreHookResult::Error), so they
+//! [`PreHookResult::Error`], so they
 //! flow through CIL exception handling. Emulated code that guards a large allocation with
 //! `try`/`catch` — which obfuscator runtimes and packers routinely do — then behaves as it
 //! would on a real runtime, instead of the whole emulation being abandoned.
 
-use crate::emulation::{engine::synthetic_exception, runtime::hook::PreHookResult};
+use crate::{
+    emulation::{
+        engine::synthetic_exception,
+        runtime::hook::{HookContext, PreHookResult},
+        thread::EmulationThread,
+        EmValue, HeapRef,
+    },
+    metadata::token::Token,
+};
 
 /// Ceiling for a general-purpose buffer materialised inside a single hook.
 ///
 /// Sized to be far above anything real code asks for in one call while staying small enough
 /// that a rejected request costs nothing. Hooks whose output has a naturally tighter bound
 /// should use a more specific constant rather than this one.
-pub(crate) const MAX_HOOK_BUFFER: usize = 16 * 1024 * 1024;
+pub const MAX_HOOK_BUFFER: usize = 16 * 1024 * 1024;
 
 /// Ceiling for a single string built by a hook, in `char`s.
 ///
 /// Padding and repeat operations take a target width from emulated code; this bounds the
 /// resulting string independently of [`MAX_HOOK_BUFFER`] because strings are measured in
 /// scalars rather than bytes.
-pub(crate) const MAX_HOOK_STRING_CHARS: usize = 4 * 1024 * 1024;
+pub const MAX_HOOK_STRING_CHARS: usize = 4 * 1024 * 1024;
+
+/// The `(byte[] buffer, int offset, int count)` arguments of a stream method, checked as the
+/// runtime's `Stream.ValidateBufferArguments` checks them before any data moves: the buffer's
+/// handle, the offset and the count.
+///
+/// A null buffer is the `ArgumentNullException` the runtime throws, a negative offset or
+/// count the `ArgumentOutOfRangeException`, and a count past the buffer's end from the offset
+/// the exception `past_end` names: `ArgumentOutOfRangeException` for a `Stream`,
+/// `ArgumentException` for `BinaryReader.Read`. Arguments of any other shape (no array, no
+/// `int32`) are no call the runtime makes, so they are an emulation error rather than an
+/// exception the program could catch.
+///
+/// # Arguments
+///
+/// * `ctx` - The hook context, whose first three arguments are the buffer, offset and count
+/// * `thread` - The emulation thread, for the buffer's length
+/// * `past_end` - The exception a range past the buffer's end throws
+pub fn buffer_range(
+    ctx: &HookContext<'_>,
+    thread: &EmulationThread,
+    past_end: Token,
+) -> std::result::Result<(HeapRef, usize, usize), PreHookResult> {
+    let throw = |exception_type, message: String| PreHookResult::Throw {
+        exception_type,
+        message,
+    };
+    let buffer = match ctx.args.first() {
+        Some(EmValue::ObjectRef(handle)) => *handle,
+        Some(EmValue::Null) => {
+            return Err(throw(
+                synthetic_exception::ARGUMENT_NULL,
+                "buffer".to_string(),
+            ))
+        }
+        other => {
+            return Err(PreHookResult::Error(format!(
+                "{}.{} with buffer {other:?}, no byte array",
+                ctx.type_name, ctx.method_name
+            )))
+        }
+    };
+    let (Some(EmValue::I32(offset)), Some(EmValue::I32(count))) =
+        (ctx.args.get(1), ctx.args.get(2))
+    else {
+        return Err(PreHookResult::Error(format!(
+            "{}.{} without int32 offset and count",
+            ctx.type_name, ctx.method_name
+        )));
+    };
+    let (Ok(offset), Ok(count)) = (usize::try_from(*offset), usize::try_from(*count)) else {
+        return Err(throw(
+            synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+            format!("offset {offset} and count {count} must be non-negative"),
+        ));
+    };
+    let length = thread
+        .heap()
+        .get_array_length(buffer)
+        .map_err(|e| PreHookResult::Error(format!("buffer is no array: {e}")))?;
+    if length.checked_sub(offset).is_none_or(|room| count > room) {
+        return Err(throw(
+            past_end,
+            format!("{count} bytes from offset {offset} pass the buffer's {length} bytes"),
+        ));
+    }
+    Ok((buffer, offset, count))
+}
 
 /// Builds the exception thrown when an emulated count argument is negative.
-pub(crate) fn negative_argument(method: &str, param: &str) -> PreHookResult {
+pub fn negative_argument(method: &str, param: &str) -> PreHookResult {
     PreHookResult::Throw {
         exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
         message: format!("{method}: '{param}' must be non-negative"),
@@ -50,7 +125,7 @@ pub(crate) fn negative_argument(method: &str, param: &str) -> PreHookResult {
 }
 
 /// Builds the exception thrown when an emulated count argument that must be positive is not.
-pub(crate) fn non_positive_argument(method: &str, param: &str) -> PreHookResult {
+pub fn non_positive_argument(method: &str, param: &str) -> PreHookResult {
     PreHookResult::Throw {
         exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
         message: format!("{method}: '{param}' must be positive"),
@@ -58,7 +133,7 @@ pub(crate) fn non_positive_argument(method: &str, param: &str) -> PreHookResult 
 }
 
 /// Builds the exception thrown when an emulated count argument exceeds its ceiling.
-pub(crate) fn oversized_argument(
+pub fn oversized_argument(
     method: &str,
     param: &str,
     requested: usize,
@@ -94,7 +169,7 @@ pub(crate) fn oversized_argument(
 // returns, and every hook in the tree already returns `PreHookResult` by value. Boxing it
 // would add a deref at each of these call sites without removing the cost anywhere.
 #[allow(clippy::result_large_err)]
-pub(crate) fn checked_len<T>(
+pub fn checked_len<T>(
     value: T,
     max: usize,
     method: &str,
@@ -115,13 +190,69 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{metadata::typesystem::PointerSize, testkit::emulation::create_test_thread};
 
     /// Asserts that `result` is a throw of `expected` exception type.
-    fn assert_throws(result: &PreHookResult, expected: crate::metadata::token::Token) {
+    fn assert_throws(result: &PreHookResult, expected: Token) {
         match result {
             PreHookResult::Throw { exception_type, .. } => assert_eq!(*exception_type, expected),
             other => panic!("expected a throw, got {other:?}"),
         }
+    }
+
+    /// `buffer_range` of `(buffer, offset, count)` over a 16-byte array, or a null buffer.
+    fn range_of(
+        buffer: bool,
+        offset: i32,
+        count: i32,
+        past_end: Token,
+    ) -> std::result::Result<(HeapRef, usize, usize), PreHookResult> {
+        let thread = create_test_thread();
+        let array = thread.heap().alloc_byte_array(&[0u8; 16]).unwrap();
+        let args = [
+            if buffer {
+                EmValue::ObjectRef(array)
+            } else {
+                EmValue::Null
+            },
+            EmValue::I32(offset),
+            EmValue::I32(count),
+        ];
+        let ctx = HookContext::new(
+            Token::new(0x0A000001),
+            "System.IO",
+            "Stream",
+            "Read",
+            PointerSize::Bit64,
+        )
+        .with_args(&args);
+        buffer_range(&ctx, &thread, past_end)
+    }
+
+    /// The buffer arguments of a stream call are checked as `Stream.ValidateBufferArguments`
+    /// checks them: null, negative, and past the end each the exception the runtime throws,
+    /// with the past-end exception the caller names (`BinaryReader` throws
+    /// `ArgumentException`). A range that ends at the buffer's end is accepted.
+    #[test]
+    fn buffer_ranges_are_checked_as_the_runtime_checks_them() {
+        let range = synthetic_exception::ARGUMENT_OUT_OF_RANGE;
+        assert_throws(
+            &range_of(false, 0, 1, range).unwrap_err(),
+            synthetic_exception::ARGUMENT_NULL,
+        );
+        assert_throws(&range_of(true, -1, 1, range).unwrap_err(), range);
+        assert_throws(&range_of(true, 0, -1, range).unwrap_err(), range);
+        assert_throws(&range_of(true, 8, 9, range).unwrap_err(), range);
+        assert_throws(&range_of(true, 17, 0, range).unwrap_err(), range);
+        // Where the past-end exception differs, a negative argument still throws
+        // `ArgumentOutOfRangeException`, as `BinaryReader.Read` does
+        let argument = synthetic_exception::ARGUMENT_EXCEPTION;
+        assert_throws(&range_of(true, 8, 9, argument).unwrap_err(), argument);
+        assert_throws(&range_of(true, -1, 1, argument).unwrap_err(), range);
+        assert_throws(&range_of(true, 0, -1, argument).unwrap_err(), range);
+        let (_, offset, count) = range_of(true, 8, 8, range).unwrap();
+        assert_eq!((offset, count), (8, 8));
+        assert!(range_of(true, 16, 0, range).is_ok());
     }
 
     #[test]

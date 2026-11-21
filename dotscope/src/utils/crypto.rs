@@ -29,10 +29,7 @@ use std::iter::repeat_n;
 use aes::Aes128;
 #[cfg(feature = "emulation")]
 use cbc::{
-    cipher::{
-        block_padding::{NoPadding, Pkcs7},
-        BlockModeDecrypt, BlockModeEncrypt, KeyInit, KeyIvInit,
-    },
+    cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyInit, KeyIvInit},
     Decryptor, Encryptor,
 };
 #[cfg(all(feature = "legacy-crypto", feature = "emulation"))]
@@ -431,10 +428,46 @@ pub fn derive_pbkdf1_key(password: &[u8], salt: &[u8], iterations: u32, key_len:
     }
 }
 
-/// Applies a crypto transformation (encryption or decryption) to data.
-///
-/// This function handles the actual cryptographic operations for AES, DES, and
-/// TripleDES in CBC and ECB modes with configurable padding.
+/// Why a symmetric transform produced no output.
+#[cfg(feature = "emulation")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CryptoFailure {
+    /// The emulator has no implementation of what was asked: an algorithm it does not know,
+    /// a cipher mode other than CBC and ECB, DES without the `legacy-crypto` feature. Not
+    /// something the runtime refuses, so not a CLR exception.
+    Unsupported(String),
+    /// What the runtime refuses with a `CryptographicException`: a key or IV of a size the
+    /// algorithm does not take, input that is not whole blocks where it must be, padding that
+    /// does not check out, a padding mode that does not exist.
+    Invalid(String),
+}
+
+#[cfg(feature = "emulation")]
+impl std::fmt::Display for CryptoFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CryptoFailure::Unsupported(what) => write!(f, "not emulated: {what}"),
+            CryptoFailure::Invalid(why) => f.write_str(why),
+        }
+    }
+}
+
+/// The block cipher an algorithm name and key select.
+#[cfg(feature = "emulation")]
+#[derive(Clone, Copy)]
+enum BlockCipher {
+    Aes128,
+    Aes192,
+    Aes256,
+    #[cfg(feature = "legacy-crypto")]
+    Des,
+    #[cfg(feature = "legacy-crypto")]
+    TripleDes,
+}
+
+/// Applies a symmetric transform (encryption or decryption) to `data` as .NET's
+/// `ICryptoTransform.TransformFinalBlock` does: the whole input, padded when encrypting and
+/// unpadded when decrypting.
 ///
 /// # Arguments
 ///
@@ -443,12 +476,17 @@ pub fn derive_pbkdf1_key(password: &[u8], salt: &[u8], iterations: u32, key_len:
 /// * `iv` - The initialization vector (ignored for ECB mode)
 /// * `is_encryptor` - True for encryption, false for decryption
 /// * `data` - The input data to transform
-/// * `mode` - Cipher mode: 1=CBC (default), 2=ECB
-/// * `padding` - Padding mode: 1=None, 2=PKCS7 (default), 3=Zeros
+/// * `mode` - `CipherMode`: 1 = CBC, 2 = ECB (3 = OFB, 4 = CFB and 5 = CTS are not emulated)
+/// * `padding` - `PaddingMode`: 1 = None, 2 = PKCS7, 3 = Zeros, 4 = ANSIX923, 5 = ISO10126
 ///
-/// # Returns
+/// # Padding
 ///
-/// The transformed data, or `None` if the algorithm/key size is unsupported.
+/// Encrypting, PKCS7, ANSIX923 and ISO10126 always add 1 to a block's worth of bytes, the
+/// last holding their count (PKCS7 repeats the count, ANSIX923 pads with zeros, ISO10126 with
+/// bytes of no meaning, zeros here); Zeros pads with zeros to the block boundary, nothing when
+/// the input already ends on one; None adds nothing and needs whole blocks. Decrypting, the
+/// count is checked and removed (PKCS7 checks every pad byte, ANSIX923 that they are zero,
+/// ISO10126 only the count); Zeros and None remove nothing.
 ///
 /// # Supported Algorithms
 ///
@@ -456,7 +494,12 @@ pub fn derive_pbkdf1_key(password: &[u8], salt: &[u8], iterations: u32, key_len:
 /// |-----------|-----------|------------|
 /// | AES/Rijndael | 16, 24, 32 bytes | 16 bytes |
 /// | DES | 8 bytes | 8 bytes |
-/// | TripleDES/3DES | 24 bytes | 8 bytes |
+/// | TripleDES/3DES | 16 (K1 K2 K1), 24 bytes | 8 bytes |
+///
+/// # Errors
+///
+/// [`CryptoFailure::Invalid`] for what the runtime refuses, [`CryptoFailure::Unsupported`]
+/// for what is not emulated (see their documentation).
 #[cfg(feature = "emulation")]
 pub fn apply_crypto_transform(
     algorithm: &str,
@@ -466,232 +509,229 @@ pub fn apply_crypto_transform(
     data: &[u8],
     mode: u8,
     padding: u8,
-) -> Option<Vec<u8>> {
-    // Normalize algorithm name
-    let alg_upper = algorithm.to_uppercase();
-    let is_ecb = mode == 2;
-
-    if alg_upper.contains("AES") || alg_upper.contains("RIJNDAEL") {
-        return if is_ecb {
-            aes_ecb_transform(key, is_encryptor, data, padding)
-        } else {
-            // CBC mode (default)
-            aes_cbc_transform(key, iv, is_encryptor, data, padding)
-        };
-    }
-
-    // DES/3DES support requires legacy-crypto feature
-    #[cfg(feature = "legacy-crypto")]
-    if alg_upper.contains("TRIPLEDES") || alg_upper.contains("3DES") {
-        if key.len() == 24 {
-            return if is_ecb {
-                tdes_ecb_transform(key, is_encryptor, data, padding)
-            } else if iv.len() >= 8 {
-                tdes_cbc_transform(key, iv, is_encryptor, data, padding)
-            } else {
-                None
-            };
+) -> std::result::Result<Vec<u8>, CryptoFailure> {
+    let (cipher, block) = select_cipher(algorithm, key)?;
+    let cbc = match mode {
+        1 => true,
+        2 => false,
+        other => {
+            return Err(CryptoFailure::Unsupported(format!(
+                "cipher mode {other} (only CBC and ECB are emulated)"
+            )))
         }
-        return None;
+    };
+    if !(1..=5).contains(&padding) {
+        return Err(CryptoFailure::Invalid(
+            "Specified padding mode is not valid for this algorithm.".to_string(),
+        ));
     }
-
-    #[cfg(feature = "legacy-crypto")]
-    if alg_upper.contains("DES") {
-        if key.len() == 8 {
-            return if is_ecb {
-                des_ecb_transform(key, is_encryptor, data, padding)
-            } else if iv.len() >= 8 {
-                des_cbc_transform(key, iv, is_encryptor, data, padding)
-            } else {
-                None
-            };
-        }
-        return None;
-    }
-
-    // DES/3DES not available without legacy-crypto
-    #[cfg(not(feature = "legacy-crypto"))]
-    if alg_upper.contains("DES") {
-        return None;
-    }
-
-    // Unknown algorithm - return None (passthrough handled by caller)
-    None
-}
-
-/// AES CBC mode transform with configurable padding.
-#[cfg(feature = "emulation")]
-fn aes_cbc_transform(
-    key: &[u8],
-    iv: &[u8],
-    is_encryptor: bool,
-    data: &[u8],
-    padding: u8,
-) -> Option<Vec<u8>> {
-    match key.len() {
-        16 => cbc_transform::<Aes128CbcEnc, Aes128CbcDec>(key, iv, 16, is_encryptor, data, padding),
-        24 => cbc_transform::<Aes192CbcEnc, Aes192CbcDec>(key, iv, 16, is_encryptor, data, padding),
-        32 => cbc_transform::<Aes256CbcEnc, Aes256CbcDec>(key, iv, 16, is_encryptor, data, padding),
-        _ => None,
-    }
-}
-
-/// AES ECB mode transform with configurable padding.
-#[cfg(feature = "emulation")]
-fn aes_ecb_transform(key: &[u8], is_encryptor: bool, data: &[u8], padding: u8) -> Option<Vec<u8>> {
-    match key.len() {
-        16 => ecb_transform::<Aes128EcbEnc, Aes128EcbDec>(key, 16, is_encryptor, data, padding),
-        24 => ecb_transform::<Aes192EcbEnc, Aes192EcbDec>(key, 16, is_encryptor, data, padding),
-        32 => ecb_transform::<Aes256EcbEnc, Aes256EcbDec>(key, 16, is_encryptor, data, padding),
-        _ => None,
-    }
-}
-
-/// Generic CBC mode transform with configurable padding.
-#[cfg(feature = "emulation")]
-fn cbc_transform<E, D>(
-    key: &[u8],
-    iv: &[u8],
-    block_size: usize,
-    is_encryptor: bool,
-    data: &[u8],
-    padding: u8,
-) -> Option<Vec<u8>>
-where
-    E: BlockModeEncrypt + KeyIvInit,
-    D: BlockModeDecrypt + KeyIvInit,
-{
-    if iv.len() < block_size {
-        return None;
-    }
-    if is_encryptor {
-        let iv_slice = iv.get(..block_size)?;
-        let cipher = E::new_from_slices(key, iv_slice).ok()?;
-        // block_size is small (8 or 16); checked arithmetic guards against overflow
-        // for absurdly large `data.len()` from adversarial input.
-        let padded_len = data
-            .len()
-            .checked_div(block_size)?
-            .checked_add(1)?
-            .checked_mul(block_size)?;
-        let mut buf = vec![0u8; padded_len];
-        let buf_prefix = buf.get_mut(..data.len())?;
-        buf_prefix.copy_from_slice(data);
-        let result = match padding {
-            1 => cipher
-                .encrypt_padded::<NoPadding>(&mut buf, data.len())
-                .ok()?,
-            3 => {
-                // Zeros padding: pad with zeros to block boundary
-                let result = cipher
-                    .encrypt_padded::<NoPadding>(&mut buf, padded_len)
-                    .ok()?;
-                return Some(result.to_vec());
-            }
-            _ => cipher.encrypt_padded::<Pkcs7>(&mut buf, data.len()).ok()?,
-        };
-        Some(result.to_vec())
+    let iv = if cbc {
+        iv.get(..block).ok_or_else(|| {
+            CryptoFailure::Invalid(
+                "Specified initialization vector (IV) does not match the block size for this \
+                 algorithm."
+                    .to_string(),
+            )
+        })?
     } else {
-        if data.is_empty() {
-            return None;
-        }
-        let iv_slice = iv.get(..block_size)?;
-        let cipher = D::new_from_slices(key, iv_slice).ok()?;
-        let mut buf = data.to_vec();
-        let result = match padding {
-            1 | 3 => cipher.decrypt_padded::<NoPadding>(&mut buf).ok()?,
-            _ => cipher.decrypt_padded::<Pkcs7>(&mut buf).ok()?,
-        };
-        Some(result.to_vec())
-    }
-}
+        &[][..]
+    };
+    let incomplete =
+        || CryptoFailure::Invalid("The input data is not a complete block.".to_string());
 
-/// Generic ECB mode transform with configurable padding.
-#[cfg(feature = "emulation")]
-fn ecb_transform<E, D>(
-    key: &[u8],
-    block_size: usize,
-    is_encryptor: bool,
-    data: &[u8],
-    padding: u8,
-) -> Option<Vec<u8>>
-where
-    E: BlockModeEncrypt + KeyInit,
-    D: BlockModeDecrypt + KeyInit,
-{
     if is_encryptor {
-        let cipher = E::new_from_slice(key).ok()?;
-        // block_size is small (8 or 16); checked arithmetic guards against overflow
-        // for absurdly large `data.len()` from adversarial input.
-        let padded_len = data
-            .len()
-            .checked_div(block_size)?
-            .checked_add(1)?
-            .checked_mul(block_size)?;
-        let mut buf = vec![0u8; padded_len];
-        let buf_prefix = buf.get_mut(..data.len())?;
-        buf_prefix.copy_from_slice(data);
-        let result = match padding {
-            1 => cipher
-                .encrypt_padded::<NoPadding>(&mut buf, data.len())
-                .ok()?,
-            3 => {
-                let result = cipher
-                    .encrypt_padded::<NoPadding>(&mut buf, padded_len)
-                    .ok()?;
-                return Some(result.to_vec());
-            }
-            _ => cipher.encrypt_padded::<Pkcs7>(&mut buf, data.len()).ok()?,
-        };
-        Some(result.to_vec())
-    } else {
-        if data.is_empty() {
-            return None;
-        }
-        let cipher = D::new_from_slice(key).ok()?;
         let mut buf = data.to_vec();
-        let result = match padding {
-            1 | 3 => cipher.decrypt_padded::<NoPadding>(&mut buf).ok()?,
-            _ => cipher.decrypt_padded::<Pkcs7>(&mut buf).ok()?,
+        let remainder = data.len().checked_rem(block).unwrap_or(0);
+        // Bytes to the next block boundary: 1..=block for the counted paddings
+        let to_boundary = block.saturating_sub(remainder);
+        match padding {
+            1 if remainder != 0 => return Err(incomplete()),
+            1 => {}
+            3 if remainder != 0 => buf.resize(data.len().saturating_add(to_boundary), 0),
+            3 => {}
+            _ => {
+                let count = to_boundary;
+                let count_byte = u8::try_from(count).unwrap_or(u8::MAX);
+                let fill = if padding == 2 { count_byte } else { 0 };
+                buf.resize(data.len().saturating_add(count.saturating_sub(1)), fill);
+                buf.push(count_byte);
+            }
+        }
+        raw_transform(cipher, key, iv, cbc, true, &mut buf)?;
+        return Ok(buf);
+    }
+
+    if !data.len().is_multiple_of(block) {
+        return Err(incomplete());
+    }
+    let mut buf = data.to_vec();
+    if buf.is_empty() {
+        return Ok(buf);
+    }
+    raw_transform(cipher, key, iv, cbc, false, &mut buf)?;
+    if matches!(padding, 2..=5) && padding != 3 {
+        let invalid =
+            || CryptoFailure::Invalid("Padding is invalid and cannot be removed.".to_string());
+        let count = usize::from(*buf.last().ok_or_else(invalid)?);
+        if count == 0 || count > block || count > buf.len() {
+            return Err(invalid());
+        }
+        let start = buf.len().saturating_sub(count);
+        let pad = buf
+            .get(start..buf.len().saturating_sub(1))
+            .ok_or_else(invalid)?;
+        let valid = match padding {
+            2 => pad.iter().all(|&byte| usize::from(byte) == count),
+            4 => pad.iter().all(|&byte| byte == 0),
+            _ => true,
         };
-        Some(result.to_vec())
+        if !valid {
+            return Err(invalid());
+        }
+        buf.truncate(start);
+    }
+    Ok(buf)
+}
+
+/// The block size, in bytes, of the symmetric algorithm `algorithm` names (16 for AES and
+/// Rijndael, 8 for DES and TripleDES), or `None` for an algorithm the emulator does not know.
+#[cfg(feature = "emulation")]
+#[must_use]
+pub fn symmetric_block_size(algorithm: &str) -> Option<usize> {
+    let name = algorithm.to_uppercase();
+    if name.contains("AES") || name.contains("RIJNDAEL") {
+        Some(16)
+    } else if name.contains("DES") {
+        Some(8)
+    } else {
+        None
     }
 }
 
-/// DES CBC mode transform (legacy-crypto feature).
-#[cfg(all(feature = "legacy-crypto", feature = "emulation"))]
-fn des_cbc_transform(
+/// The cipher `algorithm` names, and its block size, checked against the key's size.
+#[cfg(feature = "emulation")]
+fn select_cipher(
+    algorithm: &str,
+    key: &[u8],
+) -> std::result::Result<(BlockCipher, usize), CryptoFailure> {
+    let name = algorithm.to_uppercase();
+    let bad_key = || {
+        CryptoFailure::Invalid("Specified key is not a valid size for this algorithm.".to_string())
+    };
+    if name.contains("AES") || name.contains("RIJNDAEL") {
+        return match key.len() {
+            16 => Ok((BlockCipher::Aes128, 16)),
+            24 => Ok((BlockCipher::Aes192, 16)),
+            32 => Ok((BlockCipher::Aes256, 16)),
+            _ => Err(bad_key()),
+        };
+    }
+    if name.contains("TRIPLEDES") || name.contains("3DES") {
+        #[cfg(feature = "legacy-crypto")]
+        return match key.len() {
+            16 | 24 => Ok((BlockCipher::TripleDes, 8)),
+            _ => Err(bad_key()),
+        };
+        #[cfg(not(feature = "legacy-crypto"))]
+        return Err(CryptoFailure::Unsupported(
+            "TripleDES without the legacy-crypto feature".to_string(),
+        ));
+    }
+    if name.contains("DES") {
+        #[cfg(feature = "legacy-crypto")]
+        return match key.len() {
+            8 => Ok((BlockCipher::Des, 8)),
+            _ => Err(bad_key()),
+        };
+        #[cfg(not(feature = "legacy-crypto"))]
+        return Err(CryptoFailure::Unsupported(
+            "DES without the legacy-crypto feature".to_string(),
+        ));
+    }
+    Err(CryptoFailure::Unsupported(format!(
+        "symmetric algorithm {algorithm}"
+    )))
+}
+
+/// Encrypts or decrypts `buf`, whole blocks, in place, without padding.
+#[cfg(feature = "emulation")]
+fn raw_transform(
+    cipher: BlockCipher,
     key: &[u8],
     iv: &[u8],
-    is_encryptor: bool,
-    data: &[u8],
-    padding: u8,
-) -> Option<Vec<u8>> {
-    cbc_transform::<DesCbcEnc, DesCbcDec>(key, iv, 8, is_encryptor, data, padding)
+    cbc: bool,
+    encrypt: bool,
+    buf: &mut [u8],
+) -> std::result::Result<(), CryptoFailure> {
+    match cipher {
+        BlockCipher::Aes128 => raw::<Aes128CbcEnc, Aes128CbcDec, Aes128EcbEnc, Aes128EcbDec>(
+            key, iv, cbc, encrypt, buf,
+        ),
+        BlockCipher::Aes192 => raw::<Aes192CbcEnc, Aes192CbcDec, Aes192EcbEnc, Aes192EcbDec>(
+            key, iv, cbc, encrypt, buf,
+        ),
+        BlockCipher::Aes256 => raw::<Aes256CbcEnc, Aes256CbcDec, Aes256EcbEnc, Aes256EcbDec>(
+            key, iv, cbc, encrypt, buf,
+        ),
+        #[cfg(feature = "legacy-crypto")]
+        BlockCipher::Des => {
+            raw::<DesCbcEnc, DesCbcDec, DesEcbEnc, DesEcbDec>(key, iv, cbc, encrypt, buf)
+        }
+        #[cfg(feature = "legacy-crypto")]
+        BlockCipher::TripleDes => {
+            // A two-key TripleDES key is K1 K2, used as K1 K2 K1
+            let mut full = key.to_vec();
+            if full.len() == 16 {
+                full.extend_from_slice(key.get(..8).unwrap_or_default());
+            }
+            raw::<TdesCbcEnc, TdesCbcDec, TdesEcbEnc, TdesEcbDec>(&full, iv, cbc, encrypt, buf)
+        }
+    }
 }
 
-/// DES ECB mode transform (legacy-crypto feature).
-#[cfg(all(feature = "legacy-crypto", feature = "emulation"))]
-fn des_ecb_transform(key: &[u8], is_encryptor: bool, data: &[u8], padding: u8) -> Option<Vec<u8>> {
-    ecb_transform::<DesEcbEnc, DesEcbDec>(key, 8, is_encryptor, data, padding)
-}
-
-/// TripleDES CBC mode transform (legacy-crypto feature).
-#[cfg(all(feature = "legacy-crypto", feature = "emulation"))]
-fn tdes_cbc_transform(
+/// The block cipher `CE`/`CD` (CBC) or `EE`/`ED` (ECB) over `buf`, whole blocks, in place.
+#[cfg(feature = "emulation")]
+fn raw<CE, CD, EE, ED>(
     key: &[u8],
     iv: &[u8],
-    is_encryptor: bool,
-    data: &[u8],
-    padding: u8,
-) -> Option<Vec<u8>> {
-    cbc_transform::<TdesCbcEnc, TdesCbcDec>(key, iv, 8, is_encryptor, data, padding)
-}
-
-/// TripleDES ECB mode transform (legacy-crypto feature).
-#[cfg(all(feature = "legacy-crypto", feature = "emulation"))]
-fn tdes_ecb_transform(key: &[u8], is_encryptor: bool, data: &[u8], padding: u8) -> Option<Vec<u8>> {
-    ecb_transform::<TdesEcbEnc, TdesEcbDec>(key, 8, is_encryptor, data, padding)
+    cbc: bool,
+    encrypt: bool,
+    buf: &mut [u8],
+) -> std::result::Result<(), CryptoFailure>
+where
+    CE: BlockModeEncrypt + KeyIvInit,
+    CD: BlockModeDecrypt + KeyIvInit,
+    EE: BlockModeEncrypt + KeyInit,
+    ED: BlockModeDecrypt + KeyInit,
+{
+    let bad = |e: &dyn std::fmt::Display| {
+        CryptoFailure::Invalid(format!("the key or IV is not valid: {e}"))
+    };
+    let len = buf.len();
+    let incomplete =
+        || CryptoFailure::Invalid("The input data is not a complete block.".to_string());
+    match (cbc, encrypt) {
+        (true, true) => CE::new_from_slices(key, iv)
+            .map_err(|e| bad(&e))?
+            .encrypt_padded::<NoPadding>(buf, len)
+            .map(|_| ())
+            .map_err(|_| incomplete()),
+        (true, false) => CD::new_from_slices(key, iv)
+            .map_err(|e| bad(&e))?
+            .decrypt_padded::<NoPadding>(buf)
+            .map(|_| ())
+            .map_err(|_| incomplete()),
+        (false, true) => EE::new_from_slice(key)
+            .map_err(|e| bad(&e))?
+            .encrypt_padded::<NoPadding>(buf, len)
+            .map(|_| ())
+            .map_err(|_| incomplete()),
+        (false, false) => ED::new_from_slice(key)
+            .map_err(|e| bad(&e))?
+            .decrypt_padded::<NoPadding>(buf)
+            .map(|_| ())
+            .map_err(|_| incomplete()),
+    }
 }
 
 // TODO: Replace this manual implementation with the `rsa` crate once its Marvin Attack
@@ -1069,7 +1109,7 @@ mod tests {
 
         // Encrypt
         let ciphertext = apply_crypto_transform("AES", &key, &iv, true, plaintext, 1, 2);
-        assert!(ciphertext.is_some(), "Encryption should succeed");
+        assert!(ciphertext.is_ok(), "Encryption should succeed");
         let ciphertext = ciphertext.unwrap();
         assert_ne!(
             ciphertext.as_slice(),
@@ -1079,7 +1119,7 @@ mod tests {
 
         // Decrypt
         let decrypted = apply_crypto_transform("AES", &key, &iv, false, &ciphertext, 1, 2);
-        assert!(decrypted.is_some(), "Decryption should succeed");
+        assert!(decrypted.is_ok(), "Decryption should succeed");
         assert_eq!(
             decrypted.unwrap(),
             plaintext,
@@ -1135,7 +1175,10 @@ mod tests {
         let plaintext = b"test";
 
         let result = apply_crypto_transform("AES", &bad_key, &iv, true, plaintext, 1, 2);
-        assert!(result.is_none(), "Should fail with invalid key size");
+        assert!(
+            matches!(result, Err(CryptoFailure::Invalid(_))),
+            "a key size the algorithm does not take is what the runtime refuses: {result:?}"
+        );
     }
 
     #[test]
@@ -1145,7 +1188,10 @@ mod tests {
         let plaintext = b"test";
 
         let result = apply_crypto_transform("UNKNOWN_ALGO", &key, &iv, true, plaintext, 1, 2);
-        assert!(result.is_none(), "Should return None for unknown algorithm");
+        assert!(
+            matches!(result, Err(CryptoFailure::Unsupported(_))),
+            "an algorithm the emulator does not know is not emulated: {result:?}"
+        );
     }
 
     #[test]
@@ -1214,6 +1260,160 @@ mod tests {
 
         let decrypted = apply_crypto_transform("AES", &key, &iv, false, &ciphertext, 1, 2).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// The FIPS-197 appendix C.1 AES-128 vector, through ECB without padding: the raw cipher
+    /// the padding tests below decrypt with.
+    #[cfg(feature = "emulation")]
+    #[test]
+    fn the_raw_cipher_matches_fips_197() {
+        let key: Vec<u8> = (0u8..16).collect();
+        let plaintext: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(0x11)).collect();
+        let expected = [
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+            0xc5, 0x5a,
+        ];
+        let ciphertext = apply_crypto_transform("AES", &key, &[], true, &plaintext, 2, 1).unwrap();
+        assert_eq!(ciphertext, expected);
+        let decrypted = apply_crypto_transform("AES", &key, &[], false, &expected, 2, 1).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    /// Each padding mode writes the bytes its definition gives, read back through the raw
+    /// cipher, and removes them again: PKCS7 the count in every byte, Zeros zeros (none on
+    /// whole blocks), ANSIX923 zeros then the count, ISO10126 anything then the count.
+    #[cfg(feature = "emulation")]
+    #[test]
+    fn every_padding_mode_writes_and_removes_its_bytes() {
+        let key = [3u8; 16];
+        let iv = [5u8; 16];
+        let data = b"hello";
+        let raw = |ciphertext: &[u8]| {
+            apply_crypto_transform("AES", &key, &iv, false, ciphertext, 1, 1).unwrap()
+        };
+        for (padding, tail) in [
+            (2u8, vec![11u8; 11]),
+            (3, vec![0; 11]),
+            (4, [vec![0; 10], vec![11]].concat()),
+        ] {
+            let ciphertext =
+                apply_crypto_transform("AES", &key, &iv, true, data, 1, padding).unwrap();
+            assert_eq!(
+                raw(&ciphertext),
+                [data.as_slice(), &tail].concat(),
+                "padding {padding}"
+            );
+            let decrypted =
+                apply_crypto_transform("AES", &key, &iv, false, &ciphertext, 1, padding).unwrap();
+            let expected: &[u8] = if padding == 3 {
+                &raw(&ciphertext)
+            } else {
+                data
+            };
+            assert_eq!(decrypted, expected, "padding {padding}");
+        }
+        let iso = apply_crypto_transform("AES", &key, &iv, true, data, 1, 5).unwrap();
+        assert_eq!(raw(&iso).last(), Some(&11));
+        assert_eq!(
+            apply_crypto_transform("AES", &key, &iv, false, &iso, 1, 5).unwrap(),
+            data
+        );
+        // Zeros pads nothing onto whole blocks; the counted paddings a whole block
+        let block = [1u8; 16];
+        assert_eq!(
+            apply_crypto_transform("AES", &key, &iv, true, &block, 1, 3)
+                .unwrap()
+                .len(),
+            16
+        );
+        for padding in [2, 4, 5] {
+            assert_eq!(
+                apply_crypto_transform("AES", &key, &iv, true, &block, 1, padding)
+                    .unwrap()
+                    .len(),
+                32
+            );
+        }
+    }
+
+    /// Padding that does not check out, input that is not whole blocks, and an unknown
+    /// padding mode are what the runtime refuses; a cipher mode the emulator does not
+    /// compute is not emulated.
+    #[cfg(feature = "emulation")]
+    #[test]
+    fn transforms_report_why_they_fail() {
+        let key = [3u8; 16];
+        let iv = [5u8; 16];
+        let invalid = |result: std::result::Result<Vec<u8>, CryptoFailure>| {
+            matches!(result, Err(CryptoFailure::Invalid(_)))
+        };
+        // A raw block ending in 0x07 0x02: a count of 2 whose other byte is neither 2 (PKCS7)
+        // nor 0 (ANSIX923)
+        let mut padded = [0x41u8; 16];
+        padded[14] = 0x07;
+        padded[15] = 0x02;
+        let ciphertext = apply_crypto_transform("AES", &key, &iv, true, &padded, 1, 1).unwrap();
+        assert!(invalid(apply_crypto_transform(
+            "AES",
+            &key,
+            &iv,
+            false,
+            &ciphertext,
+            1,
+            2
+        )));
+        assert!(invalid(apply_crypto_transform(
+            "AES",
+            &key,
+            &iv,
+            false,
+            &ciphertext,
+            1,
+            4
+        )));
+        // ISO10126 checks only the count
+        assert_eq!(
+            apply_crypto_transform("AES", &key, &iv, false, &ciphertext, 1, 5).unwrap(),
+            padded.get(..14).unwrap()
+        );
+        let mut zero_count = padded;
+        zero_count[15] = 0;
+        let ciphertext = apply_crypto_transform("AES", &key, &iv, true, &zero_count, 1, 1).unwrap();
+        assert!(invalid(apply_crypto_transform(
+            "AES",
+            &key,
+            &iv,
+            false,
+            &ciphertext,
+            1,
+            2
+        )));
+        let mut over_block = padded;
+        over_block[15] = 17;
+        let ciphertext = apply_crypto_transform("AES", &key, &iv, true, &over_block, 1, 1).unwrap();
+        assert!(invalid(apply_crypto_transform(
+            "AES",
+            &key,
+            &iv,
+            false,
+            &ciphertext,
+            1,
+            5
+        )));
+
+        assert!(invalid(apply_crypto_transform(
+            "AES", &key, &iv, true, b"abc", 1, 1
+        )));
+        assert!(invalid(apply_crypto_transform(
+            "AES", &key, &iv, false, &[0u8; 15], 1, 2
+        )));
+        assert!(invalid(apply_crypto_transform(
+            "AES", &key, &iv, true, b"abc", 1, 6
+        )));
+        assert!(matches!(
+            apply_crypto_transform("AES", &key, &iv, true, b"abc", 4, 2),
+            Err(CryptoFailure::Unsupported(_))
+        ));
     }
 }
 
@@ -1434,6 +1634,20 @@ mod legacy_tests {
         let ciphertext_3des =
             apply_crypto_transform("3DES", &key, &iv, true, plaintext, 1, 2).unwrap();
         assert_eq!(ciphertext, ciphertext_3des);
+    }
+
+    /// A two-key TripleDES key is the three-key K1 K2 K1, as the runtime expands it.
+    #[cfg(feature = "emulation")]
+    #[test]
+    fn a_two_key_tripledes_key_is_k1_k2_k1() {
+        let two: Vec<u8> = (1u8..=16).collect();
+        let three = [two.as_slice(), two.get(..8).unwrap()].concat();
+        let iv = [0u8; 8];
+        let data = b"two keys";
+        assert_eq!(
+            apply_crypto_transform("TripleDES", &two, &iv, true, data, 1, 2).unwrap(),
+            apply_crypto_transform("TripleDES", &three, &iv, true, data, 1, 2).unwrap()
+        );
     }
 }
 

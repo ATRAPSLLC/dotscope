@@ -104,6 +104,7 @@ use crate::{
         EmValue,
     },
     metadata::{
+        streams::SharedStr,
         tables::{FieldRvaRaw, ModuleRaw},
         token::Token,
         typesystem::PointerSize,
@@ -392,6 +393,8 @@ enum VirtualFsEntry {
     Data { vfs_path: String, data: Vec<u8> },
     /// Map from an existing CowFile (takes ownership).
     CowFile { vfs_path: String, cow: CowFile },
+    /// A further name of a file mapped under `target`.
+    Alias { vfs_path: String, target: String },
 }
 
 impl ProcessBuilder {
@@ -1056,6 +1059,17 @@ impl ProcessBuilder {
         self
     }
 
+    /// Makes `vfs_path` a further name of the virtual file mapped under `target_path`, so one
+    /// file is reached by both without being held (or forked with the process) twice.
+    #[must_use]
+    pub fn with_virtual_file_alias(mut self, vfs_path: &str, target_path: &str) -> Self {
+        self.virtual_fs_entries.push(VirtualFsEntry::Alias {
+            vfs_path: vfs_path.to_string(),
+            target: target_path.to_string(),
+        });
+        self
+    }
+
     /// Disables registration of default BCL stubs.
     ///
     /// By default, the builder registers stubs for common BCL methods
@@ -1083,7 +1097,7 @@ impl ProcessBuilder {
     ///
     /// # Arguments
     ///
-    /// * `listener` - A boxed [`TraceListener`](crate::emulation::TraceListener) implementation
+    /// * `listener` - A boxed [`TraceListener`] implementation
     #[must_use]
     pub fn with_trace_listener(mut self, listener: Box<dyn TraceListener>) -> Self {
         self.trace_listeners.push(listener);
@@ -1196,7 +1210,7 @@ impl ProcessBuilder {
                 .unwrap_or(assembly.file().data());
             let name = assembly
                 .assembly()
-                .map_or_else(|| "primary".to_string(), |a| a.name.clone());
+                .map_or_else(|| "primary".to_string(), |a| a.name.to_string());
             if let Ok(image) = loader.load(pe_bytes, &address_space, name) {
                 loaded_images.push(image);
             }
@@ -1259,7 +1273,7 @@ impl ProcessBuilder {
             self.assembly
                 .as_ref()
                 .and_then(|a| a.assembly())
-                .map_or_else(|| "emulation".to_string(), |asm| asm.name.clone())
+                .map_or_else(|| "emulation".to_string(), |asm| asm.name.to_string())
         });
 
         // Create trace writer if tracing is enabled or listeners are registered
@@ -1296,6 +1310,9 @@ impl ProcessBuilder {
                 VirtualFsEntry::CowFile { vfs_path, cow } => {
                     virtual_fs.map_cow(&vfs_path, cow);
                 }
+                VirtualFsEntry::Alias { vfs_path, target } => {
+                    virtual_fs.alias(&vfs_path, &target);
+                }
             }
         }
 
@@ -1314,7 +1331,10 @@ impl ProcessBuilder {
                 let module_table = tables.table::<ModuleRaw>()?;
                 // Module is RID 1 by definition (ECMA-335 II.22.30).
                 let module_row = module_table.get(1).ok().flatten()?;
-                strings.get(module_row.name as usize).ok().map(String::from)
+                strings
+                    .get(module_row.name as usize)
+                    .ok()
+                    .map(SharedStr::from)
             });
 
             if let Some(name) = module_name {

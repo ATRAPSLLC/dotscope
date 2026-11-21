@@ -9,7 +9,10 @@ use crate::{
         tokens,
     },
     metadata::{
-        signatures::{SignatureMethod, SignatureParameter, TypeSignature},
+        signatures::{
+            SignatureArray, SignatureMethod, SignatureParameter, SignaturePointer,
+            SignatureSzArray, TypeSignature,
+        },
         token::Token,
         typesystem::CilPrimitiveKind,
     },
@@ -119,8 +122,10 @@ impl EmulationContext {
                 self.type_signature_to_token(&ptr.base, type_args, method_args, generics)
             }
 
-            // Pinned — unwrap and return inner token
-            TypeSignature::Pinned(inner) => {
+            // Pinned and modified types — unwrap and return inner token
+            TypeSignature::Pinned(inner)
+            | TypeSignature::ModifiedRequired(_, inner)
+            | TypeSignature::ModifiedOptional(_, inner) => {
                 self.type_signature_to_token(inner, type_args, method_args, generics)
             }
 
@@ -167,9 +172,20 @@ impl EmulationContext {
             modifiers: sig.return_type.modifiers.clone(),
         };
 
+        let new_varargs: Vec<SignatureParameter> = sig
+            .varargs
+            .iter()
+            .map(|p| SignatureParameter {
+                base: substitute_type_sig(&p.base),
+                by_ref: p.by_ref,
+                modifiers: p.modifiers.clone(),
+            })
+            .collect();
+
         let mut result = sig.clone();
         result.return_type = new_return;
         result.params = new_params;
+        result.varargs = new_varargs;
         result
     }
 
@@ -204,7 +220,7 @@ impl EmulationContext {
             }
             TypeSignature::SzArray(sz) => {
                 let new_elem = Self::substitute_type_signature(&sz.base, type_args, method_args);
-                TypeSignature::SzArray(crate::metadata::signatures::SignatureSzArray {
+                TypeSignature::SzArray(SignatureSzArray {
                     base: Box::new(new_elem),
                     modifiers: sz.modifiers.clone(),
                 })
@@ -215,7 +231,116 @@ impl EmulationContext {
             TypeSignature::Pinned(inner) => TypeSignature::Pinned(Box::new(
                 Self::substitute_type_signature(inner, type_args, method_args),
             )),
+            TypeSignature::Ptr(ptr) => TypeSignature::Ptr(SignaturePointer {
+                modifiers: ptr.modifiers.clone(),
+                base: Box::new(Self::substitute_type_signature(
+                    &ptr.base,
+                    type_args,
+                    method_args,
+                )),
+            }),
+            TypeSignature::Array(array) => TypeSignature::Array(SignatureArray {
+                base: Box::new(Self::substitute_type_signature(
+                    &array.base,
+                    type_args,
+                    method_args,
+                )),
+                rank: array.rank,
+                dimensions: array.dimensions.clone(),
+            }),
+            TypeSignature::FnPtr(method) => TypeSignature::FnPtr(Box::new(
+                Self::substitute_generic_params(method, type_args, method_args),
+            )),
+            TypeSignature::ModifiedRequired(modifiers, base) => TypeSignature::ModifiedRequired(
+                modifiers.clone(),
+                Box::new(Self::substitute_type_signature(
+                    base,
+                    type_args,
+                    method_args,
+                )),
+            ),
+            TypeSignature::ModifiedOptional(modifiers, base) => TypeSignature::ModifiedOptional(
+                modifiers.clone(),
+                Box::new(Self::substitute_type_signature(
+                    base,
+                    type_args,
+                    method_args,
+                )),
+            ),
             _ => sig.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::signatures::CustomModifier;
+
+    fn param(base: TypeSignature) -> SignatureParameter {
+        SignatureParameter {
+            modifiers: Vec::new(),
+            by_ref: false,
+            base,
+        }
+    }
+
+    /// Generic parameters are substituted wherever they are nested: pointers, general arrays,
+    /// function pointers, modified types and varargs as well as the simpler shapes.
+    #[test]
+    fn substitution_reaches_every_nested_type() {
+        let (a, b, c) = (
+            Token::new(0x0200_0001),
+            Token::new(0x0200_0002),
+            Token::new(0x0200_0003),
+        );
+        let modifier = CustomModifier {
+            is_required: true,
+            modifier_type: Token::new(0x0100_0009),
+        };
+        let shapes = |t: TypeSignature, m: TypeSignature, t1: TypeSignature| {
+            vec![
+                param(TypeSignature::Ptr(SignaturePointer {
+                    modifiers: Vec::new(),
+                    base: Box::new(t.clone()),
+                })),
+                param(TypeSignature::Array(SignatureArray {
+                    base: Box::new(m.clone()),
+                    rank: 2,
+                    dimensions: Vec::new(),
+                })),
+                param(TypeSignature::FnPtr(Box::new(SignatureMethod {
+                    return_type: param(t.clone()),
+                    ..SignatureMethod::default()
+                }))),
+                param(TypeSignature::GenericInst(
+                    Box::new(TypeSignature::Class(Token::new(0x0100_0008))),
+                    vec![TypeSignature::ModifiedRequired(
+                        vec![modifier.clone()],
+                        Box::new(t1),
+                    )],
+                )),
+            ]
+        };
+        let signature = SignatureMethod {
+            params: shapes(
+                TypeSignature::GenericParamType(0),
+                TypeSignature::GenericParamMethod(0),
+                TypeSignature::GenericParamType(1),
+            ),
+            varargs: vec![param(TypeSignature::GenericParamType(1))],
+            ..SignatureMethod::default()
+        };
+        let substituted =
+            EmulationContext::substitute_generic_params(&signature, Some(&[a, b]), Some(&[c]));
+        assert_eq!(
+            substituted.params,
+            shapes(
+                TypeSignature::Class(a),
+                TypeSignature::Class(c),
+                TypeSignature::Class(b),
+            )
+        );
+        assert_eq!(substituted.varargs, vec![param(TypeSignature::Class(b))]);
     }
 }

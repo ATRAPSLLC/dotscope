@@ -130,8 +130,10 @@ pub fn register(manager: &HookManager) -> Result<()> {
 
 /// Reads the StringBuilder buffer from the heap. Returns (buffer, capacity).
 fn read_sb(thread: &EmulationThread, href: crate::emulation::HeapRef) -> Option<(String, usize)> {
-    if let Ok(HeapObject::StringBuilder { buffer, capacity }) = thread.heap().get(href) {
-        Some((buffer, capacity))
+    if let Ok(HeapObject::StringBuilder { buffer, capacity }) =
+        thread.heap().get_shared(href).as_deref()
+    {
+        Some((buffer.to_string(), *capacity))
     } else {
         None
     }

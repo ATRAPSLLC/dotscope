@@ -90,9 +90,9 @@
 mod context;
 mod types;
 
-pub use context::{CaptureContext, ResourceRead};
+pub use context::{CaptureContext, CaptureStats, ResourceRead};
 pub use types::{
     AssemblyLoadMethod, BufferSource, CaptureSource, CapturedAssembly, CapturedBuffer,
-    CapturedMethodReturn, CapturedString, FileOpKind, FileOperation, MemorySnapshot, NetworkOpKind,
-    NetworkOperation,
+    CapturedMethodReturn, CapturedString, FileOpKind, FileOperation, MemoryRegionSnapshot,
+    MemorySnapshot, NetworkEndpoint, NetworkOpKind, NetworkOperation,
 };

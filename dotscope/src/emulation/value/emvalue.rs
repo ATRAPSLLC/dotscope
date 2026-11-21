@@ -1711,7 +1711,7 @@ impl EmValue {
 /// Two `HeapRef` values are equal if they point to the same heap object.
 /// This implements reference equality semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HeapRef(pub(crate) u64);
+pub struct HeapRef(pub u64);
 
 impl HeapRef {
     /// Creates a new heap reference with the given ID.

@@ -564,7 +564,7 @@ pub struct LoadedSection {
 /// PE image loader for mapping Windows executables into the emulation address space.
 ///
 /// `PeLoader` parses Portable Executable (PE) files and maps them into an
-/// [`AddressSpace`](crate::emulation::memory::AddressSpace) with proper section
+/// [`AddressSpace`] with proper section
 /// alignment, memory protection, and optional relocation support.
 ///
 /// # Features

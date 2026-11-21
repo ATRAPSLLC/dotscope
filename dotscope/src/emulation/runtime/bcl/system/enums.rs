@@ -69,8 +69,10 @@ fn enum_to_i64(value: &EmValue, thread: &EmulationThread) -> Option<i64> {
         EmValue::NativeInt(v) => Some(*v),
         EmValue::NativeUInt(v) => Some(*v as i64),
         EmValue::ObjectRef(href) => {
-            if let Ok(HeapObject::BoxedValue { value, .. }) = thread.heap().get(*href) {
-                match *value {
+            if let Ok(HeapObject::BoxedValue { value, .. }) =
+                thread.heap().get_shared(*href).as_deref()
+            {
+                match **value {
                     EmValue::I32(v) => Some(i64::from(v)),
                     EmValue::I64(v) => Some(v),
                     _ => None,

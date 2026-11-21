@@ -5,7 +5,8 @@
 
 use crate::{
     emulation::{
-        memory::HeapObject,
+        engine::synthetic_exception,
+        memory::{HeapObject, ManagedString},
         runtime::{
             bcl::limits::{oversized_argument, MAX_HOOK_STRING_CHARS},
             hook::{Hook, HookContext, HookManager, PreHookResult},
@@ -196,19 +197,19 @@ fn string_concat_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
 ///
 /// # Returns
 ///
-/// The number of characters in the string
+/// The number of UTF-16 code units in the string, as .NET counts them (a character outside
+/// the Basic Multilingual Plane is two), in O(1) (see [`ManagedString`]). A null string throws
+/// `NullReferenceException`; a receiver the emulation does not know (symbolic) leaves the
+/// call unanswered.
+///
+/// [`ManagedString`]: crate::emulation::ManagedString
 fn string_get_length_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    let Some(EmValue::ObjectRef(href)) = ctx.this else {
-        return PreHookResult::Bypass(Some(EmValue::I32(0)));
+    let string = match string_receiver(ctx, thread) {
+        Ok(string) => string,
+        Err(result) => return result,
     };
-
-    match thread.heap().get_string(*href) {
-        Ok(s) => {
-            let len = i32::try_from(s.chars().count()).unwrap_or(i32::MAX);
-            PreHookResult::Bypass(Some(EmValue::I32(len)))
-        }
-        Err(_) => PreHookResult::Bypass(Some(EmValue::I32(0))),
-    }
+    let length = i32::try_from(string.utf16_len()).unwrap_or(i32::MAX);
+    PreHookResult::Bypass(Some(EmValue::I32(length)))
 }
 
 /// Hook for `System.String.get_Chars` indexer property.
@@ -220,30 +221,109 @@ fn string_get_length_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) ->
 ///
 /// # Parameters
 ///
-/// - `index`: Zero-based position of the character
+/// - `index`: Zero-based position of the UTF-16 code unit
 ///
 /// # Returns
 ///
-/// The character at the specified index
+/// The UTF-16 code unit at `index`, in O(1) (see [`ManagedString`]): a `Char`, or for half of
+/// a surrogate pair, which no Rust `char` holds, its value as the `int32` a `char` is on the
+/// evaluation stack (ECMA-335 §III.1.1). An index outside the string throws
+/// `IndexOutOfRangeException` and a null string `NullReferenceException`, as the runtime
+/// does; a receiver or index the emulation does not know (symbolic) leaves the call
+/// unanswered.
+///
+/// [`ManagedString`]: crate::emulation::ManagedString
 fn string_get_chars_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    let Some(EmValue::ObjectRef(href)) = ctx.this else {
-        return PreHookResult::Bypass(Some(EmValue::Char('\0')));
+    let string = match string_receiver(ctx, thread) {
+        Ok(string) => string,
+        Err(result) => return result,
     };
-
-    let index = ctx
-        .args
-        .first()
-        .map(usize::try_from)
-        .and_then(|r| r.ok())
-        .unwrap_or(0);
-
-    match thread.heap().get_string(*href) {
-        Ok(s) => match s.chars().nth(index) {
-            Some(c) => PreHookResult::Bypass(Some(EmValue::Char(c))),
-            None => PreHookResult::Bypass(Some(EmValue::Char('\0'))),
+    let Some(EmValue::I32(index)) = ctx.args.first() else {
+        return PreHookResult::Continue;
+    };
+    match usize::try_from(*index)
+        .ok()
+        .and_then(|index| string.unit_at(index))
+    {
+        Some(unit) => PreHookResult::Bypass(Some(code_unit_value(unit))),
+        None => PreHookResult::Throw {
+            exception_type: synthetic_exception::INDEX_OUT_OF_RANGE,
+            message: format!(
+                "index {index} is outside the string of {} characters",
+                string.utf16_len()
+            ),
         },
-        Err(_) => PreHookResult::Bypass(Some(EmValue::Char('\0'))),
     }
+}
+
+/// The string a `String` instance method is called on, for the hooks that index or measure it.
+///
+/// # Errors
+///
+/// The hook's result instead: `NullReferenceException` for a null receiver, `Continue` (the
+/// call stays unanswered) for one the emulation does not know (symbolic), and an error for a
+/// reference to something that is not a string.
+fn string_receiver(
+    ctx: &HookContext<'_>,
+    thread: &EmulationThread,
+) -> std::result::Result<ManagedString, PreHookResult> {
+    match ctx.this {
+        Some(EmValue::ObjectRef(href)) => thread
+            .heap()
+            .get_managed_string(*href)
+            .map_err(|e| PreHookResult::Error(format!("{e}"))),
+        Some(EmValue::Null) => Err(PreHookResult::throw_null_reference()),
+        _ => Err(PreHookResult::Continue),
+    }
+}
+
+/// A UTF-16 code unit as a `char` value: a `Char`, or for half of a surrogate pair, which no
+/// Rust `char` holds, the unit as the `int32` a `char` is on the evaluation stack
+/// (ECMA-335 §III.1.1).
+fn code_unit_value(unit: u16) -> EmValue {
+    char::from_u32(u32::from(unit)).map_or(EmValue::I32(i32::from(unit)), EmValue::Char)
+}
+
+/// The `ArgumentOutOfRangeException` a `String` method throws for an index or length outside
+/// the string.
+fn argument_out_of_range(message: String) -> PreHookResult {
+    PreHookResult::Throw {
+        exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+        message,
+    }
+}
+
+/// The range `[start, start + length)` of a string of `len` code units that `start` and the
+/// optional `length` (the rest of the string by default) name, as `Substring` and
+/// `ToCharArray` take them.
+///
+/// # Errors
+///
+/// `ArgumentOutOfRangeException` when `start` or `length` is negative or the range passes the
+/// end, as the runtime throws.
+fn code_unit_range(
+    start: i32,
+    length: Option<i32>,
+    len: usize,
+) -> std::result::Result<std::ops::Range<usize>, PreHookResult> {
+    let start = usize::try_from(start)
+        .ok()
+        .filter(|&start| start <= len)
+        .ok_or_else(|| {
+            argument_out_of_range(format!("start {start} is outside a string of {len}"))
+        })?;
+    let length = match length {
+        None => len.saturating_sub(start),
+        Some(length) => usize::try_from(length)
+            .ok()
+            .filter(|&length| length <= len.saturating_sub(start))
+            .ok_or_else(|| {
+                argument_out_of_range(format!(
+                    "length {length} from {start} passes the end of a string of {len}"
+                ))
+            })?,
+    };
+    Ok(start..start.saturating_add(length))
 }
 
 /// Hook for `System.String.Substring` method.
@@ -262,29 +342,27 @@ fn string_get_chars_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
 ///
 /// A substring starting at the specified position
 fn string_substring_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    let Some(EmValue::ObjectRef(href)) = ctx.this else {
-        return PreHookResult::Bypass(Some(EmValue::Null));
+    let string = match string_receiver(ctx, thread) {
+        Ok(string) => string,
+        Err(result) => return result,
     };
-
-    let s = match thread.heap().get_string(*href) {
-        Ok(s) => s.to_string(),
-        Err(e) => return PreHookResult::Error(format!("heap allocation failed: {e}")),
+    // Indices count UTF-16 code units, as .NET's do
+    let (Some(EmValue::I32(start)), length) = (ctx.args.first(), ctx.args.get(1)) else {
+        return PreHookResult::Continue;
     };
-
-    let start = ctx
-        .args
-        .first()
-        .map(usize::try_from)
-        .and_then(|r| r.ok())
-        .unwrap_or(0);
-
-    let substring: String = if let Some(len_arg) = ctx.args.get(1) {
-        let length = usize::try_from(len_arg).unwrap_or(0);
-        s.chars().skip(start).take(length).collect()
-    } else {
-        s.chars().skip(start).collect()
+    let length = match length {
+        None => None,
+        Some(EmValue::I32(length)) => Some(*length),
+        Some(_) => return PreHookResult::Continue,
     };
-
+    let units = string.utf16_units();
+    let range = match code_unit_range(*start, length, units.len()) {
+        Ok(range) => range,
+        Err(result) => return result,
+    };
+    // A range that splits a surrogate pair keeps the half as U+FFFD: the emulator's strings
+    // are UTF-8, which has no lone surrogates
+    let substring = String::from_utf16_lossy(units.get(range).unwrap_or_default());
     match thread.heap_mut().alloc_string(&substring) {
         Ok(href) => PreHookResult::Bypass(Some(EmValue::ObjectRef(href))),
         Err(e) => PreHookResult::Error(format!("heap allocation failed: {e}")),
@@ -307,16 +385,28 @@ fn string_substring_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
 ///
 /// A character array containing the string characters
 fn string_to_char_array_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    let Some(EmValue::ObjectRef(href)) = ctx.this else {
-        return PreHookResult::Bypass(Some(EmValue::Null));
+    let string = match string_receiver(ctx, thread) {
+        Ok(string) => string,
+        Err(result) => return result,
     };
-
-    let s = match thread.heap().get_string(*href) {
-        Ok(s) => s.to_string(),
-        Err(e) => return PreHookResult::Error(format!("heap allocation failed: {e}")),
+    let units = string.utf16_units();
+    // `ToCharArray(startIndex, length)` copies that range, counted in UTF-16 code units
+    let range = match (ctx.args.first(), ctx.args.get(1)) {
+        (None, _) => 0..units.len(),
+        (Some(EmValue::I32(start)), Some(EmValue::I32(length))) => {
+            match code_unit_range(*start, Some(*length), units.len()) {
+                Ok(range) => range,
+                Err(result) => return result,
+            }
+        }
+        _ => return PreHookResult::Continue,
     };
-
-    let chars: Vec<EmValue> = s.chars().map(EmValue::Char).collect();
+    let chars: Vec<EmValue> = units
+        .get(range)
+        .unwrap_or_default()
+        .iter()
+        .map(|&unit| code_unit_value(unit))
+        .collect();
 
     match thread
         .heap_mut()
@@ -495,7 +585,9 @@ fn string_split_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreH
     let separator = match ctx.args.first() {
         Some(EmValue::Char(c)) => *c,
         Some(EmValue::ObjectRef(href)) => {
-            if let Ok(HeapObject::Array { elements, .. }) = thread.heap().get(*href) {
+            if let Ok(HeapObject::Array { elements, .. }) =
+                thread.heap().get_shared(*href).as_deref()
+            {
                 elements
                     .first()
                     .and_then(|e| {
@@ -664,30 +756,58 @@ fn string_ends_with_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
 ///
 /// Zero-based index of the first occurrence, or -1 if not found
 fn string_index_of_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    let Some(EmValue::ObjectRef(href)) = ctx.this else {
-        return PreHookResult::Bypass(Some(EmValue::I32(-1)));
+    let string = match string_receiver(ctx, thread) {
+        Ok(string) => string,
+        Err(result) => return result,
     };
-
-    let s = match thread.heap().get_string(*href) {
-        Ok(s) => s.to_string(),
-        Err(_) => return PreHookResult::Bypass(Some(EmValue::I32(-1))),
+    let units = string.utf16_units();
+    // The search starts at `startIndex`, a UTF-16 code unit index no greater than the length
+    let start = match ctx.args.get(1) {
+        None => 0,
+        Some(EmValue::I32(start)) => match usize::try_from(*start)
+            .ok()
+            .filter(|&start| start <= units.len())
+        {
+            Some(start) => start,
+            None => {
+                return argument_out_of_range(format!(
+                    "startIndex {start} is outside a string of {}",
+                    units.len()
+                ))
+            }
+        },
+        Some(_) => return PreHookResult::Continue,
     };
-
-    let index = match ctx.args.first() {
-        Some(EmValue::Char(c)) => s
-            .find(*c)
-            .map_or(-1, |i| i32::try_from(i).unwrap_or(i32::MAX)),
-        Some(EmValue::ObjectRef(href)) => thread
-            .heap()
-            .get_string(*href)
-            .map(|substr| {
-                s.find(&*substr)
-                    .map_or(-1, |i| i32::try_from(i).unwrap_or(i32::MAX))
-            })
-            .unwrap_or(-1),
-        _ => -1,
+    let rest = units.get(start..).unwrap_or_default();
+    let found = match ctx.args.first() {
+        Some(EmValue::Char(c)) => {
+            // A char argument is one code unit
+            let mut buffer = [0u16; 2];
+            let encoded = c.encode_utf16(&mut buffer);
+            match encoded {
+                [unit] => rest.iter().position(|u| u == unit),
+                _ => None,
+            }
+        }
+        Some(EmValue::I32(unit)) => u16::try_from(*unit)
+            .ok()
+            .and_then(|unit| rest.iter().position(|&u| u == unit)),
+        Some(EmValue::ObjectRef(needle)) => {
+            let needle = try_hook!(thread.heap().get_managed_string(*needle));
+            let needle = needle.utf16_units();
+            if needle.is_empty() {
+                Some(0)
+            } else {
+                rest.windows(needle.len())
+                    .position(|window| window == &*needle)
+            }
+        }
+        Some(EmValue::Null) => return PreHookResult::throw_argument_null("value"),
+        _ => return PreHookResult::Continue,
     };
-
+    let index = found.map_or(-1, |offset| {
+        i32::try_from(start.saturating_add(offset)).unwrap_or(i32::MAX)
+    });
     PreHookResult::Bypass(Some(EmValue::I32(index)))
 }
 
@@ -738,9 +858,9 @@ fn string_pad_left_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
         })
         .unwrap_or(' ');
 
-    // .NET measures `totalWidth` in characters, not UTF-8 bytes: comparing against `s.len()`
-    // under-pads any string containing a multi-byte scalar.
-    let char_count = s.chars().count();
+    // .NET measures `totalWidth` in UTF-16 code units, not UTF-8 bytes or scalars: comparing
+    // against `s.len()` under-pads any string containing a multi-byte scalar.
+    let char_count = s.encode_utf16().count();
     let result = if char_count >= total_width {
         s
     } else {
@@ -807,9 +927,9 @@ fn string_pad_right_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
         })
         .unwrap_or(' ');
 
-    // .NET measures `totalWidth` in characters, not UTF-8 bytes: comparing against `s.len()`
-    // under-pads any string containing a multi-byte scalar.
-    let char_count = s.chars().count();
+    // .NET measures `totalWidth` in UTF-16 code units, not UTF-8 bytes or scalars: comparing
+    // against `s.len()` under-pads any string containing a multi-byte scalar.
+    let char_count = s.encode_utf16().count();
     let result = if char_count >= total_width {
         s
     } else {
@@ -895,11 +1015,11 @@ fn string_join_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHo
         _ => return PreHookResult::Bypass(Some(EmValue::Null)),
     };
 
-    let Ok(obj) = thread.heap().get(array_ref) else {
+    let Ok(obj) = thread.heap().get_shared(array_ref) else {
         return PreHookResult::Bypass(Some(EmValue::Null));
     };
 
-    let parts: Vec<String> = match obj {
+    let parts: Vec<String> = match &*obj {
         HeapObject::Array { elements, .. } => elements
             .iter()
             .filter_map(|e| match e {
@@ -1260,10 +1380,13 @@ mod tests {
         )
         .with_this(Some(&this))
         .with_args(&args);
+        // The runtime throws for an index past the end; '\0' answered a character the string
+        // does not have
         let result = string_get_chars_pre(&ctx, &mut thread);
         assert!(matches!(
             result,
-            PreHookResult::Bypass(Some(EmValue::Char('\0')))
+            PreHookResult::Throw { exception_type, .. }
+                if exception_type == synthetic_exception::INDEX_OUT_OF_RANGE
         ));
     }
 
@@ -1680,5 +1803,142 @@ mod tests {
             result,
             PreHookResult::Bypass(Some(EmValue::Bool(false)))
         ));
+    }
+
+    /// Runs the `String` hook `hook` on `text` (or a null receiver) with `args`.
+    fn on_string(
+        hook: fn(&HookContext<'_>, &mut EmulationThread) -> PreHookResult,
+        text: Option<&str>,
+        args: &[EmValue],
+    ) -> (PreHookResult, EmulationThread) {
+        let mut thread = create_test_thread();
+        let this = match text {
+            Some(text) => EmValue::ObjectRef(thread.heap_mut().alloc_string(text).unwrap()),
+            None => EmValue::Null,
+        };
+        let ctx = HookContext::new(
+            Token::new(0x0A00_0001),
+            "System",
+            "String",
+            "method",
+            PointerSize::Bit64,
+        )
+        .with_this(Some(&this))
+        .with_args(args);
+        let result = hook(&ctx, &mut thread);
+        (result, thread)
+    }
+
+    /// The string a hook returned.
+    fn returned_string(result: &PreHookResult, thread: &EmulationThread) -> String {
+        match result {
+            PreHookResult::Bypass(Some(EmValue::ObjectRef(href))) => {
+                thread.heap().get_string(*href).unwrap().to_string()
+            }
+            other => panic!("expected a string: {other:?}"),
+        }
+    }
+
+    /// Whether a hook threw `exception`.
+    fn threw(result: &PreHookResult, exception: Token) -> bool {
+        matches!(result, PreHookResult::Throw { exception_type, .. } if *exception_type == exception)
+    }
+
+    /// .NET counts and indexes a string in UTF-16 code units: a character outside the Basic
+    /// Multilingual Plane is two of them. Counting the text's `char`s gave "é😀x" 3, not 4,
+    /// and shifted every index after the emoji.
+    #[test]
+    fn length_and_chars_count_utf16_code_units() {
+        let (length, _) = on_string(string_get_length_pre, Some("é😀x"), &[]);
+        assert!(matches!(
+            length,
+            PreHookResult::Bypass(Some(EmValue::I32(4)))
+        ));
+
+        let (high, _) = on_string(string_get_chars_pre, Some("é😀x"), &[EmValue::I32(1)]);
+        assert!(matches!(
+            high,
+            PreHookResult::Bypass(Some(EmValue::I32(0xD83D)))
+        ));
+        let (x, _) = on_string(string_get_chars_pre, Some("é😀x"), &[EmValue::I32(3)]);
+        assert!(matches!(x, PreHookResult::Bypass(Some(EmValue::Char('x')))));
+        let (negative, _) = on_string(string_get_chars_pre, Some("ab"), &[EmValue::I32(-1)]);
+        assert!(threw(&negative, synthetic_exception::INDEX_OUT_OF_RANGE));
+    }
+
+    /// A null string throws `NullReferenceException`; it answered a length of 0.
+    #[test]
+    fn a_null_string_throws() {
+        let (length, _) = on_string(string_get_length_pre, None, &[]);
+        assert!(threw(&length, synthetic_exception::NULL_REFERENCE));
+        let (index, _) = on_string(string_index_of_pre, None, &[EmValue::Char('a')]);
+        assert!(threw(&index, synthetic_exception::NULL_REFERENCE));
+    }
+
+    /// `Substring` takes UTF-16 indices and throws for a range outside the string; it clamped
+    /// the range and counted `char`s.
+    #[test]
+    fn substring_takes_utf16_indices() {
+        let (after, thread) = on_string(string_substring_pre, Some("é😀xy"), &[EmValue::I32(3)]);
+        assert_eq!(returned_string(&after, &thread), "xy");
+        let (middle, thread) = on_string(
+            string_substring_pre,
+            Some("é😀xy"),
+            &[EmValue::I32(1), EmValue::I32(3)],
+        );
+        assert_eq!(returned_string(&middle, &thread), "😀x");
+
+        let (past, _) = on_string(string_substring_pre, Some("abc"), &[EmValue::I32(4)]);
+        assert!(threw(&past, synthetic_exception::ARGUMENT_OUT_OF_RANGE));
+        let (long, _) = on_string(
+            string_substring_pre,
+            Some("abc"),
+            &[EmValue::I32(1), EmValue::I32(3)],
+        );
+        assert!(threw(&long, synthetic_exception::ARGUMENT_OUT_OF_RANGE));
+    }
+
+    /// `ToCharArray(startIndex, length)` copies that range; it ignored the arguments and
+    /// copied the whole string.
+    #[test]
+    fn to_char_array_copies_the_range() {
+        let (result, thread) = on_string(
+            string_to_char_array_pre,
+            Some("abcd"),
+            &[EmValue::I32(1), EmValue::I32(2)],
+        );
+        let PreHookResult::Bypass(Some(EmValue::ObjectRef(array))) = result else {
+            panic!("expected an array: {result:?}");
+        };
+        assert_eq!(thread.heap().get_array_length(array).unwrap(), 2);
+        assert_eq!(
+            thread.heap().get_array_element(array, 0).unwrap(),
+            EmValue::Char('b')
+        );
+    }
+
+    /// `IndexOf` answers a UTF-16 index and searches from `startIndex`; it answered the UTF-8
+    /// byte offset and ignored the start.
+    #[test]
+    fn index_of_answers_utf16_indices_from_the_start() {
+        // 'x' is byte 6 of "é😀x" in UTF-8 and code unit 3
+        let (x, _) = on_string(string_index_of_pre, Some("é😀x"), &[EmValue::Char('x')]);
+        assert!(matches!(x, PreHookResult::Bypass(Some(EmValue::I32(3)))));
+
+        let (second, _) = on_string(
+            string_index_of_pre,
+            Some("abab"),
+            &[EmValue::Char('a'), EmValue::I32(1)],
+        );
+        assert!(matches!(
+            second,
+            PreHookResult::Bypass(Some(EmValue::I32(2)))
+        ));
+        let (past, _) = on_string(
+            string_index_of_pre,
+            Some("ab"),
+            &[EmValue::Char('a'), EmValue::I32(3)],
+        );
+        assert!(threw(&past, synthetic_exception::ARGUMENT_OUT_OF_RANGE));
     }
 }

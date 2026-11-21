@@ -17,7 +17,7 @@
 //!
 //! The unmanaged memory has a configurable maximum size (default 16MB) to
 //! prevent runaway allocations. Exceeding this limit returns
-//! [`EmulationError::HeapMemoryLimitExceeded`](crate::emulation::EmulationError::HeapMemoryLimitExceeded).
+//! [`EmulationError::HeapMemoryLimitExceeded`].
 
 use std::collections::HashMap;
 

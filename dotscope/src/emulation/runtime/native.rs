@@ -11,7 +11,7 @@
 //!
 //! # Overview
 //!
-//! Native hooks are registered with the [`HookManager`](super::HookManager) using the
+//! Native hooks are registered with the [`HookManager`] using the
 //! [`register`] function. They use the [`NativeMethodMatcher`](super::NativeMethodMatcher)
 //! to match P/Invoke calls by DLL name and function name.
 //!
@@ -135,7 +135,17 @@ pub struct NativeFunctionRegistry {
     next_module: Arc<AtomicU64>,
 }
 
+impl Default for NativeFunctionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NativeFunctionRegistry {
+    /// Creates an empty registry.
+    ///
+    /// Fake function addresses are handed out upward from `PROC_ADDRESS_BASE`, module
+    /// handles from `LOADED_LIBRARY` and native function tokens from 1.
     pub fn new() -> Self {
         Self {
             address_to_name: Arc::new(DashMap::new()),

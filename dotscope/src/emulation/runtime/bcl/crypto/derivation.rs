@@ -29,8 +29,9 @@
 use crate::utils::derive_pbkdf1_key;
 use crate::{
     emulation::{
+        engine::synthetic_exception,
         runtime::{
-            bcl::limits::non_positive_argument,
+            bcl::{crypto::bytes_argument, limits::non_positive_argument},
             hook::{Hook, HookContext, HookManager, PreHookResult},
         },
         thread::EmulationThread,
@@ -121,22 +122,27 @@ fn password_derive_bytes_ctor_pre(
         _ => return PreHookResult::Bypass(None),
     };
 
-    let password: Vec<u8> = match ctx.args.first() {
-        Some(EmValue::ObjectRef(pwd_ref)) => {
-            if let Some(s) = thread.heap().get_string_opt(*pwd_ref) {
-                s.as_bytes().to_vec()
-            } else {
-                try_hook!(thread.heap().get_byte_array(*pwd_ref)).unwrap_or_default()
-            }
-        }
-        _ => Vec::new(),
+    let password: Vec<u8> = match bytes_argument(thread, ctx.args.first(), "password", true) {
+        Ok(password) => password.unwrap_or_default(),
+        Err(result) => return result,
     };
 
+    // A salt, or a salt size (`(string, int saltSize)`), for which the runtime draws a
+    // random salt of that size: zeros of that size stand in for it here
     let salt: Vec<u8> = match ctx.args.get(1) {
-        Some(EmValue::ObjectRef(salt_ref)) => {
-            try_hook!(thread.heap().get_byte_array(*salt_ref)).unwrap_or_default()
-        }
-        _ => Vec::new(),
+        Some(EmValue::I32(size)) => match usize::try_from(*size) {
+            Ok(size) => vec![0; size],
+            Err(_) => {
+                return PreHookResult::Throw {
+                    exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+                    message: format!("saltSize {size} must be non-negative"),
+                }
+            }
+        },
+        arg => match bytes_argument(thread, arg, "salt", false) {
+            Ok(salt) => salt.unwrap_or_default(),
+            Err(result) => return result,
+        },
     };
 
     let iterations: u32 = 100;
@@ -226,22 +232,27 @@ fn rfc2898_derive_bytes_ctor_pre(
         _ => return PreHookResult::Bypass(None),
     };
 
-    let password: Vec<u8> = match ctx.args.first() {
-        Some(EmValue::ObjectRef(pwd_ref)) => {
-            if let Some(s) = thread.heap().get_string_opt(*pwd_ref) {
-                s.as_bytes().to_vec()
-            } else {
-                try_hook!(thread.heap().get_byte_array(*pwd_ref)).unwrap_or_default()
-            }
-        }
-        _ => Vec::new(),
+    let password: Vec<u8> = match bytes_argument(thread, ctx.args.first(), "password", true) {
+        Ok(password) => password.unwrap_or_default(),
+        Err(result) => return result,
     };
 
+    // A salt, or a salt size (`(string, int saltSize)`), for which the runtime draws a
+    // random salt of that size: zeros of that size stand in for it here
     let salt: Vec<u8> = match ctx.args.get(1) {
-        Some(EmValue::ObjectRef(salt_ref)) => {
-            try_hook!(thread.heap().get_byte_array(*salt_ref)).unwrap_or_default()
-        }
-        _ => Vec::new(),
+        Some(EmValue::I32(size)) => match usize::try_from(*size) {
+            Ok(size) => vec![0; size],
+            Err(_) => {
+                return PreHookResult::Throw {
+                    exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+                    message: format!("saltSize {size} must be non-negative"),
+                }
+            }
+        },
+        arg => match bytes_argument(thread, arg, "salt", false) {
+            Ok(salt) => salt.unwrap_or_default(),
+            Err(result) => return result,
+        },
     };
 
     // .NET refuses an iteration count that is not positive. Any other count is accepted:

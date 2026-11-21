@@ -4,8 +4,8 @@
 //! in an emulated .NET process. It combines multiple memory subsystems:
 //!
 //! - **Managed heap** ([`SharedHeap`]) - Objects, arrays, and strings allocated via `newobj`, `newarr`, etc.
-//! - **Memory regions** ([`MemoryRegion`](super::MemoryRegion)) - PE images, mapped data, and unmanaged allocations
-//! - **Static fields** ([`StaticFieldStorage`](super::StaticFieldStorage)) - Static field values shared across threads
+//! - **Memory regions** ([`MemoryRegion`]) - PE images, mapped data, and unmanaged allocations
+//! - **Static fields** ([`StaticFieldStorage`]) - Static field values shared across threads
 //!
 //! # Shared Heap Semantics
 //!
@@ -187,7 +187,7 @@ impl Deref for SharedHeap {
 /// Default ceiling on unmanaged allocations for a newly created address space.
 ///
 /// Matches the `max_unmanaged_bytes` default in
-/// [`ProcessConfig`](crate::emulation::process::ProcessConfig) so that an address space built
+/// [`EmulationConfig`](crate::emulation::EmulationConfig) so that an address space built
 /// directly and one built through the process builder behave the same.
 pub const DEFAULT_MAX_UNMANAGED_BYTES: usize = 64 * 1024 * 1024;
 
@@ -330,7 +330,7 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    /// Page size for protection tracking (4KB), derived from [`page::PAGE_SIZE`].
+    /// Page size for protection tracking (4KB), derived from [`page::PAGE_SIZE`](crate::emulation::PAGE_SIZE).
     const PAGE_SIZE: u64 = super::page::PAGE_SIZE as u64;
 
     /// Creates a new address space with default settings.

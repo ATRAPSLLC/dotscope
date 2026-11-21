@@ -14,7 +14,13 @@ use crate::{
         },
         exception::ExceptionClause,
     },
-    metadata::{method::Method, signatures::TypeSignature, token::Token, typesystem::CilFlavor},
+    metadata::{
+        method::Method,
+        signatures::{SignatureMethod, TypeSignature},
+        tables::{MemberRefSignature, TableId},
+        token::Token,
+        typesystem::{CilFlavor, CilTypeReference},
+    },
     prelude::ExceptionHandlerFlags,
     Result,
 };
@@ -252,42 +258,85 @@ impl EmulationContext {
         ))
     }
 
-    /// Gets the return type of a method as a CilFlavor.
+    /// Gets the return type of a call to `method_token` as a CilFlavor: a MethodDef's, a
+    /// MemberRef's or a MethodSpec's (see [`Self::with_call_signature`]).
     ///
     /// Returns `None` if the method returns void.
     ///
     /// # Errors
     ///
-    /// Returns [`EmulationError::MethodNotFound`] if the method is not found.
+    /// Returns [`EmulationError::MethodNotFound`] if the token names no method.
     pub fn get_return_type(&self, method_token: Token) -> Result<Option<CilFlavor>> {
-        let method = self.get_method(method_token)?;
-
-        if matches!(method.signature.return_type.base, TypeSignature::Void) {
-            Ok(None)
-        } else {
-            Ok(Some(CilFlavor::from(&method.signature.return_type.base)))
-        }
+        self.with_call_signature(method_token, |signature| {
+            (!matches!(signature.return_type.base, TypeSignature::Void))
+                .then(|| CilFlavor::from(&signature.return_type.base))
+        })
     }
 
-    /// Gets the parameter types for a method as CilFlavors.
+    /// Gets the parameter types of a call to `method_token` as CilFlavors: a MethodDef's, a
+    /// MemberRef's or a MethodSpec's (see [`Self::with_call_signature`]), or a synthetic
+    /// method's.
     ///
     /// # Errors
     ///
-    /// Returns [`EmulationError::MethodNotFound`] if the method is not found.
+    /// Returns [`EmulationError::MethodNotFound`] if the token names no method.
     pub fn get_parameter_types(&self, method_token: Token) -> Result<Vec<CilFlavor>> {
         // Check synthetic methods first
         if let Some(synthetic) = self.synthetic_methods.get(&method_token) {
             return Ok(synthetic.param_types.clone());
         }
 
-        let method = self.get_method(method_token)?;
+        self.with_call_signature(method_token, |signature| {
+            signature
+                .params
+                .iter()
+                .map(|param| CilFlavor::from(&param.base))
+                .collect()
+        })
+    }
 
-        Ok(method
-            .signature
-            .params
-            .iter()
-            .map(|param| CilFlavor::from(&param.base))
-            .collect())
+    /// Runs `read` on the signature a call to `method_token` is made with: a MethodDef's
+    /// own, a MemberRef's (a method of another assembly, which is every framework method a
+    /// hook stands for), or, for a MethodSpec, that of the generic method it instantiates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmulationError::MethodNotFound`] when the token names no method, or a
+    /// MemberRef that is a field.
+    pub fn with_call_signature<R>(
+        &self,
+        method_token: Token,
+        read: impl FnOnce(&SignatureMethod) -> R,
+    ) -> Result<R> {
+        let not_found = || -> crate::Error {
+            EmulationError::MethodNotFound {
+                token: method_token,
+            }
+            .into()
+        };
+        match TableId::from_token_type(method_token.table()) {
+            Some(TableId::MemberRef) => {
+                let member = self
+                    .assembly
+                    .member_ref(&method_token)
+                    .ok_or_else(not_found)?;
+                match &member.signature {
+                    MemberRefSignature::Method(signature) => Ok(read(signature)),
+                    MemberRefSignature::Field(_) => Err(not_found()),
+                }
+            }
+            Some(TableId::MethodSpec) => {
+                let spec = self.assembly.method_spec(&method_token)?;
+                let generic = match &spec.method {
+                    CilTypeReference::MethodDef(method) => method.token(),
+                    CilTypeReference::MemberRef(member) => Some(member.token),
+                    _ => None,
+                }
+                .ok_or_else(not_found)?;
+                self.with_call_signature(generic, read)
+            }
+            _ => Ok(read(&self.get_method(method_token)?.signature)),
+        }
     }
 
     /// Gets the maximum stack size for a method.
@@ -345,10 +394,7 @@ impl EmulationContext {
     }
 
     /// Converts exception handlers from metadata format to emulation format.
-    pub(crate) fn convert_exception_handlers(
-        &self,
-        method_token: Token,
-    ) -> Result<Vec<ExceptionClause>> {
+    pub fn convert_exception_handlers(&self, method_token: Token) -> Result<Vec<ExceptionClause>> {
         let method = self.get_method(method_token)?;
         let body = method.body.get().ok_or(EmulationError::MissingMethodBody {
             token: method_token,
@@ -400,5 +446,53 @@ impl EmulationContext {
         }
 
         Ok(clauses)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use dashmap::DashMap;
+
+    use super::*;
+    use crate::{testkit::fixture, CilObject};
+
+    /// A call to a method of another assembly is a MemberRef, which is how every framework
+    /// method a hook stands for is called: its parameter and return types come from the
+    /// MemberRef's own signature, and a MemberRef naming a field is no method.
+    #[test]
+    fn a_member_ref_answers_with_its_signature() {
+        let assembly = Arc::new(CilObject::from_path(fixture("crafted_2.exe")).unwrap());
+        let context = EmulationContext::new(Arc::clone(&assembly), Arc::new(DashMap::new()));
+        let (mut methods, mut fields) = (0, 0);
+        for entry in assembly.refs_members().iter() {
+            let member = entry.value();
+            match &member.signature {
+                MemberRefSignature::Method(signature) => {
+                    let params: Vec<CilFlavor> = signature
+                        .params
+                        .iter()
+                        .map(|param| CilFlavor::from(&param.base))
+                        .collect();
+                    assert_eq!(
+                        context.get_parameter_types(member.token).unwrap(),
+                        params,
+                        "{}",
+                        member.name
+                    );
+                    let returns = (!matches!(signature.return_type.base, TypeSignature::Void))
+                        .then(|| CilFlavor::from(&signature.return_type.base));
+                    assert_eq!(context.get_return_type(member.token).unwrap(), returns);
+                    methods += 1;
+                }
+                MemberRefSignature::Field(_) => {
+                    assert!(context.get_parameter_types(member.token).is_err());
+                    fields += 1;
+                }
+            }
+        }
+        assert!(methods > 0, "the sample calls methods of other assemblies");
+        let _ = fields;
     }
 }

@@ -60,6 +60,12 @@ pub fn register(manager: &HookManager) -> Result<()> {
     register_exception_type(manager, "System", "NotSupportedException")?;
     register_exception_type(manager, "System", "NotImplementedException")?;
     register_exception_type(manager, "System", "AccessViolationException")?;
+    register_exception_type(
+        manager,
+        "System.Security.Cryptography",
+        "CryptographicException",
+    )?;
+    register_exception_type(manager, "System.IO", "InvalidDataException")?;
     register_exception_type(manager, "System", "NullReferenceException")?;
     register_exception_type(manager, "System", "IndexOutOfRangeException")?;
     register_exception_type(manager, "System", "InvalidCastException")?;

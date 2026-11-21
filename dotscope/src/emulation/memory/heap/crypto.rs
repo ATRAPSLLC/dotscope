@@ -88,7 +88,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::CryptoAlgorithm { hmac_key, .. }) =
-            state.objects.get(&heap_ref.id())
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
         {
             Ok(hmac_key.clone())
         } else {
@@ -110,7 +110,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CryptoAlgorithm { algorithm_type, .. }) => {
                 Ok(Some(Arc::clone(algorithm_type)))
             }
@@ -134,7 +134,7 @@ impl ManagedHeap {
             })?;
         if let Some(HeapObject::CryptoAlgorithm {
             accumulated_data, ..
-        }) = state.objects.get_mut(&heap_ref.id())
+        }) = state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             accumulated_data.extend_from_slice(data);
         }
@@ -162,7 +162,7 @@ impl ManagedHeap {
             hash_result,
             hmac_key,
             ..
-        }) = state.objects.get_mut(&heap_ref.id())
+        }) = state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             let hash = match algorithm_type.as_ref() {
                 "HMACSHA256" => {
@@ -204,7 +204,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::CryptoAlgorithm { hash_result, .. }) =
-            state.objects.get(&heap_ref.id())
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
         {
             Ok(hash_result.clone())
         } else {
@@ -232,7 +232,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::CryptoAlgorithm { rsa_public_key, .. }) =
-            state.objects.get_mut(&heap_ref.id())
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             *rsa_public_key = Some((modulus, exponent));
         }
@@ -252,7 +252,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::CryptoAlgorithm { rsa_public_key, .. }) =
-            state.objects.get(&heap_ref.id())
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
         {
             Ok(rsa_public_key.clone())
         } else {
@@ -310,13 +310,13 @@ impl ManagedHeap {
         if state.objects.contains_key(&id) {
             state.objects.insert(
                 id,
-                HeapObject::SymmetricAlgorithm {
+                Arc::new(HeapObject::SymmetricAlgorithm {
                     algorithm_type: algorithm_type.into(),
                     key: None,
                     iv: None,
                     mode: 1,    // CBC
                     padding: 2, // PKCS7
-                },
+                }),
             );
         }
         Ok(())
@@ -336,7 +336,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::SymmetricAlgorithm { key: key_slot, .. }) =
-            state.objects.get_mut(&heap_ref.id())
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             *key_slot = Some(key);
             return Ok(());
@@ -362,7 +362,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::SymmetricAlgorithm { iv: iv_slot, .. }) =
-            state.objects.get_mut(&heap_ref.id())
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             *iv_slot = Some(iv);
             return Ok(());
@@ -392,7 +392,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::SymmetricAlgorithm { mode, .. }) =
-            state.objects.get_mut(&heap_ref.id())
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             *mode = new_mode;
             return Ok(());
@@ -426,7 +426,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::SymmetricAlgorithm { padding, .. }) =
-            state.objects.get_mut(&heap_ref.id())
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             *padding = new_padding;
             return Ok(());
@@ -457,7 +457,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::SymmetricAlgorithm {
                 algorithm_type,
                 key,
@@ -503,10 +503,12 @@ impl ManagedHeap {
             HeapObject::CryptoTransform {
                 algorithm: algorithm.into(),
                 key,
+                initial_iv: iv.clone(),
                 iv,
                 is_encryptor,
                 mode,
                 padding,
+                held_back: Vec::new(),
             },
             type_token,
         )
@@ -531,7 +533,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CryptoTransform {
                 algorithm,
                 key,
@@ -539,6 +541,7 @@ impl ManagedHeap {
                 is_encryptor,
                 mode,
                 padding,
+                ..
             }) => Ok(Some((
                 algorithm.clone(),
                 key.clone(),
@@ -571,9 +574,86 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get_mut(&heap_ref.id()) {
+        match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
             Some(HeapObject::CryptoTransform { iv, .. }) => {
                 *iv = new_iv;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Takes the input a decryptor kept back from its last `TransformBlock`, leaving none.
+    ///
+    /// Empty when nothing is held back, or the object is not a `CryptoTransform`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LockPoisoned` if the internal `RwLock` is poisoned.
+    pub fn take_crypto_transform_held_back(&self, heap_ref: HeapRef) -> Result<Vec<u8>> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "managed heap",
+            })?;
+        match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
+            Some(HeapObject::CryptoTransform { held_back, .. }) => Ok(std::mem::take(held_back)),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Records the input a decryptor keeps back from a `TransformBlock` until the next call.
+    ///
+    /// Returns `false` if the object is not a `CryptoTransform`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LockPoisoned` if the internal `RwLock` is poisoned.
+    pub fn set_crypto_transform_held_back(
+        &self,
+        heap_ref: HeapRef,
+        bytes: Vec<u8>,
+    ) -> Result<bool> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "managed heap",
+            })?;
+        match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
+            Some(HeapObject::CryptoTransform { held_back, .. }) => {
+                *held_back = bytes;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Returns a transform to the state it was created in, as `TransformFinalBlock` leaves it:
+    /// its initial IV, nothing held back.
+    ///
+    /// Returns `false` if the object is not a `CryptoTransform`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LockPoisoned` if the internal `RwLock` is poisoned.
+    pub fn reset_crypto_transform(&self, heap_ref: HeapRef) -> Result<bool> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "managed heap",
+            })?;
+        match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
+            Some(HeapObject::CryptoTransform {
+                iv,
+                initial_iv,
+                held_back,
+                ..
+            }) => {
+                iv.clone_from(initial_iv);
+                held_back.clear();
                 Ok(true)
             }
             _ => Ok(false),
@@ -617,12 +697,12 @@ impl ManagedHeap {
         if state.objects.contains_key(&id) {
             state.objects.insert(
                 id,
-                HeapObject::KeyDerivation {
+                Arc::new(HeapObject::KeyDerivation {
                     password,
                     salt,
                     iterations,
                     hash_algorithm: hash_algorithm.into(),
-                },
+                }),
             );
             Ok(())
         } else {
@@ -695,7 +775,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::KeyDerivation {
                 password,
                 salt,

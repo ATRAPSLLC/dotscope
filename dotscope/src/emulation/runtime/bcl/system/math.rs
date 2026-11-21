@@ -84,10 +84,12 @@
 
 use crate::{
     emulation::{
+        engine::synthetic_exception,
         runtime::hook::{Hook, HookContext, HookManager, PreHookResult},
         thread::EmulationThread,
         EmValue,
     },
+    metadata::typesystem::CilFlavor,
     Result,
 };
 
@@ -677,6 +679,116 @@ fn system_math_ceiling_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread)
 
 /// Hook for `System.Math.Round` method.
 ///
+/// `System.MidpointRounding`, by the value a call passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Midpoint {
+    /// 0: a midpoint goes to the even neighbour (the default).
+    ToEven,
+    /// 1: a midpoint goes away from zero.
+    AwayFromZero,
+    /// 2: toward zero (truncation).
+    ToZero,
+    /// 3: toward negative infinity (floor).
+    ToNegativeInfinity,
+    /// 4: toward positive infinity (ceiling).
+    ToPositiveInfinity,
+}
+
+impl Midpoint {
+    /// The mode `value` names, or `None` for a value `MidpointRounding` has no member for.
+    fn from_value(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::ToEven),
+            1 => Some(Self::AwayFromZero),
+            2 => Some(Self::ToZero),
+            3 => Some(Self::ToNegativeInfinity),
+            4 => Some(Self::ToPositiveInfinity),
+            _ => None,
+        }
+    }
+}
+
+/// What a `Round` call asks for, read from its arguments by the overload its parameter types
+/// name: `Round(x)`, `Round(x, int digits)`, `Round(x, MidpointRounding)` and
+/// `Round(x, int digits, MidpointRounding)`.
+///
+/// `Ok(None)` declines the call: a `decimal` value (which this hook does not compute), or
+/// arguments whose overload the call does not say (no parameter types and more than the
+/// value, where `digits` and a mode are both an `int32` on the stack). `Err` is the throw the
+/// runtime makes: digits outside `0..=max_digits` (`ArgumentOutOfRangeException`) or a mode
+/// `MidpointRounding` has no member for (`ArgumentException`).
+fn round_call(
+    ctx: &HookContext<'_>,
+    float: CilFlavor,
+    max_digits: i32,
+) -> std::result::Result<Option<(i32, Midpoint)>, PreHookResult> {
+    let (mut digits, mut mode) = (0, Midpoint::ToEven);
+    let params: Vec<CilFlavor> = match ctx.param_types {
+        Some(types) => types.to_vec(),
+        None if ctx.args.len() == 1 => vec![float.clone()],
+        None => return Ok(None),
+    };
+    if params.first() != Some(&float) || params.len() != ctx.args.len() {
+        return Ok(None);
+    }
+    for (param, arg) in params.iter().zip(ctx.args).skip(1) {
+        let EmValue::I32(value) = arg else {
+            return Ok(None);
+        };
+        match param {
+            CilFlavor::I4 => {
+                if !(0..=max_digits).contains(value) {
+                    return Err(PreHookResult::Throw {
+                        exception_type: synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+                        message: format!("Round: digits must be 0 to {max_digits}, got {value}"),
+                    });
+                }
+                digits = *value;
+            }
+            CilFlavor::ValueType => {
+                mode = Midpoint::from_value(*value).ok_or_else(|| PreHookResult::Throw {
+                    exception_type: synthetic_exception::ARGUMENT_EXCEPTION,
+                    message: format!("Round: {value} is no MidpointRounding"),
+                })?;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some((digits, mode)))
+}
+
+/// Rounds `value` to `digits` fractional digits by `mode`, as .NET's `Math.Round` does: a
+/// value whose magnitude reaches `limit` (or a NaN) has no fractional digits left to round
+/// and is returned as it is; otherwise it is scaled by `10^digits`, rounded to an integer
+/// and scaled back.
+macro_rules! round_like_dotnet {
+    ($value:expr, $digits:expr, $mode:expr, $limit:expr, $float:ty) => {{
+        let value: $float = $value;
+        if value.is_nan() || value.abs() >= $limit {
+            value
+        } else {
+            let power10 = (10.0 as $float).powi($digits);
+            let scaled = value * power10;
+            let rounded = match $mode {
+                Midpoint::ToEven => scaled.round_ties_even(),
+                Midpoint::AwayFromZero => {
+                    let integral = scaled.trunc();
+                    let fraction = scaled - integral;
+                    if fraction.abs() >= 0.5 {
+                        integral + fraction.signum()
+                    } else {
+                        integral
+                    }
+                }
+                Midpoint::ToZero => scaled.trunc(),
+                Midpoint::ToNegativeInfinity => scaled.floor(),
+                Midpoint::ToPositiveInfinity => scaled.ceil(),
+            };
+            rounded / power10
+        }
+    }};
+}
+
 /// Rounds a value to the nearest integer or specified number of decimal places.
 ///
 /// # Handled Overloads
@@ -685,10 +797,12 @@ fn system_math_ceiling_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread)
 /// - `Math.Round(Double, Int32) -> Double`
 /// - `Math.Round(Double, MidpointRounding) -> Double`
 /// - `Math.Round(Double, Int32, MidpointRounding) -> Double`
-/// - `Math.Round(Decimal) -> Decimal`
-/// - `Math.Round(Decimal, Int32) -> Decimal`
-/// - `Math.Round(Decimal, MidpointRounding) -> Decimal`
-/// - `Math.Round(Decimal, Int32, MidpointRounding) -> Decimal`
+///
+/// A midpoint goes to the even neighbour unless a `MidpointRounding` says otherwise, and
+/// `digits` is 0 to 15, as in .NET. The `Decimal` overloads are declined
+/// ([`PreHookResult::Continue`]), and so is a call whose parameter types are unknown and
+/// that passes more than the value, since `digits` and a mode are both an `int32` on the
+/// stack.
 ///
 /// # Parameters
 ///
@@ -696,25 +810,18 @@ fn system_math_ceiling_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread)
 /// - `digits`: The number of fractional digits in the return value (optional)
 /// - `mode`: Specification for how to round value if it is midway (optional)
 fn system_math_round_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread) -> PreHookResult {
-    let Some(arg0) = ctx.args.first() else {
-        return PreHookResult::Bypass(Some(EmValue::F64(0.0)));
+    let value = match ctx.args.first() {
+        Some(EmValue::F64(value)) => *value,
+        Some(EmValue::F32(value)) => f64::from(*value),
+        _ => return PreHookResult::Continue,
     };
-
-    let value = match arg0 {
-        EmValue::F32(f) => f64::from(*f),
-        EmValue::F64(f) => *f,
-        _ => return PreHookResult::Bypass(Some(EmValue::F64(0.0))),
-    };
-
-    let decimals = match ctx.args.get(1) {
-        Some(EmValue::I32(n)) => (*n).clamp(0, 15),
-        _ => 0,
-    };
-
-    let multiplier = 10_f64.powi(decimals);
-    let rounded = (value * multiplier).round() / multiplier;
-
-    PreHookResult::Bypass(Some(EmValue::F64(rounded)))
+    match round_call(ctx, CilFlavor::R8, 15) {
+        Ok(Some((digits, mode))) => PreHookResult::Bypass(Some(EmValue::F64(round_like_dotnet!(
+            value, digits, mode, 1e16, f64
+        )))),
+        Ok(None) => PreHookResult::Continue,
+        Err(throw) => throw,
+    }
 }
 
 /// Hook for `System.Math.Truncate` method.
@@ -1249,12 +1356,22 @@ fn system_mathf_ceiling_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread
     PreHookResult::Bypass(Some(EmValue::F32(arg0.to_f32_cil().ceil())))
 }
 
-/// Hook for `System.MathF.Round` — round to nearest (single-precision).
+/// Hook for `System.MathF.Round`: `Round(Single)`, `Round(Single, Int32)`,
+/// `Round(Single, MidpointRounding)` and `Round(Single, Int32, MidpointRounding)`, rounded as
+/// .NET's `MathF.Round` does in single precision (a midpoint to the even neighbour by default,
+/// `digits` 0 to 6, a magnitude of 1e8 or more returned as it is).
 fn system_mathf_round_pre(ctx: &HookContext<'_>, _thread: &mut EmulationThread) -> PreHookResult {
-    let Some(arg0) = ctx.args.first() else {
-        return PreHookResult::Bypass(Some(EmValue::F32(0.0)));
+    let Some(EmValue::F32(value)) = ctx.args.first() else {
+        return PreHookResult::Continue;
     };
-    PreHookResult::Bypass(Some(EmValue::F32(arg0.to_f32_cil().round())))
+    let value = *value;
+    match round_call(ctx, CilFlavor::R4, 6) {
+        Ok(Some((digits, mode))) => PreHookResult::Bypass(Some(EmValue::F32(round_like_dotnet!(
+            value, digits, mode, 1e8, f32
+        )))),
+        Ok(None) => PreHookResult::Continue,
+        Err(throw) => throw,
+    }
 }
 
 /// Hook for `System.MathF.Min` — minimum of two values (single-precision).
@@ -1728,5 +1845,122 @@ mod tests {
         assert!(
             matches!(result, PreHookResult::Bypass(Some(EmValue::F64(v))) if (v - 3.125).abs() < 0.001)
         );
+    }
+
+    /// `Round` follows .NET by the overload its parameter types name: a midpoint goes to the
+    /// even neighbour unless a `MidpointRounding` says otherwise, `digits` is 0 to 15 (6 for
+    /// `MathF`), what the runtime refuses is thrown, a NaN or a value past the rounding limit
+    /// comes back as it is, and a `decimal` or an overload the call does not name is
+    /// declined. Every expected value is exactly representable, so the cases test the rule,
+    /// not the scaling.
+    #[test]
+    fn round_follows_dotnet_by_overload() {
+        let mut thread = create_test_thread();
+        let (r8, i4, mode) = (CilFlavor::R8, CilFlavor::I4, CilFlavor::ValueType);
+        let cases: Vec<(Vec<EmValue>, Vec<CilFlavor>, Option<f64>)> = vec![
+            (vec![EmValue::F64(2.5)], vec![r8.clone()], Some(2.0)),
+            (vec![EmValue::F64(3.5)], vec![r8.clone()], Some(4.0)),
+            (vec![EmValue::F64(-2.5)], vec![r8.clone()], Some(-2.0)),
+            (vec![EmValue::F64(2.4)], vec![r8.clone()], Some(2.0)),
+            (
+                vec![EmValue::F64(2.5), EmValue::I32(1)],
+                vec![r8.clone(), mode.clone()],
+                Some(3.0),
+            ),
+            (
+                vec![EmValue::F64(-2.5), EmValue::I32(1)],
+                vec![r8.clone(), mode.clone()],
+                Some(-3.0),
+            ),
+            (
+                vec![EmValue::F64(-2.5), EmValue::I32(2)],
+                vec![r8.clone(), mode.clone()],
+                Some(-2.0),
+            ),
+            (
+                vec![EmValue::F64(-2.25), EmValue::I32(3)],
+                vec![r8.clone(), mode.clone()],
+                Some(-3.0),
+            ),
+            (
+                vec![EmValue::F64(2.25), EmValue::I32(4)],
+                vec![r8.clone(), mode.clone()],
+                Some(3.0),
+            ),
+            (
+                vec![EmValue::F64(1.125), EmValue::I32(2)],
+                vec![r8.clone(), i4.clone()],
+                Some(1.12),
+            ),
+            (
+                vec![EmValue::F64(1.125), EmValue::I32(2), EmValue::I32(1)],
+                vec![r8.clone(), i4.clone(), mode.clone()],
+                Some(1.13),
+            ),
+            (vec![EmValue::F64(1e17 + 0.0)], vec![r8.clone()], Some(1e17)),
+        ];
+        for (args, params, expected) in cases {
+            let ctx = create_test_context(&args).with_param_types(Some(&params));
+            match (system_math_round_pre(&ctx, &mut thread), expected) {
+                (PreHookResult::Bypass(Some(EmValue::F64(got))), Some(want)) => {
+                    assert_eq!(got, want, "{args:?}");
+                }
+                (other, _) => panic!("{args:?}: {other:?}"),
+            }
+        }
+
+        let nan = create_test_context(&[EmValue::F64(f64::NAN)]);
+        assert!(matches!(
+            system_math_round_pre(&nan, &mut thread),
+            PreHookResult::Bypass(Some(EmValue::F64(v))) if v.is_nan()
+        ));
+
+        let mut throws = |args: &[EmValue], params: &[CilFlavor]| {
+            let ctx = create_test_context(args).with_param_types(Some(params));
+            matches!(
+                system_math_round_pre(&ctx, &mut thread),
+                PreHookResult::Throw { .. }
+            )
+        };
+        assert!(throws(
+            &[EmValue::F64(1.0), EmValue::I32(16)],
+            &[r8.clone(), i4.clone()]
+        ));
+        assert!(throws(
+            &[EmValue::F64(1.0), EmValue::I32(-1)],
+            &[r8.clone(), i4.clone()]
+        ));
+        assert!(throws(
+            &[EmValue::F64(1.0), EmValue::I32(5)],
+            &[r8.clone(), mode.clone()]
+        ));
+
+        // `digits` and a mode are both an int32: without parameter types it is declined.
+        let unknown = create_test_context(&[EmValue::F64(2.5), EmValue::I32(1)]);
+        assert!(matches!(
+            system_math_round_pre(&unknown, &mut thread),
+            PreHookResult::Continue
+        ));
+        let decimal_params = [mode.clone()];
+        let decimal =
+            create_test_context(&[EmValue::F64(2.5)]).with_param_types(Some(&decimal_params));
+        assert!(matches!(
+            system_math_round_pre(&decimal, &mut thread),
+            PreHookResult::Continue
+        ));
+
+        // MathF: single precision, digits 0 to 6.
+        let single = create_test_context(&[EmValue::F32(2.5)]);
+        assert!(matches!(
+            system_mathf_round_pre(&single, &mut thread),
+            PreHookResult::Bypass(Some(EmValue::F32(v))) if v == 2.0
+        ));
+        let r4 = [CilFlavor::R4, i4];
+        let seven =
+            create_test_context(&[EmValue::F32(1.0), EmValue::I32(7)]).with_param_types(Some(&r4));
+        assert!(matches!(
+            system_mathf_round_pre(&seven, &mut thread),
+            PreHookResult::Throw { .. }
+        ));
     }
 }

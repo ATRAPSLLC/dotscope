@@ -64,7 +64,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ReflectionMethod { method_token, .. }) => Some(*method_token),
             _ => None,
         })
@@ -103,7 +103,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ReflectionMethod {
                 method_type_args, ..
             }) => method_type_args.clone(),
@@ -150,7 +150,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ReflectionType { wrapper, .. }) => wrapper.clone(),
             _ => None,
         })
@@ -168,7 +168,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ReflectionType { type_token, .. }) => Some(*type_token),
             _ => None,
         })
@@ -223,7 +223,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ReflectionField {
                 field_token,
                 declaring_type_token,
@@ -276,7 +276,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ReflectionProperty {
                 property_name,
                 declaring_type_token,
@@ -333,7 +333,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ReflectionParameter {
                 method_token,
                 position,
@@ -407,8 +407,10 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::DynamicMethod { il_generator, .. }) =
-            state.objects.get_mut(&dynamic_method.id())
+        if let Some(HeapObject::DynamicMethod { il_generator, .. }) = state
+            .objects
+            .get_mut(&dynamic_method.id())
+            .map(Arc::make_mut)
         {
             *il_generator = Some(il_ref);
         }
@@ -428,7 +430,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::DynamicMethod { param_types, .. }) =
-            state.objects.get_mut(&dm_ref.id())
+            state.objects.get_mut(&dm_ref.id()).map(Arc::make_mut)
         {
             *param_types = params;
         }
@@ -448,7 +450,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         if let Some(HeapObject::DynamicMethod { return_type, .. }) =
-            state.objects.get_mut(&dm_ref.id())
+            state.objects.get_mut(&dm_ref.id()).map(Arc::make_mut)
         {
             *return_type = ret_type;
         }
@@ -463,7 +465,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&dm_ref.id()) {
+        Ok(match state.objects.get(&dm_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::DynamicMethod { return_type, .. }) => *return_type,
             _ => None,
         })
@@ -481,7 +483,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&dm_ref.id()) {
+        Ok(match state.objects.get(&dm_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::DynamicMethod { il_generator, .. }) => *il_generator,
             _ => None,
         })
@@ -505,7 +507,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&il_ref.id()) {
+        Ok(match state.objects.get(&il_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ILGenerator { assembler, .. }) => Some(Arc::clone(assembler)),
             _ => None,
         })
@@ -526,7 +528,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&il_ref.id()) {
+        Ok(match state.objects.get(&il_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ILGenerator { label_names, .. }) => {
                 let id = label_names.count();
                 let name = format!("_dyn_L{id}");
@@ -549,7 +551,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&il_ref.id()) {
+        Ok(match state.objects.get(&il_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ILGenerator { label_names, .. }) => label_names.get(index).cloned(),
             _ => None,
         })
@@ -571,7 +573,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&il_ref.id()) {
+        Ok(match state.objects.get(&il_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ILGenerator { local_types, .. }) => Some(local_types.push(type_token)),
             _ => None,
         })
@@ -589,7 +591,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&il_ref.id()) {
+        Ok(match state.objects.get(&il_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ILGenerator { local_types, .. }) => {
                 Some(local_types.iter().map(|(_, t)| *t).collect())
             }
@@ -614,7 +616,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&il_ref.id()) {
+        Ok(match state.objects.get(&il_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ILGenerator { token_map, .. }) => {
                 Some(token_map.push((synthetic_id, real_token)))
             }
@@ -634,7 +636,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&dm_ref.id()) {
+        Ok(match state.objects.get(&dm_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::DynamicMethod {
                 is_static,
                 param_types,
@@ -656,7 +658,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&il_ref.id()) {
+        Ok(match state.objects.get(&il_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::ILGenerator { dynamic_method, .. }) => Some(*dynamic_method),
             _ => None,
         })

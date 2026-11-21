@@ -72,7 +72,7 @@ impl EmValue {
     /// an `int32` there, whatever type the value was loaded as. Every operation reads its
     /// operands in this form; a value keeps its own type until then, for the calls that
     /// take it.
-    pub(crate) fn on_stack(&self) -> Cow<'_, EmValue> {
+    pub fn on_stack(&self) -> Cow<'_, EmValue> {
         match self {
             EmValue::Bool(value) => Cow::Owned(EmValue::I32(i32::from(*value))),
             EmValue::Char(value) => Cow::Owned(EmValue::I32(i32::from_ne_bytes(

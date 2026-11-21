@@ -3,6 +3,8 @@
 //! This module provides operations for single-dimensional arrays, multi-dimensional
 //! arrays, and byte array convenience methods on [`ManagedHeap`].
 
+use std::sync::Arc;
+
 use crate::{
     emulation::{
         engine::EmulationError,
@@ -120,7 +122,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::Array { elements, .. }) => {
                 if let Some(elem) = elements.get(index) {
                     Ok(elem.clone())
@@ -173,7 +175,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get_mut(&heap_ref.id()) {
+        match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
             Some(HeapObject::Array { elements, .. }) => {
                 let len = elements.len();
                 if let Some(slot) = elements.get_mut(index) {
@@ -215,7 +217,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::Array { elements, .. }) => Ok(elements.len()),
             Some(HeapObject::MultiArray { dimensions, .. }) => Ok(dimensions.iter().product()),
             Some(other) => Err(EmulationError::HeapTypeMismatch {
@@ -246,7 +248,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(
                 HeapObject::Array { element_type, .. }
                 | HeapObject::MultiArray { element_type, .. },
@@ -300,7 +302,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::Array { elements, .. }) => {
                 let mut bytes = Vec::with_capacity(elements.len());
                 for e in elements {
@@ -339,7 +341,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::Array {
                 elements,
                 element_type,

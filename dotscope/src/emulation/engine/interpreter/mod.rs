@@ -323,7 +323,7 @@ impl Interpreter {
     }
 
     /// Executes a standard (non-prefixed) opcode.
-    pub(crate) fn execute_standard(
+    pub fn execute_standard(
         &mut self,
         thread: &mut EmulationThread,
         instruction: &Instruction,
@@ -976,9 +976,29 @@ impl Interpreter {
                 Ok(StepResult::LoadToken { token })
             }
 
-            // Overflow-checked conversions (0xD4, 0xD5)
-            0xD4 => Self::convert(thread, ConversionType::IOvf, self.pointer_size), // conv.ovf.i
-            0xD5 => Self::convert(thread, ConversionType::UOvf, self.pointer_size), // conv.ovf.u
+            // Overflow-checked conversions of an unsigned source (0x82 - 0x8B)
+            0x82 => Self::convert(thread, ConversionType::I1OvfUn, self.pointer_size), // conv.ovf.i1.un
+            0x83 => Self::convert(thread, ConversionType::I2OvfUn, self.pointer_size), // conv.ovf.i2.un
+            0x84 => Self::convert(thread, ConversionType::I4OvfUn, self.pointer_size), // conv.ovf.i4.un
+            0x85 => Self::convert(thread, ConversionType::I8OvfUn, self.pointer_size), // conv.ovf.i8.un
+            0x86 => Self::convert(thread, ConversionType::U1OvfUn, self.pointer_size), // conv.ovf.u1.un
+            0x87 => Self::convert(thread, ConversionType::U2OvfUn, self.pointer_size), // conv.ovf.u2.un
+            0x88 => Self::convert(thread, ConversionType::U4OvfUn, self.pointer_size), // conv.ovf.u4.un
+            0x89 => Self::convert(thread, ConversionType::U8OvfUn, self.pointer_size), // conv.ovf.u8.un
+            0x8A => Self::convert(thread, ConversionType::IOvfUn, self.pointer_size), // conv.ovf.i.un
+            0x8B => Self::convert(thread, ConversionType::UOvfUn, self.pointer_size), // conv.ovf.u.un
+
+            // Overflow-checked conversions of a signed source (0xB3 - 0xBA, 0xD4, 0xD5)
+            0xB3 => Self::convert(thread, ConversionType::I1Ovf, self.pointer_size), // conv.ovf.i1
+            0xB4 => Self::convert(thread, ConversionType::U1Ovf, self.pointer_size), // conv.ovf.u1
+            0xB5 => Self::convert(thread, ConversionType::I2Ovf, self.pointer_size), // conv.ovf.i2
+            0xB6 => Self::convert(thread, ConversionType::U2Ovf, self.pointer_size), // conv.ovf.u2
+            0xB7 => Self::convert(thread, ConversionType::I4Ovf, self.pointer_size), // conv.ovf.i4
+            0xB8 => Self::convert(thread, ConversionType::U4Ovf, self.pointer_size), // conv.ovf.u4
+            0xB9 => Self::convert(thread, ConversionType::I8Ovf, self.pointer_size), // conv.ovf.i8
+            0xBA => Self::convert(thread, ConversionType::U8Ovf, self.pointer_size), // conv.ovf.u8
+            0xD4 => Self::convert(thread, ConversionType::IOvf, self.pointer_size),  // conv.ovf.i
+            0xD5 => Self::convert(thread, ConversionType::UOvf, self.pointer_size),  // conv.ovf.u
 
             // Overflow-checked arithmetic (0xD6 - 0xDB)
             0xD6 => Self::binary_op(thread, BinaryOp::AddOvf, self.pointer_size), // add.ovf
@@ -1088,7 +1108,7 @@ impl Interpreter {
     }
 
     /// Executes an instruction with 0xFE prefix (two-byte opcodes).
-    pub(crate) fn execute_fe_prefixed(
+    pub fn execute_fe_prefixed(
         &mut self,
         thread: &mut EmulationThread,
         instruction: &Instruction,
@@ -1227,35 +1247,16 @@ impl Interpreter {
                 Ok(StepResult::RefAnyType)
             }
 
-            // Overflow-checked conversions (0xFE 0x82 - 0x8A)
-            0x82 => Self::convert(thread, ConversionType::I1Ovf, self.pointer_size), // conv.ovf.i1
-            0x83 => Self::convert(thread, ConversionType::U1Ovf, self.pointer_size), // conv.ovf.u1
-            0x84 => Self::convert(thread, ConversionType::I2Ovf, self.pointer_size), // conv.ovf.i2
-            0x85 => Self::convert(thread, ConversionType::U2Ovf, self.pointer_size), // conv.ovf.u2
-            0x86 => Self::convert(thread, ConversionType::I4Ovf, self.pointer_size), // conv.ovf.i4
-            0x87 => Self::convert(thread, ConversionType::U4Ovf, self.pointer_size), // conv.ovf.u4
-            0x88 => Self::convert(thread, ConversionType::I8Ovf, self.pointer_size), // conv.ovf.i8
-            0x89 => Self::convert(thread, ConversionType::U8Ovf, self.pointer_size), // conv.ovf.u8
-            0x8A => Self::convert(thread, ConversionType::IOvf, self.pointer_size),  // conv.ovf.i
-            0x8B => Self::convert(thread, ConversionType::UOvf, self.pointer_size),  // conv.ovf.u
-
-            // conv.ovf.*.un variants
-            0xB3 => Self::convert(thread, ConversionType::I1OvfUn, self.pointer_size), // conv.ovf.i1.un
-            0xB4 => Self::convert(thread, ConversionType::U1OvfUn, self.pointer_size), // conv.ovf.u1.un
-            0xB5 => Self::convert(thread, ConversionType::I2OvfUn, self.pointer_size), // conv.ovf.i2.un
-            0xB6 => Self::convert(thread, ConversionType::U2OvfUn, self.pointer_size), // conv.ovf.u2.un
-            0xB7 => Self::convert(thread, ConversionType::I4OvfUn, self.pointer_size), // conv.ovf.i4.un
-            0xB8 => Self::convert(thread, ConversionType::U4OvfUn, self.pointer_size), // conv.ovf.u4.un
-            0xB9 => Self::convert(thread, ConversionType::I8OvfUn, self.pointer_size), // conv.ovf.i8.un
-            0xBA => Self::convert(thread, ConversionType::U8OvfUn, self.pointer_size), // conv.ovf.u8.un
-            0xBB => Self::convert(thread, ConversionType::IOvfUn, self.pointer_size), // conv.ovf.i.un
-            0xBC => Self::convert(thread, ConversionType::UOvfUn, self.pointer_size), // conv.ovf.u.un
-
             // Prefix opcodes (modify the next instruction)
             0x12 => {
                 // unaligned.
                 let alignment = instruction.get_u8_operand().unwrap_or(1);
                 self.unaligned_prefix = Some(alignment);
+                Ok(StepResult::Continue)
+            }
+            0x19 => {
+                // no.{typecheck|rangecheck|nullcheck}: the next instruction *may* skip those
+                // checks (ECMA-335 III.2.2); making them anyway is a run the prefix allows
                 Ok(StepResult::Continue)
             }
             0x13 => {

@@ -10,12 +10,13 @@ use crate::{
     metadata::{
         imports::{Import, ImportSourceId, ImportType},
         signatures::SignatureTypeSpec,
+        streams::SharedStr,
         tables::{
             MemberRef, MethodSpec, MethodSpecRc, StandAloneSigRaw, StandAloneSignature,
             TableAccess, TypeSpecRaw,
         },
         token::Token,
-        typesystem::CilTypeReference,
+        typesystem::{CilTypeReference, FullName},
     },
 };
 
@@ -172,7 +173,7 @@ impl EmulationContext {
     ///
     /// The DLL name if this is a ModuleRef-sourced import, or `None` otherwise.
     #[must_use]
-    pub fn get_import_dll_name(&self, import: &Import) -> Option<String> {
+    pub fn get_import_dll_name(&self, import: &Import) -> Option<SharedStr> {
         match import.source_id {
             ImportSourceId::ModuleRef(token) => self
                 .assembly
@@ -197,7 +198,7 @@ impl EmulationContext {
     ///
     /// A tuple of (namespace, name), or `None` if the type reference is invalid.
     #[must_use]
-    pub fn get_member_ref_type_info(member_ref: &MemberRef) -> Option<(String, String)> {
+    pub fn get_member_ref_type_info(member_ref: &MemberRef) -> Option<(SharedStr, SharedStr)> {
         match &member_ref.declaredby {
             CilTypeReference::TypeRef(cil_type_ref)
             | CilTypeReference::TypeDef(cil_type_ref)
@@ -232,13 +233,14 @@ impl EmulationContext {
     ///
     /// The type name string, or "Unknown" if the reference is invalid.
     #[must_use]
-    pub fn get_member_ref_type_name(member_ref: &MemberRef) -> String {
+    pub fn get_member_ref_type_name(member_ref: &MemberRef) -> FullName {
         match &member_ref.declaredby {
-            CilTypeReference::ModuleRef(m) => m.name.clone(),
-            _ => member_ref
-                .declaredby
-                .fullname()
-                .unwrap_or_else(|| "Unknown".to_string()),
+            CilTypeReference::ModuleRef(m) => {
+                FullName::top_level(SharedStr::default(), m.name.clone())
+            }
+            _ => member_ref.declaredby.fullname().unwrap_or_else(|| {
+                FullName::top_level(SharedStr::default(), SharedStr::from("Unknown"))
+            }),
         }
     }
 

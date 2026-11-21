@@ -92,7 +92,7 @@ fn resolve_address(arg: &EmValue, thread: &EmulationThread) -> Option<u64> {
         EmValue::I32(a) => Some(a.cast_unsigned() as u64),
         EmValue::ObjectRef(href) => {
             // Unbox: ObjectRef → BoxedValue or Object with IntPtr field
-            match thread.heap().get(*href) {
+            match thread.heap().get_shared(*href).as_deref() {
                 Ok(HeapObject::BoxedValue { value, .. }) => match value.as_ref() {
                     EmValue::NativeInt(a) => Some(a.cast_unsigned()),
                     EmValue::NativeUInt(a) => Some(*a),
@@ -1208,7 +1208,7 @@ fn marshal_get_function_pointer_for_delegate_pre(
     if let Some(href) = delegate_ref {
         if let Ok(crate::emulation::HeapObject::Delegate {
             invocation_list, ..
-        }) = thread.heap().get(href)
+        }) = thread.heap().get_shared(href).as_deref()
         {
             if let Some(entry) = invocation_list.first() {
                 let method_token = entry.method_token;

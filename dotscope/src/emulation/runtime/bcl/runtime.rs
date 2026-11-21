@@ -660,12 +660,12 @@ fn object_ctor_pre(_ctx: &HookContext<'_>, _thread: &mut EmulationThread) -> Pre
 fn object_to_string_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     let text = match ctx.this {
         Some(EmValue::ObjectRef(href)) => {
-            match thread.heap().get(*href) {
+            match thread.heap().get_shared(*href).as_deref() {
                 Ok(HeapObject::String(_)) => {
                     // String.ToString() returns itself
                     return PreHookResult::Bypass(Some(EmValue::ObjectRef(*href)));
                 }
-                Ok(HeapObject::BoxedValue { value, .. }) => match &*value {
+                Ok(HeapObject::BoxedValue { value, .. }) => match &**value {
                     EmValue::I32(v) => v.to_string(),
                     EmValue::I64(v) => v.to_string(),
                     EmValue::F32(v) => v.to_string(),
@@ -677,9 +677,9 @@ fn object_to_string_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
                 Ok(HeapObject::ReflectionType { type_token, .. }) => {
                     // Return the type's full name if available
                     if let Some(asm) = thread.assembly().cloned() {
-                        if let Some(cil_type) = asm.types().resolve(&type_token) {
+                        if let Some(cil_type) = asm.types().resolve(type_token) {
                             if cil_type.namespace.is_empty() {
-                                cil_type.name.clone()
+                                cil_type.name.to_string()
                             } else {
                                 format!("{}.{}", cil_type.namespace, cil_type.name)
                             }
@@ -693,9 +693,9 @@ fn object_to_string_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
                 Ok(HeapObject::Object { type_token, .. }) => {
                     // Try to get the type name from metadata
                     if let Some(asm) = thread.assembly().cloned() {
-                        if let Some(cil_type) = asm.types().resolve(&type_token) {
+                        if let Some(cil_type) = asm.types().resolve(type_token) {
                             if cil_type.namespace.is_empty() {
-                                cil_type.name.clone()
+                                cil_type.name.to_string()
                             } else {
                                 format!("{}.{}", cil_type.namespace, cil_type.name)
                             }
@@ -755,7 +755,8 @@ fn object_memberwise_clone_pre(
         return PreHookResult::Bypass(Some(EmValue::Null));
     };
 
-    let src_obj = match thread.heap().get(*src_ref) {
+    let binding = thread.heap().get_shared(*src_ref);
+    let src_obj = match binding.as_deref() {
         Ok(obj) => obj,
         Err(_) => return PreHookResult::Bypass(Some(EmValue::Null)),
     };
@@ -765,12 +766,12 @@ fn object_memberwise_clone_pre(
             type_token, fields, ..
         } => {
             // Allocate a new object with the same type
-            let new_ref = match thread.heap_mut().alloc_object(type_token) {
+            let new_ref = match thread.heap_mut().alloc_object(*type_token) {
                 Ok(r) => r,
                 Err(_) => return PreHookResult::Bypass(Some(EmValue::Null)),
             };
             // Copy all fields
-            for (field_token, value) in &fields {
+            for (field_token, value) in fields {
                 try_hook!(thread
                     .heap_mut()
                     .set_field(new_ref, *field_token, value.clone()));
@@ -781,7 +782,10 @@ fn object_memberwise_clone_pre(
             type_token, value, ..
         } => {
             // Clone the boxed value
-            match thread.heap_mut().alloc_boxed(type_token, (*value).clone()) {
+            match thread
+                .heap_mut()
+                .alloc_boxed(*type_token, *(*value).clone())
+            {
                 Ok(new_ref) => PreHookResult::Bypass(Some(EmValue::ObjectRef(new_ref))),
                 Err(_) => PreHookResult::Bypass(Some(EmValue::Null)),
             }
@@ -821,12 +825,14 @@ fn valuetype_equals_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
         _ => return PreHookResult::Bypass(Some(EmValue::I32(0))),
     };
 
-    let this_obj = match thread.heap().get(this_ref) {
+    let binding = thread.heap().get_shared(this_ref);
+    let this_obj = match binding.as_deref() {
         Ok(obj) => obj,
         Err(_) => return PreHookResult::Bypass(Some(EmValue::I32(0))),
     };
 
-    let other_obj = match thread.heap().get(other_ref) {
+    let binding = thread.heap().get_shared(other_ref);
+    let other_obj = match binding.as_deref() {
         Ok(obj) => obj,
         Err(_) => return PreHookResult::Bypass(Some(EmValue::I32(0))),
     };

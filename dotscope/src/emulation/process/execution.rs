@@ -96,8 +96,8 @@ use crate::{
 ///
 /// # See Also
 ///
-/// - [`EmulationLimits`](super::EmulationLimits) - Configuration for limits
-/// - [`EmulationOutcome::LimitReached`](crate::emulation::engine::EmulationOutcome::LimitReached)
+/// - [`EmulationLimits`] - Configuration for limits
+/// - [`EmulationOutcome::LimitReached`]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LimitKind {
     /// Maximum instruction count was reached.
@@ -225,27 +225,27 @@ pub struct StackTraceEntry {
 /// - Check address validity via [`is_valid_address`](Self::is_valid_address)
 pub struct EmulationProcess {
     /// Process name for identification and logging.
-    pub(super) name: String,
+    pub name: String,
 
     /// Shared process environment (address space, runtime, capture, config, etc.).
-    pub(super) context: Arc<ThreadContext>,
+    pub context: Arc<ThreadContext>,
 
     /// Loaded PE images (executables and DLLs).
-    pub(super) loaded_images: Vec<LoadedImage>,
+    pub loaded_images: Vec<LoadedImage>,
 
     /// Mapped raw data regions.
-    pub(super) mapped_regions: Vec<MappedRegionInfo>,
+    pub mapped_regions: Vec<MappedRegionInfo>,
 
     /// Total instructions executed across all method calls.
     ///
     /// Atomic for lock-free updates during execution.
-    pub(super) instruction_count: AtomicU64,
+    pub instruction_count: AtomicU64,
 
     /// Trace writer for debugging emulation.
     ///
     /// When tracing is enabled via `TracingConfig`, this writer records
     /// execution events to a file or memory buffer for later analysis.
-    pub(super) trace_writer: Option<Arc<TraceWriter>>,
+    pub trace_writer: Option<Arc<TraceWriter>>,
 }
 
 impl EmulationProcess {
@@ -750,7 +750,7 @@ impl EmulationProcess {
     ///
     /// # See Also
     ///
-    /// - [`UnknownMethodBehavior`](crate::emulation::UnknownMethodBehavior)
+    /// - [`UnknownMethodBehavior`]
     pub fn set_default_behavior(&self, behavior: UnknownMethodBehavior) -> Result<()> {
         self.context
             .runtime

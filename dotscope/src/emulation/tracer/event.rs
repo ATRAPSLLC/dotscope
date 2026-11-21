@@ -4,7 +4,7 @@
 //! tracing subsystem. Each variant captures a specific observable side-effect
 //! during CIL emulation. Events are produced by the execution engine
 //! ([`EmulationController`](crate::emulation::EmulationController) and
-//! [`CallResolver`](super::super::engine::callresolver)) and consumed by the
+//! [`CallResolver`](crate::emulation::engine::callresolver::CallResolver)) and consumed by the
 //! [`TraceWriter`](super::TraceWriter).
 //!
 //! # Event Categories

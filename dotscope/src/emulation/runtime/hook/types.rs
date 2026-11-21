@@ -164,9 +164,10 @@ pub struct HookContext<'a> {
     /// `None` if type information could not be resolved.
     pub param_types: Option<&'a [CilFlavor]>,
 
-    /// Return type if available.
+    /// Return type if available: [`CilFlavor::Void`] for a void method.
     ///
-    /// `None` if type information could not be resolved or the method returns void.
+    /// `None` only if the signature could not be read, so a matcher expecting `Void` matches
+    /// a void method rather than every method whose signature is unknown.
     pub return_type: Option<CilFlavor>,
 
     /// Target pointer size for native int/uint types.

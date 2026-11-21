@@ -28,19 +28,19 @@
 //!
 //! The runtime state manages:
 //!
-//! - [`HookManager`](super::HookManager) - Method interception (BCL hooks + P/Invoke stubs)
-//! - [`AppDomainState`](super::AppDomainState) - Application domain simulation
-//! - [`EmulationConfig`](crate::emulation::process::EmulationConfig) - Configuration
-//! - [`UnknownMethodBehavior`](super::UnknownMethodBehavior) - Fallback behavior
+//! - [`HookManager`] - Method interception (BCL hooks + P/Invoke stubs)
+//! - [`AppDomainState`] - Application domain simulation
+//! - [`EmulationConfig`] - Configuration
+//! - [`UnknownMethodBehavior`] - Fallback behavior
 //!
 //! # Hook Resolution
 //!
 //! When the emulator needs to handle a method call:
 //!
-//! 1. **Hook Matching**: Check [`HookManager`](super::HookManager) for matching hooks
+//! 1. **Hook Matching**: Check [`HookManager`] for matching hooks
 //! 2. **Pre-Hook**: Execute pre-hook (can bypass method)
 //! 3. **Original/Post-Hook**: Execute original and/or post-hook
-//! 4. **Default Behavior**: Apply [`UnknownMethodBehavior`](super::UnknownMethodBehavior)
+//! 4. **Default Behavior**: Apply [`UnknownMethodBehavior`]
 //!
 //! # Examples
 //!
@@ -74,7 +74,7 @@
 //! # Thread Safety
 //!
 //! `RuntimeState` is designed to be wrapped in `Arc<RwLock<RuntimeState>>`.
-//! The embedded [`HookManager`](super::HookManager) is internally thread-safe
+//! The embedded [`HookManager`] is internally thread-safe
 //! and can be accessed via `hooks()` without holding the `RuntimeState` lock.
 
 use std::sync::Arc;
@@ -106,7 +106,7 @@ use crate::{
 ///
 /// # Hook Access
 ///
-/// The [`HookManager`](super::HookManager) is internally thread-safe and wrapped
+/// The [`HookManager`] is internally thread-safe and wrapped
 /// in `Arc`. Use [`hooks()`](Self::hooks) to obtain a shared handle that can be
 /// passed to other components (e.g., the emulation controller) without needing to
 /// hold the `RuntimeState` lock. Registration and dispatch can happen concurrently:

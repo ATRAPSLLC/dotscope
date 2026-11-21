@@ -91,10 +91,12 @@ pub enum CallResolution {
 ///
 /// Returned by `resolve_newobj()`. The main loop acts on each variant.
 pub enum NewObjResolution {
-    /// Hook handled the constructor. Push the object reference, advance IP.
+    /// Hook handled the constructor. Push the constructed value, advance IP.
     HookedBypass {
-        /// The allocated object reference.
-        obj_ref: HeapRef,
+        /// The value `newobj` pushes: the one the hook constructed and returned (a value
+        /// type the emulator represents as a primitive, as `DateTime` is its ticks), or the
+        /// allocated object the hook initialized.
+        value: EmValue,
     },
 
     /// Enter the constructor's CIL body.

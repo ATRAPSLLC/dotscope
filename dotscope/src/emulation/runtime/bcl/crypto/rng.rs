@@ -65,7 +65,7 @@ pub fn register(manager: &HookManager) -> Result<()> {
                 "RandomNumberGenerator",
                 "Create",
             )
-            .pre(rng_crypto_ctor_pre),
+            .pre(rng_create_pre),
     )?;
 
     // RandomNumberGenerator.GetBytes(byte[]) — base class virtual
@@ -84,11 +84,28 @@ pub fn register(manager: &HookManager) -> Result<()> {
 
 // RNG tokens defined in crate::emulation::tokens::{helpers::RNG, rng_fields::STATE}.
 
-/// Hook for `RNGCryptoServiceProvider..ctor()` and `RandomNumberGenerator.Create()`.
+/// Hook for `RNGCryptoServiceProvider..ctor()`.
 ///
-/// Allocates a heap object with a single field storing the xorshift64 state.
-/// The state is initialised to [`RNG_XORSHIFT64_SEED`].
-fn rng_crypto_ctor_pre(_ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
+/// Initializes the object `newobj` allocated (`this`) with the xorshift64 state field, set to
+/// [`RNG_XORSHIFT64_SEED`]. A constructor returns nothing: the object it initializes is the
+/// one `newobj` pushes.
+fn rng_crypto_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
+    let Some(EmValue::ObjectRef(this_ref)) = ctx.this else {
+        return PreHookResult::Error("RNGCryptoServiceProvider..ctor without `this`".into());
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    let seed = EmValue::I64(RNG_XORSHIFT64_SEED as i64);
+    try_hook!(thread
+        .heap()
+        .set_field(*this_ref, tokens::rng_fields::STATE, seed));
+    PreHookResult::Bypass(None)
+}
+
+/// Hook for `RandomNumberGenerator.Create()`.
+///
+/// Allocates a heap object with a single field storing the xorshift64 state, initialised to
+/// [`RNG_XORSHIFT64_SEED`], and returns it.
+fn rng_create_pre(_ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     let state_field = tokens::rng_fields::STATE;
     let type_token = tokens::helpers::RNG;
 
@@ -171,24 +188,55 @@ mod tests {
         emulation::{
             runtime::hook::{HookContext, PreHookResult},
             thread::EmulationThread,
-            EmValue,
+            tokens, EmValue,
         },
         metadata::{token::Token, typesystem::PointerSize},
         testkit::emulation::create_test_thread,
     };
 
+    /// The constructor initializes `this`, the object `newobj` pushes, and returns nothing.
     #[test]
     fn test_rng_crypto_ctor_hook() {
         let mut thread = create_test_thread();
+        let this = EmValue::ObjectRef(thread.heap().alloc_object(Token::new(0x0100_0001)).unwrap());
         let ctx = HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
             "RNGCryptoServiceProvider",
             ".ctor",
             PointerSize::Bit64,
-        );
+        )
+        .with_this(Some(&this));
 
         let result = super::rng_crypto_ctor_pre(&ctx, &mut thread);
+
+        assert!(matches!(result, PreHookResult::Bypass(None)));
+        let EmValue::ObjectRef(this_ref) = this else {
+            unreachable!()
+        };
+        assert_eq!(
+            thread
+                .heap()
+                .get_field(this_ref, tokens::rng_fields::STATE)
+                .unwrap(),
+            EmValue::I64(super::RNG_XORSHIFT64_SEED.cast_signed())
+        );
+    }
+
+    /// `RandomNumberGenerator.Create()` is a factory: it returns the generator it makes.
+    #[test]
+    fn test_rng_create_hook() {
+        let mut thread = create_test_thread();
+        let ctx = HookContext::new(
+            Token::new(0x0A000001),
+            "System.Security.Cryptography",
+            "RandomNumberGenerator",
+            "Create",
+            PointerSize::Bit64,
+        );
+
+        let result = super::rng_create_pre(&ctx, &mut thread);
+
         assert!(matches!(
             result,
             PreHookResult::Bypass(Some(EmValue::ObjectRef(_)))
@@ -200,15 +248,15 @@ mod tests {
         let mut thread = create_test_thread();
 
         // Create RNG instance
-        let ctor_ctx = HookContext::new(
+        let create_ctx = HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
-            "RNGCryptoServiceProvider",
-            ".ctor",
+            "RandomNumberGenerator",
+            "Create",
             PointerSize::Bit64,
         );
 
-        let rng_ref = match super::rng_crypto_ctor_pre(&ctor_ctx, &mut thread) {
+        let rng_ref = match super::rng_create_pre(&create_ctx, &mut thread) {
             PreHookResult::Bypass(Some(EmValue::ObjectRef(h))) => h,
             _ => panic!("Expected ObjectRef"),
         };
@@ -248,15 +296,15 @@ mod tests {
 
         // Helper to get RNG output from a fresh thread
         fn get_rng_bytes(thread: &mut EmulationThread, len: usize) -> Vec<u8> {
-            let ctor_ctx = HookContext::new(
+            let create_ctx = HookContext::new(
                 Token::new(0x0A000001),
                 "System.Security.Cryptography",
-                "RNGCryptoServiceProvider",
-                ".ctor",
+                "RandomNumberGenerator",
+                "Create",
                 PointerSize::Bit64,
             );
 
-            let rng_ref = match super::rng_crypto_ctor_pre(&ctor_ctx, thread) {
+            let rng_ref = match super::rng_create_pre(&create_ctx, thread) {
                 PreHookResult::Bypass(Some(EmValue::ObjectRef(h))) => h,
                 _ => panic!("Expected ObjectRef"),
             };
@@ -287,15 +335,15 @@ mod tests {
     fn test_rng_crypto_successive_calls_differ() {
         let mut thread = create_test_thread();
 
-        let ctor_ctx = HookContext::new(
+        let create_ctx = HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
-            "RNGCryptoServiceProvider",
-            ".ctor",
+            "RandomNumberGenerator",
+            "Create",
             PointerSize::Bit64,
         );
 
-        let rng_ref = match super::rng_crypto_ctor_pre(&ctor_ctx, &mut thread) {
+        let rng_ref = match super::rng_create_pre(&create_ctx, &mut thread) {
             PreHookResult::Bypass(Some(EmValue::ObjectRef(h))) => h,
             _ => panic!("Expected ObjectRef"),
         };

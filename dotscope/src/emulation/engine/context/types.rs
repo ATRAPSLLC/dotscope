@@ -7,6 +7,7 @@ use crate::{
     emulation::engine::{context::EmulationContext, error::EmulationError, exceptions},
     metadata::{
         method::Method,
+        streams::SharedStr,
         tables::TableId,
         token::Token,
         typesystem::{CilFlavor, CilType, CilTypeRc, PointerSize},
@@ -329,7 +330,7 @@ impl EmulationContext {
     /// Returns the type's namespace and name, which is useful for
     /// error messages in cast failures.
     #[must_use]
-    pub fn get_type_name(&self, type_token: Token) -> Option<(String, String)> {
+    pub fn get_type_name(&self, type_token: Token) -> Option<(SharedStr, SharedStr)> {
         self.get_type(type_token)
             .map(|t| (t.namespace.clone(), t.name.clone()))
     }
@@ -415,7 +416,7 @@ impl EmulationContext {
 /// collision with real TypeDef/TypeRef/TypeSpec tokens.
 ///
 /// Distinct from synthetic exception tokens (`0x7F01_00xx`) which have their own
-/// hierarchy in [`exceptions`](crate::emulation::engine::exceptions).
+/// hierarchy in [`exceptions`].
 fn is_bcl_wrapper_token(token: Token) -> bool {
     token.value() & 0xFFFF_0000 == 0x7F00_0000
 }
