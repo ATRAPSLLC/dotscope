@@ -32,7 +32,7 @@ use crate::metadata::{
 };
 
 /// How many values a property is checked against.
-const CASES: u32 = 1024;
+pub const CASES: u32 = 1024;
 
 /// Checks `property` against [`CASES`] values `strategy` generates, from a fixed seed so every
 /// run checks the same values, and panics with the smallest failing value proptest shrinks a
@@ -63,9 +63,15 @@ where
 /// the strategy rejects the choices.
 ///
 /// The choices are a ChaCha stream seeded with the input's hash rather than the input itself
-/// (proptest's pass-through stream): past its input that stream gives zeros, and the uniform
-/// sampling rejects a draw of zero for most ranges and draws again, for ever. Measured: an
-/// empty input, and inputs that steer a strategy past a 64 KiB tail, hung the codec targets.
+/// (proptest's pass-through stream), so the fuzzer cannot steer a value byte by byte. Read
+/// directly, the input runs out: every union (`prop_oneof!`, `Union`, `option::of`, the levels
+/// of `prop_recursive`, the alternatives of a regex) and every `prop_flat_map` forks the
+/// runner for the arms it did not pick, and a fork of a pass-through stream takes the second
+/// half of what is left, the parent keeping the first. A value of a few dozen choices is left
+/// with zeros, and the uniform sampling rejects a draw of zero for most ranges and draws
+/// again, for ever. Measured: an empty input hung `method_signature` on a pass-through stream
+/// of the very bytes a recording generator read for that value (2084), with a ChaCha tail
+/// of 4 MiB after the input as well.
 pub fn from_bytes<S: Strategy>(strategy: &S, data: &[u8]) -> Option<S::Value> {
     let seed: [u8; 32] = Sha256::digest(data).into();
     let mut runner = TestRunner::new_with_rng(
@@ -175,8 +181,36 @@ fn array_shape() -> impl Strategy<Value = (u32, Vec<ArrayDimensions>)> {
         })
 }
 
+/// `inner`, or `inner` after a run of one kind of custom modifier: what a type in a nested
+/// position (a generic argument, a general array's element, a by-reference target) can be.
+/// `inner` is never itself a modified type at its root, so the run is the whole run of the
+/// encoding and decodes back to this value.
+fn maybe_modified(inner: BoxedStrategy<TypeSignature>) -> BoxedStrategy<TypeSignature> {
+    prop_oneof![
+        3 => inner.clone(),
+        1 => (any::<bool>(), vec(type_def_or_ref(), 1..3), inner).prop_map(
+            |(required, tokens, base)| {
+                let modifiers = tokens
+                    .into_iter()
+                    .map(|modifier_type| CustomModifier {
+                        is_required: required,
+                        modifier_type,
+                    })
+                    .collect();
+                if required {
+                    TypeSignature::ModifiedRequired(modifiers, Box::new(base))
+                } else {
+                    TypeSignature::ModifiedOptional(modifiers, Box::new(base))
+                }
+            }
+        ),
+    ]
+    .boxed()
+}
+
 /// A type: leaves, and pointers, by-refs, arrays, generic instantiations and function
-/// pointers nested around them.
+/// pointers nested around them, with custom modifiers in front of the types nested where a
+/// signature has no modifier list of its own (see [`TypeSignature::ModifiedRequired`]).
 pub fn type_signature() -> BoxedStrategy<TypeSignature> {
     leaf_type()
         .prop_recursive(6, 48, 6, |inner| {
@@ -187,28 +221,28 @@ pub fn type_signature() -> BoxedStrategy<TypeSignature> {
                         base: Box::new(base),
                     })
                 }),
-                inner
-                    .clone()
-                    .prop_map(|base| TypeSignature::ByRef(Box::new(base))),
+                maybe_modified(inner.clone()).prop_map(|base| TypeSignature::ByRef(Box::new(base))),
                 (custom_modifiers(), inner.clone()).prop_map(|(modifiers, base)| {
                     TypeSignature::SzArray(SignatureSzArray {
                         modifiers,
                         base: Box::new(base),
                     })
                 }),
-                (inner.clone(), array_shape()).prop_map(|(base, (rank, dimensions))| {
-                    TypeSignature::Array(SignatureArray {
-                        base: Box::new(base),
-                        rank,
-                        dimensions,
-                    })
-                }),
+                (maybe_modified(inner.clone()), array_shape()).prop_map(
+                    |(base, (rank, dimensions))| {
+                        TypeSignature::Array(SignatureArray {
+                            base: Box::new(base),
+                            rank,
+                            dimensions,
+                        })
+                    }
+                ),
                 (
                     prop_oneof![
                         type_def_or_ref().prop_map(TypeSignature::Class),
                         type_def_or_ref().prop_map(TypeSignature::ValueType)
                     ],
-                    vec(inner.clone(), 1..5)
+                    vec(maybe_modified(inner.clone()), 1..5)
                 )
                     .prop_map(|(base, arguments)| TypeSignature::GenericInst(
                         Box::new(base),

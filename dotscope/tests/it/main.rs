@@ -51,6 +51,7 @@ mod full {
     mod codegen_validation;
     mod confuserex;
     mod corpus;
+    mod determinism;
     mod jiejie;
     mod mono;
     mod netreactor;

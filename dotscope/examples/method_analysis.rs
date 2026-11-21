@@ -25,7 +25,7 @@
 
 use std::{env, path::Path};
 
-use dotscope::prelude::*;
+use dotscope::{metadata::method::ExceptionHandlerKind, prelude::*};
 
 // Helper functions to format implementation attributes
 fn format_impl_code_type(code_type: &MethodImplCodeType) -> String {
@@ -308,7 +308,7 @@ fn print_method_parameters(method: &Method) {
             println!("   Parameter [{i}]:");
             println!(
                 "     Name: {}",
-                param.name.as_ref().unwrap_or(&"<unnamed>".to_string())
+                param.name.as_deref().unwrap_or("<unnamed>")
             );
             println!("     Sequence: {}", param.sequence);
             println!("     Flags: 0x{:04X}", param.flags);
@@ -727,14 +727,11 @@ fn print_exception_handlers(body: &MethodBody) {
             println!("       Offset: 0x{:04X}", handler.handler_offset);
             println!("       Length: {} bytes", handler.handler_length);
 
-            // Handle different exception handler types based on flag bits
-            if handler.flags.bits() & 0x01 != 0 {
-                println!("     Type: Finally/Fault handler");
-            } else {
-                println!("     Type: Catch handler");
-                if let Some(_handler_type) = &handler.handler {
-                    println!("     Exception Type: <exception type>");
-                }
+            // The handler's kind (ECMA-335 II.25.4.6): 0x0 catch, 0x1 filter, 0x2 finally,
+            // 0x4 fault
+            println!("     Type: {:?} handler", handler.flags.kind());
+            if handler.flags.kind() == ExceptionHandlerKind::Catch && handler.handler.is_some() {
+                println!("     Exception Type: <exception type>");
             }
         }
     }

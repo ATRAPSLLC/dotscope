@@ -48,7 +48,7 @@ pub fn run(
 
     let assembly_name = assembly
         .assembly()
-        .map_or_else(|| "unknown".to_string(), |a| a.name.clone());
+        .map_or_else(|| "unknown".to_string(), |a| a.name.to_string());
 
     match format {
         "json" => {

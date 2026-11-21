@@ -142,7 +142,7 @@ fn resolve_owner(
         TableId::Assembly => {
             let name = assembly
                 .assembly()
-                .map_or_else(|| parent.token.to_string(), |a| a.name.clone());
+                .map_or_else(|| parent.token.to_string(), |a| a.name.to_string());
             ("assembly".to_string(), name)
         }
         TableId::Field => {
@@ -182,7 +182,7 @@ fn resolve_type_name(assembly: &CilObject, token: Token) -> String {
         let ns = &t.namespace;
         let name = &t.name;
         if ns.is_empty() {
-            name.clone()
+            name.to_string()
         } else {
             format!("{ns}.{name}")
         }
@@ -280,6 +280,7 @@ fn resolve_constructor_type(
                 return mr
                     .declaredby
                     .fullname()
+                    .map(|name| name.to_string())
                     .or_else(|| mr.declaredby.token().map(|t| t.to_string()))
                     .unwrap_or_else(|| "?".to_string());
             }
@@ -290,7 +291,7 @@ fn resolve_constructor_type(
             // Look up the method and get its declaring type
             if let Ok(method) = assembly.method(&constructor.token) {
                 if let Some(name) = method.declaring_type_fullname() {
-                    return name;
+                    return name.to_string();
                 }
             }
             constructor.token.to_string()

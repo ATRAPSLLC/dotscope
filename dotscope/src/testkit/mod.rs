@@ -5,21 +5,21 @@
 //! dev-dependency with the crate under test, so both see one crate instance and its types. It
 //! is unstable and outside the semver surface.
 //!
-//! - [`builders`]: fluent builders for metadata objects (types, methods, references).
-//! - [`factories`]: assemblies and rows crafted for validator and table tests.
-//! - [`fixtures`]: the committed samples under `tests/samples`, resolved and checked against
+//! - [`builders`](crate::testkit::builders): fluent builders for metadata objects (types, methods, references).
+//! - [`factories`](crate::testkit::factories): assemblies and rows crafted for validator and table tests.
+//! - [`fixtures`](crate::testkit::fixtures): the committed samples under `tests/samples`, resolved and checked against
 //!   their manifest.
-//! - [`helpers`]: sample loading and small utilities.
-//! - [`framework`]: the obfuscator sample harness (deobfuscate, verify, summarize).
-//! - [`verification`]: SSA-based semantic comparison of original and deobfuscated assemblies.
-//! - [`compatibility`]: load and compare whole runtime corpora (Mono, .NET).
-//! - [`corpus`]: checks swept over every assembly the fixture manifest lists.
-//! - [`dump`]: an assembly's canonical dump, for comparing what two assemblies hold.
-//! - [`equivalence`]: whether generated code computes what the SSA it came from computes.
-//! - [`passes`]: running a pass in a test the way the scheduler does, verified.
-//! - [`analysis`], [`mono`]: analysis and runtime harnesses.
-//! - [`tools`]: which external tools a test may go without, and running them with a timeout.
-//! - [`TestTypeProvider`] with [`build_cfg`], [`build_ssa`] and [`build_ssa_with_handlers`]:
+//! - [`helpers`](crate::testkit::helpers): sample loading and small utilities.
+//! - [`framework`](crate::testkit::framework): the obfuscator sample harness (deobfuscate, verify, summarize).
+//! - [`verification`](crate::testkit::verification): SSA-based semantic comparison of original and deobfuscated assemblies.
+//! - [`compatibility`](crate::testkit::compatibility): load and compare whole runtime corpora (Mono, .NET).
+//! - [`corpus`](crate::testkit::corpus): checks swept over every assembly the fixture manifest lists.
+//! - [`dump`](crate::testkit::dump): an assembly's canonical dump, for comparing what two assemblies hold.
+//! - [`equivalence`](crate::testkit::equivalence): whether generated code computes what the SSA it came from computes.
+//! - [`passes`](crate::testkit::passes): running a pass in a test the way the scheduler does, verified.
+//! - [`analysis`], [`mono`](crate::testkit::mono): analysis and runtime harnesses.
+//! - [`tools`](crate::testkit::tools): which external tools a test may go without, and running them with a timeout.
+//! - [`TestTypeProvider`](crate::testkit::TestTypeProvider) with [`build_cfg`](crate::testkit::build_cfg), [`build_ssa`](crate::testkit::build_ssa) and [`build_ssa_with_handlers`](crate::testkit::build_ssa_with_handlers):
 //!   SSA from assembled CIL.
 
 // Test support panics on what it cannot set up and indexes what it built itself.

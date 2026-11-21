@@ -189,7 +189,8 @@ fn print_instruction_analysis(assembly: &CilObject) {
                                         instruction_stats.branch_instructions =
                                             instruction_stats.branch_instructions.saturating_add(1);
                                     }
-                                    dotscope::assembly::FlowType::Call => {
+                                    dotscope::assembly::FlowType::Call
+                                    | dotscope::assembly::FlowType::CallIndirect => {
                                         instruction_stats.call_instructions =
                                             instruction_stats.call_instructions.saturating_add(1);
                                     }
@@ -380,7 +381,7 @@ fn print_stack_analysis(assembly: &CilObject) {
             // Track stack information
             if body.max_stack > local_stats.max_stack_encountered {
                 local_stats.max_stack_encountered = body.max_stack;
-                local_stats.method_with_max_stack = method.name.clone();
+                local_stats.method_with_max_stack = method.name.to_string();
             }
 
             // Check init_locals flag

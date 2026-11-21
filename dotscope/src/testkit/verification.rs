@@ -476,7 +476,7 @@ impl AssemblyStats {
         // Collect resource names
         let mut resource_names = HashSet::new();
         for entry in assembly.resources().iter() {
-            resource_names.insert(entry.value().name.clone());
+            resource_names.insert(entry.value().name.to_string());
         }
 
         Self {

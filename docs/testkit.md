@@ -261,7 +261,8 @@ How busy the machine is must never decide whether a test passes. A test orders t
 channels, joins or barriers, never with sleeps, and asserts on outcomes, never on elapsed time.
 
 Emulation has wall-clock limits in the library's defaults (a deobfuscation run's per-method
-`timeout` and `warmup_timeout`, `EmulationLimits::timeout_ms`): under load an emulation stops
+`timeout` and its template's `limits.timeout_ms`, `EmulationLimits::timeout_ms`): under load
+an emulation stops
 earlier and a string it would have decrypted stays encrypted. Tests switch them off and rely
 on the deterministic limits (instructions, call depth, memory):
 

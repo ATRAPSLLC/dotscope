@@ -1671,7 +1671,7 @@ fn test_generic_method_specs(asm: &CilObject) {
     }
 }
 
-/// Test the generic extension method ToCustomString<T>
+/// Test the generic extension method `ToCustomString<T>`
 fn test_extension_method_generic(asm: &CilObject) {
     let methods = asm.methods();
 
@@ -2004,7 +2004,7 @@ fn test_method_associations(asm: &CilObject) {
     let method_names: Vec<String> = complex_generic
         .methods
         .iter()
-        .filter_map(|(_, method_ref)| method_ref.upgrade().map(|m| m.name.clone()))
+        .filter_map(|(_, method_ref)| method_ref.upgrade().map(|m| m.name.to_string()))
         .collect();
 
     assert!(
@@ -2375,7 +2375,7 @@ fn test_generic_constraint_validation(asm: &CilObject) {
         let constraints_count = param.constraints.iter().count();
         println!("    Has {constraints_count} constraints");
 
-        let constraint_names: Vec<String> = param
+        let constraint_names: Vec<_> = param
             .constraints
             .iter()
             .filter_map(|(_, constraint)| constraint.name())
@@ -2473,7 +2473,7 @@ fn test_generic_constraint_validation(asm: &CilObject) {
             let constraints_count = param.constraints.iter().count();
             println!("    Has {constraints_count} constraints");
 
-            let constraint_names: Vec<String> = param
+            let constraint_names: Vec<_> = param
                 .constraints
                 .iter()
                 .filter_map(|(_, constraint)| constraint.name())
@@ -2656,7 +2656,7 @@ fn test_method_signature_validation(asm: &CilObject) {
         let param_names: Vec<String> = method
             .params
             .iter()
-            .filter_map(|(_, param)| param.name.clone())
+            .filter_map(|(_, param)| param.name.as_ref().map(ToString::to_string))
             .collect();
 
         println!("  Parameter names: {param_names:?}");
@@ -2709,7 +2709,7 @@ fn test_method_signature_validation(asm: &CilObject) {
             .params
             .iter()
             .filter(|(_, param)| param.sequence > 0) // Skip return parameter
-            .filter_map(|(_, param)| param.name.clone())
+            .filter_map(|(_, param)| param.name.as_ref().map(ToString::to_string))
             .collect();
 
         println!("  ✓ Generic method parameters validated: {param_names:?}");
@@ -2762,7 +2762,7 @@ fn test_field_validation(asm: &CilObject) {
         let field_names: Vec<String> = struct_type
             .fields
             .iter()
-            .map(|(_, field)| field.name.clone())
+            .map(|(_, field)| field.name.to_string())
             .collect();
 
         for expected_field in expected_fields {
@@ -2790,7 +2790,7 @@ fn test_field_validation(asm: &CilObject) {
         let field_names: Vec<String> = struct_type
             .fields
             .iter()
-            .map(|(_, field)| field.name.clone())
+            .map(|(_, field)| field.name.to_string())
             .collect();
 
         for expected_field in expected_fields {
@@ -2813,7 +2813,7 @@ fn test_field_validation(asm: &CilObject) {
         let field_names: Vec<String> = class_type
             .fields
             .iter()
-            .map(|(_, field)| field.name.clone())
+            .map(|(_, field)| field.name.to_string())
             .collect();
 
         // Should have StaticData field with RVA
@@ -2835,7 +2835,7 @@ fn test_field_validation(asm: &CilObject) {
         let field_names: Vec<String> = class_type
             .fields
             .iter()
-            .map(|(_, field)| field.name.clone())
+            .map(|(_, field)| field.name.to_string())
             .collect();
 
         // Should have backing fields for events and properties

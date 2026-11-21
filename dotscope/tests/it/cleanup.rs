@@ -25,8 +25,8 @@ use dotscope::{
             EventBuilder, EventMapBuilder, ExportedTypeBuilder, ExportedTypeRaw, FieldAttributes,
             FieldBuilder, FieldRaw, ManifestResourceBuilder, ManifestResourceRaw, MemberRefBuilder,
             MethodImplBuilder, MethodImplRaw, MethodSpecBuilder, ModuleRefBuilder,
-            StandAloneSigBuilder, TableDataOwned, TableId, TypeAttributes, TypeDefBuilder,
-            TypeRefBuilder, TypeSpecBuilder,
+            NestedClassBuilder, StandAloneSigBuilder, TableDataOwned, TableId, TypeAttributes,
+            TypeDefBuilder, TypeRefBuilder, TypeSpecBuilder,
         },
         token::Token,
         validation::ValidationConfig,
@@ -100,7 +100,7 @@ fn kept_type_refs(assembly: &CilObject) -> Vec<String> {
         .cil()
         .iter()
         .filter(|entry| entry.value().namespace == "Kept")
-        .map(|entry| entry.value().name.clone())
+        .map(|entry| entry.value().name.to_string())
         .collect()
 }
 
@@ -265,7 +265,7 @@ fn exported_types_and_resources_keep_their_assembly_refs() -> Result<()> {
     let names: Vec<String> = written
         .refs_assembly()
         .iter()
-        .map(|entry| entry.value().name.clone())
+        .map(|entry| entry.value().name.to_string())
         .collect();
     assert!(
         names.iter().any(|name| name == "Kept.Forwarded"),
@@ -467,5 +467,201 @@ fn a_row_updated_then_deleted_names_nothing() -> Result<()> {
         .types()
         .iter()
         .all(|entry| entry.value().name != "Gone"));
+    Ok(())
+}
+
+/// A TypeDef `name` in namespace `Nest`, nested (`NestedPrivate`) when `nested`; the methods
+/// built after it belong to it.
+fn class(assembly: &mut CilAssembly, name: &str, nested: bool) -> Result<Token> {
+    let visibility = if nested {
+        TypeAttributes::NESTED_PRIVATE
+    } else {
+        TypeAttributes::NOT_PUBLIC
+    };
+    let built = TypeDefBuilder::new()
+        .name(name)
+        .namespace(if nested { "" } else { "Nest" })
+        .flags(TypeAttributes::CLASS | visibility)
+        .build(assembly)?;
+    Ok(Token::from_parts(TableId::TypeDef, row(&built)))
+}
+
+/// Records `nested` as nested in `enclosing`.
+fn nest(assembly: &mut CilAssembly, nested: Token, enclosing: Token) -> Result<()> {
+    NestedClassBuilder::new()
+        .nested_class(nested.row())
+        .enclosing_class(enclosing.row())
+        .build(assembly)?;
+    Ok(())
+}
+
+/// A static method `name` of the last type built, whose body loads `token` with `ldtoken`
+/// (naming it) or does nothing.
+fn method(assembly: &mut CilAssembly, name: &str, names: Option<Token>) -> Result<()> {
+    MethodBuilder::new(name)
+        .public()
+        .static_method()
+        .returns(TypeSignature::Void)
+        .implementation(move |body| {
+            body.implementation(move |asm| {
+                if let Some(token) = names {
+                    asm.emit_opcode(0xD0, Some(Operand::Token(token)))?.pop()?;
+                }
+                asm.ret()?;
+                Ok(())
+            })
+        })
+        .build(assembly)?;
+    Ok(())
+}
+
+/// `assembly` written and loaded back so its rows are input, then cleaned with `request`
+/// (built against the reloaded rows), written and loaded back.
+fn cleaned_with(
+    assembly: CilAssembly,
+    request: impl FnOnce(&CilAssembly) -> CleanupRequest,
+) -> Result<CilObject> {
+    let mut assembly = assembly;
+    let mut assembly = CilAssembly::from_bytes(assembly.to_memory()?)?;
+    let request = request(&assembly);
+    assembly.add_cleanup(&request);
+    CilObject::from_mem_with_validation(assembly.to_memory()?, ValidationConfig::analysis())
+}
+
+/// The names of `written`'s types in `Nest` and nested in them, each with the name of the
+/// type it is nested in.
+fn nest_types(written: &CilObject) -> Vec<(String, Option<String>)> {
+    let mut types: Vec<_> = written
+        .types()
+        .iter()
+        .filter(|entry| {
+            let ty = entry.value();
+            // The outermost type of the enclosing chain is in `Nest`
+            let mut outermost = ty.clone();
+            while let Some(outer) = outermost.enclosing_type() {
+                outermost = outer;
+            }
+            ty.token.is_table(TableId::TypeDef) && outermost.namespace == "Nest"
+        })
+        .map(|entry| {
+            let ty = entry.value();
+            (
+                ty.name.to_string(),
+                ty.enclosing_type().map(|outer| outer.name.to_string()),
+            )
+        })
+        .collect();
+    types.sort();
+    types
+}
+
+/// Whether `written` has a method named `name`.
+fn has_method(written: &CilObject, name: &str) -> bool {
+    written
+        .methods()
+        .iter()
+        .any(|entry| entry.value().name == name)
+}
+
+/// Deleting a type deletes what is nested in it at every depth, with their members: a nested
+/// type cannot outlive its enclosing type, and one left behind would be a top-level type.
+#[test]
+fn deleting_a_type_deletes_its_nested_types_at_every_depth() -> Result<()> {
+    let mut assembly = CilAssembly::from_path(fixture(SAMPLE))?;
+    let outer = class(&mut assembly, "Outer", false)?;
+    method(&mut assembly, "OuterWork", None)?;
+    let middle = class(&mut assembly, "Middle", true)?;
+    method(&mut assembly, "MiddleWork", None)?;
+    let leaf = class(&mut assembly, "Leaf", true)?;
+    method(&mut assembly, "LeafWork", None)?;
+    nest(&mut assembly, middle, outer)?;
+    nest(&mut assembly, leaf, middle)?;
+
+    let written = cleaned_with(assembly, |_| {
+        let mut request = CleanupRequest::new();
+        request.add_type(outer);
+        request
+    })?;
+    assert_eq!(nest_types(&written), Vec::<(String, Option<String>)>::new());
+    assert!(!has_method(&written, "LeafWork"));
+    Ok(())
+}
+
+/// A requested type that surviving code still needs stays, whole: a method elsewhere names
+/// its nested type, so the nested type stays, the type enclosing it stays with it, and the
+/// enclosing type keeps its members instead of surviving as an emptied shell.
+#[test]
+fn a_type_enclosing_a_named_type_stays_whole() -> Result<()> {
+    let mut assembly = CilAssembly::from_path(fixture(SAMPLE))?;
+    let outer = class(&mut assembly, "Outer", false)?;
+    method(&mut assembly, "OuterWork", None)?;
+    let inner = class(&mut assembly, "Inner", true)?;
+    method(&mut assembly, "InnerWork", None)?;
+    nest(&mut assembly, inner, outer)?;
+    class(&mut assembly, "User", false)?;
+    method(&mut assembly, "NamesInner", Some(inner))?;
+
+    let written = cleaned_with(assembly, |_| {
+        let mut request = CleanupRequest::new();
+        request.add_type(outer);
+        request
+    })?;
+    assert_eq!(
+        nest_types(&written),
+        [
+            ("Inner".to_string(), Some("Outer".to_string())),
+            ("Outer".to_string(), None),
+            ("User".to_string(), None),
+        ]
+    );
+    assert!(has_method(&written, "OuterWork"));
+    assert!(has_method(&written, "InnerWork"));
+    Ok(())
+}
+
+/// A protected nested type keeps the type it is nested in, even when that type is requested.
+#[test]
+fn a_protected_nested_type_keeps_its_enclosing_type() -> Result<()> {
+    let mut assembly = CilAssembly::from_path(fixture(SAMPLE))?;
+    let outer = class(&mut assembly, "Outer", false)?;
+    method(&mut assembly, "OuterWork", None)?;
+    let inner = class(&mut assembly, "Inner", true)?;
+    method(&mut assembly, "InnerWork", None)?;
+    nest(&mut assembly, inner, outer)?;
+
+    let written = cleaned_with(assembly, |_| {
+        let mut request = CleanupRequest::new();
+        request.add_type(outer);
+        request.protect_token(inner);
+        request
+    })?;
+    assert_eq!(
+        nest_types(&written),
+        [
+            ("Inner".to_string(), Some("Outer".to_string())),
+            ("Outer".to_string(), None),
+        ]
+    );
+    Ok(())
+}
+
+/// An enclosing type with no members of its own is not an empty type to remove while a type
+/// nested in it stays: removing it would make the nested type a top-level type.
+#[test]
+fn an_empty_enclosing_type_stays_with_its_nested_type() -> Result<()> {
+    let mut assembly = CilAssembly::from_path(fixture(SAMPLE))?;
+    let outer = class(&mut assembly, "Outer", false)?;
+    let inner = class(&mut assembly, "Inner", true)?;
+    method(&mut assembly, "InnerWork", None)?;
+    nest(&mut assembly, inner, outer)?;
+
+    let written = cleaned(assembly)?;
+    assert_eq!(
+        nest_types(&written),
+        [
+            ("Inner".to_string(), Some("Outer".to_string())),
+            ("Outer".to_string(), None),
+        ]
+    );
     Ok(())
 }

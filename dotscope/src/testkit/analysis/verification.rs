@@ -302,12 +302,12 @@ pub fn verify_ssa(
     // 4. Definition sites are valid
     for var in ssa.variables() {
         let def_site = var.def_site();
-        if !def_site.is_phi() && def_site.block >= ssa.block_count() {
+        if !def_site.is_phi() && def_site.block() >= ssa.block_count() {
             errors.push(VerificationError::new(
                 "SSA",
                 format!("variable {} def_site.block", var.id()),
                 format!("< {}", ssa.block_count()),
-                def_site.block.to_string(),
+                def_site.block().to_string(),
             ));
         }
     }

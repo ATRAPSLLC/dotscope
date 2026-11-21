@@ -1213,7 +1213,7 @@ fn dump_call_targets(assembly: &CilObject, method_name: &str, label: &str) {
                 if let Some(target) = instr.get_token_operand() {
                     let target_name = assembly
                         .method(&target)
-                        .map(|m| m.name.clone())
+                        .map(|m| m.name.to_string())
                         .unwrap_or_else(|_| format!("(unresolved 0x{:08X})", target.value()));
                     eprintln!(
                         "  {} 0x{:08X} -> {}",
@@ -1239,7 +1239,7 @@ fn get_call_target_names(assembly: &CilObject, method_name: &str) -> Vec<String>
                 if let Some(target) = instr.get_token_operand() {
                     let name = assembly
                         .method(&target)
-                        .map(|m| m.name.clone())
+                        .map(|m| m.name.to_string())
                         .unwrap_or_else(|_| format!("(external 0x{:08X})", target.value()));
                     names.push(name);
                 }

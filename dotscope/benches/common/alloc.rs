@@ -102,6 +102,23 @@ pub struct AllocStats {
 /// One measurement at a time: the counters are the process's.
 static MEASURING: Mutex<()> = Mutex::new(());
 
+/// The binary's work, one holder at a time; see [`exclusive`].
+static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+/// Keeps every other holder of this guard out until it is dropped.
+///
+/// The counters are the process's: a measurement counts whatever any thread allocates while
+/// it runs, so another test of the same binary loading an assembly at that moment adds its
+/// bytes to it, as often as the scheduler lets the two overlap. A test that measures holds
+/// this guard for its whole run, setup included, so no other such test allocates during its
+/// measurement and its verdict is the same however busy the machine is. The measured work's
+/// own threads are still counted.
+pub fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Runs `work` and returns what it allocated, with its result.
 ///
 /// # Panics

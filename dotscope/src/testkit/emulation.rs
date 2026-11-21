@@ -8,9 +8,12 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::emulation::{
-    AddressSpace, CaptureContext, EmulationConfig, EmulationLimits, EmulationThread,
-    ProcessBuilder, RuntimeState, SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+use crate::{
+    emulation::{
+        AddressSpace, CaptureContext, EmulationConfig, EmulationLimits, EmulationThread,
+        ProcessBuilder, RuntimeState, SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+    },
+    CilObject,
 };
 
 /// The default emulation configuration without its wall-clock limit.
@@ -41,6 +44,13 @@ pub fn process_builder() -> ProcessBuilder {
 /// - Pre-allocated fake BCL objects for consistent hook behavior
 /// - No parent assembly context
 pub fn create_test_context() -> Arc<ThreadContext> {
+    create_test_context_with(None)
+}
+
+/// Creates a minimal [`ThreadContext`] for testing, as [`create_test_context`] does, whose
+/// thread runs in `assembly`: instructions that read metadata (a struct's field layout, a
+/// method's signature) read it there.
+pub fn create_test_context_with(assembly: Option<Arc<CilObject>>) -> Arc<ThreadContext> {
     let address_space = Arc::new(AddressSpace::new());
     let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
     Arc::new(ThreadContext::new(
@@ -48,7 +58,7 @@ pub fn create_test_context() -> Arc<ThreadContext> {
         Arc::new(RwLock::new(RuntimeState::new())),
         Arc::new(CaptureContext::new()),
         Arc::new(emulation_config()),
-        None,
+        assembly,
         fake_objects,
         Arc::new(VirtualFs::new()),
     ))

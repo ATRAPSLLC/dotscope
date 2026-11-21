@@ -37,6 +37,7 @@ pub use codecs::{
 #[cfg(feature = "compiler")]
 pub use codegen::CodegenEquivalence;
 pub use determinism::Deterministic;
+// A `macro_rules!` macro is re-exported crate-wide at most (see `identity`)
 pub(crate) use identity::raw_tables;
 pub use identity::{Heaps, TableRows};
 pub use writer::WritesBackUnchanged;

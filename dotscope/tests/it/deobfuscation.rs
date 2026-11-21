@@ -36,27 +36,8 @@ use dotscope::{
 /// Represents a decoded CIL instruction for verification.
 #[derive(Debug, Clone, PartialEq)]
 struct ExpectedInstruction {
-    pattern: MnemonicPattern,
+    mnemonic: &'static str,
     operand: Option<ExpectedOperand>,
-}
-
-/// Mnemonic matching patterns.
-#[derive(Debug, Clone, PartialEq)]
-enum MnemonicPattern {
-    /// Exact mnemonic match
-    Exact(&'static str),
-    /// Match any ldloc variant (ldloc.0-3, ldloc.s, ldloc)
-    AnyLdloc,
-    /// Match any stloc variant (stloc.0-3, stloc.s, stloc)
-    AnyStloc,
-    /// Match branch instruction with any operand (both short .s and long forms)
-    AnyBranch(&'static str),
-    /// Match any conditional branch (brfalse/brfalse.s/brtrue/brtrue.s)
-    /// Used when branch direction may be inverted by optimization
-    AnyConditionalBranch,
-    /// Match any ldc.i4 variant (ldc.i4.0-8, ldc.i4.m1, ldc.i4.s, ldc.i4)
-    /// Used when block ordering is non-deterministic
-    AnyLdcI4,
 }
 
 /// Expected operand values for verification.
@@ -81,166 +62,64 @@ enum ExpectedOperand {
 impl ExpectedInstruction {
     fn new(mnemonic: &'static str) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: None,
         }
     }
 
     fn with_i8(mnemonic: &'static str, value: i8) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: Some(ExpectedOperand::I8(value)),
         }
     }
 
     fn with_i32(mnemonic: &'static str, value: i32) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: Some(ExpectedOperand::I32(value)),
         }
     }
 
     fn with_i64(mnemonic: &'static str, value: i64) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: Some(ExpectedOperand::I64(value)),
         }
     }
 
     fn with_f32(mnemonic: &'static str, value: f32) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: Some(ExpectedOperand::F32(value)),
         }
     }
 
     fn with_f64(mnemonic: &'static str, value: f64) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: Some(ExpectedOperand::F64(value)),
         }
     }
 
     fn with_branch(mnemonic: &'static str) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: Some(ExpectedOperand::BranchTarget),
         }
     }
 
     fn with_any_operand(mnemonic: &'static str) -> Self {
         Self {
-            pattern: MnemonicPattern::Exact(mnemonic),
+            mnemonic: (mnemonic),
             operand: Some(ExpectedOperand::Any),
-        }
-    }
-
-    /// Match any ldloc variant (ldloc.0-3, ldloc.s, ldloc)
-    fn any_ldloc() -> Self {
-        Self {
-            pattern: MnemonicPattern::AnyLdloc,
-            operand: None,
-        }
-    }
-
-    /// Match any stloc variant (stloc.0-3, stloc.s, stloc)
-    fn any_stloc() -> Self {
-        Self {
-            pattern: MnemonicPattern::AnyStloc,
-            operand: None,
-        }
-    }
-
-    /// Match branch instruction (both short .s and long forms)
-    /// e.g., any_branch("brfalse") matches both "brfalse" and "brfalse.s"
-    fn any_branch(base_mnemonic: &'static str) -> Self {
-        Self {
-            pattern: MnemonicPattern::AnyBranch(base_mnemonic),
-            operand: Some(ExpectedOperand::Any),
-        }
-    }
-
-    /// Match any conditional branch (brfalse/brfalse.s/brtrue/brtrue.s).
-    /// Used when branch direction may be inverted by optimization.
-    fn any_conditional_branch() -> Self {
-        Self {
-            pattern: MnemonicPattern::AnyConditionalBranch,
-            operand: Some(ExpectedOperand::Any),
-        }
-    }
-
-    /// Match any ldc.i4 variant (ldc.i4.0-8, ldc.i4.m1, ldc.i4.s, ldc.i4).
-    /// Used when block ordering is non-deterministic.
-    fn any_ldc_i4() -> Self {
-        Self {
-            pattern: MnemonicPattern::AnyLdcI4,
-            operand: None,
         }
     }
 
     /// Check if actual instruction matches expected.
     fn matches(&self, actual: &Instruction) -> bool {
-        // First check mnemonic pattern
-        let mnemonic_matches = match &self.pattern {
-            MnemonicPattern::Exact(expected) => actual.mnemonic == *expected,
-            MnemonicPattern::AnyLdloc => {
-                actual.mnemonic == "ldloc.0"
-                    || actual.mnemonic == "ldloc.1"
-                    || actual.mnemonic == "ldloc.2"
-                    || actual.mnemonic == "ldloc.3"
-                    || actual.mnemonic == "ldloc.s"
-                    || actual.mnemonic == "ldloc"
-            }
-            MnemonicPattern::AnyStloc => {
-                actual.mnemonic == "stloc.0"
-                    || actual.mnemonic == "stloc.1"
-                    || actual.mnemonic == "stloc.2"
-                    || actual.mnemonic == "stloc.3"
-                    || actual.mnemonic == "stloc.s"
-                    || actual.mnemonic == "stloc"
-            }
-            MnemonicPattern::AnyBranch(base) => {
-                // Match both long form (e.g., "brfalse") and short form (e.g., "brfalse.s")
-                actual.mnemonic == *base || actual.mnemonic == format!("{base}.s")
-            }
-            MnemonicPattern::AnyConditionalBranch => {
-                // Match any conditional branch (direction may be inverted by optimization)
-                actual.mnemonic == "brfalse"
-                    || actual.mnemonic == "brfalse.s"
-                    || actual.mnemonic == "brtrue"
-                    || actual.mnemonic == "brtrue.s"
-            }
-            MnemonicPattern::AnyLdcI4 => {
-                // Match any ldc.i4 variant
-                actual.mnemonic == "ldc.i4.0"
-                    || actual.mnemonic == "ldc.i4.1"
-                    || actual.mnemonic == "ldc.i4.2"
-                    || actual.mnemonic == "ldc.i4.3"
-                    || actual.mnemonic == "ldc.i4.4"
-                    || actual.mnemonic == "ldc.i4.5"
-                    || actual.mnemonic == "ldc.i4.6"
-                    || actual.mnemonic == "ldc.i4.7"
-                    || actual.mnemonic == "ldc.i4.8"
-                    || actual.mnemonic == "ldc.i4.m1"
-                    || actual.mnemonic == "ldc.i4.s"
-                    || actual.mnemonic == "ldc.i4"
-            }
-        };
-
-        if !mnemonic_matches {
+        if actual.mnemonic != self.mnemonic {
             return false;
-        }
-
-        // For pattern-based matches, we don't check operands (they're inherent to the variant)
-        if matches!(
-            self.pattern,
-            MnemonicPattern::AnyLdloc
-                | MnemonicPattern::AnyStloc
-                | MnemonicPattern::AnyBranch(_)
-                | MnemonicPattern::AnyConditionalBranch
-                | MnemonicPattern::AnyLdcI4
-        ) {
-            return true;
         }
 
         match &self.operand {
@@ -291,25 +170,6 @@ macro_rules! instr {
     };
     ($mnemonic:literal, any) => {
         ExpectedInstruction::with_any_operand($mnemonic)
-    };
-    // Pattern-based matches for local variable access
-    (any_ldloc) => {
-        ExpectedInstruction::any_ldloc()
-    };
-    (any_stloc) => {
-        ExpectedInstruction::any_stloc()
-    };
-    // Match branch instruction (both short .s and long forms)
-    (any_branch: $base:literal) => {
-        ExpectedInstruction::any_branch($base)
-    };
-    // Match any conditional branch (direction may be inverted)
-    (any_conditional_branch) => {
-        ExpectedInstruction::any_conditional_branch()
-    };
-    // Match any ldc.i4 variant (block ordering may be non-deterministic)
-    (any_ldc_i4) => {
-        ExpectedInstruction::any_ldc_i4()
     };
 }
 
@@ -470,14 +330,7 @@ fn format_immediate(imm: &Immediate) -> String {
 
 /// Format an expected instruction for display.
 fn format_expected(expected: &ExpectedInstruction) -> String {
-    let mnemonic: std::borrow::Cow<'static, str> = match &expected.pattern {
-        MnemonicPattern::Exact(m) => (*m).into(),
-        MnemonicPattern::AnyLdloc => "<any ldloc>".into(),
-        MnemonicPattern::AnyStloc => "<any stloc>".into(),
-        MnemonicPattern::AnyBranch(base) => format!("<{} or {}.s>", base, base).into(),
-        MnemonicPattern::AnyConditionalBranch => "<brfalse or brtrue>".into(),
-        MnemonicPattern::AnyLdcI4 => "<any ldc.i4>".into(),
-    };
+    let mnemonic = expected.mnemonic;
 
     match &expected.operand {
         None => mnemonic.to_string(),
@@ -3274,16 +3127,15 @@ fn test_loop_conditional_branch_preserved() -> Result<()> {
         .ldc_i4_0()?
         .ret()?;
 
-    // Code generator may invert branch condition and swap blocks for optimization.
-    // Either order is semantically equivalent:
-    //   brfalse -> true_branch, false_branch  OR  brtrue -> false_branch, true_branch
+    // The code generator inverts the condition and lays the false block out first; the
+    // layout is deterministic, so the test names the instructions it produces
     run_deobfuscation_test(
         asm,
         1,
         0,
         &[
             instr!("ldarg.0"),
-            instr!(any_conditional_branch),
+            instr!("brtrue.s", branch),
             instr!("ldc.i4.0"),
             instr!("ret"),
             instr!("ldc.i4.1"),
@@ -3312,9 +3164,9 @@ fn test_loop_diamond_pattern() -> Result<()> {
     // stores. Each branch stores its value to the phi result local, and the merge
     // point loads from that local.
     //
-    // Code generator may invert branch condition and swap blocks for optimization.
-    // The phi coalescing eliminates the temp variable — both branches store directly
-    // to the phi result local.
+    // The code generator inverts the branch condition and lays the false block out first.
+    // The phi coalescing eliminates the temp variable: both branches store directly to the
+    // phi result local, local 0.
     //
     // Output pattern (with brtrue and swapped blocks):
     //   ldarg.0              ; test condition
@@ -3332,14 +3184,14 @@ fn test_loop_diamond_pattern() -> Result<()> {
         3,
         &[
             instr!("ldarg.0"),
-            instr!(any_conditional_branch), // may be brfalse or brtrue
-            instr!("ldc.i4.2"),             // false branch: load constant 2
-            instr!(any_stloc),              // false branch: store to phi result
-            instr!(any_ldloc),              // merge: load phi result
+            instr!("brtrue.s", branch),
+            instr!("ldc.i4.2"), // false branch: load constant 2
+            instr!("stloc.0"),  // false branch: store to phi result
+            instr!("ldloc.0"),  // merge: load phi result
             instr!("ret"),
-            instr!("ldc.i4.1"),       // true branch: load constant 1
-            instr!(any_stloc),        // true branch: store to phi result
-            instr!(any_branch: "br"), // true branch: jump to merge
+            instr!("ldc.i4.1"),     // true branch: load constant 1
+            instr!("stloc.0"),      // true branch: store to phi result
+            instr!("br.s", branch), // true branch: jump to merge
         ],
     )
 }
@@ -3699,8 +3551,7 @@ fn test_unflatten_switch_dynamic_preserved() -> Result<()> {
         .ldc_i4_1()?
         .ret()?;
 
-    // Dynamic selector - switch preserved
-    // Block ordering may be non-deterministic; switch table is updated to point correctly
+    // Dynamic selector - switch preserved, its cases laid out in order
     run_deobfuscation_test(
         asm,
         1,
@@ -3710,9 +3561,9 @@ fn test_unflatten_switch_dynamic_preserved() -> Result<()> {
             instr!("switch", any),
             instr!("ldc.i4.s", i8: 99),
             instr!("ret"),
-            instr!(any_ldc_i4), // case 0 or 1 (order non-deterministic)
+            instr!("ldc.i4.0"), // case 0
             instr!("ret"),
-            instr!(any_ldc_i4), // case 1 or 0 (order non-deterministic)
+            instr!("ldc.i4.1"), // case 1
             instr!("ret"),
         ],
     )

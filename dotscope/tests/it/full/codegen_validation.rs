@@ -82,10 +82,23 @@ fn sample_assemblies(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The kind of a body generation without an assembly cannot finish: it needs a token
+/// interned, which only a compile into the assembly can do.
+const NEEDS_AN_ASSEMBLY: &str = "needs a token interned (generated without an assembly)";
+
 /// The kind a refusal or failure message names.
 fn kind_of(message: &str) -> &'static str {
     if !message.contains("generated code") {
-        return "codegen error (not a validator refusal)";
+        // An operation CIL has no instruction for, or a body past what CIL can encode, keeps
+        // the method's original IL by design; any other generator error is a defect
+        return if message.contains("no CIL lowering") {
+            "no CIL lowering (keeps its original IL)"
+        } else if message.contains("has no encoding") || message.contains("more than 65535 locals")
+        {
+            "past a CIL encoding limit (keeps its original IL)"
+        } else {
+            "codegen error (not a validator refusal)"
+        };
     }
     if message.contains("which follows it in the SSA") {
         "effect out of order"
@@ -161,16 +174,19 @@ impl Findings {
         }
     }
 
-    /// Findings that are defects: everything but a generator error that is
-    /// not a validator refusal (an operation with no CIL lowering, which keeps
-    /// the method's original IL by design), and an assembly the writer cannot
-    /// write even unmodified (its bodies are encrypted on disk), which says
-    /// nothing about the code generator.
+    /// Findings that are defects: everything but an operation with no CIL
+    /// lowering or a body past a CIL encoding limit (each keeps the method's
+    /// original IL by design), a body generated without an assembly that needs
+    /// a token interned ([`NEEDS_AN_ASSEMBLY`]), and an assembly the writer
+    /// cannot write even unmodified (its bodies are encrypted on disk), which
+    /// says nothing about the code generator.
     fn defects(&self) -> usize {
         self.by_kind
             .iter()
             .filter(|(kind, _)| {
-                !kind.starts_with("codegen error") && !kind.starts_with("unwritable original")
+                !kind.ends_with("(keeps its original IL)")
+                    && **kind != NEEDS_AN_ASSEMBLY
+                    && !kind.starts_with("unwritable original")
             })
             .map(|(_, count)| *count)
             .sum()
@@ -260,13 +276,21 @@ fn sweep(check: impl Fn(&str, &Path, CilObject, &mut Findings) + Sync) -> Findin
     merged.into_inner().unwrap()
 }
 
-/// Lifts and regenerates every method of every sample, counting what the
-/// generator's validator refuses.
+/// Lifts and regenerates every method with a body of every sample, counting
+/// what the generator's validator refuses.
+///
+/// Generation here has no assembly to write into, so a body that needs a token
+/// interned (a TypeSpec for a generic load or store, a new string) cannot be
+/// finished; [`every_sample_recompiles_to_an_assembly_that_loads`] compiles
+/// those into their assembly, and counts a failure to intern there.
 #[test]
 fn every_lifted_method_regenerates_to_what_it_lifted() {
     let findings = sweep(|name, _, assembly, findings| {
         for entry in assembly.methods().iter() {
             let method = entry.value();
+            if method.rva.is_none_or(|rva| rva == 0) {
+                continue;
+            }
             let Ok(ssa) = method.ssa(&assembly) else {
                 findings.lift_errors += 1;
                 continue;
@@ -276,7 +300,12 @@ fn every_lifted_method_regenerates_to_what_it_lifted() {
                 Ok(_) => findings.generated += 1,
                 Err(error) => {
                     let message = error.to_string();
-                    findings.record(kind_of(&message), name, &method.name, &message);
+                    let kind = if message.contains("none was interned") {
+                        NEEDS_AN_ASSEMBLY
+                    } else {
+                        kind_of(&message)
+                    };
+                    findings.record(kind, name, &method.name, &message);
                 }
             }
         }
@@ -496,7 +525,7 @@ fn every_sample_recompiles_to_an_assembly_that_loads() {
                 method.local_vars.count(),
             ];
             match method.ssa(&assembly) {
-                Ok(ssa) => lifted.push((method.token, method.name.clone(), ssa, original)),
+                Ok(ssa) => lifted.push((method.token, method.name.to_string(), ssa, original)),
                 Err(_) => findings.lift_errors += 1,
             }
         }

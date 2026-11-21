@@ -97,8 +97,8 @@ impl CilTypeBuilder {
             self.external,
             None, // base type
             self.flags,
-            Arc::new(boxcar::Vec::new()), // fields
-            LazyList::new(),              // methods
+            LazyList::new(), // fields
+            LazyList::new(), // methods
             self.flavor,
         ))
     }
@@ -128,8 +128,8 @@ pub fn create_exportedtype(dummy_type: CilTypeRc) -> ExportedTypeRc {
         offset: 0,
         flags: TypeAttributes::ZERO,
         type_def_id: dummy_type.token.0,
-        name: "ExportedType".to_string(),
-        namespace: Some("Test.Namespace".to_string()),
+        name: "ExportedType".into(),
+        namespace: Some("Test.Namespace".into()),
         implementation: implementation_lock,
         custom_attributes: Default::default(),
     })

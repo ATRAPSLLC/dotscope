@@ -95,6 +95,8 @@ macro_rules! raw_tables {
         )
     };
 }
+// A `macro_rules!` macro is re-exported crate-wide at most, without `#[macro_export]`
+// (which would make it public at the crate root)
 pub(crate) use raw_tables;
 
 /// What the rows of `tables` get wrong, every table checked.

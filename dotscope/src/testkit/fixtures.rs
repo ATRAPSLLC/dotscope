@@ -157,7 +157,7 @@ fn render_manifest(manifest: &BTreeMap<String, Fixture>) -> String {
 ///
 /// When `text` is not TOML, or an entry lacks `path`, `sha256`, `source`, `license` or
 /// `suites`.
-fn parse_manifest(text: &str) -> BTreeMap<String, Fixture> {
+pub fn parse_manifest(text: &str) -> BTreeMap<String, Fixture> {
     let table: toml::Table = text.parse().expect("MANIFEST.toml is TOML");
     let string = |value: &toml::Value, key: &str| {
         value

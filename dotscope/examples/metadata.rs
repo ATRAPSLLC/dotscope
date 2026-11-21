@@ -243,7 +243,7 @@ fn print_type_system_analysis(assembly: &CilObject) {
         let namespace = if type_def.namespace.is_empty() {
             "<global>".to_string()
         } else {
-            type_def.namespace.clone()
+            type_def.namespace.to_string()
         };
 
         let entry = namespace_stats.entry(namespace).or_insert(0usize);

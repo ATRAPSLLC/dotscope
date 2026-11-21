@@ -86,7 +86,7 @@ impl PropertyBuilder {
         let property = Property {
             token,
             flags: self.flags,
-            name: self.name,
+            name: self.name.into(),
             signature: self.signature,
             default: OnceLock::new(),
             fn_setter: OnceLock::new(),

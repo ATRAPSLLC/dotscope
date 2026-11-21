@@ -72,7 +72,7 @@ fn list_resources(
         };
 
         entries.push(ResourceEntry {
-            name: name.clone(),
+            name: name.to_string(),
             size: resource.data_size,
             source: source.to_string(),
         });

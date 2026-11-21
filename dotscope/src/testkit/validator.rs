@@ -308,15 +308,22 @@ where
         }
     };
 
-    // Strict, so a case that does not load fails here instead of reaching the validator
-    // half-loaded; unvalidated, so only the validator under test judges it.
+    // A case that does not load fails the build here instead of reaching the validator
+    // half-loaded (the primary failing fails any build); unvalidated, so only the validator
+    // under test judges it. Not strict: a case built from WindowsBase, the .NET 8 Windows
+    // Desktop assembly, references names Mono 4.8 does not hold, and those are reported
+    // as missing rather than failing the case.
     let project_result = crate::project::ProjectLoader::new()
         .primary_file(&primary_path)?
         .with_search_path(fixture("mono_4.8"))?
         .auto_discover(true)
-        .strict_mode(true)
         .with_validation(ValidationConfig::disabled())
         .build()?;
+    if let Some((subject, error)) = project_result.failed_loads.first() {
+        return Err(Error::Other(format!(
+            "a dependency of the case failed to load: {subject}: {error}"
+        )));
+    }
     let object = project_result
         .project
         .get_primary()

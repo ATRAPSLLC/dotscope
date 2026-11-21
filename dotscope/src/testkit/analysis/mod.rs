@@ -50,7 +50,10 @@ mod templates;
 mod verification;
 
 // Re-export runner for test use
-pub use runner::AnalysisTestRunner;
+pub use expectations::{CallGraphExpectation, CfgExpectation, DataFlowExpectation, SsaExpectation};
+pub use runner::{AnalysisTestResult, AnalysisTestRunner};
+pub use templates::AnalysisTestCase;
+pub use verification::VerificationError;
 
 #[cfg(test)]
 mod tests {

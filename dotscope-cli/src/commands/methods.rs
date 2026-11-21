@@ -74,7 +74,7 @@ pub fn run(
         let method_display = if signatures {
             format!("{} {}", method.name, method.signature)
         } else {
-            method.name.clone()
+            method.name.to_string()
         };
 
         let body_size = method.body.get().map(|b| b.size_code);
@@ -82,7 +82,7 @@ pub fn run(
         entries.push(MethodEntry {
             token: method.token.to_string(),
             access: method.flags_access.to_string(),
-            declaring_type: declaring_fullname,
+            declaring_type: declaring_fullname.to_string(),
             name: method_display,
             is_static: method.is_static(),
             is_virtual: method.is_virtual(),

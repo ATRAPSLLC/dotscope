@@ -51,7 +51,7 @@ pub fn mscorlib_type(fullname: &str) -> Result<u32> {
         .iter()
         .find(|entry| {
             let ty = entry.value();
-            ty.token.is_table(TableId::TypeDef) && &*ty.fullname() == fullname
+            ty.token.is_table(TableId::TypeDef) && ty.fullname() == fullname
         })
         .map(|entry| entry.value().token.row())
         .ok_or_else(|| Error::Other(format!("mscorlib defines no {fullname}")))

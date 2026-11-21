@@ -154,10 +154,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = loader.build()?;
 
     if result.has_failures() {
-        eprintln!(
-            "\nWarning: {} assemblies failed to load",
-            result.failure_count()
-        );
+        eprintln!("\nWarning: {} dependency problems", result.failure_count());
+        for name in &result.missing_dependencies {
+            eprintln!("  - {}: not found", name);
+        }
         for (name, reason) in &result.failed_loads {
             eprintln!("  - {}: {}", name, reason);
         }
@@ -292,7 +292,7 @@ fn get_method_type_name(assembly: &CilObject, method_token: Token) -> String {
         .map(|t| {
             let ty = t.value();
             if ty.namespace.is_empty() {
-                ty.name.clone()
+                ty.name.to_string()
             } else {
                 format!("{}.{}", ty.namespace, ty.name)
             }

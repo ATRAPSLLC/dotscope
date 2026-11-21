@@ -473,7 +473,7 @@ fn methods_loading(assembly: &CilObject, needle: &str) -> Vec<String> {
                             .is_ok_and(|text| text.to_string_lossy().contains(needle)))
             })
         })
-        .map(|entry| entry.value().name.clone())
+        .map(|entry| entry.value().name.to_string())
         .collect()
 }
 
@@ -507,7 +507,7 @@ fn fully_protected_resources_are_restored() {
     let names: Vec<String> = output
         .resources()
         .iter()
-        .map(|entry| entry.value().name.clone())
+        .map(|entry| entry.value().name.to_string())
         .collect();
     assert_eq!(
         names,

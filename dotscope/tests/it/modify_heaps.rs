@@ -562,3 +562,128 @@ fn a_replaced_body_follows_its_strings_when_the_heap_moves() -> Result<()> {
     assert_eq!(first_loaded_string(&written, method), expected);
     Ok(())
 }
+
+/// The last row of the table of `$raw` rows in `$view`.
+macro_rules! last_row {
+    ($view:expr, $raw:ty) => {{
+        let table = $view.tables().unwrap().table::<$raw>().unwrap();
+        table.get(table.row_count).unwrap().expect("the row")
+    }};
+}
+
+/// An entry added after a heap was replaced is named where the write puts it: after the
+/// replacement's entries. Each replacement holds the original heap and one entry more, so the
+/// original rows keep their names and an entry placed as if the original heap were written
+/// would land on the extra one. Covers all four heaps: a new type's name, a new signature, a
+/// module's new MVID and a new method's string literal.
+#[test]
+fn entries_added_after_a_heap_replacement_are_named_where_they_are_written() -> Result<()> {
+    let mut assembly = CilAssembly::from_path(fixture(TEST_ASSEMBLY_PATH))?;
+    let view = assembly.view();
+    let mut strings = view.strings().unwrap().data().to_vec();
+    strings.extend_from_slice(b"ReplacementPadding\0");
+    let mut blobs = view.blobs().unwrap().data().to_vec();
+    blobs.extend_from_slice(&[0x04, 0xEE, 0xEE, 0xEE, 0xEE]);
+    let mut guids = view.guids().unwrap().data().to_vec();
+    guids.extend_from_slice(&[0xEE; 16]);
+    let mut userstrings = view.userstrings().unwrap().data().to_vec();
+    // "pad": a length, three UTF-16 code units and the terminal byte
+    userstrings.extend_from_slice(&[0x07, b'p', 0, b'a', 0, b'd', 0, 0]);
+    assembly.string_add_heap(strings)?;
+    assembly.blob_add_heap(blobs)?;
+    assembly.guid_add_heap(guids)?;
+    assembly.userstring_add_heap(userstrings)?;
+
+    TypeDefBuilder::new()
+        .name("AddedAfterReplacement")
+        .namespace("")
+        .flags(TypeAttributes::CLASS | TypeAttributes::NOT_PUBLIC)
+        .build(&mut assembly)?;
+    let signature = [0x06, 0x08];
+    StandAloneSigBuilder::new()
+        .signature(&signature)
+        .build(&mut assembly)?;
+    let mvid = [0x5A; 16];
+    let mvid_ref = assembly.guid_add(&mvid)?;
+    let mut module = last_row!(assembly.view(), ModuleRaw);
+    module.mvid = mvid_ref.placeholder();
+    assembly.table_row_update(TableId::Module, 1, TableDataOwned::Module(module))?;
+    let literal = assembly.userstring_add("LiteralAfterReplacement")?;
+    let literal = Token::new(0x7000_0000 | literal.placeholder());
+    let method = MethodBuilder::new("LoadsTheLiteral")
+        .public()
+        .static_method()
+        .returns(TypeSignature::String)
+        .implementation(move |body| {
+            body.implementation(move |asm| {
+                asm.ldstr(literal)?.ret()?;
+                Ok(())
+            })
+        })
+        .build(&mut assembly)?;
+
+    let bytes = assembly.to_memory()?;
+    let method = method.token().expect("the write numbers the new method");
+    let view = CilAssemblyView::from_mem(bytes.clone())?;
+    let name = last_row!(view, TypeDefRaw).type_name;
+    assert_eq!(
+        view.strings().unwrap().get(name as usize)?,
+        "AddedAfterReplacement"
+    );
+    let written = last_row!(view, StandAloneSigRaw).signature;
+    assert_eq!(view.blobs().unwrap().get(written as usize)?, signature);
+    let written = last_row!(view, ModuleRaw).mvid;
+    assert_eq!(
+        view.guids().unwrap().get(written as usize)?,
+        uguid::Guid::from_bytes(mvid)
+    );
+    let object = CilObject::from_mem(bytes)?;
+    assert_eq!(
+        first_loaded_string(&object, method),
+        "LiteralAfterReplacement"
+    );
+    Ok(())
+}
+
+/// Renaming a string leaves the entries of the other heaps alone, the ones no row names
+/// included: a rename is not a request to compact the heaps.
+#[test]
+fn a_renamed_string_keeps_every_entry_of_the_other_heaps() -> Result<()> {
+    // A first write gives the assembly a blob and a GUID no row names
+    let mut assembly = CilAssembly::from_path(fixture(TEST_ASSEMBLY_PATH))?;
+    let view = assembly.view();
+    let mut blobs = view.blobs().unwrap().data().to_vec();
+    blobs.extend_from_slice(&[0x02, 0xAA, 0xBB]);
+    let mut guids = view.guids().unwrap().data().to_vec();
+    guids.extend_from_slice(&[0xEE; 16]);
+    assembly.blob_add_heap(blobs)?;
+    assembly.guid_add_heap(guids)?;
+    let view = CilAssemblyView::from_mem(assembly.to_memory()?)?;
+    let guid_count = view.guids().unwrap().iter().count();
+
+    let name = last_row!(view, TypeDefRaw).type_name;
+    let mut assembly = CilAssembly::new(view);
+    assembly.string_update(name, "RenamedType")?;
+    let view = CilAssemblyView::from_mem(assembly.to_memory()?)?;
+
+    assert_eq!(
+        view.strings()
+            .unwrap()
+            .get(last_row!(view, TypeDefRaw).type_name as usize)?,
+        "RenamedType"
+    );
+    assert!(
+        view.blobs()
+            .unwrap()
+            .iter()
+            .any(|(_, blob)| blob == [0xAA, 0xBB]),
+        "the blob no row names is kept"
+    );
+    let written: Vec<_> = view.guids().unwrap().iter().map(|(_, guid)| guid).collect();
+    assert_eq!(written.len(), guid_count);
+    assert_eq!(
+        written.last().copied(),
+        Some(uguid::Guid::from_bytes([0xEE; 16]))
+    );
+    Ok(())
+}

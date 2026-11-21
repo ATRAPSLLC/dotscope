@@ -181,7 +181,7 @@ impl MethodBuilder {
             flags_vtable: self.flags_vtable,
             flags_modifiers: self.flags_modifiers,
             flags_pinvoke: AtomicU32::new(0),
-            name: self.name,
+            name: self.name.into(),
             params,
             generic_params: Default::default(),
             generic_args: LazyList::new(),

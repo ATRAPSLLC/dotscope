@@ -84,7 +84,7 @@ const MAX_EMULATIONS: usize = 64;
 
 /// The assembly `emulate_template` splices its code into: real metadata, so the code's
 /// tokens and the arguments it is given meet real types.
-const TEMPLATE: &str = "crafted_2.exe";
+pub const TEMPLATE: &str = "crafted_2.exe";
 
 /// A target's entry point: it runs one input, and fails by panicking.
 pub type Target = fn(&[u8]);

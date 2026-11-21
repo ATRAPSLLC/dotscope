@@ -121,7 +121,7 @@ fn print_type_analysis(assembly: &CilObject) {
     println!("  Sample types:");
     for type_def in types.all_types().iter().take(5) {
         let full_name = if type_def.namespace.is_empty() {
-            type_def.name.clone()
+            type_def.name.to_string()
         } else {
             format!("{}.{}", type_def.namespace, type_def.name)
         };

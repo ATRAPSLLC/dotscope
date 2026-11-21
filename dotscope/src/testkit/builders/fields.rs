@@ -51,7 +51,7 @@ impl FieldBuilder {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(CilFlavor::I4),
         ));
@@ -67,7 +67,7 @@ impl FieldBuilder {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(CilFlavor::String),
         ));
@@ -83,7 +83,7 @@ impl FieldBuilder {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(CilFlavor::Boolean),
         ));
@@ -99,7 +99,7 @@ impl FieldBuilder {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(CilFlavor::R4),
         ));
@@ -115,7 +115,7 @@ impl FieldBuilder {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(CilFlavor::Object),
         ));
@@ -160,7 +160,7 @@ impl FieldBuilder {
             token: Token::new(0x04000000 + self.rid),
             offset: self.rid as usize,
             flags: self.flags,
-            name: self.name,
+            name: self.name.into(),
             signature,
             default: OnceLock::new(),
             rva: OnceLock::new(),
@@ -190,7 +190,7 @@ impl Default for FieldBuilder {
             None,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             Some(CilFlavor::I4),
         ));

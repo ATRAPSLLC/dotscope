@@ -42,7 +42,7 @@ impl ModuleRefBuilder {
             rid: self.rid,
             offset: self.rid as usize,
             token: Token::new(0x1A000000 + self.rid),
-            name: self.name,
+            name: self.name.into(),
             custom_attributes: self.custom_attributes.unwrap_or_default(),
         })
     }
@@ -88,7 +88,7 @@ impl FileBuilder {
             token: Token::new(0x26000000 + self.rid),
             offset: self.rid as usize,
             flags: self.flags,
-            name: self.name,
+            name: self.name.into(),
             hash_value: self
                 .hash_value
                 .unwrap_or_else(|| AssemblyRefHash::new(&[1, 2, 3, 4]).unwrap()),
