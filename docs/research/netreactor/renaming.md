@@ -47,7 +47,7 @@ All original type and method names are replaced with random alphanumeric strings
 
 ## Deobfuscation Notes
 
-Renaming is **irreversible** — the original names are permanently lost. dotscope's
-`SmartRenameConfig` can assign meaningful names based on usage analysis but cannot
-recover the originals. The NRS `SymbolRenamer` stage (Stage 15) similarly uses de4dot's
+Renaming is **irreversible**: the original names are permanently lost. dotscope's
+renamer replaces them with short sequential names (`A`, `a`, `f_a`, `p_a`) so that the
+output is readable, but it cannot recover the originals. The NRS `SymbolRenamer` stage (Stage 15) similarly uses de4dot's
 renamer infrastructure to assign new readable names.

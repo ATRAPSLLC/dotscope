@@ -1,15 +1,9 @@
-//! Simple sequential name provider.
+//! Sequential replacement names for obfuscated identifiers.
 //!
-//! Provides the original `SimpleNameGenerator` (moved from `cleanup.rs`) and
-//! a [`SimpleProvider`] wrapper that implements [`RenameProvider`] using atomic
-//! counters for thread-safe name generation.
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use crate::deobfuscation::renamer::{
-    context::{IdentifierKind, RenameContext},
-    RenameProvider,
-};
+//! The renamer gives every obfuscated type, method, field and parameter a short,
+//! readable name drawn from a per-kind counter. The names carry no
+//! meaning beyond their kind; their purpose is to make decompiled output legible
+//! and stable, not to recover the original identifiers.
 
 /// Generator for simple sequential names used when renaming obfuscated identifiers.
 ///
@@ -108,79 +102,9 @@ impl SimpleNameGenerator {
     }
 }
 
-/// Thread-safe rename provider that generates simple sequential names.
-///
-/// Uses atomic counters so that [`RenameProvider::suggest_name`] can take `&self`.
-/// This is the default fallback provider when no smart rename configuration is present.
-pub struct SimpleProvider {
-    type_counter: AtomicUsize,
-    method_counter: AtomicUsize,
-    field_counter: AtomicUsize,
-    param_counter: AtomicUsize,
-}
-
-impl SimpleProvider {
-    /// Creates a new provider with all counters at zero.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            type_counter: AtomicUsize::new(0),
-            method_counter: AtomicUsize::new(0),
-            field_counter: AtomicUsize::new(0),
-            param_counter: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl RenameProvider for SimpleProvider {
-    fn name(&self) -> &'static str {
-        "SimpleProvider"
-    }
-
-    fn initialize(&mut self) -> crate::Result<()> {
-        Ok(())
-    }
-
-    fn suggest_name(&self, context: &RenameContext) -> crate::Result<Option<String>> {
-        let kind = match context.kind {
-            Some(k) => k,
-            None => return Ok(None),
-        };
-
-        let name = match kind {
-            IdentifierKind::Type => {
-                let idx = self.type_counter.fetch_add(1, Ordering::Relaxed);
-                SimpleNameGenerator::index_to_name(idx)
-            }
-            IdentifierKind::Method => {
-                let idx = self.method_counter.fetch_add(1, Ordering::Relaxed);
-                SimpleNameGenerator::index_to_name_lower(idx)
-            }
-            IdentifierKind::Field => {
-                let idx = self.field_counter.fetch_add(1, Ordering::Relaxed);
-                format!("f_{}", SimpleNameGenerator::index_to_name_lower(idx))
-            }
-            IdentifierKind::Parameter => {
-                let idx = self.param_counter.fetch_add(1, Ordering::Relaxed);
-                format!("p_{}", SimpleNameGenerator::index_to_name_lower(idx))
-            }
-        };
-
-        Ok(Some(name))
-    }
-
-    fn shutdown(&mut self) -> crate::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::deobfuscation::renamer::{
-        context::{IdentifierKind, RenameContext},
-        providers::simple::{SimpleNameGenerator, SimpleProvider},
-        RenameProvider,
-    };
+    use super::*;
 
     #[test]
     fn test_name_generator() {
@@ -206,58 +130,5 @@ mod tests {
         assert_eq!(gen.next_method_name(), "a");
         assert_eq!(gen.next_field_name(), "f_a");
         assert_eq!(gen.next_param_name(), "p_a");
-    }
-
-    #[test]
-    fn test_simple_provider_trait() {
-        let mut provider = SimpleProvider::new();
-        provider.initialize().unwrap();
-
-        let type_ctx = RenameContext {
-            kind: Some(IdentifierKind::Type),
-            ..Default::default()
-        };
-        let method_ctx = RenameContext {
-            kind: Some(IdentifierKind::Method),
-            ..Default::default()
-        };
-        let field_ctx = RenameContext {
-            kind: Some(IdentifierKind::Field),
-            ..Default::default()
-        };
-        let param_ctx = RenameContext {
-            kind: Some(IdentifierKind::Parameter),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            provider.suggest_name(&type_ctx).unwrap(),
-            Some("A".to_string())
-        );
-        assert_eq!(
-            provider.suggest_name(&type_ctx).unwrap(),
-            Some("B".to_string())
-        );
-        assert_eq!(
-            provider.suggest_name(&method_ctx).unwrap(),
-            Some("a".to_string())
-        );
-        assert_eq!(
-            provider.suggest_name(&field_ctx).unwrap(),
-            Some("f_a".to_string())
-        );
-        assert_eq!(
-            provider.suggest_name(&param_ctx).unwrap(),
-            Some("p_a".to_string())
-        );
-
-        provider.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_simple_provider_no_kind() {
-        let provider = SimpleProvider::new();
-        let ctx = RenameContext::default();
-        assert_eq!(provider.suggest_name(&ctx).unwrap(), None);
     }
 }

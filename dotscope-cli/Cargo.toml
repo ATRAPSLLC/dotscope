@@ -12,10 +12,6 @@ description = "Command-line tool for .NET assembly analysis, inspection, and deo
 name = "dotscope"
 path = "src/main.rs"
 
-[features]
-default = []
-smart-rename = ["dotscope/smart-rename"]
-
 [dependencies]
 dotscope = { path = "../dotscope", features = ["deobfuscation"] }
 clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }

@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-#[cfg(feature = "smart-rename")]
-use dotscope::deobfuscation::SmartRenameConfig;
 use dotscope::{
     analysis::Budget,
     deobfuscation::{CleanupConfig, DeobfuscationEngine, DeobfuscationResult, EngineConfig},
@@ -69,8 +67,6 @@ pub struct DeobfuscateOptions<'a> {
     pub aggressive: bool,
     pub detailed: bool,
     pub report: Option<&'a Path>,
-    #[cfg(feature = "smart-rename")]
-    pub rename_ai: Option<&'a Path>,
     pub global: &'a GlobalOptions,
 }
 
@@ -239,14 +235,6 @@ fn build_config(opts: &DeobfuscateOptions) -> EngineConfig {
     }
     if opts.no_cleanup {
         config.cleanup = CleanupConfig::disabled();
-    }
-
-    #[cfg(feature = "smart-rename")]
-    if let Some(model_path) = opts.rename_ai {
-        config.cleanup.smart_rename = Some(SmartRenameConfig {
-            model_path: model_path.to_path_buf(),
-            ..SmartRenameConfig::default()
-        });
     }
 
     config
