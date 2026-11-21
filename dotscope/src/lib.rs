@@ -45,6 +45,10 @@
 // the documented error taxonomy tied to the real one; CI sets `RUSTDOCFLAGS: -Dwarnings` so it
 // is enforced on the doc build too.
 #![deny(rustdoc::broken_intra_doc_links)]
+// A type that public API returns, takes or holds must be importable: a caller can receive it but
+// cannot name it in a signature, a field or a turbofish, and rustdoc does not list it. Each such
+// type is re-exported next to the public API that hands it out.
+#![deny(unnameable_types)]
 
 //! # dotscope
 //!
@@ -270,12 +274,12 @@
 //! # Development and Testing
 
 #[macro_use]
-pub(crate) mod macros;
+mod macros;
 
 #[macro_use]
-pub(crate) mod error;
-pub(crate) mod file;
-pub(crate) mod utils;
+mod error;
+mod file;
+mod utils;
 
 /// Test support shared by the unit and integration tests: builders, factories, fixtures,
 /// the sample harness. Unstable and outside the semver surface; integration tests reach it
@@ -862,7 +866,7 @@ pub mod metadata;
 /// - [`project::CilProject`] - Main multi-assembly container
 /// - [`project::ProjectLoader`] - Builder-style loading API with flexible configuration
 /// - [`project::ProjectResult`] - Unified result type with loading statistics
-/// - `ProjectContext` - Internal coordination for parallel loading (crate-internal)
+/// - [`project::ProjectContext`] - The barriers that coordinate assemblies loading in parallel
 ///
 /// # Examples
 ///
@@ -924,6 +928,8 @@ pub mod project;
 /// ```
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(feature = "compiler")]
+pub use cilassembly::Savepoint;
 /// Mutable assembly for editing and modification operations.
 ///
 /// `CilAssembly` provides a mutable layer on top of [`CilAssemblyView`] that enables
@@ -955,8 +961,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 pub use cilassembly::{
-    ChangeRefKind, ChangeRefRc, CilAssembly, CleanupRequest, Conflict, ConflictResolver,
-    LastWriteWinsResolver, MethodBodyBuilder, MethodBuilder, OperationResolution, Resolution,
+    AssemblyChanges, BlobComposite, ChangeIds, ChangeRef, ChangeRefKind, ChangeRefRc, CilAssembly,
+    CleanupRequest, CompositeImport, Conflict, ConflictResolver, HeapChanges,
+    LastWriteWinsResolver, MethodBodyBuilder, MethodBuilder, Operation, OperationResolution,
+    Resolution, TableModifications, TableOperation,
 };
 /// `dotscope` Error type.
 ///
@@ -976,7 +984,8 @@ pub use cilassembly::{
 /// }
 /// ```
 pub use error::{
-    Error, HeapKind, MethodLookupError, ParseFailure, ParseStage, Referrer, StreamKind,
+    EmulationError, Error, HeapKind, MethodLookupError, ParseFailure, ParseStage, Referrer,
+    StreamKind,
 };
 /// Raw assembly view for editing and modification operations.
 ///
@@ -1028,6 +1037,19 @@ pub use error::{
 pub use metadata::cilassemblyview::CilAssemblyView;
 mod cilassembly;
 
+/// Main entry point for working with .NET assemblies.
+///
+/// See [`crate::metadata::cilobject::CilObject`] for high-level analysis and metadata access.
+///
+/// # Usage Examples
+///
+/// ```rust,no_run
+/// use dotscope::CilObject;
+/// let assembly = CilObject::from_path(std::path::Path::new("tests/samples/WindowsBase.dll"))?;
+/// println!("Found {} methods", assembly.methods().len());
+/// # Ok::<(), dotscope::Error>(())
+/// ```
+pub use file::{debug::debug_type, DebugDirectoryEntry};
 /// Provides access to low-level file and memory parsing utilities.
 ///
 /// The [`crate::Parser`] type is used for decoding CIL bytecode and metadata streams.
@@ -1054,19 +1076,7 @@ pub use file::{
     sectionmap::{RvaMapping, SectionMap},
     File,
 };
-/// Main entry point for working with .NET assemblies.
-///
-/// See [`crate::metadata::cilobject::CilObject`] for high-level analysis and metadata access.
-///
-/// # Usage Examples
-///
-/// ```rust,no_run
-/// use dotscope::CilObject;
-/// let assembly = CilObject::from_path(std::path::Path::new("tests/samples/WindowsBase.dll"))?;
-/// println!("Found {} methods", assembly.methods().len());
-/// # Ok::<(), dotscope::Error>(())
-/// ```
-pub use metadata::cilobject::CilObject;
+pub use metadata::cilobject::{CilObject, ViewLoadError};
 /// Composable query builders for filtering types and methods.
 ///
 /// `TypeQuery` and `MethodQuery` provide a fluent API for searching and filtering

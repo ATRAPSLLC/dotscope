@@ -55,7 +55,7 @@
 //! # Integration
 //!
 //! These macros integrate primarily with:
-//! - [`crate::metadata::loader`] - Metadata loading system for concurrent parsing
+//! - [`CilObject`](crate::CilObject) loading - Metadata loading system for concurrent parsing
 //! - [`crate::metadata::tables`] - Shared access to metadata table structures
 //! - Internal caching systems that require synchronized access to parsed data
 

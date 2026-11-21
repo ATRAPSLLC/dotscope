@@ -228,7 +228,9 @@ jobs:
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Build documentation as docs.rs does
+    # docs.rs's cfg, with private items documented as `make doc` does: the docs link internal
+    # items, and those links resolve only there.
+    - name: Build documentation with docs.rs's cfg
       env:
         RUSTDOCFLAGS: "--cfg docsrs -Dwarnings"
-      run: cargo doc -p dotscope --all-features --no-deps
+      run: cargo doc -p dotscope --all-features --no-deps --document-private-items

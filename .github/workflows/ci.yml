@@ -107,10 +107,12 @@ jobs:
       if: runner.os == 'Linux'
       run: cargo test --workspace --release --doc --features z3 -- --test-threads=4
 
+    # Private items are documented, as `make doc` does: the docs link internal items
+    # (the loader traits, private helpers), and those links resolve only there.
     - name: Check documentation
       env:
         RUSTDOCFLAGS: "-Dwarnings"
-      run: cargo doc -p dotscope --all-features --no-deps
+      run: cargo doc -p dotscope --all-features --no-deps --document-private-items
 
   # Compiles and tests without the legacy-crypto feature (Linux only). Pinned to the declared
   # MSRV so this job also guards `rust-version`; the workspace check covers the default-feature

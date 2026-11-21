@@ -97,13 +97,16 @@ use std::{io, sync::Arc};
 
 use thiserror::Error;
 
+// Re-exported at the crate root in every feature set: the real error with `emulation`, the
+// stub below without it, so the root path survives enabling the feature.
 #[cfg(feature = "emulation")]
-use crate::emulation::EmulationError;
+pub use crate::emulation::EmulationError;
 use crate::metadata::{tables::TableId, token::Token};
 
-// Stub type for EmulationError when emulation feature is disabled.
-// This allows the Error enum to remain stable across feature configurations.
-// The type is public to match the visibility of the Error::Emulation variant.
+/// Stands in for the emulator's error when the `emulation` feature is disabled.
+///
+/// It keeps [`Error::Emulation`] the same across feature configurations. Nothing builds one
+/// without the feature, so the variant never occurs in such a build.
 #[cfg(not(feature = "emulation"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmulationError(String);
