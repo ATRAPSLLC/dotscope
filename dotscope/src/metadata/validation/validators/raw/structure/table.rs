@@ -344,7 +344,6 @@ mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        prelude::*,
         testkit::{
             factories::validation::raw_structure_table::*, get_testfile_wb, validator_test,
             TestAssembly,

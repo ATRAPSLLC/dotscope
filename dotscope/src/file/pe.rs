@@ -1981,12 +1981,12 @@ impl ResourceEntry {
 ///
 /// # Structure (16 bytes)
 ///
-/// | Offset | Size | Field          |
-/// |--------|------|----------------|
-/// | 0      | 4    | offset_to_data | (RVA - needs relocation!)
-/// | 4      | 4    | size           |
-/// | 8      | 4    | code_page      |
-/// | 12     | 4    | reserved       |
+/// | Offset | Size | Field          | Note                     |
+/// |--------|------|----------------|--------------------------|
+/// | 0      | 4    | offset_to_data | RVA - needs relocation!  |
+/// | 4      | 4    | size           |                          |
+/// | 8      | 4    | code_page      |                          |
+/// | 12     | 4    | reserved       |                          |
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceDataEntry {
     /// RVA to the actual resource data. This field needs relocation when the section moves.

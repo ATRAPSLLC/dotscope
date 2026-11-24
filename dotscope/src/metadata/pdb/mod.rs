@@ -108,7 +108,7 @@
 //! The runtime never reads debug information to load an assembly, so the PDB the image
 //! carries never fails a load: an embedded PDB that does not inflate or was written for
 //! another image, and a malformed row in it or in the image's own debug tables, are
-//! [diagnostics](crate::metadata::diagnostics) and the rest of the PDB is read. A standalone
+//! [diagnostics] and the rest of the PDB is read. A standalone
 //! PDB is something the caller asked for, so it is read in the load's mode: in strict mode
 //! the same faults fail the load. A PDB whose identity is not the one the image names (a PDB
 //! of another build) is read with a diagnostic, since its rows are well-formed; one whose
