@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.0] - 2026-11-24
 
-A correctness release built on analyssa 0.7.0. Every assembly of the test corpus loads, lifts
+A correctness release built on analyssa 0.7.1. Every assembly of the test corpus loads, lifts
 to SSA the verifier accepts and writes back holding what it held; generated code is
 translation-validated; and the public API changed wherever it could not state what the
 metadata means, so this release has many breaking changes.
