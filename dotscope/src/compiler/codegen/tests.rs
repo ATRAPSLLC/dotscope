@@ -775,6 +775,32 @@ fn test_switch_instruction() {
     );
 }
 
+/// A narrow shift re-extends the value it shifts to the window it reads, never its count: a
+/// `byte` count is a count, whatever the shift's signedness. Between the count's load and the
+/// `shr` comes no conversion.
+#[test]
+fn a_narrow_shift_leaves_its_count_as_loaded() {
+    let ssa = SsaFunctionBuilder::new(2, 0)
+        .build_with(|f| {
+            let value = f.arg(0, SsaType::I8);
+            let count = f.arg(1, SsaType::U8);
+            f.block(0, |blk| {
+                let shifted = blk.shr(value, count);
+                blk.ret_val(shifted);
+            });
+        })
+        .unwrap();
+    let mnemonics = generate_mnemonics(&ssa);
+    let shift = mnemonics
+        .iter()
+        .position(|m| *m == "shr")
+        .expect("the shift is emitted");
+    assert!(
+        mnemonics[..shift].iter().all(|m| !m.starts_with("conv")),
+        "{mnemonics:?}"
+    );
+}
+
 #[test]
 fn test_conversion_i8() {
     let ssa = SsaFunctionBuilder::new(1, 0)

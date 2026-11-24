@@ -49,12 +49,14 @@ use std::{
 };
 
 use analyssa::{
+    facts::Rewrite,
     graph::NodeId,
     ir::{
         function::{SsaConstructOptions, SsaEditOptions},
         ops::convert::ConversionIntent,
         FloatFormat,
     },
+    target::Target,
     BitSet,
 };
 
@@ -63,9 +65,10 @@ use crate::{
         cfg::ControlFlowGraph,
         ssa::{
             decompose::{decompose_instruction, Decomposed},
-            resolve_corelib_valuetype, Callee, CilPrefix, ConstValue, DefSite, RuntimeValueKind,
-            SimulationResult, SsaBlock, SsaExceptionHandler, SsaFunction, SsaInstruction, SsaOp,
-            SsaType, SsaVarId, StackSimulator, TypeProvider, VariableOrigin,
+            resolve_corelib_valuetype, Callee, CilPrefix, CilTarget, ConstValue, DefSite,
+            PhiOperand, RuntimeValueKind, SimulationResult, SsaBlock, SsaExceptionHandler,
+            SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId, StackSimulator, TypeProvider,
+            VariableOrigin,
         },
     },
     assembly::{opcodes, FlowType, Immediate, Instruction, Operand},
@@ -106,6 +109,10 @@ pub struct SsaConverter<'a, 'cfg> {
     /// Used during rename to assign correct stack-derived origins for temporary
     /// variables (those not covered by `infer_origin`, e.g. add, box, call results).
     var_stack_positions: BTreeMap<SsaVarId, usize>,
+
+    /// The depth of the evaluation stack each block leaves it at: the values it passes to
+    /// its successors on the stack.
+    exit_depths: BTreeMap<usize, usize>,
 
     /// The argument or local slot each simulation variable is a version of.
     ///
@@ -711,6 +718,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
             function: SsaFunction::with_capacity(num_args, num_locals, block_count, 0),
             address_taken: BitSet::new(num_args.saturating_add(num_locals)),
             var_stack_positions: BTreeMap::new(),
+            exit_depths: BTreeMap::new(),
             slot_versions: BTreeMap::new(),
             type_provider,
             handle_types: Default::default(),
@@ -733,6 +741,13 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         // Phase 2: give every value the simulation named a variable of the
         // function, carrying the storage location it is a version of.
         builder.materialize_simulation_variables()?;
+
+        // CIL computes every integer of 32 bits or fewer as an `int32`: stated
+        // where a narrow value leaves a block on the evaluation stack, and
+        // wherever an operation computes with a value already known narrower,
+        // before construction judges the widths its operations compute at.
+        builder.widen_stack_exits();
+        builder.widen_stack_reads();
 
         // Set original local type signatures from type provider for code generation
         if let Some(local_types) = type_provider.local_type_signatures() {
@@ -772,6 +787,9 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         // A store into a slot narrower than four bytes truncates; stated as the
         // conversion it is, once the stored values have types.
         builder.make_narrow_stores_explicit();
+
+        // And for the values typed only now: what a phi merges.
+        builder.make_stack_widening_explicit()?;
 
         // Validate no Unknown types remain on used variables
         builder.function.validate_types().map_err(Error::SsaError)?;
@@ -1091,6 +1109,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
         self.check_control_stays_in_method(&all_blocks)?;
         let exit_depths = self.compute_stack_depths(&all_blocks, assembly)?;
         self.check_stack_depths(&all_blocks, &exit_depths, assembly)?;
+        self.exit_depths.clone_from(&exit_depths);
 
         // Create a single simulator for the entire method to ensure unique variable IDs
         // across all blocks within this method. In well-formed CIL, the stack is always
@@ -1184,10 +1203,20 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                     }
                 }
 
-                // Special handling for leave instructions: they clear the stack
-                // The target of a leave instruction has stack depth 0
+                // A block that leaves a protected region, the method or a handler passes no
+                // stack on: `leave` empties it (ECMA-335 III.3.46), `ret` returns its value
+                // (whose pop its static effect does not count, not knowing the return type),
+                // `throw` and `rethrow` (III.4.24) unwind it, `endfinally` and `endfilter`
+                // (III.3.34) end the handler, and `jmp` leaves for another method (III.3.37).
                 if let Some(last_instr) = cfg_block.instructions.last() {
-                    if last_instr.flow_type == FlowType::Leave {
+                    if matches!(
+                        last_instr.flow_type,
+                        FlowType::Leave
+                            | FlowType::Return
+                            | FlowType::Throw
+                            | FlowType::EndFinally
+                            | FlowType::MethodJump
+                    ) {
                         depth = 0;
                     }
                 }
@@ -1934,7 +1963,7 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                     Some(SsaOp::Ceq { .. } | SsaOp::Clt { .. } | SsaOp::Cgt { .. }) => true,
                     _ => range(&src_type).is_some_and(|(lo, hi)| min <= lo && hi <= max),
                 };
-                if fits || !src_type.is_integer() {
+                if fits || !CilTarget::is_integer(&src_type) {
                     continue;
                 }
                 let conversion = SsaOp::conversion_between(
@@ -1963,6 +1992,400 @@ impl<'a, 'cfg> SsaConverter<'a, 'cfg> {
                 }
             }
         }
+    }
+
+    /// The width and signedness of an integer narrower than the `int32` the evaluation
+    /// stack holds it as: a `byte`, `sbyte`, `short`, `ushort`, `char` or `bool`.
+    fn narrow_integer(ty: &SsaType) -> Option<(u32, bool)> {
+        if !CilTarget::is_integer(ty) {
+            return None;
+        }
+        let width = CilTarget::bit_width(ty).filter(|width| *width < 32)?;
+        Some((width, !CilTarget::is_signed(ty)))
+    }
+
+    /// The operands of `op` it computes with as the `int32` a narrow value is on the evaluation
+    /// stack, given the type of each value.
+    ///
+    /// An arithmetic, logical or comparison operation reads its operands so, a shift the
+    /// value it shifts, a `switch` the index it dispatches on, a select whose result is wider
+    /// than an arm that arm, and a copy into a wider place (a narrow value stored into an
+    /// `int32` local) the value it copies. A conversion reads its operand at the operand's
+    /// own type: a truncation keeps the low bits either way, and a value read with its own
+    /// signedness extends as the `int32` it is would, so only one that reads a narrow value
+    /// the other way and where it shows - widening it, checking it for overflow, or converting
+    /// it to a float - converts the `int32`: `conv.u8` of an `sbyte` -1 zero-extends
+    /// `0xFFFFFFFF`.
+    ///
+    /// Everything else moves the value: an argument, a returned value, a store into a field,
+    /// an element or through a pointer, a branch's condition. The value is the same number
+    /// whichever way it is read, and the place it lands in holds it at its own type.
+    fn stack_operands(op: &SsaOp, type_of: &impl Fn(SsaVarId) -> Option<SsaType>) -> Vec<SsaVarId> {
+        let width = |var: SsaVarId| type_of(var).and_then(|ty| CilTarget::bit_width(&ty));
+        let narrower = |var: SsaVarId, than: SsaVarId| {
+            width(than).is_some_and(|than| width(var).is_some_and(|var| var < than))
+        };
+        match op {
+            SsaOp::Add { left, right, .. }
+            | SsaOp::AddOvf { left, right, .. }
+            | SsaOp::Sub { left, right, .. }
+            | SsaOp::SubOvf { left, right, .. }
+            | SsaOp::Mul { left, right, .. }
+            | SsaOp::MulOvf { left, right, .. }
+            | SsaOp::Div { left, right, .. }
+            | SsaOp::Rem { left, right, .. }
+            | SsaOp::And { left, right, .. }
+            | SsaOp::Or { left, right, .. }
+            | SsaOp::Xor { left, right, .. }
+            | SsaOp::Ceq { left, right, .. }
+            | SsaOp::Clt { left, right, .. }
+            | SsaOp::Cgt { left, right, .. }
+            | SsaOp::BranchCmp { left, right, .. } => vec![*left, *right],
+            SsaOp::Neg { operand, .. } | SsaOp::Not { operand, .. } => vec![*operand],
+            SsaOp::Shl { value, .. } | SsaOp::Shr { value, .. } => vec![*value],
+            SsaOp::Switch { value, .. } => vec![*value],
+            SsaOp::Select {
+                dest,
+                true_val,
+                false_val,
+                ..
+            } => [*true_val, *false_val]
+                .into_iter()
+                .filter(|arm| narrower(*arm, *dest))
+                .collect(),
+            SsaOp::Copy { dest, src } => {
+                if narrower(*src, *dest) {
+                    vec![*src]
+                } else {
+                    Vec::new()
+                }
+            }
+            SsaOp::IntConv {
+                operand,
+                target,
+                unsigned,
+                overflow_check,
+                ..
+            } => {
+                let Some((source_width, source_unsigned)) =
+                    type_of(*operand).as_ref().and_then(Self::narrow_integer)
+                else {
+                    return Vec::new();
+                };
+                // A pointer-sized target has no fixed width, and is wider than 16 bits.
+                let widens =
+                    CilTarget::bit_width(target).is_none_or(|target| target > source_width);
+                let reads_otherwise = *unsigned != source_unsigned
+                    && type_of(*operand).is_some_and(|ty| ty != SsaType::Bool);
+                if reads_otherwise && (*overflow_check || widens) {
+                    vec![*operand]
+                } else {
+                    Vec::new()
+                }
+            }
+            SsaOp::IntToFloat {
+                operand, unsigned, ..
+            } => match type_of(*operand).as_ref().and_then(Self::narrow_integer) {
+                Some((_, source_unsigned)) if source_unsigned != *unsigned => vec![*operand],
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// The extension of `value`, an integer narrower than `int32`, by its own signedness to
+    /// the `int32` the evaluation stack holds it as, read by the instruction at `instr_idx`
+    /// of `block_idx`: the instruction and the value it defines.
+    fn stack_widening(
+        function: &mut SsaFunction,
+        value: SsaVarId,
+        block_idx: usize,
+        instr_idx: usize,
+    ) -> Option<(SsaInstruction, SsaVarId)> {
+        let (_, unsigned) = function
+            .variable(value)
+            .and_then(|variable| Self::narrow_integer(variable.var_type()))?;
+        let widened = function.create_variable(
+            VariableOrigin::Phi,
+            0,
+            DefSite::instruction(block_idx, instr_idx),
+            SsaType::I32,
+        );
+        let instr = SsaInstruction::synthetic(SsaOp::IntConv {
+            dest: widened,
+            operand: value,
+            target: SsaType::I32,
+            overflow_check: false,
+            unsigned,
+        })
+        .with_result_type(SsaType::I32);
+        Some((instr, widened))
+    }
+
+    /// The narrow integers the instruction `op` computes with ([`Self::stack_operands`]),
+    /// each once.
+    fn narrow_stack_reads(function: &SsaFunction, op: &SsaOp) -> Vec<SsaVarId> {
+        let type_of = |var: SsaVarId| function.variable(var).map(|v| v.var_type().clone());
+        let mut reads: Vec<SsaVarId> = Self::stack_operands(op, &type_of)
+            .into_iter()
+            .filter(|var| {
+                type_of(*var)
+                    .as_ref()
+                    .and_then(Self::narrow_integer)
+                    .is_some()
+            })
+            .collect();
+        reads.sort_unstable();
+        reads.dedup();
+        reads
+    }
+
+    /// States the `int32` a narrow integer is on the evaluation stack wherever an operation
+    /// computes with it, for every value whose type is known before construction.
+    ///
+    /// CIL holds every integer of 32 bits or fewer as an `int32` (ECMA-335 III.1.1, III.1.5):
+    /// a load of a `byte` zero-extends it and one of an `sbyte` sign-extends it, and the
+    /// instructions compute with that. The lift types a value by where it came from, so a
+    /// `byte` local read and added to an `int32` would otherwise be an 8-bit operand of a
+    /// 32-bit addition, which no analysis reasons about: every operation of the IR reads its
+    /// operands at their types' own widths, and the verifier holds an operation to one width,
+    /// construction included.
+    ///
+    /// So each read an operation makes of a narrow value ([`Self::stack_operands`]) reads its
+    /// extension by its own signedness to an `int32`, defined right before the operation. The
+    /// narrow value stays where it is moved into a typed place - a store, an argument, a
+    /// returned value - and the code generator emits nothing for the extension, which is the
+    /// value the stack already holds. A value typed only once construction has merged it,
+    /// through a phi, is extended after it ([`Self::make_stack_widening_explicit`]).
+    fn widen_stack_reads(&mut self) {
+        for block_idx in 0..self.function.blocks().len() {
+            let count = self
+                .function
+                .block(block_idx)
+                .map_or(0, |block| block.instructions().len());
+            // Last first, so an insertion moves no instruction still to be read.
+            for instr_idx in (0..count).rev() {
+                let Some(op) = self
+                    .function
+                    .block(block_idx)
+                    .and_then(|block| block.instruction(instr_idx))
+                    .map(|instr| instr.op().clone())
+                else {
+                    continue;
+                };
+                let reads = Self::narrow_stack_reads(&self.function, &op);
+                if reads.is_empty() {
+                    continue;
+                }
+                let mut rewritten = op;
+                let mut widenings = Vec::with_capacity(reads.len());
+                for read in reads {
+                    if let Some((instr, widened)) =
+                        Self::stack_widening(&mut self.function, read, block_idx, instr_idx)
+                    {
+                        rewritten.replace_uses(read, widened);
+                        widenings.push(instr);
+                    }
+                }
+                if let Some(block) = self.function.block_mut(block_idx) {
+                    if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
+                        instr.set_op_preserving_type(rewritten, Rewrite::Host);
+                    }
+                    for widening in widenings.into_iter().rev() {
+                        block.instructions_mut().insert(instr_idx, widening);
+                    }
+                }
+            }
+        }
+    }
+
+    /// States the `int32` a narrow value is where a block leaves it on the evaluation stack
+    /// for its successors.
+    ///
+    /// A value a block passes on the stack is read in another block, where construction
+    /// names it only once it has resolved the read to its definition, after
+    /// [`Self::widen_stack_reads`] has run; and the successor reads it as the `int32` the stack
+    /// holds, whatever reads it there. So the last value of each stack position a block
+    /// leaves filled is extended, by its own signedness, at the end of the block, as a
+    /// version of that position: the successor's read reaches the extension, and a join of
+    /// two such values merges two `int32`s. A `bool` is not: a truth value is 0 or 1 at any
+    /// width, the verifier holds it to none, and two joined stay one, which a computing read
+    /// extends where it is made ([`Self::make_stack_widening_explicit`]).
+    fn widen_stack_exits(&mut self) {
+        for block_idx in 0..self.function.blocks().len() {
+            let depth = self.exit_depths.get(&block_idx).copied().unwrap_or(0);
+            if depth == 0 {
+                continue;
+            }
+            // The last definition of each position the block leaves filled.
+            let mut last: BTreeMap<usize, SsaVarId> = BTreeMap::new();
+            if let Some(block) = self.function.block(block_idx) {
+                for instr in block.instructions() {
+                    for def in instr.op().defs() {
+                        let position = (0..depth).find(|position| {
+                            self.function.rename_group(def) == self.stack_group(*position)
+                        });
+                        if let Some(position) = position {
+                            last.insert(position, def);
+                        }
+                    }
+                }
+            }
+            for (position, value) in last {
+                // A truth value is 0 or 1 at any width, and a join of two stays one.
+                let Some(unsigned) = self
+                    .function
+                    .variable(value)
+                    .filter(|v| *v.var_type() != SsaType::Bool)
+                    .and_then(|v| Self::narrow_integer(v.var_type()))
+                    .map(|(_, unsigned)| unsigned)
+                else {
+                    continue;
+                };
+                let at = self.function.block(block_idx).map_or(0, |block| {
+                    let count = block.instructions().len();
+                    let terminates = block
+                        .instructions()
+                        .last()
+                        .is_some_and(|instr| instr.op().is_terminator());
+                    if terminates {
+                        count.saturating_sub(1)
+                    } else {
+                        count
+                    }
+                });
+                let widened = self.function.create_variable(
+                    self.stack_slot_origin(position),
+                    0,
+                    DefSite::instruction(block_idx, at),
+                    SsaType::I32,
+                );
+                self.function
+                    .set_rename_group(widened, self.stack_group(position));
+                let widening = SsaInstruction::synthetic(SsaOp::IntConv {
+                    dest: widened,
+                    operand: value,
+                    target: SsaType::I32,
+                    overflow_check: false,
+                    unsigned,
+                })
+                .with_result_type(SsaType::I32);
+                if let Some(block) = self.function.block_mut(block_idx) {
+                    block.instructions_mut().insert(at, widening);
+                }
+            }
+        }
+    }
+
+    /// [`Self::widen_stack_reads`] for the values construction typed: a phi's result read by
+    /// an operation that computes with it, and a phi operand narrower than the phi's result,
+    /// which is merged as the `int32` it is on the stack and so extended at the end of the
+    /// predecessor it arrives from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insertion's repair fails.
+    fn make_stack_widening_explicit(&mut self) -> Result<()> {
+        // What each instruction reads narrow, and each phi operand to extend.
+        let mut reads: Vec<(usize, usize, Vec<SsaVarId>)> = Vec::new();
+        let mut merged: Vec<(usize, usize, usize, SsaVarId)> = Vec::new();
+        for (block_idx, block) in self.function.blocks().iter().enumerate() {
+            for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
+                let result = self
+                    .function
+                    .variable(phi.result())
+                    .and_then(|v| CilTarget::bit_width(v.var_type()));
+                for (operand_idx, operand) in phi.operands().iter().enumerate() {
+                    let narrower = self
+                        .function
+                        .variable(operand.value())
+                        .and_then(|v| Self::narrow_integer(v.var_type()))
+                        .is_some_and(|(width, _)| result.is_some_and(|result| width < result));
+                    if narrower {
+                        merged.push((block_idx, phi_idx, operand_idx, operand.value()));
+                    }
+                }
+            }
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                let narrow = Self::narrow_stack_reads(&self.function, instr.op());
+                if !narrow.is_empty() {
+                    reads.push((block_idx, instr_idx, narrow));
+                }
+            }
+        }
+        if reads.is_empty() && merged.is_empty() {
+            return Ok(());
+        }
+        // Each phi operand reads its extension, defined at the end of its predecessor.
+        let mut at_exits: Vec<(usize, SsaInstruction)> = Vec::new();
+        for (block_idx, phi_idx, operand_idx, value) in merged {
+            let Some(predecessor) = self
+                .function
+                .block(block_idx)
+                .and_then(|block| block.phi_nodes().get(phi_idx))
+                .and_then(|phi| phi.operands().get(operand_idx))
+                .map(PhiOperand::predecessor)
+            else {
+                continue;
+            };
+            let exit = self
+                .function
+                .block(predecessor)
+                .map_or(0, |block| block.instructions().len());
+            let Some((instr, widened)) =
+                Self::stack_widening(&mut self.function, value, predecessor, exit)
+            else {
+                continue;
+            };
+            if let Some(operand) = self
+                .function
+                .block_mut(block_idx)
+                .and_then(|block| block.phi_nodes_mut().get_mut(phi_idx))
+                .and_then(|phi| phi.operands_mut().get_mut(operand_idx))
+            {
+                operand.set_value(widened);
+            }
+            at_exits.push((predecessor, instr));
+        }
+        // Each read its own extension, defined right before it; the last first, so an
+        // insertion moves no instruction still to be rewritten.
+        let mut before: Vec<(usize, usize, SsaOp, Vec<SsaInstruction>)> = Vec::new();
+        for (block_idx, instr_idx, narrow) in reads {
+            let Some(mut op) = self
+                .function
+                .block(block_idx)
+                .and_then(|block| block.instruction(instr_idx))
+                .map(|instr| instr.op().clone())
+            else {
+                continue;
+            };
+            let mut widenings = Vec::with_capacity(narrow.len());
+            for read in narrow {
+                if let Some((instr, widened)) =
+                    Self::stack_widening(&mut self.function, read, block_idx, instr_idx)
+                {
+                    op.replace_uses(read, widened);
+                    widenings.push(instr);
+                }
+            }
+            before.push((block_idx, instr_idx, op, widenings));
+        }
+        before.sort_by_key(|entry| std::cmp::Reverse((entry.0, entry.1)));
+        self.function
+            .edit(SsaEditOptions::new(), |editor| {
+                for (block_idx, instr_idx, op, widenings) in before {
+                    editor.replace_instruction_op(block_idx, instr_idx, op)?;
+                    for widening in widenings.into_iter().rev() {
+                        editor.insert_instruction(block_idx, instr_idx, widening)?;
+                    }
+                }
+                for (predecessor, widening) in at_exits {
+                    editor.insert_before_terminator(predecessor, widening)?;
+                }
+                Ok(())
+            })
+            .map_err(|e| Error::SsaError(e.to_string()))?;
+        Ok(())
     }
 
     /// Resolves Unknown-typed phi variables from their operands.
@@ -2301,7 +2724,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        analysis::{SsaVerifier, TypeRef, VerifyLevel},
+        analysis::{SsaVerifier, TypeRef, VerifierError, VerifyLevel},
         assembly::InstructionAssembler,
         testkit::{build_cfg, build_ssa, build_ssa_with_handlers, TestTypeProvider},
     };
@@ -2479,6 +2902,236 @@ mod tests {
             value = *src;
         }
         value
+    }
+
+    /// The SSA of `asm`, its arguments and locals typed as given.
+    fn lifted(asm: InstructionAssembler, args: Vec<SsaType>, locals: Vec<SsaType>) -> SsaFunction {
+        let (_, cfg) = build_cfg(asm).expect("assembles and decodes");
+        build_ssa(&cfg, &TestTypeProvider::typed(args, locals)).expect("SSA construction failed")
+    }
+
+    /// Whether `var` is the `int32` extension of a narrow value: a conversion to `int32`
+    /// reading `unsigned` as given.
+    fn is_widening(ssa: &SsaFunction, var: SsaVarId, unsigned: bool) -> bool {
+        ssa.variable(var)
+            .is_some_and(|v| *v.var_type() == SsaType::I32)
+            && matches!(
+                defining_op(ssa, var),
+                Some(SsaOp::IntConv {
+                    target: SsaType::I32,
+                    overflow_check: false,
+                    unsigned: reads,
+                    ..
+                }) if *reads == unsigned
+            )
+    }
+
+    /// No operation of `ssa` computes over operands of two widths.
+    fn widths_agree(ssa: &SsaFunction) -> bool {
+        !SsaVerifier::new(ssa)
+            .verify(VerifyLevel::Standard)
+            .iter()
+            .any(|finding| matches!(finding, VerifierError::InvalidOperandWidths { .. }))
+    }
+
+    /// An operation reads a narrow value as the `int32` the evaluation stack holds it as
+    /// (ECMA-335 III.1.1): `b ^ b` over a `byte` is an `int32` exclusive or of its
+    /// zero-extension, and over an `sbyte` of its sign-extension, so no operation computes
+    /// over an 8-bit operand and a 32-bit one.
+    #[test]
+    fn an_operation_reads_a_narrow_value_as_its_int32() {
+        for (ty, unsigned) in [
+            (SsaType::U8, true),
+            (SsaType::I8, false),
+            (SsaType::I16, false),
+            (SsaType::Char, true),
+            (SsaType::Bool, true),
+        ] {
+            let mut asm = InstructionAssembler::new();
+            asm.ldarg_0()
+                .unwrap()
+                .ldarg_0()
+                .unwrap()
+                .xor()
+                .unwrap()
+                .ret()
+                .unwrap();
+            let ssa = lifted(asm, vec![ty.clone()], vec![]);
+            let Some(SsaOp::Xor { left, right, .. }) = defining_op(&ssa, returned_value(&ssa))
+            else {
+                panic!("the body returns an exclusive or:\n{ssa}");
+            };
+            assert!(
+                is_widening(&ssa, *left, unsigned) && is_widening(&ssa, *right, unsigned),
+                "{ty:?} is read as its int32:\n{ssa}"
+            );
+            assert!(widths_agree(&ssa), "{ty:?}:\n{ssa}");
+        }
+    }
+
+    /// A narrow value stored into a wider slot stores the `int32` it is: an `sbyte` -1
+    /// stored into an `int32` local is -1 there, so a later `conv.u8` of the local reads
+    /// `0xFFFFFFFF`, not the byte's own bits.
+    #[test]
+    fn a_narrow_value_stored_into_a_wider_slot_is_its_int32() {
+        let mut asm = InstructionAssembler::new();
+        asm.ldarg_0()
+            .unwrap()
+            .stloc_0()
+            .unwrap()
+            .ldloc_0()
+            .unwrap()
+            .ret()
+            .unwrap();
+        let ssa = lifted(asm, vec![SsaType::I8], vec![SsaType::I32]);
+        assert!(
+            is_widening(&ssa, returned_value(&ssa), false),
+            "the local holds the sign-extended int32:\n{ssa}"
+        );
+    }
+
+    /// A `char` stored into a `byte` local is truncated to it, as every narrower store is:
+    /// a `char` is an integer to the instructions that read it.
+    #[test]
+    fn a_char_stored_into_a_byte_slot_is_truncated() {
+        let mut asm = InstructionAssembler::new();
+        asm.ldarg_0()
+            .unwrap()
+            .stloc_0()
+            .unwrap()
+            .ldloc_0()
+            .unwrap()
+            .ret()
+            .unwrap();
+        let ssa = lifted(asm, vec![SsaType::Char], vec![SsaType::U8]);
+        let truncates = ssa
+            .blocks()
+            .iter()
+            .flat_map(|block| block.instructions())
+            .any(|instr| {
+                matches!(
+                    instr.op(),
+                    SsaOp::IntConv {
+                        target: SsaType::U8,
+                        ..
+                    }
+                )
+            });
+        assert!(truncates, "the store truncates the char to a byte:\n{ssa}");
+    }
+
+    /// A conversion that reads a narrow value the other way than its own signedness, where
+    /// that shows, converts the `int32` the stack holds: `conv.u8` of an `sbyte` -1
+    /// zero-extends `0xFFFFFFFF`. One that reads it as its own signedness, or truncates it,
+    /// reads the narrow value itself, which converts alike.
+    #[test]
+    fn a_conversion_reads_a_narrow_value_as_the_stack_holds_it() {
+        let conversion = |ty: SsaType, emit: fn(&mut InstructionAssembler)| {
+            let mut asm = InstructionAssembler::new();
+            asm.ldarg_0().unwrap();
+            emit(&mut asm);
+            asm.ret().unwrap();
+            let ssa = lifted(asm, vec![ty], vec![]);
+            let Some(SsaOp::IntConv { operand, .. }) = defining_op(&ssa, returned_value(&ssa))
+            else {
+                panic!("the body returns a conversion:\n{ssa}");
+            };
+            (ssa.clone(), *operand)
+        };
+        let (ssa, operand) = conversion(SsaType::I8, |asm| {
+            asm.conv_u8().unwrap();
+        });
+        assert!(is_widening(&ssa, operand, false), "{ssa}");
+        let (ssa, operand) = conversion(SsaType::I8, |asm| {
+            asm.conv_i8().unwrap();
+        });
+        assert!(!is_widening(&ssa, operand, false), "{ssa}");
+        let (ssa, operand) = conversion(SsaType::I16, |asm| {
+            asm.conv_u1().unwrap();
+        });
+        assert!(!is_widening(&ssa, operand, false), "{ssa}");
+    }
+
+    /// A comparison's result is read as the `int32` 0 or 1 it pushes: `not` of it is -2 or
+    /// -1, not a logical negation.
+    #[test]
+    fn a_comparison_result_is_read_as_its_int32() {
+        let mut asm = InstructionAssembler::new();
+        asm.ldarg_0()
+            .unwrap()
+            .ldarg_1()
+            .unwrap()
+            .ceq()
+            .unwrap()
+            .not()
+            .unwrap()
+            .ret()
+            .unwrap();
+        let ssa = lifted(asm, vec![SsaType::I32, SsaType::I32], vec![]);
+        let Some(SsaOp::Not { operand, .. }) = defining_op(&ssa, returned_value(&ssa)) else {
+            panic!("the body returns a complement:\n{ssa}");
+        };
+        assert!(is_widening(&ssa, *operand, true), "{ssa}");
+    }
+
+    /// A narrow value merged with a wider one where two paths join is merged as the `int32`
+    /// it is: the phi reads its extension, defined at the end of the path it arrives from.
+    #[test]
+    fn a_narrow_value_merged_into_a_wider_phi_is_its_int32() {
+        let mut asm = InstructionAssembler::new();
+        asm.ldarg_1()
+            .unwrap()
+            .brtrue_s("wide")
+            .unwrap()
+            .ldarg_0()
+            .unwrap()
+            .br_s("join")
+            .unwrap()
+            .label("wide")
+            .unwrap()
+            .ldc_i4(300)
+            .unwrap()
+            .label("join")
+            .unwrap()
+            .ret()
+            .unwrap();
+        let ssa = lifted(asm, vec![SsaType::U8, SsaType::I32], vec![]);
+        let phis: Vec<_> = ssa
+            .blocks()
+            .iter()
+            .flat_map(|block| block.phi_nodes())
+            .filter(|phi| {
+                ssa.variable(phi.result())
+                    .is_some_and(|v| *v.var_type() == SsaType::I32)
+            })
+            .collect();
+        assert!(!phis.is_empty(), "the join merges into an int32:\n{ssa}");
+        for phi in phis {
+            for operand in phi.operands() {
+                let ty = ssa.variable(operand.value()).map(|v| v.var_type().clone());
+                assert_eq!(
+                    ty,
+                    Some(SsaType::I32),
+                    "every merged value is an int32:\n{ssa}"
+                );
+            }
+        }
+    }
+
+    /// A block that returns, throws or leaves passes no stack on, so the narrow value it
+    /// returns is no value flowing to a successor, and nothing widens it.
+    #[test]
+    fn a_returned_narrow_value_is_not_widened() {
+        let mut asm = InstructionAssembler::new();
+        asm.ldarg_0().unwrap().ret().unwrap();
+        let ssa = lifted(asm, vec![SsaType::U8], vec![]);
+        let conversions = ssa
+            .blocks()
+            .iter()
+            .flat_map(|block| block.instructions())
+            .filter(|instr| matches!(instr.op(), SsaOp::IntConv { .. }))
+            .count();
+        assert_eq!(conversions, 0, "the byte is returned as it is:\n{ssa}");
     }
 
     #[test]

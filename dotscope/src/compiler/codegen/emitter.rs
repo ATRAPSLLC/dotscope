@@ -239,29 +239,65 @@ pub fn emit_ldloca(encoder: &mut InstructionEncoder, index: u16) -> Result<()> {
     Ok(())
 }
 
-/// Emits a conversion instruction based on target type and options.
+/// Emits a conversion of the value on the stack, of type `source` when known, to `target`.
+///
+/// The IR's integer conversion reads its operand at the operand's own declared width and,
+/// widening, extends it as `unsigned` says; CIL's `conv` converts the `int32` or `int64` on
+/// the evaluation stack (ECMA-335 III.1.1, III.3.27 - III.3.30), where a value of 16 bits or
+/// fewer is held extended by its own type's signedness. So:
+///
+/// - A narrow source read the other way than its own signedness is first re-extended as the
+///   conversion reads it (`conv.u1` for an `sbyte` read unsigned), wherever the difference
+///   shows: in a widening, an overflow check or a conversion to a float. A truncation keeps
+///   the low bits either way. The lift states such readings itself; a pass may write one.
+/// - An unchecked widening to 64 bits or to a native integer extends as `unsigned` says:
+///   `conv.u8` zero-extends and `conv.i8` sign-extends, whatever the target's signedness
+///   (C# spells `(ulong)intValue` `conv.i8`). A narrower target names its own width and
+///   signedness, which is what the result is.
+/// - An unsigned integer converted to a float goes through `conv.r.un`, which reads it as
+///   unsigned, and then to the target width: `conv.r4` or `conv.r8` alone read it as signed,
+///   and `uint` 3000000000 came out negative.
+///
+/// A target with no conversion CIL can spell is an error, not a conversion left out.
 ///
 /// # Arguments
 ///
-/// * `target` - The target type to convert to
-/// * `overflow_check` - Whether to check for overflow
-/// * `unsigned` - Whether the source value is unsigned
-///
-/// An unsigned integer converted to a float goes through `conv.r.un`, which
-/// reads it as unsigned, and then to the target width: `conv.r4` or `conv.r8`
-/// alone read it as signed, and `uint` 3000000000 came out negative. A target
-/// with no conversion CIL can spell is an error, not a conversion left out.
+/// * `source` - The type of the value converted, when known.
+/// * `target` - The type to convert to.
+/// * `overflow_check` - Whether to check for overflow.
+/// * `unsigned` - Whether the source value is read as unsigned.
 ///
 /// # Errors
 ///
 /// Returns [`Error::CodegenFailed`] for a target no `conv` produces.
 pub fn emit_conv(
     encoder: &mut InstructionEncoder,
+    source: Option<&SsaType>,
     target: &SsaType,
     overflow_check: bool,
     unsigned: bool,
 ) -> Result<()> {
-    if matches!(target, SsaType::F32 | SsaType::F64) {
+    let float = matches!(target, SsaType::F32 | SsaType::F64);
+    let target_bits = target.size_bytes().map(|bytes| bytes.saturating_mul(8));
+    if let Some((bits, own_unsigned)) = source.and_then(|source| match source {
+        SsaType::I8 => Some((8, false)),
+        SsaType::U8 => Some((8, true)),
+        SsaType::I16 => Some((16, false)),
+        SsaType::U16 | SsaType::Char => Some((16, true)),
+        _ => None,
+    }) {
+        let widens = target_bits.is_none_or(|target| target > bits);
+        if own_unsigned != unsigned && (overflow_check || float || widens) {
+            let extension = match (bits, unsigned) {
+                (8, true) => "conv.u1",
+                (8, false) => "conv.i1",
+                (_, true) => "conv.u2",
+                (_, false) => "conv.i2",
+            };
+            encoder.emit_instruction(extension, None)?;
+        }
+    }
+    if float {
         if unsigned {
             encoder.emit_instruction("conv.r.un", None)?;
         }
@@ -273,18 +309,33 @@ pub fn emit_conv(
         encoder.emit_instruction(width, None)?;
         return Ok(());
     }
-    let base = match target {
-        SsaType::I8 => "i1",
-        SsaType::I16 => "i2",
-        SsaType::I32 => "i4",
-        SsaType::I64 => "i8",
-        SsaType::U8 => "u1",
-        SsaType::U16 | SsaType::Char => "u2",
-        SsaType::U32 => "u4",
-        SsaType::U64 => "u8",
-        SsaType::NativeInt => "i",
-        SsaType::NativeUInt => "u",
-        other => {
+    let base = match (target, overflow_check) {
+        // An unchecked widening extends as the source is read.
+        (SsaType::I64 | SsaType::U64, false) => {
+            if unsigned {
+                "u8"
+            } else {
+                "i8"
+            }
+        }
+        (SsaType::NativeInt | SsaType::NativeUInt, false) => {
+            if unsigned {
+                "u"
+            } else {
+                "i"
+            }
+        }
+        (SsaType::I8, _) => "i1",
+        (SsaType::I16, _) => "i2",
+        (SsaType::I32, _) => "i4",
+        (SsaType::I64, _) => "i8",
+        (SsaType::U8, _) => "u1",
+        (SsaType::U16 | SsaType::Char, _) => "u2",
+        (SsaType::U32, _) => "u4",
+        (SsaType::U64, _) => "u8",
+        (SsaType::NativeInt, _) => "i",
+        (SsaType::NativeUInt, _) => "u",
+        (other, _) => {
             return Err(Error::CodegenFailed(format!(
                 "no CIL conversion produces {other:?}"
             )))
@@ -553,14 +604,86 @@ mod tests {
             (SsaType::F64, false, true, &["conv.r.un", "conv.r8"]),
         ];
         for (target, overflow, unsigned, expected) in cases {
-            let got = mnemonics(|e| emit_conv(e, target, *overflow, *unsigned)).unwrap();
+            let got = mnemonics(|e| emit_conv(e, None, target, *overflow, *unsigned)).unwrap();
             assert_eq!(
                 &got, expected,
                 "{target:?} overflow={overflow} unsigned={unsigned}"
             );
         }
-        assert!(mnemonics(|e| emit_conv(e, &SsaType::Bool, false, false)).is_err());
-        assert!(mnemonics(|e| emit_conv(e, &SsaType::Object, false, false)).is_err());
+        assert!(mnemonics(|e| emit_conv(e, None, &SsaType::Bool, false, false)).is_err());
+        assert!(mnemonics(|e| emit_conv(e, None, &SsaType::Object, false, false)).is_err());
+    }
+
+    /// An unchecked widening extends as the conversion reads its source, not as the
+    /// target's type is signed: `IntConv { target: U64, unsigned: false }` of an `int32`
+    /// sign-extends, and `IntConv { target: I64, unsigned: true }` zero-extends.
+    #[test]
+    fn a_widening_extends_as_its_source_is_read() {
+        let cases: &[(SsaType, bool, &[&str])] = &[
+            (SsaType::U64, false, &["conv.i8"]),
+            (SsaType::I64, true, &["conv.u8"]),
+            (SsaType::NativeUInt, false, &["conv.i"]),
+            (SsaType::NativeInt, true, &["conv.u"]),
+        ];
+        for (target, unsigned, expected) in cases {
+            let got =
+                mnemonics(|e| emit_conv(e, Some(&SsaType::I32), target, false, *unsigned)).unwrap();
+            assert_eq!(&got, expected, "{target:?} unsigned={unsigned}");
+        }
+    }
+
+    /// A narrow source on the stack is extended by its own signedness; read the other way,
+    /// it is re-extended first wherever that shows, and not for a truncation.
+    #[test]
+    fn a_narrow_source_read_the_other_way_is_re_extended() {
+        let cases: &[(SsaType, SsaType, bool, bool, &[&str])] = &[
+            (
+                SsaType::I8,
+                SsaType::I64,
+                false,
+                true,
+                &["conv.u1", "conv.u8"],
+            ),
+            (
+                SsaType::U16,
+                SsaType::U64,
+                false,
+                false,
+                &["conv.i2", "conv.i8"],
+            ),
+            (
+                SsaType::Char,
+                SsaType::I32,
+                false,
+                false,
+                &["conv.i2", "conv.i4"],
+            ),
+            (
+                SsaType::I8,
+                SsaType::U8,
+                true,
+                true,
+                &["conv.u1", "conv.ovf.u1.un"],
+            ),
+            (
+                SsaType::I16,
+                SsaType::F64,
+                false,
+                true,
+                &["conv.u2", "conv.r.un", "conv.r8"],
+            ),
+            (SsaType::I8, SsaType::I64, false, false, &["conv.i8"]),
+            (SsaType::U8, SsaType::I64, false, true, &["conv.u8"]),
+            (SsaType::I16, SsaType::U8, false, true, &["conv.u1"]),
+        ];
+        for (source, target, overflow, unsigned, expected) in cases {
+            let got =
+                mnemonics(|e| emit_conv(e, Some(source), target, *overflow, *unsigned)).unwrap();
+            assert_eq!(
+                &got, expected,
+                "{source:?} -> {target:?} overflow={overflow} unsigned={unsigned}"
+            );
+        }
     }
 
     #[test]

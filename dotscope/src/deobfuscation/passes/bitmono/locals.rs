@@ -387,6 +387,18 @@ fn constant_operand(defs: &Defs, left: SsaVarId, right: SsaVarId) -> Option<(Ssa
     defs.bits(left).map(|value| (right, value))
 }
 
+/// The narrow value `var` is the stack's `int32` of ([`CilTarget::is_stack_widening`]), or
+/// `var` itself: a load of an 8- or 16-bit local is that local's value, widened as the stack
+/// holds it.
+fn unwidened(defs: &Defs, var: SsaVarId) -> SsaVarId {
+    match defs.op(var) {
+        Some(op @ SsaOp::IntConv { operand, .. }) if CilTarget::is_stack_widening(defs.ssa, op) => {
+            *operand
+        }
+        _ => var,
+    }
+}
+
 /// The encode defining `var`: `conv_w(((x ^ k) * m) + a)`.
 fn encode_of(defs: &Defs, var: SsaVarId) -> Option<Encode> {
     let (sum, narrow) = match defs.op(var)? {
@@ -411,6 +423,7 @@ fn encode_of(defs: &Defs, var: SsaVarId) -> Option<Encode> {
         return None;
     };
     let (operand, xor) = constant_operand(defs, *left, *right)?;
+    let operand = unwidened(defs, operand);
     let width = width_of(narrow.clone(), defs.ssa, sum)?;
     let key = Key {
         xor,
@@ -427,7 +440,8 @@ fn encode_of(defs: &Defs, var: SsaVarId) -> Option<Encode> {
 }
 
 /// The decode `op` starts, if it is the `y - a` of `conv_w(((y - a) * m') ^ k)` and each step
-/// is read by the next alone.
+/// is read by the next alone. A `y` the stack widens is read as the narrow value, when the
+/// widening is read by the decode alone.
 fn decode_at(
     defs: &Defs,
     users: &HashMap<SsaVarId, Vec<Use>>,
@@ -451,6 +465,12 @@ fn decode_at(
             .and_then(|block| block.instructions().get(*instr_idx))
             .map(|instr| instr.op().clone()),
         _ => None,
+    };
+    let narrow_read = unwidened(defs, *read);
+    let read = if narrow_read != *read && next(*read).is_some() {
+        narrow_read
+    } else {
+        *read
     };
 
     let SsaOp::Mul {
@@ -490,7 +510,7 @@ fn decode_at(
         None => (mixed, None),
     };
     Some(Decode {
-        read: *read,
+        read,
         dest,
         unnarrowed: mixed,
         inverse,
@@ -662,8 +682,9 @@ mod tests {
     use super::*;
     use crate::{
         analysis::{CallGraph, SsaFunctionBuilder},
+        assembly::InstructionAssembler,
         metadata::token::Token,
-        testkit::passes::run_verified,
+        testkit::{build_cfg, build_ssa, passes::run_verified, TestTypeProvider},
     };
 
     /// A 32-bit key: the xor key, an odd multiplier and its inverse, the addend.
@@ -772,6 +793,81 @@ mod tests {
                 ssa.get_definition(var)
             );
         }
+    }
+
+    /// A `char` local is encoded on its store and decoded on its load, which the lift reads as
+    /// the stack's `int32` of the `char`: the decode reads the local through that widening, and
+    /// the web is carried plain all the same.
+    #[test]
+    fn a_narrow_local_decoded_from_its_widened_load_is_carried_plain() {
+        const XOR16: i32 = 23259;
+        const MULTIPLIER16: i32 = 53605;
+        const INVERSE16: i32 = 63597;
+        const ADDEND16: i32 = 8710;
+        let mut asm = InstructionAssembler::new();
+        asm.ldarg_0()
+            .unwrap()
+            .ldc_i4(XOR16)
+            .unwrap()
+            .xor()
+            .unwrap()
+            .ldc_i4(MULTIPLIER16)
+            .unwrap()
+            .mul()
+            .unwrap()
+            .ldc_i4(ADDEND16)
+            .unwrap()
+            .add()
+            .unwrap()
+            .conv_u2()
+            .unwrap()
+            .stloc_0()
+            .unwrap()
+            .ldloc_0()
+            .unwrap()
+            .ldc_i4(ADDEND16)
+            .unwrap()
+            .sub()
+            .unwrap()
+            .ldc_i4(INVERSE16)
+            .unwrap()
+            .mul()
+            .unwrap()
+            .ldc_i4(XOR16)
+            .unwrap()
+            .xor()
+            .unwrap()
+            .conv_u2()
+            .unwrap()
+            .ret()
+            .unwrap();
+        let (_, cfg) = build_cfg(asm).expect("assembles and decodes");
+        let mut ssa = build_ssa(
+            &cfg,
+            &TestTypeProvider::typed(vec![SsaType::Char], vec![SsaType::Char]),
+        )
+        .expect("lifts");
+        let widened = ssa.all_instructions().any(|instr| {
+            CilTarget::is_stack_widening(&ssa, instr.op())
+                && matches!(instr.op(), SsaOp::IntConv { operand, .. }
+                    if ssa.variable(*operand).is_some_and(|v| *v.var_type() == SsaType::Char))
+        });
+        assert!(widened, "the lift widens the loaded char:\n{ssa}");
+        assert!(run(&mut ssa), "the web is reversed:\n{ssa}");
+        let decoded = ssa
+            .all_instructions()
+            .filter_map(|instr| match instr.op() {
+                SsaOp::Return {
+                    value: Some(value), ..
+                } => Some(*value),
+                _ => None,
+            })
+            .next()
+            .expect("returns a value");
+        assert!(
+            matches!(ssa.get_definition(decoded), Some(SsaOp::Copy { .. })),
+            "the load is the plain local:\n{ssa}"
+        );
     }
 
     #[test]

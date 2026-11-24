@@ -43,7 +43,7 @@ use analyssa::analysis::copies::ParallelCopy;
 
 use crate::{
     analysis::{
-        BlockRange, Callee, CilPrefix, CmpKind, ConstValue, FloatFormat, HandlerKind,
+        BlockRange, Callee, CilPrefix, CilTarget, CmpKind, ConstValue, FloatFormat, HandlerKind,
         RuntimeValueKind, SsaBlock, SsaFunction, SsaOp, SsaType, SsaVarId, SsaVerifier,
         VerifierError, VerifyLevel,
     },
@@ -314,6 +314,67 @@ struct InternedArrayInfo {
     field_token: Token,
     /// Token of `RuntimeHelpers.InitializeArray` MemberRef (for `call`).
     initialize_array_token: Token,
+}
+
+/// The width and signedness of a narrow integer type: one the evaluation stack holds
+/// extended to an `int32` by its signedness. A `bool` has none: a truth value is its 0 or 1
+/// however it is held, so there is no form of it to re-establish.
+fn narrow_form(ty: &SsaType) -> Option<(u32, bool)> {
+    match ty {
+        SsaType::I8 => Some((8, false)),
+        SsaType::U8 => Some((8, true)),
+        SsaType::I16 => Some((16, false)),
+        SsaType::U16 | SsaType::Char => Some((16, true)),
+        _ => None,
+    }
+}
+
+/// The stack form a copy `op` has to give its destination, when the stack does not already
+/// hold the source that way: a copy into a narrow integer from one of another width or
+/// signedness. A same-width reinterpretation keeps the bits, which is a copy to the IR, but
+/// the stack holds a `byte` 255 zero-extended and an `sbyte` -1 sign-extended; and a copy
+/// from a wider integer keeps only the destination's bits. A copy into a wider integer needs
+/// nothing: a narrow value's stack form is the wider one's value. Nor does a copy of an
+/// `int32` the stack already holds in the destination's form: a constant in its range, a
+/// comparison's 0 or 1, or a truth value.
+fn converting_copy(ssa: &SsaFunction, op: &SsaOp) -> Option<(u32, bool)> {
+    let SsaOp::Copy { dest, src } = op else {
+        return None;
+    };
+    let dest_form = ssa
+        .variable(*dest)
+        .and_then(|var| narrow_form(var.var_type()))?;
+    let source = ssa.variable(*src)?.var_type();
+    let converts = match narrow_form(source) {
+        Some(src_form) => src_form != dest_form,
+        None => source.is_integer() && *source != SsaType::Bool,
+    };
+    if !converts {
+        return None;
+    }
+    let (min, max) = match dest_form {
+        (8, true) => (0, i64::from(u8::MAX)),
+        (8, false) => (i64::from(i8::MIN), i64::from(i8::MAX)),
+        (16, true) => (0, i64::from(u16::MAX)),
+        _ => (i64::from(i16::MIN), i64::from(i16::MAX)),
+    };
+    let held = match ssa.get_definition(*src) {
+        Some(SsaOp::Ceq { .. } | SsaOp::Clt { .. } | SsaOp::Cgt { .. }) => true,
+        Some(SsaOp::Const { value, .. }) => {
+            let stack: Option<i64> = match value {
+                ConstValue::I8(v) => Some(i64::from(*v)),
+                ConstValue::U8(v) => Some(i64::from(*v)),
+                ConstValue::I16(v) => Some(i64::from(*v)),
+                ConstValue::U16(v) => Some(i64::from(*v)),
+                ConstValue::I32(v) => Some(i64::from(*v)),
+                ConstValue::U32(v) => Some(i64::from(v.cast_signed())),
+                _ => None,
+            };
+            stack.is_some_and(|v| (min..=max).contains(&v))
+        }
+        _ => false,
+    };
+    (!held).then_some(dest_form)
 }
 
 /// The stack slots a call pops for `count` arguments.
@@ -2042,12 +2103,214 @@ impl SsaCodeGenerator {
     ) -> Result<()> {
         let op = Self::op_at(ssa, tag)?;
         let start = encoder.instruction_count();
+        self.read_narrow_operands(encoder, ssa, op)?;
         for prefix in CilPrefix::of(op) {
             Self::generate_prefix(encoder, &prefix)?;
         }
         self.generate_op_core_untracked(encoder, ssa, tag.block, op, next_entry)?;
+        Self::normalize_narrow_result(encoder, ssa, op)?;
         self.record_group(start, encoder.instruction_count(), tag);
         Ok(())
+    }
+
+    /// Re-extends the operands of `op`, already on the stack, that it reads at a narrow width
+    /// differently from how the stack holds them.
+    ///
+    /// The stack holds a narrow value extended by its own type's signedness. An operation
+    /// computing at a narrow width (a pass narrows `(short)(a / b)` to a 16-bit division)
+    /// whose result depends on its operands' high bits - a right shift, a division or
+    /// remainder, an overflow-checked operation, a comparison - reads them extended by its
+    /// own signedness instead, and CIL computes at 32 bits: an `int16` -1 shifted right
+    /// unsigned at 16 bits is `0x7FFF`, the stack's `0xFFFFFFFF` shifted is not. Each such
+    /// operand is re-extended as the operation reads it: in place on top of the stack, and
+    /// through temporaries below it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a temporary cannot be declared.
+    fn read_narrow_operands(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        let form = |var: &SsaVarId| ssa.variable(*var).and_then(|v| narrow_form(v.var_type()));
+        let dest_form = op.dest().as_ref().and_then(form);
+        // The operands in stack order, and the narrow reading the operation makes of them.
+        let (operands, reading): (Vec<SsaVarId>, Option<(u32, bool)>) = match op {
+            SsaOp::Shr {
+                value,
+                amount,
+                unsigned,
+                ..
+            } => (
+                vec![*value, *amount],
+                dest_form.map(|(width, _)| (width, *unsigned)),
+            ),
+            SsaOp::Div {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::Rem {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::AddOvf {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::SubOvf {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::MulOvf {
+                left,
+                right,
+                unsigned,
+                ..
+            } => (
+                vec![*left, *right],
+                dest_form.map(|(width, _)| (width, *unsigned)),
+            ),
+            SsaOp::Clt {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::Cgt {
+                left,
+                right,
+                unsigned,
+                ..
+            } => (
+                vec![*left, *right],
+                form(left).map(|(width, _)| (width, *unsigned)),
+            ),
+            SsaOp::BranchCmp {
+                left,
+                right,
+                cmp,
+                unsigned,
+                ..
+            } if !matches!(cmp, CmpKind::Eq | CmpKind::Ne) => (
+                vec![*left, *right],
+                form(left).map(|(width, _)| (width, *unsigned)),
+            ),
+            // An equality reads both alike; operands held alike already are.
+            SsaOp::Ceq { left, right, .. } | SsaOp::BranchCmp { left, right, .. } => {
+                let alike = form(left) == form(right);
+                (
+                    vec![*left, *right],
+                    form(left)
+                        .filter(|_| !alike)
+                        .map(|(width, _)| (width, true)),
+                )
+            }
+            _ => return Ok(()),
+        };
+        let Some((width, unsigned)) = reading else {
+            return Ok(());
+        };
+        // A shift reads its count as a count, in no window: only the shifted value is read.
+        let counted = matches!(op, SsaOp::Shr { .. });
+        let needs: Vec<bool> = operands
+            .iter()
+            .enumerate()
+            .map(|(index, operand)| {
+                !(counted && index == 1)
+                    && form(operand).is_some_and(|(own_width, own_unsigned)| {
+                        own_width == width && own_unsigned != unsigned
+                    })
+            })
+            .collect();
+        let Some(lowest) = needs.iter().position(|need| *need) else {
+            return Ok(());
+        };
+        // Everything above the lowest operand to re-extend is set aside, top first.
+        let mut aside: Vec<(u16, SsaType)> = Vec::new();
+        for operand in operands.iter().skip(lowest.saturating_add(1)).rev() {
+            let class = ssa
+                .variable(*operand)
+                .map_or(SsaType::I32, |var| var.var_type().stack_type());
+            let slot = self.allocate_temp_local(&class)?;
+            emitter::emit_stloc(encoder, slot)?;
+            aside.push((slot, class));
+        }
+        Self::emit_subword_normalize(encoder, width, !unsigned)?;
+        for (index, (slot, class)) in (lowest.saturating_add(1)..).zip(aside.into_iter().rev()) {
+            emitter::emit_ldloc(encoder, slot)?;
+            if needs.get(index).copied().unwrap_or(false) {
+                Self::emit_subword_normalize(encoder, width, !unsigned)?;
+            }
+            self.release_temp_local(slot, &class);
+        }
+        Ok(())
+    }
+
+    /// Re-establishes the stack form of a narrow result of `op`.
+    ///
+    /// CIL computes every integer operation at 32 bits, so an operation the IR computes at a
+    /// narrow width (a pass narrows `(byte)(a ^ b)` to an 8-bit `xor`) leaves bits above its
+    /// width the stack's form of its type does not have: the sum of two `ushort`s carries
+    /// into bit 16. The result is truncated and extended as its type is held; an
+    /// overflow-checked operation instead checks that its 32-bit result fits its type, which
+    /// is the overflow at its width.
+    fn normalize_narrow_result(
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        let checked = match op {
+            SsaOp::Add { .. }
+            | SsaOp::Sub { .. }
+            | SsaOp::Mul { .. }
+            | SsaOp::Div { .. }
+            | SsaOp::Rem { .. }
+            | SsaOp::And { .. }
+            | SsaOp::Or { .. }
+            | SsaOp::Xor { .. }
+            | SsaOp::Neg { .. }
+            | SsaOp::Not { .. }
+            | SsaOp::Shl { .. }
+            | SsaOp::Shr { .. } => None,
+            SsaOp::AddOvf { unsigned, .. }
+            | SsaOp::SubOvf { unsigned, .. }
+            | SsaOp::MulOvf { unsigned, .. } => Some(*unsigned),
+            _ => return Ok(()),
+        };
+        let Some((width, unsigned)) = op
+            .dest()
+            .and_then(|dest| ssa.variable(dest))
+            .and_then(|var| narrow_form(var.var_type()))
+        else {
+            return Ok(());
+        };
+        match checked {
+            None => Self::emit_subword_normalize(encoder, width, !unsigned),
+            Some(reads_unsigned) => {
+                let base = match (width, unsigned) {
+                    (8, true) => "u1",
+                    (8, false) => "i1",
+                    (_, true) => "u2",
+                    (_, false) => "i2",
+                };
+                let mnemonic = if reads_unsigned {
+                    format!("conv.ovf.{base}.un")
+                } else {
+                    format!("conv.ovf.{base}")
+                };
+                encoder.emit_instruction(&mnemonic, None)
+            }
+        }
     }
 
     /// The operation at `tag`.
@@ -2115,7 +2378,7 @@ impl SsaCodeGenerator {
             | SsaOp::Shl { .. }
             | SsaOp::Shr { .. }
             | SsaOp::Neg { .. }
-            | SsaOp::Not { .. } => Self::generate_arithmetic_op(encoder, op)?,
+            | SsaOp::Not { .. } => Self::generate_arithmetic_op(encoder, ssa, op)?,
 
             // Conversion operations
             SsaOp::IntConv { .. }
@@ -2125,7 +2388,7 @@ impl SsaCodeGenerator {
             | SsaOp::FloatToInt { .. }
             | SsaOp::FloatConv { .. }
             | SsaOp::Ckfinite { .. } => {
-                Self::generate_conversion_op(encoder, op)?;
+                Self::generate_conversion_op(encoder, ssa, op)?;
             }
 
             // Comparison operations
@@ -2449,7 +2712,23 @@ impl SsaCodeGenerator {
     /// Handles: `Add`, `Sub`, `Mul`, `Div`, `Rem`, overflow-checked variants,
     /// `And`, `Or`, `Xor`, `Shl`, `Shr`, `Neg`, `Not`.
     /// Operands are already on the evaluation stack.
-    fn generate_arithmetic_op(encoder: &mut InstructionEncoder, op: &SsaOp) -> Result<()> {
+    ///
+    /// A shift count is an `int32` or a native integer in CIL (ECMA-335 III.3.58, III.3.59);
+    /// one the IR states as 64 bits, as strength reduction states `x * 2^32` over an
+    /// `int64`, is narrowed first: a count that fits the shift fits an `int32`.
+    fn generate_arithmetic_op(
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        if let SsaOp::Shl { amount, .. } | SsaOp::Shr { amount, .. } = op {
+            if ssa
+                .variable(*amount)
+                .is_some_and(|count| matches!(count.var_type(), SsaType::I64 | SsaType::U64))
+            {
+                encoder.emit_instruction("conv.i4", None)?;
+            }
+        }
         match op {
             SsaOp::Add { dest, .. } => {
                 encoder.emit_instruction("add", None)?;
@@ -2593,19 +2872,25 @@ impl SsaCodeGenerator {
     ///
     /// Handles: `Conv` (with overflow check and unsigned variants), `Ckfinite`.
     /// Operand is already on the evaluation stack.
-    fn generate_conversion_op(encoder: &mut InstructionEncoder, op: &SsaOp) -> Result<()> {
+    fn generate_conversion_op(
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        let source = |operand: &SsaVarId| ssa.variable(*operand).map(|var| var.var_type());
         match op {
             // An integer conversion carries an overflow check and whether its
             // source is read unsigned (`.un`); integer→float carries only the
             // latter; the pointer and float-width conversions carry neither.
+            SsaOp::IntConv { .. } if CilTarget::is_stack_widening(ssa, op) => {}
             SsaOp::IntConv {
                 dest,
+                operand,
                 target,
                 overflow_check,
                 unsigned,
-                ..
             } => {
-                emitter::emit_conv(encoder, target, *overflow_check, *unsigned)?;
+                emitter::emit_conv(encoder, source(operand), target, *overflow_check, *unsigned)?;
                 let _ = dest;
             }
             // A float→integer conversion's flag is the destination's sign, which
@@ -2617,22 +2902,23 @@ impl SsaCodeGenerator {
                 overflow_check,
                 ..
             } => {
-                emitter::emit_conv(encoder, target, *overflow_check, false)?;
+                emitter::emit_conv(encoder, None, target, *overflow_check, false)?;
                 let _ = dest;
             }
             SsaOp::IntToFloat {
                 dest,
+                operand,
                 target,
                 unsigned,
                 ..
             } => {
-                emitter::emit_conv(encoder, target, false, *unsigned)?;
+                emitter::emit_conv(encoder, source(operand), target, false, *unsigned)?;
                 let _ = dest;
             }
             SsaOp::IntToPtr { dest, target, .. }
             | SsaOp::PtrToInt { dest, target, .. }
             | SsaOp::FloatConv { dest, target, .. } => {
-                emitter::emit_conv(encoder, target, false, false)?;
+                emitter::emit_conv(encoder, None, target, false, false)?;
                 let _ = dest;
             }
 
@@ -3952,7 +4238,8 @@ impl SsaCodeGenerator {
                 continue;
             }
             if let SsaOp::Copy { dest, src } = op {
-                self.emit_copy_row(encoder, ssa, *dest, *src)?;
+                let converts = converting_copy(ssa, op);
+                self.emit_copy_row(encoder, ssa, (*dest, *src), converts, tag)?;
                 continue;
             }
             let materialised = op
@@ -4142,12 +4429,17 @@ impl SsaCodeGenerator {
 
     /// Emits a copy that keeps its row: the source into the destination's
     /// place, or nothing when the two share one or nothing reads the copy.
+    ///
+    /// A copy that `converts` (see [`converting_copy`]) re-extends the source into the
+    /// destination's stack form on the way, as the copy's own run of instructions, and is
+    /// made even when the two share a place.
     fn emit_copy_row(
         &mut self,
         encoder: &mut InstructionEncoder,
         ssa: &SsaFunction,
-        dest: SsaVarId,
-        src: SsaVarId,
+        (dest, src): (SsaVarId, SsaVarId),
+        converts: Option<(u32, bool)>,
+        tag: OpTag,
     ) -> Result<()> {
         let Some(storage) = self.method.storage.as_ref() else {
             return Ok(());
@@ -4164,13 +4456,19 @@ impl SsaCodeGenerator {
             }
             return Ok(());
         };
-        if storage.materialise(src).is_none()
+        if converts.is_none()
+            && storage.materialise(src).is_none()
             && storage.place(src) == Some(place)
             && storage.also_store(dest).is_none()
         {
             return Ok(());
         }
         self.emit_value(encoder, ssa, src)?;
+        if let Some((width, unsigned)) = converts {
+            let start = encoder.instruction_count();
+            Self::emit_subword_normalize(encoder, width, !unsigned)?;
+            self.record_group(start, encoder.instruction_count(), tag);
+        }
         self.store_value(encoder, dest)
     }
 
@@ -4217,7 +4515,14 @@ impl SsaCodeGenerator {
                 let op = Self::op_at(ssa, tag)?;
                 if let SsaOp::Copy { src, .. } = op {
                     let src = *src;
-                    return self.emit_value(encoder, ssa, src);
+                    let converts = converting_copy(ssa, op);
+                    self.emit_value(encoder, ssa, src)?;
+                    if let Some((width, unsigned)) = converts {
+                        let start = encoder.instruction_count();
+                        Self::emit_subword_normalize(encoder, width, !unsigned)?;
+                        self.record_group(start, encoder.instruction_count(), tag);
+                    }
+                    return Ok(());
                 }
                 for operand in Self::get_operands_in_stack_order(op) {
                     self.emit_value(encoder, ssa, operand)?;

@@ -61,9 +61,9 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::{
-    analysis::{ConstValue, SsaFunction, SsaOp, SsaType, SsaVarId, VariableOrigin},
+    analysis::{CilTarget, ConstValue, SsaFunction, SsaOp, SsaType, SsaVarId, VariableOrigin},
     assembly::{decode_stream, Immediate, Instruction, Operand},
-    compiler::codegen::{LayoutEntry, SsaCodeGenerator},
+    compiler::codegen::{converting_copy, LayoutEntry, SsaCodeGenerator},
     metadata::{
         method::{ExceptionHandler, ExceptionHandlerFlags, Method},
         signatures::TypeSignature,
@@ -368,7 +368,19 @@ impl<'a> SsaFacts<'a> {
                         *slot = Some((block_idx, instr_idx));
                     }
                 }
-                if let SsaOp::Copy { dest, src } = instr.op() {
+                // A copy, and a widening the stack already holds, define the value they read.
+                let alias = match instr.op() {
+                    SsaOp::Copy { dest, src } if converting_copy(ssa, instr.op()).is_none() => {
+                        Some((*dest, *src))
+                    }
+                    SsaOp::IntConv { dest, operand, .. }
+                        if CilTarget::is_stack_widening(ssa, instr.op()) =>
+                    {
+                        Some((*dest, *operand))
+                    }
+                    _ => None,
+                };
+                if let Some((dest, src)) = alias {
                     if let Some(slot) = parent.get_mut(dest.index()) {
                         *slot = Some(src.index());
                     }
@@ -1414,7 +1426,8 @@ impl<'a, 'b> Interpreter<'a, 'b> {
         }
 
         if let Some(dest) = op.dest() {
-            if !matches!(op, SsaOp::Copy { .. }) {
+            // A copy is its source's value, unless it converts it.
+            if !matches!(op, SsaOp::Copy { .. }) || converting_copy(self.facts.ssa, op).is_some() {
                 let class = Val::Class(self.facts.class_of(dest));
                 if !matches!(op, SsaOp::Const { .. }) {
                     state.kill(class);

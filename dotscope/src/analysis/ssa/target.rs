@@ -30,6 +30,7 @@ use crate::{
     analysis::ssa::{
         facts::CilVariableFacts,
         types::{FieldRef, MethodRef, SigRef, SsaType, TypeRef},
+        SsaFunction, SsaOp,
     },
     assembly::{FlowType, Instruction, InstructionCategory, Operand, StackBehavior},
     metadata::{
@@ -50,6 +51,39 @@ pub struct CilTarget {
 }
 
 impl CilTarget {
+    /// Whether `op` is a conversion the CIL evaluation stack already holds the result of: an
+    /// unchecked conversion to a 32-bit integer of a narrower integer read with its own
+    /// signedness. The lift states each narrow value's widening to the `int32` it is on the
+    /// stack as one; it has no instruction, and the value it defines is its operand's as the
+    /// stack holds it.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The function `op` is in, for its operand's type.
+    /// * `op` - The operation.
+    #[must_use]
+    pub fn is_stack_widening(ssa: &SsaFunction, op: &SsaOp) -> bool {
+        let SsaOp::IntConv {
+            operand,
+            target,
+            overflow_check: false,
+            unsigned,
+            ..
+        } = op
+        else {
+            return false;
+        };
+        if !matches!(target, SsaType::I32 | SsaType::U32) {
+            return false;
+        }
+        match ssa.variable(*operand).map(|var| var.var_type()) {
+            Some(SsaType::I8 | SsaType::I16) => !*unsigned,
+            Some(SsaType::U8 | SsaType::U16 | SsaType::Char) => *unsigned,
+            Some(SsaType::Bool) => true,
+            _ => false,
+        }
+    }
+
     /// 64-bit CIL target (8-byte pointers). The default for x86_64 hosts.
     #[must_use]
     pub const fn x64() -> Self {
@@ -196,6 +230,13 @@ impl Target for CilTarget {
         t.is_float()
     }
 
+    fn is_boolean(t: &Self::Type) -> bool {
+        // A `bool` is a truth value: 0 or 1, which every instruction reading it
+        // reads as an integer, and which no analysis may take for a byte that
+        // holds other values.
+        *t == SsaType::Bool
+    }
+
     fn is_signed(t: &Self::Type) -> bool {
         matches!(
             t,
@@ -226,16 +267,18 @@ impl Target for CilTarget {
     }
 
     fn operand_width(t: &Self::Type) -> Option<u32> {
-        // A value is typed by where it came from, but an instruction reads it
-        // off the evaluation stack, which holds every integer up to 32 bits as
-        // `int32` (ECMA-335 III.1.1): a `byte` local and an `int32` constant
-        // are one width to `xor`. `native int` mixes with `int32`, and a float
-        // computes in the runtime's own `F` (III.1.5), so neither has a width
-        // to agree on; `int32` against `int64` stays unverifiable.
-        match t.arithmetic_class()? {
-            SsaType::I32 => Some(32),
-            SsaType::I64 => Some(64),
-            _ => None,
+        // An operation reads an integer at its own type's width, as every
+        // analysis reads it: the lift states the `int32` the evaluation stack
+        // holds a narrower integer as wherever an operation computes with it
+        // (`SsaConverter::widen_stack_reads`), so a `byte` mixed
+        // with an `int32` is a lift defect the verifier reports. `native int`
+        // mixes with `int32`, a float computes in the runtime's own `F`
+        // (ECMA-335 III.1.5), and a `bool` is a truth value, 0 or 1 at any
+        // width, so none of them has a width to agree on.
+        if t.is_float() || *t == SsaType::Bool {
+            None
+        } else {
+            Self::bit_width(t)
         }
     }
 
@@ -402,25 +445,25 @@ impl Target for CilTarget {
     }
 }
 
-/// A constant as the CIL evaluation stack holds it: its bits and the width
-/// they occupy.
+/// A constant's bits at its own declared width.
 ///
-/// Every integer narrower than 32 bits is widened to `int32` by the load that
-/// puts it on the stack, keeping its numeric value; `int64` and native integers
-/// keep their own width. A conversion reads this, and what it does with the
-/// high bits is the conversion's decision, not the constant's variant's.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-fn stack_bits(value: &ConstValue<CilTarget>, ptr_size: PointerSize) -> Option<(u64, u32)> {
-    let narrow = |numeric: i64| Some((u64::from(numeric as i32 as u32), 32));
+/// An integer conversion of the IR reads its operand at the operand's declared
+/// width, as analyssa's evaluator does: the extension of a narrower-than-`int32`
+/// value to the `int32` the CIL evaluation stack holds is stated by the lift
+/// wherever a conversion would read it otherwise
+/// (`SsaConverter::widen_stack_reads`), so `I8(-1)` converted reading
+/// it unsigned is 255, the conversion of the bits it holds.
+#[allow(clippy::cast_sign_loss)]
+fn own_bits(value: &ConstValue<CilTarget>, ptr_size: PointerSize) -> Option<(u64, u32)> {
     match value {
-        ConstValue::I8(v) => narrow(i64::from(*v)),
-        ConstValue::I16(v) => narrow(i64::from(*v)),
-        ConstValue::I32(v) => narrow(i64::from(*v)),
-        ConstValue::U8(v) => narrow(i64::from(*v)),
-        ConstValue::U16(v) => narrow(i64::from(*v)),
+        ConstValue::I8(v) => Some((u64::from(*v as u8), 8)),
+        ConstValue::U8(v) => Some((u64::from(*v), 8)),
+        ConstValue::I16(v) => Some((u64::from(*v as u16), 16)),
+        ConstValue::U16(v) => Some((u64::from(*v), 16)),
+        ConstValue::I32(v) => Some((u64::from(*v as u32), 32)),
         ConstValue::U32(v) => Some((u64::from(*v), 32)),
-        ConstValue::True => narrow(1),
-        ConstValue::False => narrow(0),
+        ConstValue::True => Some((1, 8)),
+        ConstValue::False => Some((0, 8)),
         ConstValue::I64(v) => Some((*v as u64, 64)),
         ConstValue::U64(v) => Some((*v, 64)),
         ConstValue::NativeInt(v) => Some((*v as u64, ptr_size.bits())),
@@ -429,7 +472,7 @@ fn stack_bits(value: &ConstValue<CilTarget>, ptr_size: PointerSize) -> Option<(u
     }
 }
 
-/// `bits` of a `width`-bit stack value read as a number: sign-extended when
+/// `bits` of a `width`-bit value read as a number: sign-extended when
 /// `signed`, zero-extended otherwise.
 #[allow(clippy::cast_possible_wrap)]
 fn stack_numeric(bits: u64, width: u32, signed: bool) -> i128 {
@@ -446,19 +489,6 @@ fn stack_numeric(bits: u64, width: u32, signed: bool) -> i128 {
     } else {
         i128::from(masked)
     }
-}
-
-/// Whether `target` is an unsigned integer type.
-const fn is_unsigned_target(target: &SsaType) -> bool {
-    matches!(
-        target,
-        SsaType::U8
-            | SsaType::U16
-            | SsaType::U32
-            | SsaType::U64
-            | SsaType::NativeUInt
-            | SsaType::Char
-    )
 }
 
 /// `numeric` converted to `target`, truncating to the target's width.
@@ -491,28 +521,31 @@ fn numeric_to_target(
     Some(converted.mask_native(ptr_size))
 }
 
-/// A CIL conversion of a constant, without overflow checking.
+/// An integer conversion of a constant, without overflow checking.
 ///
-/// The source is read at its stack width. Widening, it is zero-extended when
-/// the conversion reads it as unsigned (`conv.*.un`) or converts to an unsigned
-/// type - `conv.u8` of an `int32` zero-extends, which is why C# spells
-/// `(ulong)intValue` as `conv.i8` - and sign-extended otherwise. Narrowing
-/// truncates, where the two readings agree.
+/// The source is read at its own width ([`own_bits`]) and, widening, extended as
+/// the conversion reads it: by zero when `unsigned_source` (`conv.u8`, every
+/// `.un` form, which the lift marks so) and by sign otherwise, whatever the
+/// target's own signedness - `conv.i8` of an `int32` -1 into a `ulong` is all
+/// ones. Narrowing truncates, where the two readings agree.
 fn cil_convert_const(
     value: &ConstValue<CilTarget>,
     target: &SsaType,
     unsigned_source: bool,
     ptr_size: PointerSize,
 ) -> Option<ConstValue<CilTarget>> {
-    let (bits, width) = stack_bits(value, ptr_size)?;
-    let signed = !(unsigned_source || is_unsigned_target(target));
-    numeric_to_target(stack_numeric(bits, width, signed), target, ptr_size)
+    let (bits, width) = own_bits(value, ptr_size)?;
+    numeric_to_target(
+        stack_numeric(bits, width, !unsigned_source),
+        target,
+        ptr_size,
+    )
 }
 
-/// A CIL conversion of a constant with overflow checking (`conv.ovf.*`).
+/// An integer conversion of a constant with overflow checking (`conv.ovf.*`).
 ///
-/// The source is the number its stack bits spell, read as unsigned for
-/// `conv.ovf.*.un` and as signed otherwise, and the conversion succeeds only
+/// The source is the number its own bits spell ([`own_bits`]), read as unsigned
+/// for `conv.ovf.*.un` and as signed otherwise, and the conversion succeeds only
 /// when that number is representable in the target: `conv.ovf.u4` of `-1`
 /// throws, `conv.ovf.u4.un` of the same bits is `0xFFFF_FFFF`.
 fn cil_convert_const_checked(
@@ -521,7 +554,7 @@ fn cil_convert_const_checked(
     unsigned_source: bool,
     ptr_size: PointerSize,
 ) -> Option<ConstValue<CilTarget>> {
-    let (bits, width) = stack_bits(value, ptr_size)?;
+    let (bits, width) = own_bits(value, ptr_size)?;
     let numeric = stack_numeric(bits, width, !unsigned_source);
     let native_bits = ptr_size.bits();
     let signed_range = |bits: u32| {
@@ -687,12 +720,13 @@ mod tests {
         );
     }
 
-    /// An operation computes over its operands as the evaluation stack holds
-    /// them: a `byte` or `char` against an `int32` is one width, as is `int32`
-    /// against `native int` and `float32` against `float64`; `int32` against
-    /// `int64` is not.
+    /// An operation computes over its operands at their own types' widths: a
+    /// `byte` or `char` against an `int32` is two widths, which the lift never
+    /// writes (it states the `int32` the evaluation stack holds a narrow value
+    /// as), while `int32` against `native int` and `float32` against `float64`
+    /// mix as CIL mixes them; `int32` against `int64` does not.
     #[test]
-    fn operands_compute_at_their_stack_width() {
+    fn operands_compute_at_their_own_width() {
         /// Verifies `dest = left xor right` (a comparison when `compare`),
         /// the operands typed `left` and `right` and `dest` the class they
         /// compute in.
@@ -737,39 +771,19 @@ mod tests {
                 .iter()
                 .any(|finding| matches!(finding, VerifierError::InvalidOperandWidths { .. }))
         }
-        assert!(!mismatched(false, SsaType::U8, SsaType::I32));
-        assert!(!mismatched(true, SsaType::Char, SsaType::I32));
-        assert!(!mismatched(true, SsaType::I16, SsaType::U8));
+        assert!(mismatched(false, SsaType::U8, SsaType::I32));
+        assert!(mismatched(true, SsaType::Char, SsaType::I32));
+        assert!(mismatched(true, SsaType::I16, SsaType::U8));
+        assert!(!mismatched(true, SsaType::U8, SsaType::I8));
         assert!(!mismatched(false, SsaType::I32, SsaType::NativeInt));
         assert!(!mismatched(true, SsaType::F32, SsaType::F64));
         assert!(mismatched(false, SsaType::I32, SsaType::I64));
         assert!(mismatched(true, SsaType::U16, SsaType::I64));
     }
 
-    /// `b ^ b` over a `byte` is the `int32` zero the evaluation stack holds,
-    /// not a byte one.
-    #[test]
-    fn a_byte_cancelled_by_itself_is_an_int32_zero() {
-        let (dest, byte) = (SsaVarId::from_index(1), SsaVarId::from_index(0));
-        let xor: SsaOp = SsaOp::Xor {
-            dest,
-            left: byte,
-            right: byte,
-            flags: None,
-        };
-        assert_eq!(
-            analyssa::analysis::algebraic::simplify_op(
-                &xor,
-                &std::collections::BTreeMap::new(),
-                Some(&SsaType::U8)
-            ),
-            analyssa::analysis::algebraic::SimplifyResult::Constant(ConstValue::I32(0))
-        );
-    }
-
     /// `(b << 3) | (b >> 5)` over a `byte` computes at 32 bits on the
-    /// evaluation stack: the bits shifted past bit 7 stay, so it is no 8-bit
-    /// rotate.
+    /// evaluation stack, over the `int32` the lift reads it as: the bits shifted
+    /// past bit 7 stay, so it is no 8-bit rotate.
     #[test]
     fn a_byte_shifted_both_ways_is_no_byte_rotate() {
         let mut ssa: SsaFunction = SsaFunction::new(1, 0);
@@ -779,7 +793,7 @@ mod tests {
             DefSite::entry(),
             SsaType::U8,
         );
-        let [three, five, left, right, rotated] = [0, 1, 2, 3, 4].map(|index| {
+        let [widened, three, five, left, right, rotated] = [0, 1, 2, 3, 4, 5].map(|index| {
             ssa.create_variable(
                 VariableOrigin::Phi,
                 0,
@@ -795,6 +809,13 @@ mod tests {
         };
         let mut block = SsaBlock::new(0);
         for op in [
+            SsaOp::IntConv {
+                dest: widened,
+                operand: byte,
+                target: SsaType::I32,
+                overflow_check: false,
+                unsigned: true,
+            },
             SsaOp::Const {
                 dest: three,
                 value: ConstValue::I32(3),
@@ -805,13 +826,13 @@ mod tests {
             },
             SsaOp::Shl {
                 dest: left,
-                value: byte,
+                value: widened,
                 amount: three,
                 flags: None,
             },
             SsaOp::Shr {
                 dest: right,
-                value: byte,
+                value: widened,
                 amount: five,
                 unsigned: true,
                 flags: None,
@@ -846,13 +867,18 @@ mod tests {
 
     #[test]
     fn widening_an_int32_extends_it_as_the_conversion_says() {
-        // conv.i8 sign-extends; conv.u8 zero-extends, as does any `.un` form.
+        // conv.i8 sign-extends, into a `ulong` too; conv.u8 zero-extends, as does
+        // any `.un` form: the lift marks both as reading the source unsigned.
         assert_eq!(
             conv(ConstValue::I32(-1), SsaType::I64, false),
             Some(ConstValue::I64(-1))
         );
         assert_eq!(
             conv(ConstValue::I32(-1), SsaType::U64, false),
+            Some(ConstValue::U64(u64::MAX))
+        );
+        assert_eq!(
+            conv(ConstValue::I32(-1), SsaType::U64, true),
             Some(ConstValue::U64(0xFFFF_FFFF))
         );
         assert_eq!(
@@ -873,6 +899,34 @@ mod tests {
         assert_eq!(
             conv(ConstValue::I32(0x1234), SsaType::U8, false),
             Some(ConstValue::U8(0x34))
+        );
+    }
+
+    /// A narrow source is read at its own width, as the IR's conversion reads its
+    /// operand: an `sbyte` -1 read unsigned is 255, a `byte` 200 read signed is
+    /// -56. The `int32` the stack holds is the lift's to state.
+    #[test]
+    fn a_narrow_source_is_read_at_its_own_width() {
+        assert_eq!(
+            conv(ConstValue::I8(-1), SsaType::I64, true),
+            Some(ConstValue::I64(255))
+        );
+        assert_eq!(
+            conv(ConstValue::U8(200), SsaType::I32, false),
+            Some(ConstValue::I32(-56))
+        );
+        assert_eq!(
+            conv(ConstValue::U8(200), SsaType::I32, true),
+            Some(ConstValue::I32(200))
+        );
+        assert_eq!(
+            conv(ConstValue::I16(-1), SsaType::U64, false),
+            Some(ConstValue::U64(u64::MAX))
+        );
+        assert_eq!(conv_ovf(ConstValue::I8(-1), SsaType::U8, false), None);
+        assert_eq!(
+            conv_ovf(ConstValue::I8(-1), SsaType::U8, true),
+            Some(ConstValue::U8(255))
         );
     }
 
