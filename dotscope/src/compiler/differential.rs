@@ -798,7 +798,7 @@ fn random_program(rng: &mut Stream) -> Program {
                     out.ldc_i4(width - 1);
                     out.op("and");
                 }
-                out.op(rng.pick(&["shl", "shr", "shr.un"]));
+                out.op(rng.pick::<&str>(&["shl", "shr", "shr.un"]));
             }
             _ => {
                 let second = stack[stack.len() - 2];
@@ -836,7 +836,7 @@ fn random_program(rng: &mut Stream) -> Program {
         let top = stack.pop().unwrap();
         let second = *stack.last().unwrap();
         out.convert_kind(top, second, rng);
-        out.op(rng.pick(&["add", "xor", "or", "sub"]));
+        out.op(rng.pick::<&str>(&["add", "xor", "or", "sub"]));
     }
     out.op("ret");
     let (bytecode, _, _) = out.asm.finish().unwrap();
