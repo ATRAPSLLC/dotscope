@@ -38,8 +38,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use analyssa::{
     analysis::{Budget, Machine, Rounds},
     events::{Event, EventListener},
+    ir::function::SsaEditOptions,
     passes::utils::resolve_chains,
-    BitSet,
+    target::Target,
+    BitSet, PointerSize,
 };
 
 use crate::{
@@ -165,10 +167,10 @@ impl ConstantPropagationPass {
         rounds: &mut Rounds,
         assembly: &CilObject,
         resolver: &CallResolver,
-    ) -> BTreeMap<SsaVarId, ConstValue> {
+    ) -> analyssa::Result<BTreeMap<SsaVarId, ConstValue>> {
         let block_count = ssa.block_count();
         if block_count == 0 {
-            return BTreeMap::new();
+            return Ok(BTreeMap::new());
         }
 
         // Recompute use tracking before SCCP analysis.
@@ -224,7 +226,13 @@ impl ConstantPropagationPass {
             let prev_count = constants.len();
 
             // Run identity and absorbing element optimizations
-            Self::optimize_algebraic_identities(ssa, &mut constants, method_token, changes);
+            Self::optimize_algebraic_identities(
+                ssa,
+                &mut constants,
+                method_token,
+                changes,
+                machine.ptr_size,
+            );
 
             // Run involutory operation simplification (--x=x, ~~x=x)
             Self::simplify_involutory_ops(ssa, method_token, changes);
@@ -248,7 +256,14 @@ impl ConstantPropagationPass {
         }
 
         // Apply all constant folding transformations
-        Self::apply_constant_folding(ssa, &constants, &sccp_result, method_token, changes);
+        Self::apply_constant_folding(
+            ssa,
+            &constants,
+            &sccp_result,
+            method_token,
+            changes,
+            machine.ptr_size,
+        );
 
         // Apply control flow simplifications
         Self::simplify_control_flow(
@@ -258,9 +273,9 @@ impl ConstantPropagationPass {
             method_token,
             changes,
             machine,
-        );
+        )?;
 
-        constants
+        Ok(constants)
     }
 
     /// Optimizes algebraic identity operations and absorbing elements.
@@ -278,11 +293,13 @@ impl ConstantPropagationPass {
     /// * `constants` - Map of known constants (updated with new discoveries).
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
+    /// * `ptr_size` - The pointer width native constants are read at.
     fn optimize_algebraic_identities(
         ssa: &mut SsaFunction,
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
+        ptr_size: PointerSize,
     ) {
         let mut transformations: Vec<(usize, usize, AlgebraicResult)> = Vec::new();
 
@@ -308,6 +325,15 @@ impl ConstantPropagationPass {
 
         // Apply the transformations
         for (block_idx, instr_idx, result) in transformations {
+            // The constant each result writes, in its destination's type.
+            let held = match &result {
+                AlgebraicResult::Constant { dest, value } => {
+                    Self::held_by(ssa, *dest, value, ptr_size)
+                }
+                AlgebraicResult::Copy { dest, src } => constants
+                    .get(src)
+                    .and_then(|value| Self::held_by(ssa, *dest, value, ptr_size)),
+            };
             if let Some(block) = ssa.block_mut(block_idx) {
                 let Some(instr) = block.instructions_mut().get_mut(instr_idx) else {
                     continue;
@@ -317,6 +343,9 @@ impl ConstantPropagationPass {
                 match result {
                     AlgebraicResult::Constant { dest, value } => {
                         constants.insert(dest, value.clone());
+                        let Some(value) = held else {
+                            continue;
+                        };
                         instr.set_op(SsaOp::Const {
                             dest,
                             value: value.clone(),
@@ -328,8 +357,10 @@ impl ConstantPropagationPass {
                     }
                     AlgebraicResult::Copy { dest, src } => {
                         // If src is a known constant, propagate it
-                        if let Some(value) = constants.get(&src).cloned() {
-                            constants.insert(dest, value.clone());
+                        if let Some(value) = held {
+                            if let Some(known) = constants.get(&src).cloned() {
+                                constants.insert(dest, known);
+                            }
                             instr.set_op(SsaOp::Const {
                                 dest,
                                 value: value.clone(),
@@ -444,13 +475,11 @@ impl ConstantPropagationPass {
     /// 1. **Duplicate conversions**: `conv.i4(conv.i4(x))` → `conv.i4(x)`
     ///    When the same conversion is applied twice, the outer one is redundant.
     ///
-    /// 2. **Unnecessary conversions**: `conv.i4(x)` where x is already i32 → `x`
-    ///    When converting to a type the value already has.
+    /// 2. **Unnecessary conversions**: `conv.i4(x)` where the conversion leaves `x`'s value as
+    ///    it is ([`Self::conversion_is_copy`]).
     ///
-    /// 3. **Widening chain simplification**: `conv.i8(conv.i4(x))` → `conv.i8(x)`
-    ///    For unsigned widening conversions, the intermediate conversion can be skipped.
-    ///    Only applied when the intermediate conversion is lossless and the unsigned flag
-    ///    is consistent.
+    /// 3. **Widening chain simplification**: `conv.i8(conv.i4(x))` → `conv.i8(x)` where one
+    ///    conversion computes what the two do ([`Self::widening_chain_reading`]).
     ///
     /// Note: Narrowing conversions and lossy float conversions (`conv.r8(conv.r4(x))`)
     /// are NOT optimized as they may change semantics.
@@ -548,12 +577,12 @@ impl ConstantPropagationPass {
                         // We check the SOURCE type of the inner conversion to determine
                         // if the inner conversion is narrowing.
                         if let Some(source_var) = ssa.variable(inner_conv.operand) {
-                            let source_type = source_var.var_type();
-                            if Self::is_safe_widening_chain(
-                                source_type,
+                            if let Some(unsigned) = Self::widening_chain_reading(
+                                source_var.var_type(),
                                 &inner_conv.target,
-                                target,
                                 inner_conv.unsigned,
+                                target,
+                                *unsigned,
                             ) {
                                 transformations.push(ConvTransform::ReplaceOperand {
                                     block_idx,
@@ -561,7 +590,7 @@ impl ConstantPropagationPass {
                                     dest: *dest,
                                     new_operand: inner_conv.operand,
                                     target: target.clone(),
-                                    unsigned: *unsigned,
+                                    unsigned,
                                     reason: "widening chain",
                                 });
                                 continue;
@@ -571,7 +600,7 @@ impl ConstantPropagationPass {
 
                     // Pattern 2: Unnecessary conversion - check if operand already has target type
                     if let Some(var) = ssa.variable(*operand) {
-                        if Self::types_match(var.var_type(), target) {
+                        if Self::conversion_is_copy(var.var_type(), target) {
                             transformations.push(ConvTransform::ReplaceWithCopy {
                                 block_idx,
                                 instr_idx,
@@ -643,103 +672,115 @@ impl ConstantPropagationPass {
         }
     }
 
-    /// Checks if two types match for the purpose of conversion elimination.
-    ///
-    /// This is conservative - types must match exactly or be equivalent on the stack.
-    fn types_match(var_type: &SsaType, target: &SsaType) -> bool {
-        if var_type == target {
-            return true;
-        }
-
-        // Check stack type equivalence - CIL promotes small integers to I32
-        // So if converting to I32 and var is already I8/I16/U8/U16, it's unnecessary
-        matches!(
-            (var_type, target),
-            // Small integers (I8, U8, I16, U16, Bool, Char) are already I32 on the stack
-            // U32 is treated as I32 on stack (bidirectional)
-            // I64 and U64 are interchangeable for bit patterns
-            // Native int types are interchangeable
-            (
-                SsaType::I8
-                    | SsaType::U8
-                    | SsaType::I16
-                    | SsaType::U16
-                    | SsaType::Bool
-                    | SsaType::Char
-                    | SsaType::U32,
-                SsaType::I32
-            ) | (SsaType::I32, SsaType::U32)
-                | (SsaType::U64, SsaType::I64)
-                | (SsaType::I64, SsaType::U64)
-                | (SsaType::NativeInt, SsaType::NativeUInt)
-                | (SsaType::NativeUInt, SsaType::NativeInt)
-        )
+    /// `value` as the constant `dest` holds: an integer stated in `dest`'s own type, as a copy
+    /// of a fitting `int32` into a `byte` slot holds a byte, which code generation loads at
+    /// the type's width. `None` where that type does not hold the value, and there is no
+    /// constant of `dest` to write; any other value as it is.
+    fn held_by(
+        ssa: &SsaFunction,
+        dest: SsaVarId,
+        value: &ConstValue,
+        ptr_size: PointerSize,
+    ) -> Option<ConstValue> {
+        let Some(ty) = ssa
+            .variable(dest)
+            .map(|variable| variable.var_type().clone())
+            .filter(|ty| CilTarget::is_integer(ty) && CilTarget::bit_width(ty).is_some())
+        else {
+            return Some(value.clone());
+        };
+        let Some((bits, _)) = value.integer_pattern(ptr_size) else {
+            return Some(value.clone());
+        };
+        let held = ConstValue::from_bits_of_type(bits, &ty)?;
+        let same = held.as_i64().is_some() && held.as_i64() == value.as_i64()
+            || held.integer_pattern(ptr_size) == value.integer_pattern(ptr_size);
+        same.then_some(held)
     }
 
-    /// Whether `conv.T2(conv.T1(x))` computes what `conv.T2(x)` does, for `x` of type
-    /// `source_type`, `T1` = `inner_target` and `T2` = `outer_target`, so that the inner
-    /// conversion can be skipped.
+    /// The width a fixed-width integer type holds and whether it is unsigned: how the IR
+    /// reads a value of it.
+    fn integer_layout(ty: &SsaType) -> Option<(u32, bool)> {
+        Some(match ty {
+            SsaType::I8 => (8, false),
+            SsaType::U8 | SsaType::Bool => (8, true),
+            SsaType::I16 => (16, false),
+            SsaType::U16 | SsaType::Char => (16, true),
+            SsaType::I32 => (32, false),
+            SsaType::U32 => (32, true),
+            SsaType::I64 => (64, false),
+            SsaType::U64 => (64, true),
+            _ => return None,
+        })
+    }
+
+    /// Whether the integer conversion of a value of type `source` to `target` is a copy of it:
+    /// a reinterpretation of one width the evaluation stack holds alike, or one between the
+    /// two native integers.
     ///
-    /// It can exactly when the inner conversion leaves `x`'s stack value as it is: the outer
-    /// conversion then sees the same value either way. On the evaluation stack a value
-    /// narrower than 32 bits is held extended to 32 bits by its own signedness (`int8` -1 is
-    /// `0xFFFFFFFF`, `uint8` 255 is `0x000000FF`), and a conversion to a narrow type
-    /// truncates and extends again by the *target's* signedness (ECMA-335 III.3.27). So:
+    /// A conversion that changes the width is never a copy, whichever way it reads its
+    /// operand: an operation reads every operand at its type's own width, so a copy of an
+    /// `int8` into an `int32` would hand an 8-bit value to every reader of a 32-bit one. The
+    /// widening the evaluation stack makes of a narrow value is stated by the lift as the
+    /// conversion it is, and stays one.
     ///
-    /// - a source wider than `T1` is truncated, and the conversion cannot be skipped;
-    /// - a 4-byte `T1` leaves any 32-bit stack value as it is (`conv.i4`, `conv.u4`);
-    /// - a narrower `T1` leaves the value as it is when the source has its width and its
-    ///   signedness, or is narrower and either unsigned (its upper bits are zero, which any
-    ///   extension keeps) or held under a signed `T1` (sign extension of a sign-extended
-    ///   value). An `int16` -1 through `conv.u2` becomes 65535, not -1, and `conv.i8` then
-    ///   differs from `conv.i8` of the source.
-    ///
-    /// The chain is only considered when the outer conversion widens past `T1`, and float
-    /// conversions are left alone (`conv.r8(conv.r4(x))` rounds twice). The outer
-    /// conversion's own signedness does not matter: it is applied to the same value.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_type` - The type of the inner conversion's operand
-    /// * `inner_target` - `T1`
-    /// * `outer_target` - `T2`
-    /// * `inner_unsigned` - Whether `T1` is unsigned (`conv.u1`, `conv.u2`, `conv.u4`)
-    fn is_safe_widening_chain(
-        source_type: &SsaType,
-        inner_target: &SsaType,
-        outer_target: &SsaType,
-        inner_unsigned: bool,
-    ) -> bool {
-        if source_type.is_float() || inner_target.is_float() || outer_target.is_float() {
-            return false;
-        }
-        let (Some(source_size), Some(inner_size), Some(outer_size)) = (
-            source_type.size_bytes(),
-            inner_target.size_bytes(),
-            outer_target.size_bytes(),
-        ) else {
-            // Native widths depend on the machine: be conservative
-            return false;
-        };
-        if source_size > inner_size || inner_size >= outer_size {
-            return false;
-        }
-        if inner_size >= 4 {
+    /// Nor is a reinterpretation of a narrow value under the other signedness: the bits are
+    /// the same, but the stack holds a `char` 0xFFFF zero-extended and an `int16` -1
+    /// sign-extended, so the conversion is the `conv.i2` that makes one the other. `int32`
+    /// and `uint32`, like `int64` and `uint64`, are one stack value.
+    fn conversion_is_copy(source: &SsaType, target: &SsaType) -> bool {
+        if source == target {
             return true;
         }
-        let source_unsigned = matches!(
-            source_type,
-            SsaType::U8
-                | SsaType::U16
-                | SsaType::U32
-                | SsaType::U64
-                | SsaType::Bool
-                | SsaType::Char
-        );
-        if source_size == inner_size {
-            source_unsigned == inner_unsigned
+        match (Self::integer_layout(source), Self::integer_layout(target)) {
+            (Some((source_bits, source_unsigned)), Some((target_bits, target_unsigned))) => {
+                source_bits == target_bits
+                    && (source_bits >= 32 || source_unsigned == target_unsigned)
+            }
+            _ => matches!(
+                (source, target),
+                (SsaType::NativeInt, SsaType::NativeUInt)
+                    | (SsaType::NativeUInt, SsaType::NativeInt)
+            ),
+        }
+    }
+
+    /// The reading (`unsigned` or not) of the one conversion of `x` to `outer_target` that
+    /// computes what `outer(inner(x))` does, when there is one: `inner` converts `x`, of type
+    /// `source`, to `inner_target`, reading it unsigned when `inner_unsigned` says so, and
+    /// `outer` converts that to `outer_target`, reading it as `outer_unsigned` says.
+    ///
+    /// Each conversion reads its operand at the operand's own type and extends it as its flag
+    /// says. Only a chain of two widenings is considered: a truncation in it cannot be
+    /// skipped, and float and native conversions are left alone.
+    ///
+    /// - An `inner` of the source's own width only restates its type: the bits are `x`'s, and
+    ///   `outer` reads them as it would read `x`.
+    /// - Two extensions of one kind are one: zero then zero, sign then sign.
+    /// - A zero-extension leaves the sign bit of the wider value clear, so any extension after
+    ///   it is a zero-extension too.
+    /// - A sign-extension and then a zero-extension is no single conversion: an `int16` -1 is
+    ///   `0xFFFFFFFF` as an `int32` and `0x00000000FFFFFFFF` as a `uint64` from it, but
+    ///   `0x000000000000FFFF` zero-extended from its own 16 bits.
+    fn widening_chain_reading(
+        source: &SsaType,
+        inner_target: &SsaType,
+        inner_unsigned: bool,
+        outer_target: &SsaType,
+        outer_unsigned: bool,
+    ) -> Option<bool> {
+        let (source_bits, _) = Self::integer_layout(source)?;
+        let (inner_bits, _) = Self::integer_layout(inner_target)?;
+        let (outer_bits, _) = Self::integer_layout(outer_target)?;
+        if source_bits > inner_bits || inner_bits >= outer_bits {
+            return None;
+        }
+        if source_bits == inner_bits {
+            Some(outer_unsigned)
+        } else if inner_unsigned || inner_unsigned == outer_unsigned {
+            Some(inner_unsigned)
         } else {
-            source_unsigned || !inner_unsigned
+            None
         }
     }
 
@@ -773,6 +814,9 @@ impl ConstantPropagationPass {
         // Apply the transformations
         for (dest, value, block_idx, instr_idx) in new_constants {
             constants.insert(dest, value.clone());
+            let Some(value) = Self::held_by(ssa, dest, &value, machine.ptr_size) else {
+                continue;
+            };
 
             if let Some(block) = ssa.block_mut(block_idx) {
                 if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
@@ -930,6 +974,9 @@ impl ConstantPropagationPass {
 
         for (block_idx, instr_idx, dest, value) in replacements {
             constants.insert(dest, value.clone());
+            let Some(value) = Self::held_by(ssa, dest, &value, machine.ptr_size) else {
+                continue;
+            };
             if let Some(block) = ssa.block_mut(block_idx) {
                 if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
                     instr.set_op(SsaOp::Const { dest, value });
@@ -994,6 +1041,9 @@ impl ConstantPropagationPass {
 
         for (block_idx, instr_idx, dest, value) in new_constants {
             constants.insert(dest, value.clone());
+            let Some(value) = Self::held_by(ssa, dest, &value, machine.ptr_size) else {
+                continue;
+            };
             if let Some(block) = ssa.block_mut(block_idx) {
                 if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
                     instr.set_op(SsaOp::Const { dest, value });
@@ -1282,6 +1332,7 @@ impl ConstantPropagationPass {
     /// * `sccp_result` - The SCCP analysis results.
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
+    /// * `ptr_size` - The pointer width native constants are read at.
     #[allow(clippy::cast_possible_truncation)]
     fn apply_constant_folding(
         ssa: &mut SsaFunction,
@@ -1289,7 +1340,15 @@ impl ConstantPropagationPass {
         sccp_result: &SccpResult,
         method_token: Token,
         changes: &mut EventLog,
+        ptr_size: PointerSize,
     ) {
+        // Each known value in the type of the variable that holds it.
+        let held: BTreeMap<SsaVarId, ConstValue> = constants
+            .iter()
+            .filter_map(|(dest, value)| {
+                Self::held_by(ssa, *dest, value, ptr_size).map(|held| (*dest, held))
+            })
+            .collect();
         for block_idx in 0..ssa.block_count() {
             if !sccp_result.is_block_executable(block_idx) {
                 continue;
@@ -1305,7 +1364,7 @@ impl ConstantPropagationPass {
 
                     // Check if this instruction's result is a known constant
                     if let Some(dest) = op.dest() {
-                        if let Some(value) = constants.get(&dest) {
+                        if let Some(value) = held.get(&dest) {
                             // Skip DecryptedArray: arrays are mutable reference types.
                             // Propagating them materializes a fresh array at each use
                             // site, breaking in-place modifications (e.g., XOR loops
@@ -1608,12 +1667,13 @@ impl ConstantPropagationPass {
         method_token: Token,
         changes: &mut EventLog,
         machine: Machine,
-    ) {
+    ) -> analyssa::Result<()> {
         // One dominator-tree walk answers for every block, and the answer has
         // to be taken before the first rewrite: folding a terminator changes
         // the edges the next block's answer would be computed from.
         let loop_headers = Self::loop_headers(ssa);
 
+        let mut folds: Vec<(usize, SsaOp, usize)> = Vec::new();
         for block_idx in 0..ssa.block_count() {
             if !sccp_result.is_block_executable(block_idx) {
                 continue;
@@ -1704,19 +1764,28 @@ impl ConstantPropagationPass {
                 None
             };
 
-            // Second pass: apply the simplification with mutable borrow
             if let Some((new_op, target)) = simplification {
-                if let Some(block) = ssa.block_mut(block_idx) {
-                    if let Some(last_instr) = block.instructions_mut().last_mut() {
-                        last_instr.set_op(new_op);
-                        changes
-                            .record(EventKind::BranchSimplified)
-                            .at(method_token, block_idx)
-                            .message(format!("simplified to unconditional branch to {target}"));
-                    }
-                }
+                folds.push((block_idx, new_op, target));
             }
         }
+        if folds.is_empty() {
+            return Ok(());
+        }
+        // A folded branch drops the edges it no longer takes, and with them the operands their
+        // targets' phis held for this block.
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            for (block_idx, new_op, _) in &folds {
+                editor.fold_terminator_pruning_phis(*block_idx, new_op.clone())?;
+            }
+            Ok(())
+        })?;
+        for (block_idx, _, target) in folds {
+            changes
+                .record(EventKind::BranchSimplified)
+                .at(method_token, block_idx)
+                .message(format!("simplified to unconditional branch to {target}"));
+        }
+        Ok(())
     }
 }
 
@@ -1756,7 +1825,7 @@ impl SsaPass<CilTarget, CompilerContext> for ConstantPropagationPass {
             &mut rounds,
             &assembly,
             host.call_graph.resolver(),
-        );
+        )?;
         // Reported to the host, not with the changes: running out of rounds is
         // no change of the function's.
         if let Some(exhaustion) = rounds.exhausted() {

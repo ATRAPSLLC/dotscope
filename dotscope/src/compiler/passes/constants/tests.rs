@@ -1,7 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-#[cfg(feature = "emulation")]
-use crate::emulation::{ConversionType, EmValue};
 use crate::{
     analysis::{
         AccessQualifiers, Budget, CallData, CallGraph, Callee, CilTarget, CmpKind, ConstValue,
@@ -775,224 +773,210 @@ fn test_switch_out_of_range_uses_default() {
     }
 }
 
-#[test]
-fn test_types_match_identical() {
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I64,
-        &SsaType::I64
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::F32,
-        &SsaType::F32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::F64,
-        &SsaType::F64
-    ));
-}
-
-#[test]
-fn test_types_match_stack_equivalence() {
-    // Small integers promote to I32 on the stack
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I8,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U8,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I16,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U16,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::Bool,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::Char,
-        &SsaType::I32
-    ));
-
-    // U32 and I32 are interchangeable
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U32,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::U32
-    ));
-
-    // I64 and U64 are interchangeable
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I64,
-        &SsaType::U64
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U64,
-        &SsaType::I64
-    ));
-
-    // Native int types
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::NativeInt,
-        &SsaType::NativeUInt
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::NativeUInt,
-        &SsaType::NativeInt
-    ));
-}
-
-#[test]
-fn test_types_no_match() {
-    // Floats don't match integers
-    assert!(!ConstantPropagationPass::types_match(
-        &SsaType::F32,
-        &SsaType::I32
-    ));
-    assert!(!ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::F32
-    ));
-
-    // Different sizes don't match
-    assert!(!ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::I64
-    ));
-    assert!(!ConstantPropagationPass::types_match(
-        &SsaType::I64,
-        &SsaType::I32
-    ));
-}
-
-/// The integer conversion targets, each with the `conv` that produces it and whether it is
-/// unsigned (the inner conversion's `unsigned` flag).
-#[cfg(feature = "emulation")]
-const CONVERSIONS: [(SsaType, ConversionType, bool); 8] = [
-    (SsaType::I8, ConversionType::I1, false),
-    (SsaType::U8, ConversionType::U1, true),
-    (SsaType::I16, ConversionType::I2, false),
-    (SsaType::U16, ConversionType::U2, true),
-    (SsaType::I32, ConversionType::I4, false),
-    (SsaType::U32, ConversionType::U4, true),
-    (SsaType::I64, ConversionType::I8, false),
-    (SsaType::U64, ConversionType::U8, true),
+/// The fixed-width integer types the conversion rules reason about.
+const INTEGERS: [SsaType; 9] = [
+    SsaType::I8,
+    SsaType::U8,
+    SsaType::I16,
+    SsaType::U16,
+    SsaType::Char,
+    SsaType::I32,
+    SsaType::U32,
+    SsaType::I64,
+    SsaType::U64,
 ];
 
-/// Values of `source` as the evaluation stack holds them: a type narrower than 32 bits
-/// extended to 32 by its own signedness, wider ones as they are. Every value of an 8- or
-/// 16-bit type, and the edges of the wider ones.
-#[cfg(feature = "emulation")]
-fn stack_values(source: &SsaType) -> Vec<EmValue> {
-    let wide: [i64; 8] = [
+/// Every value of an 8- or 16-bit type, and the edges of a wider one, as constants of it.
+fn values_of(ty: &SsaType) -> Vec<ConstValue> {
+    let edges: [i64; 10] = [
         0,
         1,
         -1,
         127,
         -128,
+        255,
         i64::from(i32::MAX),
         i64::from(i32::MIN),
-        i64::from(u32::MAX),
+        i64::MAX,
+        i64::MIN,
     ];
-    match source {
-        SsaType::I8 => (i8::MIN..=i8::MAX)
-            .map(|v| EmValue::I32(i32::from(v)))
-            .collect(),
-        SsaType::U8 => (u8::MIN..=u8::MAX)
-            .map(|v| EmValue::I32(i32::from(v)))
-            .collect(),
-        SsaType::I16 => (i16::MIN..=i16::MAX)
-            .map(|v| EmValue::I32(i32::from(v)))
-            .collect(),
-        SsaType::U16 => (u16::MIN..=u16::MAX)
-            .map(|v| EmValue::I32(i32::from(v)))
-            .collect(),
-        SsaType::I32 | SsaType::U32 => wide.iter().map(|&v| EmValue::I32(v as i32)).collect(),
-        _ => wide
-            .iter()
-            .chain(&[i64::MAX, i64::MIN])
-            .map(|&v| EmValue::I64(v))
-            .collect(),
+    match ty {
+        SsaType::I8 => (i8::MIN..=i8::MAX).map(ConstValue::I8).collect(),
+        SsaType::U8 => (u8::MIN..=u8::MAX).map(ConstValue::U8).collect(),
+        SsaType::I16 => (i16::MIN..=i16::MAX).map(ConstValue::I16).collect(),
+        SsaType::U16 | SsaType::Char => (u16::MIN..=u16::MAX).map(ConstValue::U16).collect(),
+        SsaType::I32 => edges.iter().map(|&v| ConstValue::I32(v as i32)).collect(),
+        SsaType::U32 => edges.iter().map(|&v| ConstValue::U32(v as u32)).collect(),
+        SsaType::I64 => edges.iter().map(|&v| ConstValue::I64(v)).collect(),
+        _ => edges.iter().map(|&v| ConstValue::U64(v as u64)).collect(),
     }
 }
 
-/// Whenever the pass skips the inner conversion of `conv.T2(conv.T1(x))`, the result is the
-/// same for every value `x` can hold, by the emulator's conversions (an oracle independent
-/// of the pass); and every chain whose inner conversion is the identity on the stack value
-/// is skipped. Every integer source, `T1` and wider `T2` is tried.
-#[cfg(feature = "emulation")]
-#[test]
-fn a_widening_chain_is_skipped_exactly_when_the_result_is_the_same() {
-    let convert = |value: &EmValue, conversion: ConversionType| {
-        value.convert(conversion, PointerSize::Bit64).unwrap()
+/// The IR's integer conversion of a constant, the target's kernel that constant folding and
+/// the evaluator share: an oracle independent of the rules under test.
+fn convert(value: &ConstValue, target: &SsaType, unsigned: bool) -> Option<ConstValue> {
+    value.convert_to(target, unsigned, 8)
+}
+
+/// The `int32` (or `int64`) the evaluation stack holds a value of `ty` as: its bits read
+/// with its own signedness.
+fn stack_form(value: &ConstValue, ty: &SsaType) -> Option<ConstValue> {
+    let unsigned = matches!(
+        ty,
+        SsaType::U8 | SsaType::U16 | SsaType::Char | SsaType::U32 | SsaType::U64
+    );
+    let wide = if ty.size_bytes() == Some(8) {
+        SsaType::I64
+    } else {
+        SsaType::I32
     };
-    for (source, _, _) in &CONVERSIONS {
-        let values = stack_values(source);
-        for (inner, inner_conversion, inner_unsigned) in &CONVERSIONS {
-            for (outer, outer_conversion, _) in &CONVERSIONS {
+    convert(value, &wide, unsigned)
+}
+
+/// A conversion becomes a copy exactly when the evaluation stack holds its result as it
+/// holds its operand: for every value, the operand's stack form is the result's. A width
+/// change is never a copy, whatever it computes.
+#[test]
+fn a_conversion_is_a_copy_exactly_when_the_stack_holds_both_alike() {
+    for source in &INTEGERS {
+        let values = values_of(source);
+        for target in &INTEGERS {
+            for unsigned in [false, true] {
+                let rule = ConstantPropagationPass::conversion_is_copy(source, target);
+                let same_width = source.size_bytes() == target.size_bytes();
+                let alike = values.iter().all(|value| {
+                    convert(value, target, unsigned)
+                        .and_then(|converted| stack_form(&converted, target))
+                        == stack_form(value, source)
+                });
+                assert_eq!(
+                    rule,
+                    same_width && alike,
+                    "{source:?} to {target:?} unsigned={unsigned}"
+                );
+            }
+        }
+    }
+    assert!(ConstantPropagationPass::conversion_is_copy(
+        &SsaType::F64,
+        &SsaType::F64
+    ));
+    assert!(!ConstantPropagationPass::conversion_is_copy(
+        &SsaType::F32,
+        &SsaType::I32
+    ));
+    assert!(ConstantPropagationPass::conversion_is_copy(
+        &SsaType::NativeInt,
+        &SsaType::NativeUInt
+    ));
+}
+
+/// The cases named: an `int8` widened to an `int32` stays the conversion it is, however it
+/// reads its operand; `int32` and `uint32` restate one another's bits.
+#[test]
+fn a_widening_is_never_a_copy() {
+    let is_copy = ConstantPropagationPass::conversion_is_copy;
+    assert!(!is_copy(&SsaType::I8, &SsaType::I32));
+    assert!(!is_copy(&SsaType::U8, &SsaType::I32));
+    assert!(!is_copy(&SsaType::Bool, &SsaType::I32));
+    assert!(is_copy(&SsaType::U32, &SsaType::I32));
+    assert!(is_copy(&SsaType::I64, &SsaType::U64));
+    assert!(is_copy(&SsaType::Char, &SsaType::U16));
+    assert!(!is_copy(&SsaType::Char, &SsaType::I16));
+    assert!(!is_copy(&SsaType::I8, &SsaType::U8));
+}
+
+/// Whenever the rule skips the inner conversion of `outer(inner(x))`, the one conversion it
+/// keeps gives the same result for every value `x` can hold; and wherever one conversion of
+/// either reading does, the rule finds it. Every integer source, wider-or-equal inner target,
+/// wider outer target, and both readings of each conversion are tried.
+#[test]
+fn a_widening_chain_is_one_conversion_exactly_when_one_computes_both() {
+    for source in &INTEGERS {
+        let values = values_of(source);
+        for inner in &INTEGERS {
+            if inner.size_bytes() < source.size_bytes() {
+                continue;
+            }
+            for outer in &INTEGERS {
                 if outer.size_bytes() <= inner.size_bytes() {
                     continue;
                 }
-                let skipped = ConstantPropagationPass::is_safe_widening_chain(
-                    source,
-                    inner,
-                    outer,
-                    *inner_unsigned,
-                );
-                let same = values.iter().all(|value| {
-                    convert(&convert(value, *inner_conversion), *outer_conversion)
-                        == convert(value, *outer_conversion)
-                });
-                let identity = values
-                    .iter()
-                    .all(|value| &convert(value, *inner_conversion) == value);
-                if skipped {
-                    assert!(
-                        same,
-                        "{source:?} through {inner:?} to {outer:?} is skipped and differs"
-                    );
-                }
-                if identity {
-                    assert!(
-                        skipped,
-                        "{source:?} through {inner:?} to {outer:?} is the identity and kept"
-                    );
+                for inner_unsigned in [false, true] {
+                    for outer_unsigned in [false, true] {
+                        let chain = |value: &ConstValue| {
+                            convert(value, inner, inner_unsigned)
+                                .and_then(|mid| convert(&mid, outer, outer_unsigned))
+                        };
+                        let one = |unsigned: bool| {
+                            values
+                                .iter()
+                                .all(|value| chain(value) == convert(value, outer, unsigned))
+                        };
+                        let rule = ConstantPropagationPass::widening_chain_reading(
+                            source,
+                            inner,
+                            inner_unsigned,
+                            outer,
+                            outer_unsigned,
+                        );
+                        let case = format!(
+                            "{source:?} through {inner:?} (unsigned={inner_unsigned}) to {outer:?} (unsigned={outer_unsigned})"
+                        );
+                        match rule {
+                            Some(unsigned) => {
+                                assert!(one(unsigned), "{case} is skipped and differs")
+                            }
+                            None => assert!(
+                                !one(false) && !one(true),
+                                "{case} is one conversion and kept"
+                            ),
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// The chains the rule is about, named: an `int16` through `conv.u2` is no longer -1, so
-/// `conv.i8` of it differs from `conv.i8` of the source; a value narrower than its unsigned
-/// `T1` keeps its zero upper bits; a source wider than `T1` is truncated; floats are kept.
+/// The chains named: an `int16` -1 sign-extended to 32 bits and zero-extended from there is
+/// `0xFFFFFFFF`, no single conversion of it; zero-extended first, any extension after is a
+/// zero-extension; a source wider than the inner target is truncated; floats are kept.
 #[test]
-fn widening_chains_follow_the_source_signedness() {
-    let safe = |source, inner, outer, inner_unsigned| {
-        ConstantPropagationPass::is_safe_widening_chain(&source, &inner, &outer, inner_unsigned)
+fn widening_chains_keep_the_extension_each_step_makes() {
+    let reading = |source, inner, inner_unsigned, outer, outer_unsigned| {
+        ConstantPropagationPass::widening_chain_reading(
+            &source,
+            &inner,
+            inner_unsigned,
+            &outer,
+            outer_unsigned,
+        )
     };
-    assert!(!safe(SsaType::I16, SsaType::U16, SsaType::I64, true));
-    assert!(safe(SsaType::I16, SsaType::I16, SsaType::U64, false));
-    assert!(safe(SsaType::U8, SsaType::U16, SsaType::I64, true));
-    assert!(!safe(SsaType::I8, SsaType::U16, SsaType::I32, true));
-    assert!(safe(SsaType::I8, SsaType::I16, SsaType::U64, false));
-    assert!(safe(SsaType::I8, SsaType::U32, SsaType::I64, true));
-    assert!(!safe(SsaType::I32, SsaType::U8, SsaType::I32, true));
-    assert!(!safe(SsaType::I32, SsaType::I64, SsaType::I32, false));
-    assert!(!safe(SsaType::F32, SsaType::F32, SsaType::F64, false));
-    assert!(!safe(SsaType::I32, SsaType::I32, SsaType::F64, false));
+    assert_eq!(
+        reading(SsaType::I16, SsaType::I32, false, SsaType::U64, true),
+        None
+    );
+    assert_eq!(
+        reading(SsaType::I8, SsaType::U32, true, SsaType::I64, false),
+        Some(true)
+    );
+    assert_eq!(
+        reading(SsaType::I16, SsaType::I16, false, SsaType::U64, true),
+        Some(true)
+    );
+    assert_eq!(
+        reading(SsaType::I8, SsaType::I16, false, SsaType::U64, false),
+        Some(false)
+    );
+    assert_eq!(
+        reading(SsaType::I32, SsaType::U8, true, SsaType::I32, true),
+        None
+    );
+    assert_eq!(
+        reading(SsaType::F32, SsaType::F32, false, SsaType::F64, false),
+        None
+    );
 }
 
 #[test]
