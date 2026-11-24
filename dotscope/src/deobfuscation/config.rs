@@ -241,9 +241,6 @@ pub struct EngineConfig {
     /// the assembly's, set when detection runs.
     pub unflattening: UnflattenConfig,
 
-    /// Target specific obfuscator (bypasses detection).
-    pub target_obfuscator: Option<String>,
-
     /// NOP threshold for dead method detection in BitMono-style junk analysis.
     pub detection_nop_threshold: usize,
 
@@ -358,7 +355,6 @@ impl Default for EngineConfig {
             passes: PassConfig::default(),
             emulation: EmulationConfig::default(),
             unflattening: UnflattenConfig::default(),
-            target_obfuscator: None,
             detection_nop_threshold: 50_000,
             cleanup: CleanupConfig::default(),
         }
@@ -494,21 +490,6 @@ impl EngineConfig {
     #[must_use]
     pub fn with_budget(mut self, budget: WorkBudget) -> Self {
         self.budget = budget;
-        self
-    }
-
-    /// Targets a specific obfuscator, bypassing automatic detection.
-    ///
-    /// # Arguments
-    ///
-    /// * `obfuscator` - The obfuscator plugin ID to target.
-    ///
-    /// # Returns
-    ///
-    /// The modified configuration (builder pattern).
-    #[must_use]
-    pub fn with_target_obfuscator(mut self, obfuscator: impl Into<String>) -> Self {
-        self.target_obfuscator = Some(obfuscator.into());
         self
     }
 
@@ -727,11 +708,9 @@ mod tests {
     #[test]
     fn test_builder_pattern() {
         let config = EngineConfig::new()
-            .with_budget(EngineConfig::BUDGET.with_limit(Budget::PipelineRounds, 100))
-            .with_target_obfuscator("confuserex");
+            .with_budget(EngineConfig::BUDGET.with_limit(Budget::PipelineRounds, 100));
 
         assert_eq!(config.budget.limit(Budget::PipelineRounds), 100);
-        assert_eq!(config.target_obfuscator, Some("confuserex".to_string()));
     }
 
     #[test]
