@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use analyssa::{passes::deadcode, World};
+use analyssa::{passes, scheduling::ModulePass, World};
 
 use crate::{
     analysis::{CilTarget, MethodRef, SsaFunction},
@@ -24,7 +24,7 @@ use crate::{
 ///
 /// Operates at the assembly level to identify methods that are never
 /// called and not entry points. Delegates the reachability walk to
-/// [`analyssa::passes::deadcode::run_global`] via an internal `World`-trait
+/// [`analyssa::passes::DeadMethodEliminationPass`] via an internal `World`-trait
 /// adapter that combines SSA-derived and static call edges.
 pub struct DeadMethodEliminationPass;
 
@@ -77,10 +77,7 @@ impl SsaPass<CilTarget, CompilerContext> for DeadMethodEliminationPass {
 
     fn run_global(&self, host: &CompilerContext) -> analyssa::Result<bool> {
         let world = CtxWorld::new(host);
-        Ok(deadcode::run_global::<CilTarget, _, _>(
-            &world,
-            &host.events,
-        ))
+        passes::DeadMethodEliminationPass.run(&world, &host.events)
     }
 }
 

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use analyssa::{analysis::Budget, passes::copying};
+use analyssa::{passes, scheduling::PassEnv};
 
 use crate::{
     analysis::{CilTarget, MethodRef, SsaFunction, SsaType, SsaVarId, VariableOrigin},
@@ -55,11 +55,9 @@ impl SsaPass<CilTarget, CompilerContext> for CopyPropagationPass {
         let assembly = host
             .assembly()
             .ok_or_else(|| analyssa::Error::new("CopyPropagationPass requires an assembly"))?;
-        let changed = copying::run(
+        let changed = passes::CopyPropagationPass.propagate(
             ssa,
-            method,
-            &host.events,
-            host.budget().limit(Budget::CopyRounds),
+            &PassEnv::from_host(method, host),
             |ssa, resolved| propagate_local_types(ssa, resolved, &assembly),
         );
         Ok(changed)

@@ -494,7 +494,6 @@ impl<'a> MethodQuery<'a> {
     }
 
     /// Returns a lazy iterator over matching methods.
-    #[must_use]
     pub fn iter(&self) -> Box<dyn Iterator<Item = MethodRc> + '_> {
         let base: Box<dyn Iterator<Item = MethodRc> + '_> = match &self.source {
             MethodQuerySource::Assembly(map) => {

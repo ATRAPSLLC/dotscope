@@ -1187,12 +1187,7 @@ impl<'a> PeGenerator<'a> {
         }
 
         // Check if user has added any native imports
-        let user_imports = self.assembly.changes().native_imports().native();
-        if !user_imports.is_empty() {
-            return true;
-        }
-
-        false
+        !self.assembly.changes().native_imports().native().is_empty()
     }
 
     /// Writes the COR20 (CLR) header.

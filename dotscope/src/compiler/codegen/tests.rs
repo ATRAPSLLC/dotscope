@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 
 use analyssa::{
+    analysis::context::AnalysisContext,
     events::NullListener,
     ir::{value::DecryptedArrayData, FlagCondition},
-    passes::algebraic,
+    passes::AlgebraicSimplificationPass,
+    scheduling::{FunctionPass, PassEnv},
 };
 
 use crate::{
@@ -3701,12 +3703,14 @@ fn a_rotate_idiom_folded_by_the_algebraic_pass_still_computes_the_rotate() {
         ssa.variable_mut(var).unwrap().set_type(SsaType::U32);
     }
 
-    let changed = algebraic::run(
+    let changed = AlgebraicSimplificationPass.run(
         &mut ssa,
-        &MethodRef::new(Token::new(0x0600_0001)),
-        &NullListener,
-        CilTarget::x64().machine(),
-    );
+        &PassEnv::new(
+            &MethodRef::new(Token::new(0x0600_0001)),
+            &NullListener,
+            AnalysisContext::new(CilTarget::x64().machine()),
+        ),
+    ) == Ok(true);
     assert!(changed, "the idiom should fold");
     assert!(
         ssa.blocks()
