@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - 2026-11-23
+## [0.10.0] - 2026-11-24
 
 A correctness release built on analyssa 0.7.0. Every assembly of the test corpus loads, lifts
 to SSA the verifier accepts and writes back holding what it held; generated code is
@@ -14,7 +14,7 @@ metadata means, so this release has many breaking changes.
 
 ### Changed
 
-- **Built on analyssa 0.7.0** (**BREAKING**): a call is one `SsaOp::Call` holding `CallData`
+- **Built on analyssa 0.7.1** (**BREAKING**): a call is one `SsaOp::Call` holding `CallData`
   and its `Callee` (read through `SsaOpCilExt::method_call`), CIL prefixes sit on the
   operation they prefix (`CilPrefix`), evaluators take a `Machine` instead of a
   `PointerSize`, a float constant is `ConstValue::Float(FloatBits)` and `EmValue` converts
@@ -159,8 +159,14 @@ metadata means, so this release has many breaking changes.
 - Every corpus method lifts to SSA the verifier accepts (typed arithmetic, enums as their
   underlying integer, `.locals init` locals read zero), and code the runtime refuses (falling
   off the end, a branch into an operand, a join at two stack depths) is an error.
-- Constant folding respects width, kind and NaN, pure-call folding needs a pure callee, and
-  the `z3` solver states every operation as the value it computes.
+- Constant folding respects width, kind and NaN, writes each constant in its variable's
+  type, drops the phi operands of the edges a folded branch removes, pure-call folding needs
+  a pure callee, and the `z3` solver states every operation as the value it computes.
+- Integers narrower than 32 bits compute as the `int32` the evaluation stack holds (#288):
+  the lift states each widening as a conversion, a conversion reads its operand at its own
+  width, a store into a narrower slot truncates, and generated code keeps every narrow value
+  in its stack form. Comparisons, remainders, phis and address offsets over mixed widths
+  are no longer folded wrongly.
 - The x86 lift of native stubs is exact or refuses (flags, partial registers, MUL/DIV,
   extensions, shifts and rotates), so a stub it cannot follow stays native.
 - Exception clauses come nested first in a stable order, generated code handles `calli`,
@@ -204,11 +210,12 @@ metadata means, so this release has many breaking changes.
   samples are checked by what they print under Mono and deobfuscated twice to byte-identical
   output, the System.Reflection.Metadata oracle compares every corpus assembly, failing fuzz
   inputs are replayed as regression tests, benchmarks measure time and memory, and every
-  documentation example compiles and runs as a doc test.
+  documentation example compiles and runs as a doc test. Random mixed-width methods are
+  lifted, optimised and regenerated against an interpreter of their CIL.
 
 ### Dependencies
 
-- `analyssa` 0.6.0 → 0.7.0, `z3` 0.21.0 → 0.23.0, `iced-x86` 1.21.0 → 1.22.0, and patch
+- `analyssa` 0.6.0 → 0.7.1, `z3` 0.21.0 → 0.23.0, `iced-x86` 1.21.0 → 1.22.0, and patch
   updates of the rest.
 - `mistralrs` and `tokio` removed; `toml` and `proptest` are optional, for `testkit`.
 
