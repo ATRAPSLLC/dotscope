@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - 2026-11-21
+## [0.10.0] - 2026-11-23
 
 A correctness release built on analyssa 0.7.0. Every assembly of the test corpus loads, lifts
 to SSA the verifier accepts and writes back holding what it held; generated code is
@@ -38,15 +38,14 @@ metadata means, so this release has many breaking changes.
   (`SharedStr`; a `Document`'s name is a `DocumentName`, its hash `SharedBytes`) and are
   returned shared, `CilType::fullname()` returns a `FullName`, and per-type lists are
   allocated on first push.
-- Output is deterministic, a failing load names the first failing row in token order, and
-  every documentation example compiles and runs as a doc test.
+- Output is deterministic, and a failing load names the first failing row in token order.
 - **BREAKING** API changes besides the above:
   - assembly: `FlowType::CallIndirect` (`calli`) and `MethodJump` (`jmp`), both `Call`
     before; `Instruction::fall_through` and `FlowType::falls_through`; a branch operand is
     `Operand::Target(rva)`.
   - loading: `CilObject::from_view` and `from_view_with_validation` return a `ViewLoadError`
     that keeps the view; a coded index whose tag names no table reads as null
-    (`TableInfo::decode_coded_index` returns `Option`).
+    (`TableInfo::decode_coded_index` returns `Option`, #290).
   - metadata: a type's `FieldList`, `PropertyList`, `EventList` and `modifiers`, `ParamList`
     and `Method::local_vars` are `LazyList`s, and attached lists (`Property::fn_other`,
     `Event::fn_on_other`, `security`) are `RowList`s; `Identity::PubKey`/`EcmaKey` hold an
@@ -93,7 +92,8 @@ metadata means, so this release has many breaking changes.
   `SmartRenameConfig`, `CleanupConfig::smart_rename`, the CLI's `--rename-ai` and the
   `mistralrs` and `tokio` dependencies. Cleanup renames to sequential names as before.
 - **BREAKING**: configuration nothing read (`DecryptorHeuristics`, `UnflatteningThresholds`,
-  `detection_threshold`, `verify_semantics`, `resolution_strategies`),
+  `detection_threshold`, `verify_semantics`, `resolution_strategies`,
+  `EngineConfig::target_obfuscator` and `with_target_obfuscator`),
   `analysis::conv_op_for_target`, `Method::varargs`, `Method::is_forwarded_pinvoke` (always
   false; `Method::is_forward_ref` is the `ForwardRef` test),
   `AssemblyChanges::referenced_string_offsets` (nothing read it), the public table loaders
@@ -137,11 +137,13 @@ metadata means, so this release has many breaking changes.
 #### Write path and cleanup
 
 - An assembly written back unchanged holds what it held: large and fat method bodies, shared
-  heap tails, user strings, the debug directory, unassigned coded index tags, every exception
-  clause, and the native import and export tables.
-- A write that renumbers rows or replaces bodies regenerates the embedded Portable PDB and
-  the debug directory entries naming it (#291); in-image debug tables follow the methods it
-  deletes, replaces and adds.
+  heap tails, user strings, the debug directory, every exception clause, and the native
+  import and export tables. A row whose coded index tag names no table (ConfuserEx's "invalid
+  metadata") no longer fails the write (#290).
+- The debug directory follows the write (#291): a write that renumbers rows or replaces
+  bodies regenerates the embedded Portable PDB and the entries naming it, and in-image debug
+  tables follow the methods it deletes, replaces and adds; a write that does neither keeps
+  the CodeView entry of a standalone PDB, which still matches the output.
 - Heap placeholders no longer pass for offsets, an index too wide for its column is refused,
   replaced bodies follow a moved user string heap, and renamed strings keep their tails.
   Writes no longer scan every change per placeholder or string (adding 8000 types: about 9x
@@ -201,7 +203,8 @@ metadata means, so this release has many breaking changes.
   assembly must load and every method lift, and no verdict depends on machine load. Packer
   samples are checked by what they print under Mono and deobfuscated twice to byte-identical
   output, the System.Reflection.Metadata oracle compares every corpus assembly, failing fuzz
-  inputs are replayed as regression tests, and benchmarks measure time and memory.
+  inputs are replayed as regression tests, benchmarks measure time and memory, and every
+  documentation example compiles and runs as a doc test.
 
 ### Dependencies
 
