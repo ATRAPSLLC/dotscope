@@ -50,6 +50,8 @@
 
 mod codegen;
 mod context;
+#[cfg(test)]
+mod differential;
 mod host;
 mod pass;
 mod passes;
