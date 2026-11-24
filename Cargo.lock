@@ -45,9 +45,9 @@ dependencies = [
 
 [[package]]
 name = "analyssa"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f255dbf7cb07a93f19e670aa7e7753f07f43552d1b70b35f0a049e2aae58312"
+checksum = "f182911ddfa5d4a2c2a62d46e7f24c13c9fcc6525b139022d18b7b0db16b8c6f"
 dependencies = [
  "boxcar",
  "dashmap",
