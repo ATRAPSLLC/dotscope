@@ -11,7 +11,6 @@ use crate::{
         tables::{Param, ParamAttributes, ParamRc, TableInfoRef, TableRow},
         token::Token,
     },
-    utils::LazyList,
     Result,
 };
 
@@ -149,7 +148,7 @@ impl ParamRaw {
             flags: ParamAttributes::new(self.flags),
             sequence: self.sequence,
             name: if self.name != 0 {
-                Some(strings.get(self.name as usize)?.to_string())
+                Some(strings.get_shared(self.name as usize)?)
             } else {
                 None
             },
@@ -158,7 +157,7 @@ impl ParamRaw {
             modifiers: Arc::new(boxcar::Vec::new()),
             base: OnceLock::new(),
             is_by_ref: AtomicBool::new(false),
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         }))
     }
 }

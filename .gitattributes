@@ -63,3 +63,7 @@ yarn.lock text eol=lf
 # Fuzz corpus and artifacts (treat as binary to avoid corruption)
 fuzz/corpus/** binary
 fuzz/artifacts/** binary
+
+# Test samples are exact bytes: MANIFEST.toml hashes them and the PDBs embed and checksum
+# their sources, so no checkout converts their line endings (last, to override the rules above)
+dotscope/tests/samples/** -text

@@ -34,18 +34,36 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use dotscope::emulation::thread::{EmulationThread, ThreadCallFrame};
+//! ```
+//! use dotscope::emulation::{EmValue, EmulationThread, ThreadId};
+//! use dotscope::metadata::token::Token;
+//! # use std::sync::{Arc, RwLock};
+//! # use dotscope::emulation::{
+//! #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+//! #     ThreadContext, VirtualFs,
+//! # };
+//! # let address_space = Arc::new(AddressSpace::new());
+//! # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+//! # let context = Arc::new(ThreadContext::new(
+//! #     address_space,
+//! #     Arc::new(RwLock::new(RuntimeState::new())),
+//! #     Arc::new(CaptureContext::new()),
+//! #     Arc::new(EmulationConfig::default()),
+//! #     None,
+//! #     fake_objects,
+//! #     Arc::new(VirtualFs::new()),
+//! # ));
 //!
 //! // Create a thread
-//! let mut thread = EmulationThread::new(thread_id, address_space, capture, assembly);
+//! let mut thread = EmulationThread::new(ThreadId::new(1), context);
 //!
-//! // Start executing a method
-//! thread.start_method(method_token, locals, args, expects_return);
+//! // Start executing a method: no locals, no arguments, a return value
+//! thread.start_method(Token::new(0x0600_0001), vec![], vec![], true);
 //!
 //! // Push/pop values on evaluation stack
 //! thread.push(EmValue::I32(42))?;
 //! let value = thread.pop()?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use std::{
@@ -61,7 +79,7 @@ use crate::{
         exception::ThreadExceptionState,
         fakeobjects::SharedFakeObjects,
         filesystem::VirtualFs,
-        memory::{AddressSpace, DelegateEntry, HeapObject, ManagedHeap},
+        memory::{AddressSpace, HeapObject, ManagedHeap},
         process::EmulationConfig,
         runtime::RuntimeState,
         thread::ThreadContext,
@@ -283,6 +301,11 @@ pub struct ThreadCallFrame {
     /// loaded assembly calls another method, the controller uses this index to
     /// fetch instructions and resolve metadata from the correct assembly.
     assembly_index: Option<u32>,
+
+    /// The entries of a multicast delegate still to run after this frame's method, one of the
+    /// delegate's entries, returns. Held by the frame so an exception unwinding it drops them
+    /// with it, as the CLR does: the exception leaves the delegate's `Invoke`.
+    multicast: Option<MulticastState>,
 }
 
 impl ThreadCallFrame {
@@ -322,7 +345,19 @@ impl ThreadCallFrame {
             method_type_args: None,
             call_id: 0,
             assembly_index: None,
+            multicast: None,
         }
+    }
+
+    /// Records the entries of a multicast delegate still to run when this frame, running one
+    /// of its entries, returns.
+    pub fn set_multicast(&mut self, state: MulticastState) {
+        self.multicast = Some(state);
+    }
+
+    /// Takes the entries of a multicast delegate still to run after this frame's method.
+    pub fn take_multicast(&mut self) -> Option<MulticastState> {
+        self.multicast.take()
     }
 
     /// Returns the method token for this frame.
@@ -574,17 +609,31 @@ impl ThreadCallFrame {
 ///
 /// # Example
 ///
-/// ```ignore
-/// // Create a new thread
-/// let thread = EmulationThread::new(
-///     ThreadId::new(1),
-///     address_space,
-///     capture,
-///     Some(assembly),
-/// );
+/// ```
+/// use dotscope::emulation::{EmulationThread, ThreadId};
+/// # use std::sync::{Arc, RwLock};
+/// # use dotscope::emulation::{
+/// #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+/// #     ThreadContext, VirtualFs,
+/// # };
+/// # let address_space = Arc::new(AddressSpace::new());
+/// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+/// # let context = Arc::new(ThreadContext::new(
+/// #     address_space,
+/// #     Arc::new(RwLock::new(RuntimeState::new())),
+/// #     Arc::new(CaptureContext::new()),
+/// #     Arc::new(EmulationConfig::default()),
+/// #     None,
+/// #     fake_objects,
+/// #     Arc::new(VirtualFs::new()),
+/// # ));
 ///
-/// // Or create the main thread with ID 1
-/// let main = EmulationThread::main(address_space, capture, Some(assembly));
+/// // Create a new thread
+/// let thread = EmulationThread::new(ThreadId::new(1), Arc::clone(&context));
+///
+/// // Or create the main thread, `ThreadId::MAIN`
+/// let main = EmulationThread::main(context);
+/// assert_eq!(main.id(), ThreadId::MAIN);
 /// ```
 pub struct EmulationThread {
     /// Unique identifier for this thread.
@@ -617,33 +666,54 @@ pub struct EmulationThread {
     /// Total instructions executed by this thread.
     instructions_executed: u64,
 
+    /// Native work hooks do for this thread, against the emulation's instruction budget.
+    work: WorkMeter,
+
     /// Return value when thread completes.
     return_value: Option<EmValue>,
 
-    /// Pending multicast delegate invocation state.
-    ///
-    /// When a delegate with multiple entries in its invocation list is invoked,
-    /// the first entry is dispatched immediately and remaining entries are stored
-    /// here. After each entry's method returns, the controller checks this state
-    /// and dispatches the next entry until all are exhausted.
+    /// The entries still to run of the multicast delegate being dispatched, between the
+    /// dispatcher choosing an entry and the controller entering it: the controller moves it to
+    /// the entry's frame, or reissues the `Invoke` at once when the entry ran without one.
     multicast_state: Option<MulticastState>,
+
+    /// The delegate whose `Invoke` the controller reissues for its next entry, and the index of
+    /// that entry: the dispatcher starts there instead of at the first entry.
+    delegate_resume: Option<(HeapRef, usize)>,
 }
 
-/// State for tracking multicast delegate invocation progress.
+/// The native work hooks do for a thread (key derivation rounds, modular exponentiation),
+/// measured in the units of the emulation's instruction budget: an expensive call costs
+/// what the IL that computed it would, so it ends the run where a long loop would rather
+/// than under a ceiling of its own.
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkMeter {
+    /// Instructions the run had executed when the current step began
+    executed: u64,
+    /// The run's instruction budget, 0 for none
+    limit: u64,
+    /// Work charged since the step began
+    charged: u64,
+}
+
+/// The entries of a multicast delegate still to run after the one that is running.
 ///
-/// When a delegate's `Invoke` is called and the invocation list has multiple
-/// entries, the dispatcher stores remaining entries and the original arguments
-/// here. The controller processes one entry at a time; only the last entry's
-/// return value is propagated to the caller.
+/// A multicast delegate's `Invoke` runs its entries in order and returns the last one's
+/// result. The dispatcher runs one entry per `Invoke`; when that entry returns, the controller
+/// reissues the `Invoke` at its call site with the same arguments, and the dispatcher starts
+/// at `next_entry`. Every entry so runs as a call from the original caller: it returns there,
+/// with the caller's stack and pending `leave` restored, and only the last entry's result
+/// stays on the stack.
 #[derive(Debug, Clone)]
 pub struct MulticastState {
-    /// Remaining delegate entries to invoke (front = next to dispatch).
-    pub remaining_entries: Vec<DelegateEntry>,
-    /// Arguments passed to each delegate entry (excluding the 'this' delegate ref).
-    pub delegate_args: Vec<EmValue>,
-    /// Call depth when multicast dispatch started, used to detect when
-    /// the current entry's method has returned back to the dispatch level.
-    pub dispatch_depth: usize,
+    /// The delegate being invoked.
+    pub delegate: HeapRef,
+    /// The arguments `Invoke` was called with, the delegate first.
+    pub invoke_args: Vec<EmValue>,
+    /// The index in the invocation list of the entry to run next.
+    pub next_entry: usize,
+    /// The offset of the `Invoke` call instruction in the caller, where it is reissued.
+    pub call_offset: u32,
 }
 
 /// A request to invoke a method via reflection.
@@ -701,8 +771,10 @@ impl EmulationThread {
             tls: HashMap::new(),
             context,
             instructions_executed: 0,
+            work: WorkMeter::default(),
             return_value: None,
             multicast_state: None,
+            delegate_resume: None,
         }
     }
 
@@ -929,8 +1001,18 @@ impl EmulationThread {
 
     /// Pushes a new call frame onto the call stack.
     ///
-    /// Used when entering a method.
-    pub fn push_frame(&mut self, frame: ThreadCallFrame) {
+    /// Used when entering a method. A frame that names no assembly runs in its caller's: a
+    /// method of an assembly loaded with `Assembly.Load` calls its own methods by its own
+    /// tokens, and without the caller's assembly the callee's token was read against the main
+    /// assembly's metadata. A call into another assembly names that assembly explicitly.
+    pub fn push_frame(&mut self, mut frame: ThreadCallFrame) {
+        if frame.assembly_index().is_none() {
+            let caller = self
+                .call_stack
+                .last()
+                .and_then(ThreadCallFrame::assembly_index);
+            frame.set_assembly_index(caller);
+        }
         self.call_stack.push(frame);
     }
 
@@ -1006,11 +1088,33 @@ impl EmulationThread {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # use dotscope::emulation::{EmValue, EmulationThread};
+    /// # use std::sync::{Arc, RwLock};
+    /// # use dotscope::emulation::{
+    /// #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+    /// #     ThreadContext, VirtualFs,
+    /// # };
+    /// # let address_space = Arc::new(AddressSpace::new());
+    /// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+    /// # let context = Arc::new(ThreadContext::new(
+    /// #     address_space,
+    /// #     Arc::new(RwLock::new(RuntimeState::new())),
+    /// #     Arc::new(CaptureContext::new()),
+    /// #     Arc::new(EmulationConfig::default()),
+    /// #     None,
+    /// #     fake_objects,
+    /// #     Arc::new(VirtualFs::new()),
+    /// # ));
+    /// # let mut thread = EmulationThread::main(context);
+    /// # for value in [1, 2, 3] {
+    /// #     thread.push(EmValue::I32(value))?;
+    /// # }
     /// // For a method call like: Foo(arg1, arg2, arg3)
     /// // Stack before (top on right): [..., arg1, arg2, arg3]
     /// let args = thread.pop_args(3)?;
     /// // args = [arg1, arg2, arg3]
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn pop_args(&mut self, count: usize) -> Result<Vec<EmValue>> {
         let mut args = Vec::with_capacity(count);
@@ -1060,27 +1164,43 @@ impl EmulationThread {
         &mut self.exception_state
     }
 
-    /// Sets a pending multicast delegate invocation state.
+    /// Records the entries still to run of the multicast delegate the dispatcher is invoking.
     ///
-    /// Called by the delegate dispatcher when a delegate with multiple entries
-    /// in its invocation list is invoked. The remaining entries (after the first)
-    /// and the original arguments are stored here for the controller to process.
+    /// Called by the delegate dispatcher when it runs an entry with more after it. The
+    /// controller takes it right away (see [`take_multicast_state`](Self::take_multicast_state)).
     pub fn set_multicast_state(&mut self, state: MulticastState) {
         self.multicast_state = Some(state);
     }
 
-    /// Takes and returns the pending multicast state, leaving `None` in its place.
-    ///
-    /// Called by the controller after a multicast entry's method returns to
-    /// check if there are more entries to dispatch.
+    /// Takes the entries still to run of the multicast delegate the dispatcher just invoked,
+    /// for the controller to attach to the entry's frame or to reissue the `Invoke` with.
     pub fn take_multicast_state(&mut self) -> Option<MulticastState> {
         self.multicast_state.take()
     }
 
-    /// Returns `true` if there is a pending multicast delegate invocation.
+    /// Returns `true` if the dispatcher left entries of a multicast delegate to run.
     #[must_use]
     pub fn has_multicast_state(&self) -> bool {
         self.multicast_state.is_some()
+    }
+
+    /// Makes the next `Invoke` of `delegate` start at entry `entry` of its invocation list:
+    /// the controller reissues the `Invoke` for a multicast delegate's next entry.
+    pub fn resume_delegate_at(&mut self, delegate: HeapRef, entry: usize) {
+        self.delegate_resume = Some((delegate, entry));
+    }
+
+    /// Returns the entry an `Invoke` of `delegate` starts at: the one
+    /// [`resume_delegate_at`](Self::resume_delegate_at) recorded for it, which this consumes,
+    /// or the first.
+    pub fn take_delegate_resume(&mut self, delegate: HeapRef) -> usize {
+        match self.delegate_resume {
+            Some((resumed, entry)) if resumed == delegate => {
+                self.delegate_resume = None;
+                entry
+            }
+            _ => 0,
+        }
     }
 
     /// Returns a reference to the shared address space.
@@ -1207,6 +1327,33 @@ impl EmulationThread {
     /// Called by the interpreter after each instruction.
     pub fn increment_instructions(&mut self) {
         self.instructions_executed = self.instructions_executed.saturating_add(1);
+    }
+
+    /// Charges `units` of native work, in instructions, before a hook does it.
+    ///
+    /// Returns `false` when the run's instruction budget cannot cover it: the work is
+    /// charged all the same, and the hook returns without doing it
+    /// (`PreHookResult::Bypass(None)`). The run then ends at its next limit check, before
+    /// the emulated code goes on, as it would had the IL done the work. Without a budget
+    /// every charge is covered.
+    pub fn charge_work(&mut self, units: u64) -> bool {
+        self.work.charged = self.work.charged.saturating_add(units);
+        let total = self.work.executed.saturating_add(self.work.charged);
+        self.work.limit == 0 || total < self.work.limit
+    }
+
+    /// Starts a step: `executed` instructions of a `limit` budget (0 for none) are spent.
+    pub fn begin_work(&mut self, executed: u64, limit: u64) {
+        self.work = WorkMeter {
+            executed,
+            limit,
+            charged: 0,
+        };
+    }
+
+    /// The native work charged since the step began, for the run's instruction count.
+    pub fn take_work(&mut self) -> u64 {
+        std::mem::take(&mut self.work.charged)
     }
 
     /// Returns the method token of the currently executing method.
@@ -1535,7 +1682,24 @@ impl EmulationThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::emulation::{create_test_context, create_test_thread};
+    use crate::testkit::emulation::{create_test_context, create_test_thread};
+
+    /// A hook's work is covered while the run's executed instructions and the work charged
+    /// this step stay under the budget; the charge stands either way, for the run's count,
+    /// and without a budget every charge is covered.
+    #[test]
+    fn work_is_charged_against_the_rest_of_the_budget() {
+        let mut thread = create_test_thread();
+        thread.begin_work(900, 1000);
+        assert!(thread.charge_work(50));
+        assert!(thread.charge_work(49));
+        assert!(!thread.charge_work(1));
+        assert_eq!(thread.take_work(), 100);
+        assert_eq!(thread.take_work(), 0);
+
+        thread.begin_work(900, 0);
+        assert!(thread.charge_work(u64::MAX));
+    }
 
     /// The index selects which loaded assembly's metadata a frame executes against, and
     /// emulated code grows that list. Narrowing it binds the frame to a different assembly

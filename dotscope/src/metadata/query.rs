@@ -37,7 +37,7 @@ type TypeFilter<'a> = Box<dyn Fn(&CilType) -> bool + 'a>;
 /// A boxed filter predicate over [`Method`] references.
 type MethodFilter<'a> = Box<dyn Fn(&Method) -> bool + 'a>;
 
-/// A boxed filter predicate over [`Field`](crate::metadata::tables::Field) references.
+/// A boxed filter predicate over [`Field`] references.
 type FieldFilter<'a> = Box<dyn Fn(&Field) -> bool + 'a>;
 
 /// A composable query builder for filtering types in an assembly.
@@ -162,7 +162,7 @@ impl<'a> TypeQuery<'a> {
     /// Filters to types whose fullname matches exactly.
     #[must_use]
     pub fn fullname(mut self, fqn: &'a str) -> Self {
-        self.filters.push(Box::new(move |t| &*t.fullname() == fqn));
+        self.filters.push(Box::new(move |t| t.fullname() == fqn));
         self
     }
 
@@ -494,7 +494,6 @@ impl<'a> MethodQuery<'a> {
     }
 
     /// Returns a lazy iterator over matching methods.
-    #[must_use]
     pub fn iter(&self) -> Box<dyn Iterator<Item = MethodRc> + '_> {
         let base: Box<dyn Iterator<Item = MethodRc> + '_> = match &self.source {
             MethodQuerySource::Assembly(map) => {
@@ -614,12 +613,12 @@ impl<'a> FieldQuery<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::CilObject;
+    use crate::{testkit::fixture, CilObject};
 
     #[test]
     fn test_type_query_defined_filters_typerefs() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         let all_types = assembly.types().all_types();
         let defined_types = assembly.query_types().defined().find_all();
@@ -633,7 +632,7 @@ mod tests {
     #[test]
     fn test_type_query_chained_filters() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         let public_defined = assembly.query_types().defined().public().find_all();
 
@@ -647,7 +646,7 @@ mod tests {
     #[test]
     fn test_type_query_exists_and_count() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         assert!(assembly.query_types().defined().exists());
         assert!(assembly.query_types().defined().count() > 0);
@@ -656,7 +655,7 @@ mod tests {
     #[test]
     fn test_method_query_from_assembly() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         let static_methods = assembly.query_methods().static_methods().find_all();
         assert!(!static_methods.is_empty());
@@ -666,7 +665,7 @@ mod tests {
     #[test]
     fn test_method_query_static_constructors() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         let cctors = assembly.query_methods().static_constructors().find_all();
         assert!(cctors.iter().all(|m| m.is_cctor()));
@@ -675,7 +674,7 @@ mod tests {
     #[test]
     fn test_type_query_methods_pivot() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         // Get public methods from defined public types
         let methods = assembly
@@ -693,7 +692,7 @@ mod tests {
     #[test]
     fn test_method_query_by_name() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         let ctors = assembly.query_methods().name(".ctor").find_all();
         assert!(!ctors.is_empty());
@@ -703,7 +702,7 @@ mod tests {
     #[test]
     fn test_type_query_tokens() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         let tokens = assembly.query_types().defined().public().tokens();
         let types = assembly.query_types().defined().public().find_all();
@@ -714,7 +713,7 @@ mod tests {
     #[test]
     fn test_type_query_from_type_methods() {
         let assembly =
-            CilObject::from_path("tests/samples/WindowsBase.dll").expect("Failed to load assembly");
+            CilObject::from_path(fixture("WindowsBase.dll")).expect("Failed to load assembly");
 
         // Find a type that has methods, then query its methods
         let type_opt = assembly.query_types().defined().has_methods().find_first();

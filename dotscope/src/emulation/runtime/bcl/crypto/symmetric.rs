@@ -33,15 +33,25 @@
 use crate::{
     emulation::{
         capture::{BufferSource, CaptureSource},
+        engine::synthetic_exception,
         runtime::{
-            bcl::crypto::{extract_xml_element, resolve_crypto_key_iv},
+            bcl::{
+                crypto::{
+                    extract_xml_element, finish_crypto_stream, resolve_crypto_key_iv,
+                    transform_failure, transform_stream_data,
+                },
+                limits::buffer_range,
+            },
             hook::{Hook, HookContext, HookManager, PreHookResult},
         },
         thread::EmulationThread,
-        EmValue,
+        EmValue, HeapRef,
     },
     metadata::token::Token,
-    utils::{apply_crypto_transform, base64_decode, verify_rsa_pkcs1v15},
+    utils::{
+        apply_crypto_transform, base64_decode, rsa_verify_work, symmetric_block_size,
+        verify_rsa_pkcs1v15, CryptoFailure,
+    },
     Result,
 };
 
@@ -667,15 +677,151 @@ fn triple_des_create_pre(_ctx: &HookContext<'_>, thread: &mut EmulationThread) -
     }
 }
 
+/// The exception the runtime throws for an argument of a transform call.
+fn argument_error(exception_type: Token, message: String) -> PreHookResult {
+    PreHookResult::Throw {
+        exception_type,
+        message,
+    }
+}
+
+/// A transform's parameters, as the heap gives them: algorithm, key, IV, whether it
+/// encrypts, cipher mode, padding mode.
+type TransformParameters = (std::sync::Arc<str>, Vec<u8>, Vec<u8>, bool, u8, u8);
+
+/// The `ICryptoTransform` a transform call is made on, and its parameters; an emulation
+/// error when `this` is no transform the heap holds.
+fn this_transform(
+    ctx: &HookContext<'_>,
+    thread: &EmulationThread,
+) -> std::result::Result<(HeapRef, TransformParameters), PreHookResult> {
+    let Some(EmValue::ObjectRef(transform_ref)) = ctx.this else {
+        return Err(PreHookResult::Error(format!(
+            "ICryptoTransform.{} called without a transform object",
+            ctx.method_name
+        )));
+    };
+    match thread.heap().get_crypto_transform_info(*transform_ref) {
+        Ok(Some(info)) => Ok((*transform_ref, info)),
+        Ok(None) => Err(PreHookResult::Error(format!(
+            "ICryptoTransform.{} called on an object that is no emulated transform",
+            ctx.method_name
+        ))),
+        Err(e) => Err(PreHookResult::Error(format!("heap read failed: {e}"))),
+    }
+}
+
+/// The input bytes a transform call names, `(inputBuffer, inputOffset, inputCount)` as its
+/// first three arguments, checked as the runtime's `UniversalCryptoTransform` checks them
+/// before any work: a null buffer is the `ArgumentNullException` it throws, and a negative
+/// or too large offset, a negative count, or a count past the buffer's end the
+/// `ArgumentOutOfRangeException`. `TransformBlock` (`whole_blocks` the block size) also
+/// refuses a count that is not positive or not whole blocks, with the same exception.
+/// Arguments of any other shape are no call the runtime makes: an emulation error.
+fn input_range(
+    ctx: &HookContext<'_>,
+    thread: &EmulationThread,
+    whole_blocks: Option<usize>,
+) -> std::result::Result<Vec<u8>, PreHookResult> {
+    let out_of_range = |message: String| {
+        Err(argument_error(
+            synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+            message,
+        ))
+    };
+    let bytes = match ctx.args.first() {
+        Some(EmValue::ObjectRef(handle)) => match thread.heap().get_byte_array(*handle) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                return Err(PreHookResult::Error(format!(
+                    "ICryptoTransform.{} of an object that is no byte[]",
+                    ctx.method_name
+                )))
+            }
+            Err(e) => return Err(PreHookResult::Error(format!("heap read failed: {e}"))),
+        },
+        Some(EmValue::Null) => {
+            return Err(argument_error(
+                synthetic_exception::ARGUMENT_NULL,
+                "inputBuffer".to_string(),
+            ))
+        }
+        other => {
+            return Err(PreHookResult::Error(format!(
+                "ICryptoTransform.{} with inputBuffer {other:?}, no byte array",
+                ctx.method_name
+            )))
+        }
+    };
+    let (Some(EmValue::I32(offset)), Some(EmValue::I32(count))) =
+        (ctx.args.get(1), ctx.args.get(2))
+    else {
+        return Err(PreHookResult::Error(format!(
+            "ICryptoTransform.{} without int32 inputOffset and inputCount",
+            ctx.method_name
+        )));
+    };
+    let Some(offset) = usize::try_from(*offset).ok().filter(|o| *o <= bytes.len()) else {
+        return out_of_range(format!(
+            "inputOffset {offset} is outside the input buffer's {} bytes",
+            bytes.len()
+        ));
+    };
+    let Ok(count) = usize::try_from(*count) else {
+        return out_of_range(format!("inputCount {count} must be non-negative"));
+    };
+    if let Some(block) = whole_blocks {
+        if count == 0 || !count.is_multiple_of(block) {
+            return out_of_range(format!(
+                "inputCount {count} is not a positive multiple of the block size {block}"
+            ));
+        }
+    }
+    match bytes.get(offset..offset.saturating_add(count)) {
+        Some(input) => Ok(input.to_vec()),
+        None => out_of_range(format!(
+            "{count} bytes from {offset} pass the input buffer's {} bytes",
+            bytes.len()
+        )),
+    }
+}
+
+/// Records a transform's output for the capture of decrypted and encrypted buffers.
+fn capture_transformed(thread: &mut EmulationThread, data: &[u8], algorithm: &str, label: &str) {
+    let source = CaptureSource::new(
+        thread.current_method().unwrap_or(Token::new(0)),
+        thread.id(),
+        thread.current_offset().unwrap_or(0),
+        0,
+    );
+    thread.capture().capture_buffer(
+        data.to_vec(),
+        source,
+        BufferSource::CryptoTransform {
+            algorithm: algorithm.to_string(),
+        },
+        label,
+    );
+}
+
 /// Hook for `System.Security.Cryptography.ICryptoTransform.TransformBlock` method.
 ///
-/// Transforms a single block of data incrementally. Unlike `TransformFinalBlock`, this
-/// does not apply padding and is used for streaming block-by-block encryption/decryption.
+/// Transforms whole blocks of data incrementally, without padding, as the runtime's
+/// transforms do:
 ///
-/// For CBC mode, the IV on the transform object is updated after each call to maintain
-/// proper chaining:
-/// - **Encryption**: the new IV is set to the ciphertext output block.
-/// - **Decryption**: the new IV is set to the ciphertext input block (before decryption).
+/// - the input count must be a positive multiple of the block size, and the output buffer
+///   must have room for as many bytes from its offset;
+/// - a decryptor whose padding is removed (PKCS7, ANSIX923, ISO10126) keeps the latest block
+///   back until the next call or `TransformFinalBlock`, since only the final block's padding
+///   is removed, and returns the blocks before it;
+/// - in CBC mode the next call chains from the last ciphertext block: the output for an
+///   encryptor, the input for a decryptor.
+///
+/// What the runtime refuses is thrown, checked in its order before any work: a null buffer
+/// is `ArgumentNullException`, every offset and count it refuses `ArgumentOutOfRangeException`,
+/// and a key of the wrong size `CryptographicException`. A call on no emulated transform, or
+/// a cipher the emulator does not compute, is an emulation error. The input is never handed
+/// back as the output.
 ///
 /// # Handled Overloads
 ///
@@ -689,130 +835,111 @@ fn triple_des_create_pre(_ctx: &HookContext<'_>, thread: &mut EmulationThread) -
 /// - `outputBuffer`: Output byte array to receive transformed data
 /// - `outputOffset`: Offset in outputBuffer to start writing
 fn transform_block_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    if ctx.args.is_empty() {
-        return PreHookResult::Bypass(Some(EmValue::I32(0)));
+    let (transform_ref, (algorithm, key, iv, is_encryptor, mode, padding)) =
+        match this_transform(ctx, thread) {
+            Ok(transform) => transform,
+            Err(result) => return result,
+        };
+    let Some(block) = symmetric_block_size(&algorithm) else {
+        return transform_failure(CryptoFailure::Unsupported(format!(
+            "symmetric algorithm {algorithm}"
+        )));
+    };
+    let data = match input_range(ctx, thread, Some(block)) {
+        Ok(data) => data,
+        Err(result) => return result,
+    };
+    // The output must have room for `inputCount` bytes from `outputOffset`, before any work
+    let output_handle = match ctx.args.get(3) {
+        Some(EmValue::ObjectRef(handle)) => *handle,
+        Some(EmValue::Null) => {
+            return argument_error(
+                synthetic_exception::ARGUMENT_NULL,
+                "outputBuffer".to_string(),
+            )
+        }
+        other => {
+            return PreHookResult::Error(format!(
+                "ICryptoTransform.TransformBlock with outputBuffer {other:?}, no byte array"
+            ))
+        }
+    };
+    let Some(EmValue::I32(output_offset)) = ctx.args.get(4) else {
+        return PreHookResult::Error(
+            "ICryptoTransform.TransformBlock without an int32 outputOffset".to_string(),
+        );
+    };
+    let room = try_hook!(thread.heap().get_array_length(output_handle));
+    let Some(output_offset) = usize::try_from(*output_offset)
+        .ok()
+        .filter(|o| room.checked_sub(*o).is_some_and(|left| data.len() <= left))
+    else {
+        return argument_error(
+            synthetic_exception::ARGUMENT_OUT_OF_RANGE,
+            format!(
+                "{} bytes from outputOffset {output_offset} pass the output buffer's {room} bytes",
+                data.len()
+            ),
+        );
+    };
+
+    // A depadding decryptor keeps the latest block back for the final call to unpad.
+    let input = if is_encryptor {
+        data
+    } else {
+        let mut input = try_hook!(thread.heap().take_crypto_transform_held_back(transform_ref));
+        input.extend_from_slice(&data);
+        if matches!(padding, 2 | 4 | 5) && !input.is_empty() {
+            let keep = input.split_off(input.len().saturating_sub(block));
+            try_hook!(thread
+                .heap()
+                .set_crypto_transform_held_back(transform_ref, keep));
+        }
+        input
+    };
+
+    let output = match apply_crypto_transform(&algorithm, &key, &iv, is_encryptor, &input, mode, 1)
+    {
+        Ok(output) => output,
+        Err(failure) => return transform_failure(failure),
+    };
+    // CBC chains from the last ciphertext block
+    if mode == 1 {
+        let ciphertext = if is_encryptor { &output } else { &input };
+        if let Some(last) = ciphertext
+            .len()
+            .checked_sub(block)
+            .and_then(|at| ciphertext.get(at..))
+        {
+            try_hook!(thread
+                .heap()
+                .update_crypto_transform_iv(transform_ref, last.to_vec()));
+        }
     }
 
-    let Some(EmValue::ObjectRef(input_handle)) = ctx.args.first() else {
-        return PreHookResult::Bypass(Some(EmValue::I32(0)));
-    };
-
-    let Some(input_bytes) = try_hook!(thread.heap().get_byte_array(*input_handle)) else {
-        return PreHookResult::Bypass(Some(EmValue::I32(0)));
-    };
-
-    // Extract offset and count
-    #[allow(clippy::cast_sign_loss)]
-    let (offset, count) = match (ctx.args.get(1), ctx.args.get(2)) {
-        (Some(EmValue::I32(o)), Some(EmValue::I32(c))) => (*o as usize, *c as usize),
-        _ => (0, input_bytes.len()),
-    };
-
-    let end = offset
-        .checked_add(count)
-        .unwrap_or(input_bytes.len())
-        .min(input_bytes.len());
-    let data = if offset < input_bytes.len() {
-        let Some(slice) = input_bytes.get(offset..end) else {
-            return PreHookResult::Bypass(Some(EmValue::I32(0)));
-        };
-        slice.to_vec()
-    } else {
-        return PreHookResult::Bypass(Some(EmValue::I32(0)));
-    };
-
-    let actual_count = data.len();
-
-    // Get output buffer and offset
-    let (output_handle, output_offset) = match (ctx.args.get(3), ctx.args.get(4)) {
-        #[allow(clippy::cast_sign_loss)]
-        (Some(EmValue::ObjectRef(h)), Some(EmValue::I32(o))) => (*h, *o as usize),
-        (Some(EmValue::ObjectRef(h)), _) => (*h, 0),
-        _ => {
-            // No output buffer — just return the count as a no-op
-            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            return PreHookResult::Bypass(Some(EmValue::I32(actual_count as i32)));
-        }
-    };
-
-    // Try to get transform info from `this` (the ICryptoTransform object)
-    let transform_ref = match ctx.this {
-        Some(EmValue::ObjectRef(r)) => *r,
-        _ => {
-            // No transform — passthrough: copy input to output
-            for (i, &byte) in data.iter().enumerate() {
-                let Some(idx) = output_offset.checked_add(i) else {
-                    break;
-                };
-                try_hook!(thread.heap_mut().set_array_element(
-                    output_handle,
-                    idx,
-                    EmValue::I32(i32::from(byte)),
-                ));
-            }
-            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            return PreHookResult::Bypass(Some(EmValue::I32(actual_count as i32)));
-        }
-    };
-
-    let result_bytes = if let Some((algorithm, key, iv, is_encryptor, mode, padding)) =
-        try_hook!(thread.heap().get_crypto_transform_info(transform_ref))
-    {
-        // Save original ciphertext for CBC IV chaining on decryption
-        let original_input = if !is_encryptor && mode == 1 {
-            Some(data.clone())
-        } else {
-            None
-        };
-
-        // Use NoPadding (1) for TransformBlock — padding is only applied in TransformFinalBlock
-        let _ = padding; // suppress unused warning; we intentionally override
-        let transform_result =
-            apply_crypto_transform(&algorithm, &key, &iv, is_encryptor, &data, mode, 1);
-
-        match transform_result {
-            Some(transformed) => {
-                // Update IV for CBC chaining
-                if mode == 1 {
-                    let new_iv = if is_encryptor {
-                        // For encryption, new IV = ciphertext output
-                        transformed.clone()
-                    } else {
-                        // For decryption, new IV = original ciphertext input
-                        original_input.unwrap_or_else(|| data.clone())
-                    };
-                    try_hook!(thread
-                        .heap()
-                        .update_crypto_transform_iv(transform_ref, new_iv));
-                }
-                transformed
-            }
-            None => data,
-        }
-    } else {
-        data
-    };
-
-    // Write result to output buffer
-    for (i, &byte) in result_bytes.iter().enumerate() {
-        let Some(idx) = output_offset.checked_add(i) else {
-            break;
-        };
+    for (i, &byte) in output.iter().enumerate() {
         try_hook!(thread.heap_mut().set_array_element(
             output_handle,
-            idx,
+            output_offset.saturating_add(i),
             EmValue::I32(i32::from(byte)),
         ));
     }
-
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    PreHookResult::Bypass(Some(EmValue::I32(result_bytes.len() as i32)))
+    PreHookResult::Bypass(Some(EmValue::I32(output.len() as i32)))
 }
 
 /// Hook for `System.Security.Cryptography.ICryptoTransform.TransformFinalBlock` method.
 ///
-/// Transforms the final block of data using the associated crypto transform's algorithm,
-/// key, IV, mode, and padding. Falls back to passthrough if the transform fails.
+/// Transforms the final input, with what a decryptor kept back from `TransformBlock` before
+/// it, padding when encrypting and checking and removing the padding when decrypting, then
+/// returns the transform to its initial IV so it can be used again, as the runtime does.
+///
+/// What the runtime refuses is thrown: a null buffer is `ArgumentNullException`, an offset or
+/// count it refuses `ArgumentOutOfRangeException`, and a wrong-sized key, input that is not
+/// whole blocks, or padding that does not check out (the failure decrypting with the wrong
+/// key gives) `CryptographicException`. A call on no emulated transform, or a cipher the
+/// emulator does not compute, is an emulation error. The input is never handed back as the
+/// output.
 ///
 /// # Handled Overloads
 ///
@@ -824,75 +951,32 @@ fn transform_block_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 /// - `inputOffset`: Offset in inputBuffer to start reading
 /// - `inputCount`: Number of bytes to transform
 fn transform_final_block_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    if ctx.args.is_empty() {
-        return PreHookResult::Bypass(Some(EmValue::Null));
-    }
-
-    let Some(EmValue::ObjectRef(input_handle)) = ctx.args.first() else {
-        return PreHookResult::Bypass(Some(EmValue::Null));
+    let (transform_ref, (algorithm, key, iv, is_encryptor, mode, padding)) =
+        match this_transform(ctx, thread) {
+            Ok(transform) => transform,
+            Err(result) => return result,
+        };
+    let data = match input_range(ctx, thread, None) {
+        Ok(data) => data,
+        Err(result) => return result,
     };
+    let mut input = try_hook!(thread.heap().take_crypto_transform_held_back(transform_ref));
+    input.extend_from_slice(&data);
 
-    let Some(input_bytes) = try_hook!(thread.heap().get_byte_array(*input_handle)) else {
-        return PreHookResult::Bypass(Some(EmValue::Null));
+    let result = apply_crypto_transform(&algorithm, &key, &iv, is_encryptor, &input, mode, padding);
+    try_hook!(thread.heap().reset_crypto_transform(transform_ref));
+    let output = match result {
+        Ok(output) => output,
+        Err(failure) => return transform_failure(failure),
     };
-
-    // Apply offset/count if provided
-    #[allow(clippy::cast_sign_loss)]
-    let data = match (ctx.args.get(1), ctx.args.get(2)) {
-        (Some(EmValue::I32(offset)), Some(EmValue::I32(count))) => {
-            let offset = *offset as usize;
-            let count = *count as usize;
-            match offset.checked_add(count) {
-                Some(end) if end <= input_bytes.len() => input_bytes
-                    .get(offset..end)
-                    .map_or_else(|| input_bytes.clone(), <[u8]>::to_vec),
-                _ => input_bytes.clone(),
-            }
-        }
-        _ => input_bytes.clone(),
-    };
-
-    // Try to get transform info from `this` (the ICryptoTransform object)
-    let result_bytes = if let Some(EmValue::ObjectRef(transform_ref)) = ctx.this {
-        if let Some((algorithm, key, iv, is_encryptor, mode, padding)) =
-            try_hook!(thread.heap().get_crypto_transform_info(*transform_ref))
-        {
-            let transform_result =
-                apply_crypto_transform(&algorithm, &key, &iv, is_encryptor, &data, mode, padding);
-
-            match transform_result {
-                Some(transformed) => {
-                    let label = if is_encryptor {
-                        "encrypted_block"
-                    } else {
-                        "decrypted_block"
-                    };
-                    let source = CaptureSource::new(
-                        thread.current_method().unwrap_or(Token::new(0)),
-                        thread.id(),
-                        thread.current_offset().unwrap_or(0),
-                        0,
-                    );
-                    thread.capture().capture_buffer(
-                        transformed.clone(),
-                        source,
-                        BufferSource::CryptoTransform {
-                            algorithm: algorithm.to_string(),
-                        },
-                        label,
-                    );
-                    transformed
-                }
-                None => data,
-            }
-        } else {
-            data
-        }
+    let label = if is_encryptor {
+        "encrypted_block"
     } else {
-        data
+        "decrypted_block"
     };
+    capture_transformed(thread, &output, &algorithm, label);
 
-    match thread.heap().alloc_byte_array(&result_bytes) {
+    match thread.heap().alloc_byte_array(&output) {
         Ok(result) => PreHookResult::Bypass(Some(EmValue::ObjectRef(result))),
         Err(e) => PreHookResult::Error(format!("heap allocation failed: {e}")),
     }
@@ -962,27 +1046,26 @@ fn crypto_stream_ctor_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
 fn crypto_stream_read_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     let crypto_stream_ref = match ctx.this {
         Some(EmValue::ObjectRef(r)) => *r,
-        _ => return PreHookResult::Bypass(Some(EmValue::I32(0))),
+        Some(EmValue::Null) => return PreHookResult::throw_null_reference(),
+        _ => return PreHookResult::Error("CryptoStream.Read without a stream".to_string()),
     };
-
+    // The runtime checks the arguments, then whether the stream reads
+    let (buffer_ref, offset, count) =
+        match buffer_range(ctx, thread, synthetic_exception::ARGUMENT_OUT_OF_RANGE) {
+            Ok(range) => range,
+            Err(result) => return result,
+        };
     let Some((underlying_stream, transform_ref, mode)) =
         try_hook!(thread.heap().get_crypto_stream_info(crypto_stream_ref))
     else {
-        return PreHookResult::Bypass(Some(EmValue::I32(0)));
+        return PreHookResult::Error("CryptoStream.Read on no emulated CryptoStream".to_string());
     };
-
     if mode != 0 {
-        return PreHookResult::Bypass(Some(EmValue::I32(0)));
+        return argument_error(
+            synthetic_exception::NOT_SUPPORTED,
+            "Stream does not support reading.".to_string(),
+        );
     }
-
-    // Intentional cast: array indices are always non-negative in .NET
-    #[allow(clippy::cast_sign_loss)]
-    let (buffer_ref, offset, count) = match (ctx.args.first(), ctx.args.get(1), ctx.args.get(2)) {
-        (Some(EmValue::ObjectRef(b)), Some(EmValue::I32(o)), Some(EmValue::I32(c))) => {
-            (*b, *o as usize, *c as usize)
-        }
-        _ => return PreHookResult::Bypass(Some(EmValue::I32(0))),
-    };
 
     if try_hook!(thread
         .heap()
@@ -992,67 +1075,26 @@ fn crypto_stream_read_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
         let Some((stream_data, underlying_pos)) =
             try_hook!(thread.heap().get_stream_data(underlying_stream))
         else {
-            return PreHookResult::Bypass(Some(EmValue::I32(0)));
+            return PreHookResult::Error("CryptoStream.Read over no emulated stream".to_string());
         };
-
-        // Use data from the underlying stream's current position, not from offset 0
-        let effective_data: &[u8] = stream_data.get(underlying_pos..).unwrap_or(&[]);
-
-        let transformed_data = if let Some((algorithm, key, iv, is_encryptor, mode, padding)) =
-            try_hook!(thread.heap().get_crypto_transform_info(transform_ref))
-        {
-            let transform_result = apply_crypto_transform(
-                &algorithm,
-                &key,
-                &iv,
-                is_encryptor,
-                effective_data,
-                mode,
-                padding,
-            );
-
-            match transform_result {
-                Some(data) => {
-                    if !is_encryptor {
-                        let source = CaptureSource::new(
-                            thread.current_method().unwrap_or(Token::new(0)),
-                            thread.id(),
-                            thread.current_offset().unwrap_or(0),
-                            0,
-                        );
-                        thread.capture().capture_buffer(
-                            data.clone(),
-                            source,
-                            BufferSource::CryptoTransform {
-                                algorithm: algorithm.to_string(),
-                            },
-                            "decrypted_stream",
-                        );
-                    }
-                    data
-                }
-                None => effective_data.to_vec(),
-            }
-        } else {
-            effective_data.to_vec()
+        // From the underlying stream's current position, not from offset 0
+        let remaining = stream_data.get(underlying_pos..).unwrap_or(&[]).to_vec();
+        let transformed = match transform_stream_data(thread, transform_ref, &remaining) {
+            Ok(transformed) => transformed,
+            Err(result) => return result,
         };
-
         try_hook!(thread
             .heap()
-            .set_crypto_stream_transformed(crypto_stream_ref, transformed_data));
+            .set_crypto_stream_transformed(crypto_stream_ref, transformed));
     }
 
     let Some(bytes) = try_hook!(thread.heap().read_crypto_stream(crypto_stream_ref, count)) else {
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
-
     for (i, &byte) in bytes.iter().enumerate() {
-        let Some(idx) = offset.checked_add(i) else {
-            break;
-        };
         try_hook!(thread.heap_mut().set_array_element(
             buffer_ref,
-            idx,
+            offset.saturating_add(i),
             EmValue::I32(i32::from(byte)),
         ));
     }
@@ -1077,54 +1119,48 @@ fn crypto_stream_read_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
 fn crypto_stream_write_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     let crypto_stream_ref = match ctx.this {
         Some(EmValue::ObjectRef(r)) => *r,
-        _ => return PreHookResult::Bypass(None),
+        Some(EmValue::Null) => return PreHookResult::throw_null_reference(),
+        _ => return PreHookResult::Error("CryptoStream.Write without a stream".to_string()),
     };
-
+    // The runtime checks the arguments, then whether the stream writes
+    let (buffer_ref, offset, count) =
+        match buffer_range(ctx, thread, synthetic_exception::ARGUMENT_OUT_OF_RANGE) {
+            Ok(range) => range,
+            Err(result) => return result,
+        };
     let Some((_, _, mode)) = try_hook!(thread.heap().get_crypto_stream_info(crypto_stream_ref))
     else {
-        return PreHookResult::Bypass(None);
+        return PreHookResult::Error("CryptoStream.Write on no emulated CryptoStream".to_string());
     };
-
     if mode != 1 {
-        return PreHookResult::Bypass(None);
+        return argument_error(
+            synthetic_exception::NOT_SUPPORTED,
+            "Stream does not support writing.".to_string(),
+        );
     }
-
-    // Intentional cast: array indices are always non-negative in .NET
-    #[allow(clippy::cast_sign_loss)]
-    let (buffer_ref, offset, count) = match (ctx.args.first(), ctx.args.get(1), ctx.args.get(2)) {
-        (Some(EmValue::ObjectRef(b)), Some(EmValue::I32(o)), Some(EmValue::I32(c))) => {
-            (*b, *o as usize, *c as usize)
-        }
-        _ => return PreHookResult::Bypass(None),
-    };
-
     let Some(buffer_data) = try_hook!(thread.heap().get_byte_array(buffer_ref)) else {
-        return PreHookResult::Bypass(None);
+        return PreHookResult::Error(
+            "CryptoStream.Write from an array that is no byte[]".to_string(),
+        );
     };
-
-    let end = offset
-        .checked_add(count)
-        .unwrap_or(buffer_data.len())
-        .min(buffer_data.len());
-    let bytes_to_write = if offset < buffer_data.len() {
-        let Some(slice) = buffer_data.get(offset..end) else {
-            return PreHookResult::Bypass(None);
-        };
-        slice.to_vec()
-    } else {
-        return PreHookResult::Bypass(None);
-    };
+    // In range: `buffer_range` checked it against the buffer's length
+    let bytes_to_write = buffer_data
+        .get(offset..offset.saturating_add(count))
+        .unwrap_or_default();
 
     try_hook!(thread
         .heap()
-        .crypto_stream_append_write(crypto_stream_ref, &bytes_to_write));
+        .crypto_stream_append_write(crypto_stream_ref, bytes_to_write));
 
     PreHookResult::Bypass(None)
 }
 
 /// Hook for `System.Security.Cryptography.CryptoStream.FlushFinalBlock` method.
 ///
-/// Flushes the final block, applying padding and completing encryption.
+/// Flushes the final block, applying padding and completing encryption (or checking and
+/// removing it, for a decryptor), into the stream beneath, as
+/// [`finish_crypto_stream`] describes. A second call is the `NotSupportedException` the
+/// runtime throws.
 ///
 /// # Handled Overloads
 ///
@@ -1135,78 +1171,20 @@ fn crypto_stream_flush_final_block_pre(
 ) -> PreHookResult {
     let crypto_stream_ref = match ctx.this {
         Some(EmValue::ObjectRef(r)) => *r,
-        _ => return PreHookResult::Bypass(None),
-    };
-
-    let Some((underlying_stream, transform_ref, mode)) =
-        try_hook!(thread.heap().get_crypto_stream_info(crypto_stream_ref))
-    else {
-        return PreHookResult::Bypass(None);
-    };
-
-    if mode != 1 {
-        return PreHookResult::Bypass(None);
-    }
-
-    let Some(write_buffer) = try_hook!(thread
-        .heap()
-        .get_crypto_stream_write_buffer(crypto_stream_ref))
-    else {
-        return PreHookResult::Bypass(None);
-    };
-
-    if write_buffer.is_empty() {
-        return PreHookResult::Bypass(None);
-    }
-
-    let transformed_data = if let Some((algorithm, key, iv, is_encryptor, mode, padding)) =
-        try_hook!(thread.heap().get_crypto_transform_info(transform_ref))
-    {
-        let transform_result = apply_crypto_transform(
-            &algorithm,
-            &key,
-            &iv,
-            is_encryptor,
-            &write_buffer,
-            mode,
-            padding,
-        );
-
-        match transform_result {
-            Some(data) => {
-                if is_encryptor {
-                    let source = CaptureSource::new(
-                        thread.current_method().unwrap_or(Token::new(0)),
-                        thread.id(),
-                        thread.current_offset().unwrap_or(0),
-                        0,
-                    );
-                    thread.capture().capture_buffer(
-                        data.clone(),
-                        source,
-                        BufferSource::CryptoTransform {
-                            algorithm: algorithm.to_string(),
-                        },
-                        "encrypted_stream",
-                    );
-                }
-                data
-            }
-            None => write_buffer,
+        Some(EmValue::Null) => return PreHookResult::throw_null_reference(),
+        _ => {
+            return PreHookResult::Error(
+                "CryptoStream.FlushFinalBlock without a stream".to_string(),
+            )
         }
-    } else {
-        write_buffer
     };
-
-    try_hook!(thread
-        .heap_mut()
-        .write_to_stream(underlying_stream, &transformed_data));
-
-    try_hook!(thread
-        .heap()
-        .clear_crypto_stream_write_buffer(crypto_stream_ref));
-
-    PreHookResult::Bypass(None)
+    match finish_crypto_stream(thread, crypto_stream_ref, true) {
+        Ok(true) => PreHookResult::Bypass(None),
+        Ok(false) => PreHookResult::Error(
+            "CryptoStream.FlushFinalBlock on no emulated CryptoStream".to_string(),
+        ),
+        Err(result) => result,
+    }
 }
 
 /// Hook for `RSA.FromXmlString(string)`.
@@ -1214,28 +1192,34 @@ fn crypto_stream_flush_final_block_pre(
 /// Parses an RSA XML key string and stores the modulus + exponent on the heap object.
 /// Supports the standard `<RSAKeyValue><Modulus>...</Modulus><Exponent>...</Exponent></RSAKeyValue>` format.
 fn rsa_from_xml_string_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
-    let algo_ref = match ctx.this {
-        Some(EmValue::ObjectRef(r)) => *r,
-        _ => return PreHookResult::Bypass(None),
+    let Some(EmValue::ObjectRef(algo_ref)) = ctx.this else {
+        return PreHookResult::Error("RSA.FromXmlString without an RSA object".to_string());
     };
+    let algo_ref = *algo_ref;
 
     let xml_string = match ctx.args.first() {
         Some(EmValue::ObjectRef(r)) => match thread.heap().get_string(*r) {
             Ok(s) => s.to_string(),
-            Err(_) => return PreHookResult::Bypass(None),
+            Err(e) => return PreHookResult::Error(format!("heap read failed: {e}")),
         },
-        _ => return PreHookResult::Bypass(None),
+        _ => return argument_error(synthetic_exception::ARGUMENT_NULL, "xmlString".to_string()),
     };
 
-    // Simple XML parsing for <Modulus> and <Exponent> base64 values
+    // The public key's <Modulus> and <Exponent>, base64. A key without them, or not base64,
+    // is the CryptographicException the runtime throws, not a key left unset.
     let modulus = extract_xml_element(&xml_string, "Modulus").and_then(|b64| base64_decode(&b64));
     let exponent = extract_xml_element(&xml_string, "Exponent").and_then(|b64| base64_decode(&b64));
-
-    if let (Some(mod_bytes), Some(exp_bytes)) = (modulus, exponent) {
-        try_hook!(thread
-            .heap()
-            .set_rsa_public_key(algo_ref, mod_bytes, exp_bytes));
-    }
+    let (Some(mod_bytes), Some(exp_bytes)) = (modulus, exponent) else {
+        return argument_error(
+            synthetic_exception::CRYPTOGRAPHIC,
+            "Input string does not contain a valid encoding of the 'RSA' 'Modulus' and \
+             'Exponent' parameters."
+                .to_string(),
+        );
+    };
+    try_hook!(thread
+        .heap()
+        .set_rsa_public_key(algo_ref, mod_bytes, exp_bytes));
 
     PreHookResult::Bypass(None)
 }
@@ -1278,6 +1262,10 @@ fn rsa_verify_hash_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
+    // The key came from emulated code, of any size
+    if !thread.charge_work(rsa_verify_work(&modulus, &exponent)) {
+        return PreHookResult::Bypass(None);
+    }
     let result = verify_rsa_pkcs1v15(
         &modulus,
         &exponent,
@@ -1293,11 +1281,16 @@ fn rsa_verify_hash_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 mod tests {
     use crate::{
         emulation::{
-            runtime::hook::{HookContext, PreHookResult},
-            EmValue,
+            engine::synthetic_exception,
+            runtime::{
+                bcl::io::stream::stream_dispose_pre,
+                hook::{HookContext, PreHookResult},
+            },
+            EmValue, EmulationThread, HeapRef,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
+        utils::apply_crypto_transform,
     };
 
     #[test]
@@ -1395,12 +1388,13 @@ mod tests {
         assert!(matches!(result, PreHookResult::Bypass(None)));
     }
 
+    /// A transform call without a transform object is no call the runtime makes: an
+    /// emulation error, not the input copied to the output.
     #[test]
-    fn test_transform_block_passthrough() {
+    fn a_transform_without_a_transform_object_is_an_error() {
         let mut thread = create_test_thread();
         let input = thread.heap().alloc_byte_array(&[1, 2, 3, 4]).unwrap();
         let output = thread.heap().alloc_byte_array(&[0, 0, 0, 0]).unwrap();
-
         let args = [
             EmValue::ObjectRef(input),
             EmValue::I32(0),
@@ -1408,24 +1402,20 @@ mod tests {
             EmValue::ObjectRef(output),
             EmValue::I32(0),
         ];
-        let ctx = HookContext::new(
-            Token::new(0x0A000001),
-            "System.Security.Cryptography",
-            "ICryptoTransform",
-            "TransformBlock",
-            PointerSize::Bit64,
-        )
-        .with_args(&args);
-
-        let result = super::transform_block_pre(&ctx, &mut thread);
-
-        // Without a transform `this`, passthrough copies input to output
+        let block = transform_context("TransformBlock", None, &args);
         assert!(matches!(
-            result,
-            PreHookResult::Bypass(Some(EmValue::I32(4)))
+            super::transform_block_pre(&block, &mut thread),
+            PreHookResult::Error(_)
         ));
-        let out_bytes = thread.heap().get_byte_array(output).unwrap().unwrap();
-        assert_eq!(out_bytes, vec![1, 2, 3, 4]);
+        let final_block = transform_context("TransformFinalBlock", None, &args[..3]);
+        assert!(matches!(
+            super::transform_final_block_pre(&final_block, &mut thread),
+            PreHookResult::Error(_)
+        ));
+        assert_eq!(
+            thread.heap().get_byte_array(output).unwrap().unwrap(),
+            vec![0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -1437,10 +1427,11 @@ mod tests {
         let iv = vec![0u8; 16];
         let transform_ref = thread
             .heap()
-            .alloc_crypto_transform("AES", key, iv, false, 1, 2, None)
+            .alloc_crypto_transform("AES", key, iv, false, 1, 1, None)
             .unwrap();
 
-        // A full AES block of zeros — encrypted with key=0, IV=0 in CBC mode
+        // A full AES block of zeros, encrypted with key=0, IV=0 in CBC mode; without padding
+        // to remove, the decryptor returns the block at once
         // this is a well-known test vector
         let input_data = vec![
             0x66, 0xe9, 0x4b, 0xd4, 0xef, 0x8a, 0x2c, 0x3b, 0x88, 0x4c, 0xfa, 0x59, 0xca, 0x34,
@@ -1489,29 +1480,334 @@ mod tests {
         assert_eq!(updated_info.2, input_data); // IV should now be the ciphertext input
     }
 
-    #[test]
-    fn test_transform_final_block_hook() {
-        let mut thread = create_test_thread();
-        let input = thread.heap().alloc_byte_array(&[1, 2, 3, 4]).unwrap();
-
-        let args = [EmValue::ObjectRef(input)];
-        let ctx = HookContext::new(
+    /// A hook context for `ICryptoTransform.method` on `this` with `args`.
+    fn transform_context<'a>(
+        method: &'a str,
+        this: Option<&'a EmValue>,
+        args: &'a [EmValue],
+    ) -> HookContext<'a> {
+        HookContext::new(
             Token::new(0x0A000001),
             "System.Security.Cryptography",
             "ICryptoTransform",
-            "TransformFinalBlock",
+            method,
             PointerSize::Bit64,
         )
-        .with_args(&args);
+        .with_this(this)
+        .with_args(args)
+    }
 
-        let result = super::transform_final_block_pre(&ctx, &mut thread);
-
-        if let PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) = result {
-            let bytes = thread.heap().get_byte_array(handle).unwrap().unwrap();
-            assert_eq!(bytes, vec![1, 2, 3, 4]);
-        } else {
-            panic!("Expected ObjectRef");
+    /// `TransformFinalBlock` of `data` on `transform`: the bytes, or the hook's result.
+    fn final_block(
+        thread: &mut EmulationThread,
+        transform: HeapRef,
+        data: &[u8],
+    ) -> Result<Vec<u8>, PreHookResult> {
+        let input = thread.heap().alloc_byte_array(data).unwrap();
+        let this = EmValue::ObjectRef(transform);
+        let len = i32::try_from(data.len()).unwrap();
+        let args = [
+            EmValue::ObjectRef(input),
+            EmValue::I32(0),
+            EmValue::I32(len),
+        ];
+        let ctx = transform_context("TransformFinalBlock", Some(&this), &args);
+        match super::transform_final_block_pre(&ctx, thread) {
+            PreHookResult::Bypass(Some(EmValue::ObjectRef(handle))) => {
+                Ok(thread.heap().get_byte_array(handle).unwrap().unwrap())
+            }
+            other => Err(other),
         }
+    }
+
+    /// `TransformBlock` of `data` on `transform` into a fresh output of `room` bytes at
+    /// `output_offset`: the hook's result, and the output buffer.
+    fn transform_block(
+        thread: &mut EmulationThread,
+        transform: HeapRef,
+        data: &[u8],
+        room: usize,
+        output_offset: i32,
+    ) -> (PreHookResult, HeapRef) {
+        let input = thread.heap().alloc_byte_array(data).unwrap();
+        let output = thread.heap().alloc_byte_array(&vec![0u8; room]).unwrap();
+        let this = EmValue::ObjectRef(transform);
+        let len = i32::try_from(data.len()).unwrap();
+        let args = [
+            EmValue::ObjectRef(input),
+            EmValue::I32(0),
+            EmValue::I32(len),
+            EmValue::ObjectRef(output),
+            EmValue::I32(output_offset),
+        ];
+        let ctx = transform_context("TransformBlock", Some(&this), &args);
+        (super::transform_block_pre(&ctx, thread), output)
+    }
+
+    /// `TransformBlock` chains the IV forward; `TransformFinalBlock` then returns the
+    /// transform to the IV it was created with, so the next use encrypts as a fresh one.
+    #[test]
+    fn a_transform_returns_to_its_first_iv_after_the_final_block() {
+        let mut thread = create_test_thread();
+        let (key, iv) = (vec![7u8; 16], vec![9u8; 16]);
+        let alloc = |thread: &mut EmulationThread| {
+            thread
+                .heap()
+                .alloc_crypto_transform("AES", key.clone(), iv.clone(), true, 1, 2, None)
+                .unwrap()
+        };
+        let encryptor = alloc(&mut thread);
+        let fresh = alloc(&mut thread);
+        let plaintext = b"after a block";
+        let (result, _) = transform_block(&mut thread, encryptor, &[1u8; 16], 16, 0);
+        assert!(matches!(
+            result,
+            PreHookResult::Bypass(Some(EmValue::I32(16)))
+        ));
+        let chained = final_block(&mut thread, encryptor, plaintext).unwrap();
+        let expected = final_block(&mut thread, fresh, plaintext).unwrap();
+        assert_ne!(
+            chained, expected,
+            "the first final block chains from the block"
+        );
+        assert_eq!(
+            final_block(&mut thread, encryptor, plaintext).unwrap(),
+            expected
+        );
+    }
+
+    /// `TransformBlock` checks its arguments as the runtime does, before any work: a count
+    /// that is zero or not whole blocks, and an output without room for the input count, are
+    /// `ArgumentOutOfRangeException`, and the transform's state is left as it was.
+    #[test]
+    fn transform_block_refuses_what_the_runtime_refuses() {
+        let mut thread = create_test_thread();
+        let encryptor = thread
+            .heap()
+            .alloc_crypto_transform("AES", vec![7u8; 16], vec![9u8; 16], true, 1, 2, None)
+            .unwrap();
+        let out_of_range = |result: &PreHookResult| {
+            matches!(
+                result,
+                PreHookResult::Throw { exception_type, .. }
+                    if *exception_type == synthetic_exception::ARGUMENT_OUT_OF_RANGE
+            )
+        };
+        assert!(out_of_range(
+            &transform_block(&mut thread, encryptor, &[], 16, 0).0
+        ));
+        assert!(out_of_range(
+            &transform_block(&mut thread, encryptor, &[1; 15], 16, 0).0
+        ));
+        assert!(out_of_range(
+            &transform_block(&mut thread, encryptor, &[1; 16], 31, 16).0
+        ));
+        assert!(out_of_range(
+            &transform_block(&mut thread, encryptor, &[1; 16], 16, -1).0
+        ));
+        let (iv, untouched) = {
+            let info = thread
+                .heap()
+                .get_crypto_transform_info(encryptor)
+                .unwrap()
+                .unwrap();
+            (info.2, vec![9u8; 16])
+        };
+        assert_eq!(iv, untouched, "a refused call leaves the IV as it was");
+        let (result, output) = transform_block(&mut thread, encryptor, &[1; 16], 32, 16);
+        assert!(matches!(
+            result,
+            PreHookResult::Bypass(Some(EmValue::I32(16)))
+        ));
+        let written = thread.heap().get_byte_array(output).unwrap().unwrap();
+        assert_eq!(written.get(..16), Some([0u8; 16].as_slice()));
+    }
+
+    /// A write-mode CryptoStream disposed without `FlushFinalBlock`, as a `using` block
+    /// leaves it, still writes its final padded block, as the runtime's `Dispose` does; once
+    /// complete, `FlushFinalBlock` is the `NotSupportedException` the runtime throws, and a
+    /// second `Dispose` writes nothing more.
+    #[test]
+    fn disposing_a_crypto_stream_writes_its_final_block() {
+        let mut thread = create_test_thread();
+        let (key, iv) = (vec![7u8; 16], vec![9u8; 16]);
+        let plaintext = b"written in a using block";
+        let expected = apply_crypto_transform("AES", &key, &iv, true, plaintext, 1, 2).unwrap();
+        let encryptor = thread
+            .heap()
+            .alloc_crypto_transform("AES", key, iv, true, 1, 2, None)
+            .unwrap();
+        let underlying = thread.heap().alloc_stream(Vec::new(), None).unwrap();
+        let stream = thread
+            .heap()
+            .alloc_crypto_stream(underlying, encryptor, 1, None)
+            .unwrap();
+        let buffer = thread.heap().alloc_byte_array(plaintext).unwrap();
+        let this = EmValue::ObjectRef(stream);
+        let len = i32::try_from(plaintext.len()).unwrap();
+        let args = [
+            EmValue::ObjectRef(buffer),
+            EmValue::I32(0),
+            EmValue::I32(len),
+        ];
+        let stream_call = |method| {
+            HookContext::new(
+                Token::new(0x0A000001),
+                "System.Security.Cryptography",
+                "CryptoStream",
+                method,
+                PointerSize::Bit64,
+            )
+        };
+        let write = stream_call("Write").with_this(Some(&this)).with_args(&args);
+        assert!(matches!(
+            super::crypto_stream_write_pre(&write, &mut thread),
+            PreHookResult::Bypass(None)
+        ));
+        let dispose = stream_call("Dispose").with_this(Some(&this));
+        assert!(matches!(
+            stream_dispose_pre(&dispose, &mut thread),
+            PreHookResult::Bypass(None)
+        ));
+        let written = |thread: &EmulationThread| {
+            thread
+                .heap()
+                .get_stream_data(underlying)
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        assert_eq!(written(&thread), expected);
+        assert!(matches!(
+            stream_dispose_pre(&dispose, &mut thread),
+            PreHookResult::Bypass(None)
+        ));
+        assert_eq!(written(&thread), expected);
+        let flush = stream_call("FlushFinalBlock").with_this(Some(&this));
+        assert!(matches!(
+            super::crypto_stream_flush_final_block_pre(&flush, &mut thread),
+            PreHookResult::Throw { exception_type, .. }
+                if exception_type == synthetic_exception::NOT_SUPPORTED
+        ));
+    }
+
+    /// A PKCS7 decryptor keeps the latest block back from `TransformBlock`, since only the
+    /// final block carries padding, and `TransformFinalBlock` unpads it; the transform is
+    /// then back at its first IV, so it encrypts the same input to the same output again.
+    #[test]
+    fn a_padding_decryptor_holds_the_last_block_back() {
+        let mut thread = create_test_thread();
+        let (key, iv) = (vec![7u8; 16], vec![9u8; 16]);
+        let plaintext: Vec<u8> = (0u8..20).collect();
+        let encryptor = thread
+            .heap()
+            .alloc_crypto_transform("AES", key.clone(), iv.clone(), true, 1, 2, None)
+            .unwrap();
+        let ciphertext = final_block(&mut thread, encryptor, &plaintext).unwrap();
+        assert_eq!(ciphertext.len(), 32);
+        assert_eq!(
+            final_block(&mut thread, encryptor, &plaintext).unwrap(),
+            ciphertext
+        );
+
+        let decryptor = thread
+            .heap()
+            .alloc_crypto_transform("AES", key, iv, false, 1, 2, None)
+            .unwrap();
+        let input = thread.heap().alloc_byte_array(&ciphertext).unwrap();
+        let output = thread.heap().alloc_byte_array(&[0u8; 32]).unwrap();
+        let this = EmValue::ObjectRef(decryptor);
+        let args = [
+            EmValue::ObjectRef(input),
+            EmValue::I32(0),
+            EmValue::I32(32),
+            EmValue::ObjectRef(output),
+            EmValue::I32(0),
+        ];
+        let ctx = transform_context("TransformBlock", Some(&this), &args);
+        assert!(matches!(
+            super::transform_block_pre(&ctx, &mut thread),
+            PreHookResult::Bypass(Some(EmValue::I32(16)))
+        ));
+        let first = thread.heap().get_byte_array(output).unwrap().unwrap();
+        assert_eq!(first.get(..16), plaintext.get(..16));
+        assert_eq!(
+            final_block(&mut thread, decryptor, &[]).unwrap(),
+            plaintext.get(16..).unwrap()
+        );
+    }
+
+    /// Decrypting with the wrong key leaves padding that does not check out: the
+    /// `CryptographicException` the runtime throws, not the ciphertext as the plaintext.
+    /// So is input that is not whole blocks, and a key of the wrong size.
+    #[test]
+    fn what_the_runtime_refuses_is_a_cryptographic_exception() {
+        let mut thread = create_test_thread();
+        let iv = vec![0u8; 16];
+        let encryptor = thread
+            .heap()
+            .alloc_crypto_transform("AES", vec![1u8; 16], iv.clone(), true, 1, 2, None)
+            .unwrap();
+        let ciphertext = final_block(&mut thread, encryptor, b"the secret").unwrap();
+        let cryptographic = |result: Result<Vec<u8>, PreHookResult>| {
+            matches!(
+                result,
+                Err(PreHookResult::Throw { exception_type, .. })
+                    if exception_type == synthetic_exception::CRYPTOGRAPHIC
+            )
+        };
+
+        let wrong_key = thread
+            .heap()
+            .alloc_crypto_transform("AES", vec![2u8; 16], iv.clone(), false, 1, 2, None)
+            .unwrap();
+        assert!(cryptographic(final_block(
+            &mut thread,
+            wrong_key,
+            &ciphertext
+        )));
+        let right_key = thread
+            .heap()
+            .alloc_crypto_transform("AES", vec![1u8; 16], iv.clone(), false, 1, 2, None)
+            .unwrap();
+        assert!(cryptographic(final_block(
+            &mut thread,
+            right_key,
+            &ciphertext[..15]
+        )));
+        let short_key = thread
+            .heap()
+            .alloc_crypto_transform("AES", vec![1u8; 15], iv, true, 1, 2, None)
+            .unwrap();
+        assert!(cryptographic(final_block(&mut thread, short_key, b"x")));
+    }
+
+    /// An RSA key whose XML has no base64 modulus and exponent is the
+    /// `CryptographicException` the runtime throws, not a key left unset.
+    #[test]
+    fn a_malformed_rsa_key_is_refused() {
+        let mut thread = create_test_thread();
+        let rsa = thread.heap().alloc_crypto_algorithm("RSA", None).unwrap();
+        let xml = thread
+            .heap()
+            .alloc_string("<RSAKeyValue><Modulus>not base64!</Modulus></RSAKeyValue>")
+            .unwrap();
+        let this = EmValue::ObjectRef(rsa);
+        let args = [EmValue::ObjectRef(xml)];
+        let ctx = HookContext::new(
+            Token::new(0x0A000001),
+            "System.Security.Cryptography",
+            "RSA",
+            "FromXmlString",
+            PointerSize::Bit64,
+        )
+        .with_this(Some(&this))
+        .with_args(&args);
+        assert!(matches!(
+            super::rsa_from_xml_string_pre(&ctx, &mut thread),
+            PreHookResult::Throw { exception_type, .. }
+                if exception_type == synthetic_exception::CRYPTOGRAPHIC
+        ));
     }
 }
 
@@ -1524,7 +1820,7 @@ mod legacy_tests {
             EmValue,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     #[test]

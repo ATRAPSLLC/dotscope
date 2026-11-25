@@ -77,9 +77,12 @@ mod unmanaged;
 
 pub use addressspace::{AddressSpace, SharedHeap};
 pub use arguments::ArgumentStorage;
-pub use heap::{DelegateEntry, DictionaryKey, EncodingType, HeapObject, ManagedHeap, TypeWrapper};
+pub use heap::{
+    DelegateEntry, DictionaryKey, EncodingType, HeapIter, HeapObject, HeapState, ManagedHeap,
+    ManagedString, TypeWrapper,
+};
 pub use locals::LocalVariables;
-pub use page::{Page, PAGE_SIZE};
+pub use page::{Page, PageDataGuard, PAGE_SIZE};
 pub use region::{MemoryProtection, MemoryRegion, SectionInfo, ThreadId};
 pub use stack::EvaluationStack;
 pub use statics::{StaticFieldStorage, TypeInitState};

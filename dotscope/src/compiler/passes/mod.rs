@@ -83,7 +83,6 @@ mod copying;
 mod deadcode;
 mod inlining;
 mod proxy;
-mod strength;
 
 // Re-export the analyssa-supplied target-agnostic pass structs at the
 // dotscope namespace so existing callers (registered via
@@ -92,16 +91,16 @@ pub use analyssa::passes::{
     AlgebraicSimplificationPass, BlockMergingPass, ControlFlowSimplificationPass,
     DeadCodeEliminationPass, GlobalValueNumberingPass, JumpThreadingPass, LicmPass,
     LoopCanonicalizationPass, MemoryOptimizationPass, OpaquePredicatePass, PredicateResult,
-    ReassociationPass, ValueRangePropagationPass,
+    ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
 };
+pub use proxy::{ForwardKind, ProxyArgSource};
 
-// CIL-specific pass impls remain dotscope-side. `copying` and `strength`
-// keep their custom hooks (CIL local-type propagation, interprocedural
-// value ranges); `deadcode` keeps its CIL-call-graph-aware
+// CIL-specific pass impls remain dotscope-side. `copying` keeps its custom
+// hook (CIL local-type propagation); `deadcode` keeps its CIL-call-graph-aware
 // `DeadMethodEliminationPass`; `constants`, `inlining`, `proxy` are
 // CIL-specific in their entirety.
 pub use self::constants::ConstantPropagationPass;
 pub use self::{
     copying::CopyPropagationPass, deadcode::DeadMethodEliminationPass, inlining::InliningPass,
-    proxy::ProxyDevirtualizationPass, strength::StrengthReductionPass,
+    proxy::ProxyDevirtualizationPass,
 };

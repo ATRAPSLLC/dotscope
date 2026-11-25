@@ -69,10 +69,10 @@ use crate::{
         },
         signatures::parse_method_signature,
         streams::{Blob, Strings},
-        tables::{MetadataTable, ParamMap, ParamPtrMap, TableId, TableInfoRef, TableRow},
+        tables::{MemberRanges, ParamList, ParamMap, ParamPtrMap, TableId, TableInfoRef, TableRow},
         token::Token,
     },
-    utils::LazyList,
+    utils::{LazyList, RowList},
     Result,
 };
 
@@ -123,8 +123,8 @@ use crate::{
 ///
 /// # Usage Patterns
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::tables::methoddef::raw::MethodDefRaw;
+/// ```no_run
+/// use dotscope::metadata::tables::MethodDefRaw;
 /// use dotscope::metadata::streams::{Strings, Blob};
 ///
 /// # fn process_method_entry(raw_entry: &MethodDefRaw, strings: &Strings, blob: &Blob) -> dotscope::Result<()> {
@@ -144,6 +144,7 @@ use crate::{
 /// println!("Signature has {} bytes", signature_data.len());
 /// # Ok(())
 /// # }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety
@@ -224,7 +225,10 @@ impl MethodDefRaw {
     /// * `blob` - The blob heap for signature data retrieval
     /// * `params_map` - Collection of all Param entries for parameter resolution
     /// * `param_ptr_map` - Collection of `ParamPtr` entries for indirection (if present)
-    /// * `table` - The `MethodDef` table for parameter range calculation
+    /// * `param_ranges` - The normalized `ParamList` runs of the whole `MethodDef` table
+    ///   ([`TablesHeader::member_ranges`](crate::metadata::streams::TablesHeader::member_ranges)
+    ///   with [`MemberList::MethodDefParams`](crate::metadata::tables::MemberList::MethodDefParams)),
+    ///   which also decide whether `param_ptr_map` is consulted
     ///
     /// # Returns
     /// * `Ok(MethodRc)` - Successfully resolved method with complete parameter metadata
@@ -232,90 +236,28 @@ impl MethodDefRaw {
     ///
     /// # Errors
     ///
-    /// Returns an error if signature parsing, parameter resolution, or name retrieval fails.
-    ///
+    /// Returns an error if signature parsing or name retrieval fails, or if a position in the
+    /// method's parameter run names a `ParamPtr` row or a parameter that is not loaded (the run
+    /// itself is always in range: the ranges are normalized).
     pub fn to_owned(
         &self,
         strings: &Strings,
         blob: &Blob,
         params_map: &ParamMap,
         param_ptr_map: &ParamPtrMap,
-        table: &MetadataTable<MethodDefRaw>,
+        param_ranges: &MemberRanges,
     ) -> Result<MethodRc> {
         let signature = parse_method_signature(blob.get(self.signature as usize)?)?;
 
-        let type_params = if self.param_list == 0 || params_map.is_empty() {
-            Arc::new(boxcar::Vec::new())
-        } else {
-            let next_row_id = self
-                .rid
-                .checked_add(1)
-                .ok_or_else(|| malformed_error!("MethodDef rid overflow: {}", self.rid))?;
-            let start = self.param_list as usize;
-            let end = if next_row_id > table.row_count {
-                params_map.len().saturating_add(1)
-            } else {
-                match table.get(next_row_id)? {
-                    Some(next_row) => next_row.param_list as usize,
-                    None => {
-                        return Err(malformed_error!(
-                            "Failed to resolve param_end from next row - {}",
-                            next_row_id
-                        ))
-                    }
-                }
-            };
-
-            if start > params_map.len() || end > params_map.len().saturating_add(1) || end < start {
-                Arc::new(boxcar::Vec::new())
-            } else {
-                let type_params = Arc::new(boxcar::Vec::with_capacity(end.saturating_sub(start)));
-                for counter in start..end {
-                    let param_rid = u32::try_from(counter).map_err(|_| {
-                        malformed_error!("Param row index out of range: {}", counter)
-                    })?;
-                    let actual_param_token = if param_ptr_map.is_empty() {
-                        Token::from_parts(TableId::Param, param_rid)
-                    } else {
-                        // Built from the TableId enum rather than a hand-written prefix so the
-                        // table id cannot drift from the value `ParamPtrReader` keys rows under.
-                        // It had: this was `0x0A00_0000`, which is MemberRef, while ParamPtr is
-                        // `0x07` — so the lookup below never hit and every assembly carrying a
-                        // ParamPtr table failed to load.
-                        let param_ptr_token = Token::from_parts(TableId::ParamPtr, param_rid);
-
-                        match param_ptr_map.get(&param_ptr_token) {
-                            Some(param_ptr) => {
-                                Token::from_parts(TableId::Param, param_ptr.value().param)
-                            }
-                            None => {
-                                return Err(malformed_error!(
-                                    "Failed to resolve ParamPtr - {}",
-                                    param_ptr_token.value()
-                                ))
-                            }
-                        }
-                    };
-
-                    match params_map.get(&actual_param_token) {
-                        Some(param) => _ = type_params.push(param.value().clone()),
-                        None => {
-                            return Err(malformed_error!(
-                                "Failed to resolve param - {}",
-                                actual_param_token.value()
-                            ))
-                        }
-                    }
-                }
-
-                type_params
-            }
-        };
+        let type_params = ParamList::new();
+        for param in param_ranges.members(self.rid, param_ptr_map, |ptr| ptr.param, params_map) {
+            _ = type_params.push(param?);
+        }
         Ok(Arc::new(Method {
             rid: self.rid,
             token: self.token,
             meta_offset: self.offset,
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             impl_code_type: MethodImplCodeType::from_impl_flags(self.impl_flags),
             impl_management: MethodImplManagement::from_impl_flags(self.impl_flags),
             impl_options: MethodImplOptions::from_impl_flags(self.impl_flags),
@@ -324,18 +266,17 @@ impl MethodDefRaw {
             flags_modifiers: MethodModifiers::from_method_flags(self.flags),
             flags_pinvoke: AtomicU32::new(0),
             params: type_params,
-            varargs: Arc::new(boxcar::Vec::new()),
-            generic_params: LazyList::new(),
+            generic_params: Default::default(),
             generic_args: LazyList::new(),
             signature,
             rva: if self.rva == 0 { None } else { Some(self.rva) },
             body: OnceLock::new(),
-            local_vars: Arc::new(boxcar::Vec::new()),
-            overrides: Arc::new(boxcar::Vec::new()),
-            interface_impls: LazyList::new(),
-            security: OnceLock::new(),
+            local_vars: LazyList::new(),
+            overrides: Default::default(),
+            interface_impls: Default::default(),
+            security: RowList::new(),
             blocks: OnceLock::new(),
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
             declaring_type: OnceLock::new(),
         }))
     }

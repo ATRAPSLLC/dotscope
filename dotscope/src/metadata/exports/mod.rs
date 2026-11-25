@@ -71,7 +71,7 @@ pub use container::{
     ExportEntry, ExportSource, ExportTarget, ExportedFunction, NativeExportRef,
     UnifiedExportContainer,
 };
-pub use native::{ExportFunction, NativeExports};
+pub use native::{ExportDirectory, ExportForwarder, ExportFunction, NativeExports};
 
 mod builder;
 mod cil;

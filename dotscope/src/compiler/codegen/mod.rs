@@ -1,82 +1,76 @@
 //! SSA to CIL code generation.
 //!
-//! This module provides the ability to convert SSA form back to CIL bytecode,
-//! completing the roundtrip: CIL → SSA → (transformations) → CIL.
+//! Converts SSA back to CIL bytecode, completing the roundtrip
+//! CIL -> SSA -> (transformations) -> CIL.
 //!
-//! # Architecture
+//! # How a body is generated
 //!
-//! The code generator works in several phases:
-//!
-//! 1. **Register Allocation**: Maps SSA variables to CIL locals
-//! 2. **Phi Elimination**: Converts phi nodes to moves at predecessor block ends
-//! 3. **Block Ordering**: Orders blocks for efficient code layout
-//! 4. **Instruction Selection**: Converts SSA ops to CIL instructions
-//! 5. **Branch Resolution**: Resolves block indices to bytecode offsets
+//! 1. **Storage** ([`storage`]): which values are emitted at their use rather
+//!    than given a row ([`FoldForest`](analyssa::analysis::folding::FoldForest)),
+//!    which share a slot ([`Gathering`](analyssa::analysis::webs::Gathering)),
+//!    and which argument or local slot each web is, with its type. Decided once,
+//!    from one model of the order the body is emitted in.
+//! 2. **Layout**: blocks ordered so fall-through paths need no jump, exception
+//!    regions contiguous, and every phi-carrying edge out of a multi-way branch
+//!    given a block of its own.
+//! 3. **Emission**: each block's operations in SSA order. An operation's
+//!    operands are loaded from their slots or produced in place as expression
+//!    trees; its result is stored to its slot, or left for the consumer it was
+//!    folded into. Phi copies are one parallel copy per predecessor.
+//! 4. **Validation** ([`validate`](mod@validate)): the finished body is checked against the
+//!    SSA by an independent abstract interpretation. A body that reads a value
+//!    other than the one the SSA names, reorders an effect or truncates a value
+//!    in a narrow slot is refused, and the method keeps its original IL.
 //!
 //! # Module Organization
 //!
 //! - [`emitter`]: Low-level CIL instruction emission helpers
-//!
-//! # Optimizations
-//!
-//! The code generator performs several optimizations:
-//!
-//! - **Stack-based value forwarding**: Values that are immediately consumed by
-//!   the next instruction are left on the stack instead of storing to locals.
-//! - **Fallthrough optimization**: Jumps to the immediately following block are
-//!   eliminated since execution falls through naturally.
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use dotscope::compiler::SsaCodeGenerator;
-//!
-//! let generator = SsaCodeGenerator::new();
-//! let (bytecode, max_stack, locals) = generator.generate(&ssa_function)?;
-//! ```
+//! - [`storage`]: Folding, slot sharing and slot typing
+//! - [`validate`](mod@validate): Translation validation of generated bodies
 
-mod coalescing;
 mod emitter;
+mod storage;
+mod validate;
+
+pub use validate::validate_lift;
 
 #[cfg(test)]
 mod tests;
 
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    hash::{Hash, Hasher},
-};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Simple hash for generating unique field names for interned array data.
-fn crc32_hash(data: &[u8]) -> u32 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish() as u32
-}
+use analyssa::analysis::copies::ParallelCopy;
 
 use crate::{
     analysis::{
-        CmpKind, ConstValue, HandlerKind, SsaBlock, SsaExceptionHandler, SsaFunction,
-        SsaInstruction, SsaOp, SsaType, SsaVarId, SsaVariable, VariableOrigin,
+        BlockRange, Callee, CilPrefix, CilTarget, CmpKind, ConstValue, FloatFormat, HandlerKind,
+        RuntimeValueKind, SsaBlock, SsaFunction, SsaOp, SsaType, SsaVarId, SsaVerifier,
+        VerifierError, VerifyLevel,
     },
-    assembly::{Immediate, InstructionEncoder, Operand},
+    assembly::{decode_stream, Immediate, InstructionEncoder, Operand},
     cilassembly::CilAssembly,
-    compiler::codegen::coalescing::LocalCoalescer,
+    compiler::codegen::{
+        storage::{infer_type, is_slot_type, Materialise, Place, Storage},
+        validate::{validate, EmitGroup, OpTag, Validation},
+    },
     metadata::{
-        method::ExceptionHandler,
+        method::{validate_protected_region_flow, ExceptionHandler},
         signatures::{
-            encode_field_signature, CustomModifiers, SignatureField, SignatureLocalVariable,
-            TypeSignature,
+            encode_field_signature, encode_method_signature, encode_typespec_signature,
+            CustomModifiers, SignatureField, SignatureLocalVariable, SignatureMethod,
+            SignatureParameter, SignatureTypeSpec, TypeSignature,
         },
         tables::{
             skip_unreadable, ClassLayoutRaw, CodedIndex, CodedIndexType, FieldRaw, FieldRvaRaw,
-            MemberRefRaw, NestedClassRaw, TableDataOwned, TableId, TypeDefRaw, TypeRefRaw,
+            MemberRefBuilder, MemberRefRaw, NestedClassRaw, TableDataOwned, TableId, TypeDefRaw,
+            TypeRefBuilder, TypeSpecRaw,
         },
         token::Token,
     },
-    Error, Result,
+    Error, Parser, Result,
 };
 
-/// Output of [`SsaCodeGenerator::compile`] — everything needed to assemble a method body.
+/// Output of [`SsaCodeGenerator::compile`] - everything needed to assemble a method body.
 ///
 /// Contains the CIL bytecode, stack depth, local variable signatures, and remapped
 /// exception handlers. This is the bridge between code generation and
@@ -92,22 +86,11 @@ pub struct CompilationResult {
     pub exception_handlers: Vec<ExceptionHandler>,
 }
 
-/// Describes how an SSA variable maps to CIL storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum VarStorage {
-    /// Variable is stored in an argument slot
-    Arg(u16),
-    /// Variable is stored in a local slot
-    Local(u16),
-    /// Variable is currently on the evaluation stack (not yet stored)
-    Stack,
-}
-
 /// Pool of reusable temporary local slots.
 ///
-/// Temporaries (e.g., for phi copies) are allocated from this pool and can be
-/// released back for reuse by other temporaries of the same type.
-/// Uses LIFO (stack) order for better cache locality.
+/// Temporaries (a rotate's operands, a parallel copy's cycle breakers) are
+/// allocated from this pool and released back for reuse by other temporaries of
+/// the same type.
 #[derive(Debug, Default)]
 struct TempPool {
     /// Free slots indexed by type
@@ -116,13 +99,11 @@ struct TempPool {
 
 impl TempPool {
     /// Try to allocate a slot from the pool for the given type.
-    /// Returns `Some(slot)` if a free slot is available, `None` otherwise.
     fn try_allocate(&mut self, ty: &SsaType) -> Option<u16> {
         self.free_by_type.get_mut(ty).and_then(Vec::pop)
     }
 
     /// Release a slot back to the pool for the given type.
-    /// Uses LIFO (push) for better cache locality when reallocated.
     fn release(&mut self, slot: u16, ty: SsaType) {
         self.free_by_type.entry(ty).or_default().push(slot);
     }
@@ -135,17 +116,16 @@ impl TempPool {
 
 /// One entry in the emission order.
 ///
-/// Out-of-SSA needs somewhere to put a phi copy for the edge `from → to`. When `from` has a
+/// Out-of-SSA needs somewhere to put a phi copy for the edge `from -> to`. When `from` has a
 /// single successor the copy can simply precede its branch, but a multi-way terminator
 /// (`Branch`, `BranchCmp`, `Switch`) has no such place: the copy belongs *on the edge*, and
 /// each edge needs its own.
 ///
 /// Edge blocks are therefore ordinary entries in the emission order rather than labelled runs
 /// spliced into branch emission. That makes "does code sit between this block and its
-/// successor" a structural property the layout answers — whatever lands between two blocks is
-/// something the layout placed — rather than a condition each branch emitter has to maintain
-/// by predicting what will be emitted after it. Getting that prediction wrong is the class of
-/// unsound fall-through elision this pass removes.
+/// successor" a structural property the layout answers - whatever lands between two blocks is
+/// something the layout placed - rather than a condition each branch emitter has to maintain
+/// by predicting what will be emitted after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutEntry {
     /// A real SSA block, identified by its block id.
@@ -159,14 +139,68 @@ enum LayoutEntry {
     },
 }
 
-/// SSA to CIL code generator.
+/// What generating one block asks of the whole function, computed once per
+/// method rather than rescanned per block.
+#[derive(Default)]
+struct MethodIndex {
+    /// The blocks the runtime enters through exception dispatch: every handler
+    /// and filter entry.
+    dispatch_entries: BTreeSet<usize>,
+    /// The entries entered with the exception object on the stack: catch and
+    /// filter handlers, and filters.
+    object_entries: BTreeSet<usize>,
+    /// For each block, the blocks whose phis take an operand on an edge from
+    /// it, in ascending order.
+    phi_successors: BTreeMap<usize, Vec<usize>>,
+}
+
+impl MethodIndex {
+    /// The index of `ssa`.
+    fn of(ssa: &SsaFunction) -> Self {
+        let mut index = Self::default();
+        for handler in ssa.exception_handlers() {
+            index.dispatch_entries.extend(handler.entry_blocks());
+            if matches!(handler.kind(), HandlerKind::Catch | HandlerKind::Filter) {
+                index
+                    .object_entries
+                    .extend(handler.handler_range.map(|range| range.start()));
+            }
+            index
+                .object_entries
+                .extend(handler.filter_range.map(|range| range.start()));
+        }
+        for block in ssa.blocks() {
+            for phi in block.phi_nodes() {
+                for operand in phi.operands() {
+                    let successors = index
+                        .phi_successors
+                        .entry(operand.predecessor())
+                        .or_default();
+                    if successors.last() != Some(&block.id()) {
+                        successors.push(block.id());
+                    }
+                }
+            }
+        }
+        index
+    }
+}
+
+/// The state code generation keeps for one method.
 ///
-/// Converts SSA form back to executable CIL bytecode with optimizations.
-pub struct SsaCodeGenerator {
-    /// Map from SSA variables to their storage location
-    var_storage: BTreeMap<SsaVarId, VarStorage>,
-    /// Next available local index
-    next_local: u16,
+/// Replaced whole at the start of every method, so nothing one method decided
+/// can leak into the next; only the session's interning outlives a method.
+#[derive(Default)]
+struct MethodState {
+    /// What generating one block asks of the whole function, computed once.
+    index: MethodIndex,
+    /// The current method's storage decisions.
+    storage: Option<Storage>,
+    /// The type of every local slot of the current method, temporaries
+    /// included, by slot.
+    slot_types: Vec<SsaType>,
+    /// By slot: the method's own local the slot is, if it is one.
+    declared: Vec<Option<u16>>,
     /// Map from block index to label name
     block_labels: BTreeMap<usize, String>,
     /// Label for each edge that was given its own block, keyed by `(from, to)`.
@@ -175,67 +209,102 @@ pub struct SsaCodeGenerator {
     /// branch whose target appears here jumps to the edge block instead of the target
     /// block; the edge block does the copies and then continues to the real target.
     split_edge_labels: BTreeMap<(usize, usize), String>,
-    /// Variables that are currently on the stack (for optimization)
-    stack_vars: Vec<SsaVarId>,
-    /// Cache of interned decrypted strings (string content -> heap index)
-    interned_strings: HashMap<String, u32>,
-    /// Deferred constants: single-use constants that should be generated inline
-    /// Maps variable ID to the constant value and whether it's been consumed
-    deferred_constants: BTreeMap<SsaVarId, ConstValue>,
-    /// Last loaded storage location for dup optimization.
-    /// When we load the same location twice in a row, we can use `dup` instead.
-    last_load: Option<VarStorage>,
-    /// Global use counts for all variables across all blocks.
-    /// Used to determine if a value needs to be stored to a local.
-    global_use_counts: BTreeMap<SsaVarId, usize>,
-    /// Types of allocated locals (local_idx -> SsaType).
-    /// Used for generating correct local variable signatures.
+    /// Types of the generated locals (local_idx -> SsaType), for the public
+    /// [`Self::local_types`] view.
     local_types: BTreeMap<u16, SsaType>,
-    /// Map from original local index to compacted local index.
-    /// Used for building local signatures with correct types.
+    /// Map from original local index to the slot it is generated in. Original
+    /// locals keep their indices, so this is the identity over them.
     original_to_compacted: BTreeMap<u16, u16>,
     /// Map from block ID to its byte offset in the generated bytecode.
     /// Used for remapping exception handler offsets.
     block_offsets: BTreeMap<usize, u32>,
-    /// Stack-local variables: variables that can live entirely on the evaluation
-    /// stack without needing a local slot. These are single-use values defined
-    /// and consumed within the same basic block before any control flow.
-    stack_locals: BTreeSet<SsaVarId>,
-    /// Pool of reusable temporary local slots for phi copies and other temps.
+    /// Every entry of the emitted layout, in order, with its final offset.
+    ///
+    /// A region's extent is read from this rather than from the offset of the
+    /// block numbered one past it: the layout does not emit blocks in index
+    /// order, so that block can sit anywhere, and a region measured to it
+    /// swallows whatever the layout put in between.
+    layout_offsets: Vec<(LayoutEntry, u32)>,
+    /// Pool of reusable temporary local slots.
     temp_pool: TempPool,
-    /// Locals that are actually used during code generation.
-    /// Used to determine the true num_locals (eliminating unused locals).
-    used_locals: BTreeSet<u16>,
-    /// Cache of interned decrypted arrays — maps array data bytes to the
+    /// The emitted runs implementing each SSA instruction, by instruction
+    /// index, for the translation validator.
+    emit_groups: Vec<EmitGroup>,
+    /// Where each value an instruction defines is defined.
+    def_sites: BTreeMap<SsaVarId, OpTag>,
+    /// The place the last emitted instruction loaded, with the instruction
+    /// count after it: a load of the same place right after it is a `dup`.
+    last_load: Option<(Place, usize)>,
+}
+
+/// SSA to CIL code generator.
+///
+/// One generator compiles the methods of one assembly: a decrypted string or
+/// array, or a TypeSpec, interned for one method is reused by the next, and the
+/// array types they need are finalised once with
+/// [`Self::finalize_array_types`]. A generator used with a second assembly would
+/// name the first one's rows.
+pub struct SsaCodeGenerator {
+    /// Cache of interned decrypted strings (string content -> heap index)
+    interned_strings: HashMap<String, u32>,
+    /// The TypeSpec naming each type a load or store spells with a token it
+    /// does not carry itself (`ldelem !0`), interned with the assembly.
+    type_specs: HashMap<SsaType, Token>,
+    /// The assembly's own TypeSpec rows, by signature blob, read on the first
+    /// type that needs one so an existing row is reused.
+    existing_type_specs: Option<HashMap<Vec<u8>, Token>>,
+    /// Cache of interned decrypted arrays - maps array data bytes to the
     /// FieldDef token and InitializeArray MemberRef token needed for codegen.
     interned_arrays: HashMap<Vec<u8>, InternedArrayInfo>,
     /// Tokens created during code generation that must be protected from cleanup.
     /// Includes FieldDef tokens for array initializer data and the parent TypeDef.
     protected_tokens: BTreeSet<Token>,
     /// TypeDef token of the parent type for interned array fields.
-    /// Created lazily during `finalize_array_types()` — must be the LAST
+    /// Created lazily during `finalize_array_types()` - must be the LAST
     /// TypeDef appended so it owns all trailing fields via field_list ranges.
     array_parent_type: Option<Token>,
     /// RID of the first array data field, used as field_list for the parent TypeDef.
     array_first_field_rid: Option<u32>,
-    /// Cache of data size → nested TypeDef token for `__StaticArrayInitTypeSize=N` types.
+    /// Cache of data size -> nested TypeDef token for `__StaticArrayInitTypeSize=N` types.
     /// Each unique array data size gets its own explicit-layout valuetype with
     /// ClassLayout.ClassSize = N, required by RuntimeHelpers.InitializeArray.
     array_size_types: BTreeMap<usize, Token>,
-    /// Pre-computed set of all SSA variables that appear as phi operands.
-    /// Used to quickly check whether a variable feeds into any phi node,
-    /// avoiding repeated O(blocks × phis × operands) scans.
-    all_phi_operands: BTreeSet<SsaVarId>,
-    /// Pre-computed set of SSA variables used outside their defining block.
-    /// A variable is in this set if any instruction in a block other than its
-    /// definition block references it. Used to determine whether a value must
-    /// be stored to a local (stack values don't persist across block boundaries).
-    cross_block_uses: BTreeSet<SsaVarId>,
-    /// Local indices accessed via LoadLocalAddr (address-taken locals).
-    /// Const/Copy instructions that store to these locals must not be filtered
-    /// out as dead, even if the dest variable has zero SSA uses — the runtime
-    /// reads the actual memory location through the pointer.
-    address_taken_locals: BTreeSet<u16>,
+    /// What the method being compiled added to the session's interning, for
+    /// [`Self::compile`] to take back if the method fails.
+    interned_this_method: Vec<Interned>,
+    /// The core library types this session added a reference to, by
+    /// namespace and name.
+    corelib_types: HashMap<(&'static str, &'static str), CodedIndex>,
+    /// The `RuntimeHelpers.InitializeArray` the generated code calls, once
+    /// found or added.
+    initialize_array: Option<Token>,
+    /// The state of the method being generated, replaced whole when the next
+    /// one starts.
+    method: MethodState,
+}
+
+/// An entry the current method added to one of the session's interning
+/// tables.
+enum Interned {
+    /// A decrypted string, by content.
+    String(String),
+    /// The TypeSpec naming a type.
+    TypeSpec(SsaType),
+    /// A TypeSpec row added for a signature.
+    TypeSpecRow(Vec<u8>),
+    /// A decrypted array, by data.
+    Array(Vec<u8>),
+    /// The `__StaticArrayInitTypeSize` type for a size.
+    SizeType(usize),
+    /// A token protected from cleanup.
+    Protected(Token),
+    /// The first array data field, which the parent type's field list starts
+    /// at.
+    FirstArrayField,
+    /// A reference added to a core library type.
+    CorelibType(&'static str, &'static str),
+    /// The `RuntimeHelpers.InitializeArray` reference.
+    InitializeArray,
 }
 
 /// Information needed to emit a `RuntimeHelpers.InitializeArray` call for a decrypted array.
@@ -247,37 +316,74 @@ struct InternedArrayInfo {
     initialize_array_token: Token,
 }
 
-/// Immutable context for block-level code generation.
-///
-/// Bundles references to block-specific data structures that are passed
-/// unchanged through recursive code generation calls.
-struct BlockCodegenContext<'a> {
-    /// The SSA function being generated
-    ssa: &'a SsaFunction,
-    /// Operations in topological order for this block
-    ops: &'a [&'a SsaOp],
-    /// Pre-computed operands for each operation
-    operands_cache: &'a [Vec<SsaVarId>],
-    /// Maps variable IDs to their defining operation index
-    def_map: &'a BTreeMap<SsaVarId, usize>,
-    /// Current block index being generated
-    current_block_idx: usize,
+/// The width and signedness of a narrow integer type: one the evaluation stack holds
+/// extended to an `int32` by its signedness. A `bool` has none: a truth value is its 0 or 1
+/// however it is held, so there is no form of it to re-establish.
+fn narrow_form(ty: &SsaType) -> Option<(u32, bool)> {
+    match ty {
+        SsaType::I8 => Some((8, false)),
+        SsaType::U8 => Some((8, true)),
+        SsaType::I16 => Some((16, false)),
+        SsaType::U16 | SsaType::Char => Some((16, true)),
+        _ => None,
+    }
 }
 
-/// Work item for iterative code generation.
+/// The stack form a copy `op` has to give its destination, when the stack does not already
+/// hold the source that way: a copy into a narrow integer from one of another width or
+/// signedness. A same-width reinterpretation keeps the bits, which is a copy to the IR, but
+/// the stack holds a `byte` 255 zero-extended and an `sbyte` -1 sign-extended; and a copy
+/// from a wider integer keeps only the destination's bits. A copy into a wider integer needs
+/// nothing: a narrow value's stack form is the wider one's value. Nor does a copy of an
+/// `int32` the stack already holds in the destination's form: a constant in its range, a
+/// comparison's 0 or 1, or a truth value.
+fn converting_copy(ssa: &SsaFunction, op: &SsaOp) -> Option<(u32, bool)> {
+    let SsaOp::Copy { dest, src } = op else {
+        return None;
+    };
+    let dest_form = ssa
+        .variable(*dest)
+        .and_then(|var| narrow_form(var.var_type()))?;
+    let source = ssa.variable(*src)?.var_type();
+    let converts = match narrow_form(source) {
+        Some(src_form) => src_form != dest_form,
+        None => source.is_integer() && *source != SsaType::Bool,
+    };
+    if !converts {
+        return None;
+    }
+    let (min, max) = match dest_form {
+        (8, true) => (0, i64::from(u8::MAX)),
+        (8, false) => (i64::from(i8::MIN), i64::from(i8::MAX)),
+        (16, true) => (0, i64::from(u16::MAX)),
+        _ => (i64::from(i16::MIN), i64::from(i16::MAX)),
+    };
+    let held = match ssa.get_definition(*src) {
+        Some(SsaOp::Ceq { .. } | SsaOp::Clt { .. } | SsaOp::Cgt { .. }) => true,
+        Some(SsaOp::Const { value, .. }) => {
+            let stack: Option<i64> = match value {
+                ConstValue::I8(v) => Some(i64::from(*v)),
+                ConstValue::U8(v) => Some(i64::from(*v)),
+                ConstValue::I16(v) => Some(i64::from(*v)),
+                ConstValue::U16(v) => Some(i64::from(*v)),
+                ConstValue::I32(v) => Some(i64::from(*v)),
+                ConstValue::U32(v) => Some(i64::from(v.cast_signed())),
+                _ => None,
+            };
+            stack.is_some_and(|v| (min..=max).contains(&v))
+        }
+        _ => false,
+    };
+    (!held).then_some(dest_form)
+}
+
+/// The stack slots a call pops for `count` arguments.
 ///
-/// We use a multi-phase approach to ensure correct operand ordering:
-/// - `Pending`: First visit - check if already generated
-/// - `LoadOperand`: Load/generate a specific operand for an instruction
-/// - `Emit`: All operands loaded, emit the operation
-enum CodeGenWorkItem {
-    /// First visit: check if already generated, then schedule operand loads
-    Pending(usize),
-    /// Load or generate a specific operand for instruction at idx
-    /// (op_idx, operand_idx) - which operand of which instruction
-    LoadOperand(usize, usize),
-    /// All operands are on stack, emit the operation
-    Emit(usize),
+/// A signature holds at most 65535 parameters, so a larger count is a call no
+/// method can have.
+fn call_arity(count: usize) -> Result<u16> {
+    u16::try_from(count)
+        .map_err(|_| Error::CodegenFailed(format!("a call with {count} arguments has no encoding")))
 }
 
 impl Default for SsaCodeGenerator {
@@ -291,29 +397,18 @@ impl SsaCodeGenerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            var_storage: BTreeMap::new(),
-            next_local: 0,
-            block_labels: BTreeMap::new(),
-            split_edge_labels: BTreeMap::new(),
-            stack_vars: Vec::new(),
             interned_strings: HashMap::new(),
-            deferred_constants: BTreeMap::new(),
-            last_load: None,
-            global_use_counts: BTreeMap::new(),
-            local_types: BTreeMap::new(),
-            original_to_compacted: BTreeMap::new(),
-            block_offsets: BTreeMap::new(),
-            stack_locals: BTreeSet::new(),
-            temp_pool: TempPool::default(),
-            used_locals: BTreeSet::new(),
+            type_specs: HashMap::new(),
+            existing_type_specs: None,
             interned_arrays: HashMap::new(),
             protected_tokens: BTreeSet::new(),
             array_parent_type: None,
             array_first_field_rid: None,
             array_size_types: BTreeMap::new(),
-            all_phi_operands: BTreeSet::new(),
-            cross_block_uses: BTreeSet::new(),
-            address_taken_locals: BTreeSet::new(),
+            interned_this_method: Vec::new(),
+            corelib_types: HashMap::new(),
+            initialize_array: None,
+            method: MethodState::default(),
         }
     }
 
@@ -339,7 +434,7 @@ impl SsaCodeGenerator {
             return Ok(()); // Already finalized
         }
 
-        let parent_token = Self::create_array_parent_type(assembly, first_field_rid)?;
+        let parent_token = self.create_array_parent_type(assembly, first_field_rid)?;
         self.array_parent_type = Some(parent_token);
         self.protected_tokens.insert(parent_token);
 
@@ -377,45 +472,22 @@ impl SsaCodeGenerator {
     /// # Note
     ///
     /// This method does not support `DecryptedString` constants. If the SSA contains
-    /// decrypted strings, use [`generate_with_assembly`](Self::generate_with_assembly) instead
-    /// to properly intern strings into the assembly's #US heap.
+    /// decrypted strings, use [`compile`](Self::compile) instead to properly intern
+    /// strings into the assembly's #US heap.
     pub fn generate(&mut self, ssa: &SsaFunction) -> Result<(Vec<u8>, u16, u16)> {
         self.generate_internal(ssa, None)
     }
 
-    /// Generates CIL bytecode from an SSA function with assembly mutation support.
-    ///
-    /// This method should be used when the SSA may contain `DecryptedString` constants
-    /// from deobfuscation passes. The mutator is used to add decrypted strings to the
-    /// assembly's #US heap and obtain proper indices for `ldstr` instructions.
-    ///
-    /// # Arguments
-    ///
-    /// * `ssa` - The SSA function to convert.
-    /// * `mutator` - An assembly mutator for adding metadata entries (strings, etc.).
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (bytecode, max_stack, num_locals).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if code generation fails due to invalid SSA, encoding issues,
-    /// or problems adding strings to the heap.
-    pub fn generate_with_assembly(
-        &mut self,
-        ssa: &SsaFunction,
-        assembly: &mut CilAssembly,
-    ) -> Result<(Vec<u8>, u16, u16)> {
-        self.generate_internal(ssa, Some(assembly))
-    }
-
     /// Generates CIL bytecode and builds a complete [`CompilationResult`].
     ///
-    /// This is the high-level entry point that wraps [`generate_with_assembly`](Self::generate_with_assembly)
-    /// and adds local variable signature building and exception handler remapping.
-    /// The result contains everything needed for [`MethodBodyBuilder::from_compilation`](crate::cilassembly::MethodBodyBuilder::from_compilation)
+    /// Generates the body, interning what it needs with the assembly, and adds
+    /// local variable signature building and exception handler remapping. The
+    /// result contains everything needed for
+    /// [`MethodBodyBuilder::from_compilation`](crate::cilassembly::MethodBodyBuilder::from_compilation)
     /// to assemble the final method body.
+    ///
+    /// All or nothing: a method that fails leaves the assembly, and what this
+    /// generator has interned for the session, as they were before the call.
     ///
     /// # Arguments
     ///
@@ -434,7 +506,51 @@ impl SsaCodeGenerator {
         ssa: &SsaFunction,
         assembly: &mut CilAssembly,
     ) -> Result<CompilationResult> {
-        let (bytecode, max_stack, num_locals) = self.generate_with_assembly(ssa, assembly)?;
+        let savepoint = assembly.changes().savepoint();
+        self.interned_this_method.clear();
+        let compiled = self.compile_body(ssa, assembly);
+        if compiled.is_err() {
+            assembly.changes_mut().rollback_to(&savepoint)?;
+            for interned in std::mem::take(&mut self.interned_this_method) {
+                match interned {
+                    Interned::String(value) => {
+                        self.interned_strings.remove(&value);
+                    }
+                    Interned::TypeSpec(ty) => {
+                        self.type_specs.remove(&ty);
+                    }
+                    Interned::TypeSpecRow(blob) => {
+                        if let Some(existing) = self.existing_type_specs.as_mut() {
+                            existing.remove(&blob);
+                        }
+                    }
+                    Interned::Array(data) => {
+                        self.interned_arrays.remove(&data);
+                    }
+                    Interned::SizeType(size) => {
+                        self.array_size_types.remove(&size);
+                    }
+                    Interned::Protected(token) => {
+                        self.protected_tokens.remove(&token);
+                    }
+                    Interned::FirstArrayField => self.array_first_field_rid = None,
+                    Interned::CorelibType(namespace, name) => {
+                        self.corelib_types.remove(&(namespace, name));
+                    }
+                    Interned::InitializeArray => self.initialize_array = None,
+                }
+            }
+        }
+        compiled
+    }
+
+    /// Generates one body and what [`Self::compile`] returns for it.
+    fn compile_body(
+        &mut self,
+        ssa: &SsaFunction,
+        assembly: &mut CilAssembly,
+    ) -> Result<CompilationResult> {
+        let (bytecode, max_stack, num_locals) = self.generate_internal(ssa, Some(assembly))?;
 
         // Build local variable signatures from codegen's compacted types.
         // Runtime-handle TypeRefs should have been pre-resolved via
@@ -446,6 +562,14 @@ impl SsaCodeGenerator {
         // Remap exception handlers using block offset mapping
         #[allow(clippy::cast_possible_truncation)]
         let exception_handlers = self.remap_exception_handlers(ssa, bytecode.len() as u32)?;
+
+        // A body whose clauses let control into a handler, or out of a region
+        // without `leave`, is one the runtime rejects the first time it is
+        // called. Such a body is not emitted; the method keeps its original.
+        if !exception_handlers.is_empty() {
+            let instructions = decode_stream(&mut Parser::new(&bytecode), 0)?;
+            validate_protected_region_flow(&instructions, &exception_handlers)?;
+        }
 
         Ok(CompilationResult {
             bytecode,
@@ -459,95 +583,98 @@ impl SsaCodeGenerator {
     ///
     /// # Errors
     ///
-    /// Returns an error if a local variable's type cannot be determined from
-    /// either the codegen state or the original SSA function.
+    /// Returns an error if a generated local's type is unknown.
     fn build_local_signatures(
         &self,
         ssa: &SsaFunction,
         num_locals: u16,
     ) -> Result<Vec<SignatureLocalVariable>> {
-        let mut locals = Vec::with_capacity(num_locals as usize);
+        let mut locals = Vec::with_capacity(usize::from(num_locals));
         for idx in 0..num_locals {
-            // Priority: original_to_compacted (preserves exact original types for
-            // LoadLocal/LoadLocalAddr referenced locals) > local_types (SSA-inferred).
-            // This is important because LoadLocalAddr needs the exact declared type
-            // (e.g., char for ldloca + char::ToString()).
-            let local_type = if let Some(base) = self
-                .original_to_compacted
-                .iter()
-                .find(|(_, &new)| new == idx)
-                .and_then(|(&orig, _)| {
-                    ssa.original_local_types()
-                        .and_then(|types| types.get(orig as usize))
-                        .map(|v| v.base.clone())
-                }) {
-                base
-            } else if let Some(ssa_type) = self.local_types.get(&idx) {
-                ssa_type.to_type_signature()
-            } else {
-                // Fallback: infer type from SSA variables mapped to this slot.
-                // This handles cases where get_storage returns a raw Local index
-                // for variables not tracked in local_types (e.g., x86-translated
-                // methods where synthetic locals bypass type registration).
-                self.infer_local_type_from_ssa(ssa, idx).ok_or_else(|| {
+            let slot = usize::from(idx);
+            // The original declaration, when this slot has one, in preference
+            // to anything inferred from SSA: `ldloca` needs the exact declared
+            // type, not one widened by inference (`char` for `ldloca` followed
+            // by `char::ToString()`).
+            //
+            // Taken whole rather than for its type alone, because `pinned` and
+            // `byref` are part of what the slot is. A pinned local that loses
+            // the marker lets the collector move the object while a pointer
+            // into it is still live - a fault the generated code cannot see and
+            // the verifier will not catch.
+            if let Some(original) = self.original_declaration(ssa, slot) {
+                locals.push(original.clone());
+                continue;
+            }
+            let slot_type = self
+                .method
+                .slot_types
+                .get(slot)
+                .filter(|slot_type| is_slot_type(slot_type))
+                .ok_or_else(|| {
                     Error::CodegenFailed(format!(
-                        "cannot determine type for local variable {idx}: \
-                         not in codegen local_types and no original type mapping found"
+                        "local variable {idx} has type {:?}, which no local can be declared with",
+                        self.method.slot_types.get(slot)
                     ))
-                })?
-            };
+                })?;
             locals.push(SignatureLocalVariable {
                 modifiers: CustomModifiers::default(),
                 is_pinned: false,
                 is_byref: false,
-                base: local_type,
+                base: slot_type.to_type_signature(),
             });
         }
         Ok(locals)
     }
 
-    /// Infers the type for a local slot by examining SSA variables.
-    ///
-    /// Looks for SSA variables whose storage maps to the given local slot
-    /// (either through `var_storage` or through raw `Local(idx)` origin matching),
-    /// and returns the first non-unknown type found.
-    fn infer_local_type_from_ssa(
+    /// The original declaration of the method's own local that `slot` is.
+    fn original_declaration<'s>(
         &self,
-        ssa: &SsaFunction,
-        local_idx: u16,
-    ) -> Option<TypeSignature> {
-        let target_storage = VarStorage::Local(local_idx);
+        ssa: &'s SsaFunction,
+        slot: usize,
+    ) -> Option<&'s SignatureLocalVariable> {
+        let original = self.method.declared.get(slot).copied().flatten()?;
+        ssa.original_local_types()?.get(usize::from(original))
+    }
 
-        // First check var_storage for variables explicitly mapped to this slot
-        for (&var_id, &storage) in &self.var_storage {
-            if storage == target_storage {
-                if let Some(var) = ssa.variable(var_id) {
-                    let var_type = var.var_type();
-                    if !var_type.is_unknown() {
-                        return Some(var_type.to_type_signature());
-                    }
+    /// The slot the method's own local `local` is generated in.
+    fn declared_slot(&self, local: u16) -> Result<u16> {
+        self.method
+            .original_to_compacted
+            .get(&local)
+            .copied()
+            .ok_or_else(|| {
+                Error::CodegenFailed(format!("local {local} is addressed but has no slot"))
+            })
+    }
+
+    /// The declared type of every local slot, for the validator's store-width
+    /// check; `None` for a byref slot.
+    fn validation_slot_types(&self, ssa: &SsaFunction) -> Vec<Option<TypeSignature>> {
+        (0..self.method.slot_types.len())
+            .map(|slot| {
+                if let Some(original) = self.original_declaration(ssa, slot) {
+                    return (!original.is_byref).then(|| original.base.clone());
                 }
-            }
-        }
-
-        // Then check for variables with Local origin matching this index
-        // (used when get_storage falls back to raw Local(idx))
-        for var in ssa.variables() {
-            if let VariableOrigin::Local(idx) = var.origin() {
-                if idx == local_idx && !var.var_type().is_unknown() {
-                    return Some(var.var_type().to_type_signature());
-                }
-            }
-        }
-
-        None
+                self.method
+                    .slot_types
+                    .get(slot)
+                    .map(SsaType::to_type_signature)
+            })
+            .collect()
     }
 
     /// Remaps SSA exception handlers to bytecode offsets using block offset mapping.
     ///
+    /// A clause none of whose blocks was emitted is dropped: it guarded code
+    /// control no longer reaches.
+    ///
     /// # Errors
     ///
-    /// Returns an error if any exception handler has out-of-bounds offsets after remapping.
+    /// Returns [`Error::EhRegionNotContiguous`] when the layout interleaves a
+    /// region with code outside it, and [`Error::CodegenFailed`] when a clause
+    /// is emitted only in part, has a region of no bytes, or lies outside the
+    /// code.
     fn remap_exception_handlers(
         &self,
         ssa: &SsaFunction,
@@ -560,51 +687,59 @@ impl SsaCodeGenerator {
         let mut handlers = Vec::new();
 
         for eh in ssa.exception_handlers() {
-            let offset_of = |block: usize| self.block_offsets.get(&block).copied();
+            // A region is named by the blocks it covers, and those blocks are
+            // where it is in *this* body. The offsets recorded when the method
+            // was first read describe the layout it had then, which code
+            // generation has just replaced, so falling back to them produces a
+            // clause pointing outside the method - `handler=932..1078` in a
+            // body 301 bytes long, which is how this was found.
+            let span = |range: Option<BlockRange>| match range {
+                Some(range) => self.region_span(range, bytecode_len),
+                None => Ok(None),
+            };
+            let protected = span(eh.protected_range)?;
+            let handler = span(eh.handler_range)?;
+            let filter = span(eh.filter_range)?;
 
-            let try_offset = eh
-                .protected_range
-                .and_then(|range| offset_of(range.start()))
-                .unwrap_or(eh.try_offset);
-
-            let handler_offset = eh
-                .handler_range
-                .and_then(|range| offset_of(range.start()))
-                .unwrap_or(eh.handler_offset);
-
-            let try_end = eh
-                .protected_range
-                .and_then(|range| {
-                    // The exclusive end can be one past the last block, which has
-                    // no offset of its own; the try region then runs to wherever
-                    // the handler begins.
-                    offset_of(range.end()).or(Some(handler_offset))
-                })
-                .unwrap_or(eh.try_offset.saturating_add(eh.try_length));
-
-            let handler_end = eh
-                .handler_range
-                .and_then(|range| {
-                    // Likewise: a handler ending with the method has no block
-                    // after it, so it extends to the end of the bytecode.
-                    offset_of(range.end()).or(Some(bytecode_len))
-                })
-                .unwrap_or(eh.handler_offset.saturating_add(eh.handler_length));
-
-            let filter_offset = eh
-                .filter_range
-                .and_then(|range| offset_of(range.start()))
-                .unwrap_or(eh.class_token_or_filter);
-
-            // Drop handlers with empty try or handler regions. This happens
-            // legitimately when optimization eliminates the guarded code — the
-            // handler becomes unreachable and can be safely removed.
-            if try_offset >= try_end || handler_offset >= handler_end {
-                log::debug!(
-                    "Dropping exception handler with empty region \
-                     (try={try_offset}..{try_end}, handler={handler_offset}..{handler_end})"
-                );
+            // Only reachable blocks are emitted, and a handler is reachable
+            // exactly when its protected code is. A clause none of whose
+            // blocks was emitted guarded code that no longer runs, and goes
+            // with it. Any other partial clause is code the runtime would run
+            // without the clause that makes it valid - a handler entered by
+            // nothing, or protected code with nothing to catch what it throws.
+            if protected.is_none() && handler.is_none() && filter.is_none() {
                 continue;
+            }
+            let (Some((try_offset, try_end)), Some((handler_offset, handler_end))) =
+                (protected, handler)
+            else {
+                return Err(Error::CodegenFailed(format!(
+                    "exception clause is only partly emitted: try={protected:?} \
+                     handler={handler:?} filter={filter:?}"
+                )));
+            };
+
+            // Without a filter range this field is the caught type's token
+            // rather than an offset, so the recorded value is the right one. A
+            // filter that *is* a region follows the same rule as the others.
+            let filter_offset = match (eh.filter_range, filter) {
+                (Some(_), Some((offset, _))) => offset,
+                (Some(_), None) => {
+                    return Err(Error::CodegenFailed(format!(
+                        "filter clause is emitted without its filter: \
+                         try={try_offset}..{try_end} handler={handler_offset}..{handler_end}"
+                    )));
+                }
+                (None, _) => eh.class_token_or_filter,
+            };
+
+            // An emitted region that occupies no bytes cannot be stated: a
+            // clause's lengths are positive.
+            if try_offset >= try_end || handler_offset >= handler_end {
+                return Err(Error::CodegenFailed(format!(
+                    "exception clause has an empty region \
+                     (try={try_offset}..{try_end}, handler={handler_offset}..{handler_end})"
+                )));
             }
 
             // Validate offsets are within bytecode bounds. After the EH-aware
@@ -618,7 +753,12 @@ impl SsaCodeGenerator {
                 return Err(Error::CodegenFailed(format!(
                     "Exception handler offsets out of bounds \
                      (try={try_offset}..{try_end}, handler={handler_offset}..{handler_end}, \
-                     bytecode_len={bytecode_len})"
+                     bytecode_len={bytecode_len}); regions try={:?} handler={:?}, \
+                     {} block offsets recorded, highest {:?}",
+                    eh.protected_range.map(|r| (r.start(), r.end())),
+                    eh.handler_range.map(|r| (r.start(), r.end())),
+                    self.method.block_offsets.len(),
+                    self.method.block_offsets.values().max(),
                 )));
             }
 
@@ -636,26 +776,87 @@ impl SsaCodeGenerator {
         Ok(handlers)
     }
 
+    /// The byte extent of the blocks `range` covers, as emitted.
+    ///
+    /// The region is every layout entry that belongs to it: its blocks, and
+    /// the edge blocks carrying phi copies out of them, which run as part of
+    /// the region. They must be contiguous in the layout - an exception clause
+    /// names one span of bytes - and the region ends where the next entry after
+    /// them begins, or with the method.
+    ///
+    /// # Returns
+    ///
+    /// `(start, end)`, or `None` when none of the region's blocks was emitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EhRegionNotContiguous`] when the layout interleaves the
+    /// region with code that is not in it, which no exception clause can
+    /// describe.
+    fn region_span(&self, range: BlockRange, code_len: u32) -> Result<Option<(u32, u32)>> {
+        let belongs = |entry: &LayoutEntry| match *entry {
+            LayoutEntry::Block(block) | LayoutEntry::SplitEdge { from: block, .. } => {
+                block >= range.start() && block < range.end()
+            }
+        };
+        let mut members = self
+            .method
+            .layout_offsets
+            .iter()
+            .enumerate()
+            .filter(|(_, (entry, _))| belongs(entry))
+            .map(|(index, _)| index);
+        let Some(first) = members.next() else {
+            return Ok(None);
+        };
+        let last = members.next_back().unwrap_or(first);
+        if let Some((intruder, _)) = self
+            .method
+            .layout_offsets
+            .get(first..=last)
+            .into_iter()
+            .flatten()
+            .find(|(entry, _)| !belongs(entry))
+        {
+            return Err(Error::EhRegionNotContiguous {
+                start: range.start(),
+                end: range.end(),
+                intruder: format!("{intruder:?}"),
+            });
+        }
+        let start = self
+            .method
+            .layout_offsets
+            .get(first)
+            .map_or(code_len, |(_, offset)| *offset);
+        let end = self
+            .method
+            .layout_offsets
+            .get(last.saturating_add(1))
+            .map_or(code_len, |(_, offset)| *offset);
+        Ok(Some((start, end)))
+    }
+
     /// Returns the types of any temporary locals allocated during code generation.
     ///
     /// These are locals that were created for PHI copy cycles or other codegen needs,
     /// beyond the original locals from the SSA function. The returned map contains
     /// (local_index -> type) pairs for these temporaries.
     ///
-    /// This should be called after `generate_with_assembly` to get the types needed
-    /// for generating a correct local variable signature.
+    /// Read it after [`generate`](Self::generate) or [`compile`](Self::compile) for the
+    /// types a correct local variable signature needs.
     #[must_use]
     pub fn local_types(&self) -> &BTreeMap<u16, SsaType> {
-        &self.local_types
+        &self.method.local_types
     }
 
     /// Returns the mapping from original local indices to compacted indices.
     ///
-    /// This should be called after `generate_with_assembly` to get the mapping needed
-    /// for building local signatures with correct types from original SSA.
+    /// Read it after [`generate`](Self::generate) or [`compile`](Self::compile) for the
+    /// mapping that builds local signatures with the original SSA's types.
     #[must_use]
     pub fn original_local_mapping(&self) -> &BTreeMap<u16, u16> {
-        &self.original_to_compacted
+        &self.method.original_to_compacted
     }
 
     /// Returns the mapping from block IDs to their byte offsets in the generated code.
@@ -663,107 +864,99 @@ impl SsaCodeGenerator {
     /// This is used for remapping exception handler offsets. After code generation,
     /// the map contains each block's start offset in the new bytecode layout.
     ///
-    /// This should be called after `generate_with_assembly` to get the offsets for
-    /// exception handler remapping.
+    /// Read it after [`generate`](Self::generate) or [`compile`](Self::compile) for the
+    /// offsets exception handler remapping needs.
     #[must_use]
     pub fn block_offsets(&self) -> &BTreeMap<usize, u32> {
-        &self.block_offsets
+        &self.method.block_offsets
     }
 
-    /// Internal generation method that optionally uses an assembly for string interning.
     fn generate_internal(
         &mut self,
         ssa: &SsaFunction,
         assembly: Option<&mut CilAssembly>,
     ) -> Result<(Vec<u8>, u16, u16)> {
-        // Reset state
-        self.var_storage.clear();
-        self.next_local = 0;
-        self.block_labels.clear();
-        self.split_edge_labels.clear();
-        self.stack_vars.clear();
-        self.interned_strings.clear();
-        self.deferred_constants.clear();
-        self.last_load = None;
-        self.local_types.clear();
-        self.original_to_compacted.clear();
-        self.block_offsets.clear();
-        self.stack_locals.clear();
-        self.temp_pool.clear();
-        self.used_locals.clear();
-        self.interned_arrays.clear();
-        self.all_phi_operands.clear();
-        self.cross_block_uses.clear();
-        self.address_taken_locals.clear();
-        // Note: protected_tokens and array_parent_type are NOT cleared here.
-        // They accumulate across multiple compile() calls within the same
-        // codegen session, since all methods share the same parent TypeDef
-        // and the field tokens must survive until cleanup.
+        // A handler phi and the values a throw hands it share one place, since
+        // no copy runs on an exceptional edge. A value one of them shares with
+        // other code - two locals a rewrite found both start as zero - gets a
+        // copy of its own first, or the place would have to hold two values at
+        // once (`SsaFunction::isolate_exceptional_operands`).
+        let isolated;
+        let ssa = if ssa.has_exception_handlers() {
+            let mut copy = ssa.clone();
+            if copy.isolate_exceptional_operands()? > 0 {
+                isolated = copy;
+                &isolated
+            } else {
+                ssa
+            }
+        } else {
+            ssa
+        };
+
+        // A fresh method state. protected_tokens, array_parent_type, the
+        // string, array and TypeSpec caches accumulate across the methods of
+        // one session: all methods share the same parent TypeDef, a value
+        // interned for one method is the same row for the next, and the field
+        // tokens must survive until cleanup.
+        self.method = MethodState {
+            index: MethodIndex::of(ssa),
+            ..MethodState::default()
+        };
+        for (block_idx, block) in ssa.blocks().iter().enumerate() {
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                let tag = OpTag {
+                    block: block_idx,
+                    instr: instr_idx,
+                };
+                for dest in instr.op().defs() {
+                    self.method.def_sites.insert(dest, tag);
+                }
+            }
+        }
+
+        // The validator below checks the generated code against this SSA, so
+        // the SSA must be well-formed: a read of nothing, or a phi short an
+        // operand, would make it check against nonsense. Checked before the
+        // assembly is touched.
+        // Two kinds of finding say nothing about the code: a cosmetic one (a
+        // variable nothing defines and nothing reads, an id left behind by
+        // pruning), and a stale use list, since emission builds its own
+        // def-use index from the instructions and never reads the recorded one.
+        let mut findings = SsaVerifier::new(ssa).verify(VerifyLevel::Standard);
+        findings.retain(|finding| {
+            !finding.is_cosmetic() && !matches!(finding, VerifierError::StaleUseList { .. })
+        });
+        if !findings.is_empty() {
+            let shown: Vec<String> = findings.iter().take(5).map(ToString::to_string).collect();
+            return Err(Error::CodegenFailed(format!(
+                "the SSA handed to code generation is malformed ({} findings: {})",
+                findings.len(),
+                shown.join("; ")
+            )));
+        }
 
         // Phase 0: Pre-intern all decrypted strings (if assembly provided)
         if let Some(assembly) = assembly {
             self.preintern_decrypted_values(ssa, assembly)?;
         }
 
-        // Phase 1: Allocate storage for all SSA variables based on their origins
-        self.allocate_storage(ssa)?;
-
-        // Identify address-taken locals (accessed via LoadLocalAddr). Stores to
-        // these locals must not be filtered out as "dead" by the Const/Copy
-        // skip logic, because the runtime reads the actual memory location
-        // through the pointer even though no SSA variable directly uses the
-        // dest. Example: Monitor.Enter(obj, ref lockTaken) reads lockTaken
-        // through the pointer and throws if it wasn't initialized to false.
-        for block in ssa.blocks() {
-            for instr in block.instructions() {
-                if let SsaOp::LoadLocalAddr { local_index, .. } = instr.op() {
-                    self.address_taken_locals.insert(*local_index);
-                }
+        // Phase 1: storage.
+        let storage = Storage::build(ssa)?;
+        self.method.slot_types = storage.local_types().to_vec();
+        self.method.declared = storage.declared().to_vec();
+        for (slot, original) in self.method.declared.iter().enumerate() {
+            if let (Some(original), Ok(slot)) = (original, u16::try_from(slot)) {
+                self.method.original_to_compacted.insert(*original, slot);
             }
         }
-
-        // Pre-compute the actual definition block for each variable by scanning
-        // instructions. This is more reliable than var.def_site() which can be
-        // stale after SSA passes that move/merge blocks without updating metadata.
-        let mut actual_def_block: BTreeMap<SsaVarId, usize> = BTreeMap::new();
-        for block in ssa.blocks() {
-            let block_id = block.id();
-            for phi in block.phi_nodes() {
-                actual_def_block.insert(phi.result(), block_id);
-            }
-            for instr in block.instructions() {
-                if let Some(dest) = instr.def() {
-                    actual_def_block.insert(dest, block_id);
-                }
-            }
-        }
-
-        // Pre-compute cross-block use set: variables used in blocks other than
-        // where they are defined. These must be stored to locals because the CIL
-        // evaluation stack doesn't persist across block boundaries.
-        for block in ssa.blocks() {
-            let block_id = block.id();
-            for instr in block.instructions() {
-                for &used_var in &instr.uses() {
-                    if let Some(&def_block) = actual_def_block.get(&used_var) {
-                        if def_block != block_id {
-                            self.cross_block_uses.insert(used_var);
-                        }
-                    }
-                }
-            }
-            // Phi operand uses always cross block boundaries
-            for phi in block.phi_nodes() {
-                for op in phi.operands() {
-                    self.cross_block_uses.insert(op.value());
-                }
-            }
-        }
+        self.method.storage = Some(storage);
 
         // Phase 2: Create block labels using actual block IDs (not sequential indices)
         for block in ssa.blocks() {
             let block_id = block.id();
-            self.block_labels
+            self.method
+                .block_labels
                 .insert(block_id, format!("block_{block_id}"));
         }
         // Also collect all branch targets and create labels for them
@@ -778,7 +971,7 @@ impl SsaCodeGenerator {
             // Catch handler entry: exception object is on the stack (depth 1)
             if let Some(handler_block) = handler.handler_range.map(|range| range.start()) {
                 if matches!(handler.kind(), HandlerKind::Catch | HandlerKind::Filter) {
-                    if let Some(label) = self.block_labels.get(&handler_block) {
+                    if let Some(label) = self.method.block_labels.get(&handler_block) {
                         encoder.set_label_stack_depth(label, 1);
                     }
                 }
@@ -787,23 +980,29 @@ impl SsaCodeGenerator {
             // A filter range only exists on a filter clause, so its presence is
             // the kind test.
             if let Some(filter_block) = handler.filter_range.map(|range| range.start()) {
-                if let Some(label) = self.block_labels.get(&filter_block) {
+                if let Some(label) = self.method.block_labels.get(&filter_block) {
                     encoder.set_label_stack_depth(label, 1);
                 }
             }
         }
 
         // Collect branch targets - blocks that are referenced by some branch instruction
-        let branch_targets: BTreeSet<usize> = self.block_labels.keys().copied().collect();
+        let branch_targets: BTreeSet<usize> = self.method.block_labels.keys().copied().collect();
 
-        // Include blocks that have ops OR are branch targets (even if they only have
-        // undecomposed instructions). Blocks that are branch targets must be included
-        // so their labels can be defined.
+        // Include the blocks control can reach that have ops or are branch
+        // targets (even if they only have undecomposed instructions). Blocks
+        // that are branch targets must be included so their labels can be
+        // defined. A block nothing reaches is left out: a handler whose
+        // protected code is gone would otherwise be emitted with no clause to
+        // enter it, and a clause with no handler would leave its protected
+        // code unguarded.
+        let reached = Self::reachable_blocks(ssa);
         let blocks_to_include: BTreeSet<usize> = ssa
             .blocks()
             .iter()
             .filter(|b| !b.instructions().is_empty() || branch_targets.contains(&b.id()))
             .map(SsaBlock::id)
+            .filter(|block| reached.contains(block))
             .collect();
 
         // Compute optimal block layout to minimize unnecessary branches.
@@ -813,7 +1012,7 @@ impl SsaCodeGenerator {
         // Give every phi-carrying edge out of a multi-way terminator its own block, and
         // register a label for it, so the copies are ordinary layout entries rather than
         // runs spliced into branch emission.
-        let layout = self.expand_layout_with_edge_blocks(ssa, &block_ids)?;
+        let layout = self.expand_layout_with_edge_blocks(ssa, &block_ids);
 
         for idx in 0..layout.len() {
             let Some(&entry) = layout.get(idx) else {
@@ -829,14 +1028,14 @@ impl SsaCodeGenerator {
 
             match entry {
                 LayoutEntry::Block(block_id) => {
-                    let Some(block) = ssa.block(block_id) else {
+                    if ssa.block(block_id).is_none() {
                         continue;
-                    };
+                    }
                     // Record block start offset for exception handler remapping
                     let pos_before = encoder.current_position();
-                    self.block_offsets.insert(block_id, pos_before);
+                    self.method.block_offsets.insert(block_id, pos_before);
 
-                    self.generate_block(&mut encoder, ssa, block, block_id, next_entry)?;
+                    self.generate_block(&mut encoder, ssa, block_id, next_entry)?;
                 }
                 LayoutEntry::SplitEdge { from, to } => {
                     self.generate_edge_block(&mut encoder, ssa, from, to, next_entry)?;
@@ -850,27 +1049,50 @@ impl SsaCodeGenerator {
         // Phase 5: Update block_offsets with final positions (after branch optimization)
         // The branch optimizer in finalize() may shrink branches, changing positions.
         // We need to use the final label positions to get accurate block offsets.
-        for (label, position) in &final_label_positions {
-            if let Some(block_id_str) = label.strip_prefix("block_") {
-                if let Ok(block_id) = block_id_str.parse::<usize>() {
-                    self.block_offsets.insert(block_id, *position);
+        for (&block_id, label) in &self.method.block_labels {
+            if let Some(&position) = final_label_positions.get(label) {
+                self.method.block_offsets.insert(block_id, position);
+            }
+        }
+        for &entry in &layout {
+            let label = match entry {
+                LayoutEntry::Block(block_id) => self.method.block_labels.get(&block_id),
+                LayoutEntry::SplitEdge { from, to } => {
+                    self.method.split_edge_labels.get(&(from, to))
                 }
+            };
+            let position = label
+                .and_then(|label| final_label_positions.get(label))
+                .ok_or_else(|| {
+                    Error::CodegenFailed(format!("layout entry {entry:?} has no emitted position"))
+                })?;
+            self.method.layout_offsets.push((entry, *position));
+        }
+
+        let num_locals = u16::try_from(self.method.slot_types.len()).map_err(|_| {
+            Error::CodegenFailed("the method needs more than 65535 locals".to_string())
+        })?;
+        for (slot, slot_type) in self.method.slot_types.iter().enumerate() {
+            if let Ok(slot) = u16::try_from(slot) {
+                self.method.local_types.insert(slot, slot_type.clone());
             }
         }
 
-        // Calculate actual num_locals based on locals that were actually used.
-        // This eliminates unused locals that were pre-allocated but never accessed.
-        let num_locals = if self.used_locals.is_empty() {
-            0
-        } else {
-            // We need max_index + 1 because local indices are 0-based
-            self.used_locals
-                .iter()
-                .max()
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1)
-        };
+        // A body that reads a value other than the one the SSA names, reorders
+        // an effect or truncates a value is not emitted: the method keeps its
+        // original body rather than computing something else.
+        let locals = self.validation_slot_types(ssa);
+        #[allow(clippy::cast_possible_truncation)]
+        let handlers = self.remap_exception_handlers(ssa, bytecode.len() as u32)?;
+        validate(&Validation {
+            ssa,
+            bytecode: &bytecode,
+            handlers: &handlers,
+            layout: &self.method.layout_offsets,
+            groups: &self.method.emit_groups,
+            locals: &locals,
+        })?;
+
         Ok((bytecode, max_stack, num_locals))
     }
 
@@ -894,25 +1116,87 @@ impl SsaCodeGenerator {
                         let change_ref = assembly.userstring_add(s)?;
                         self.interned_strings
                             .insert(s.to_string(), change_ref.placeholder());
+                        self.interned_this_method
+                            .push(Interned::String(s.to_string()));
+                    }
+                    SsaOp::LoadElement { elem_type: ty, .. }
+                    | SsaOp::StoreElement { elem_type: ty, .. }
+                    | SsaOp::LoadIndirect { value_type: ty, .. }
+                    | SsaOp::StoreIndirect { value_type: ty, .. }
+                        if emitter::needs_type_spec(ty) && !self.type_specs.contains_key(ty) =>
+                    {
+                        let token = self.intern_type_spec(ty, assembly)?;
+                        self.type_specs.insert(ty.clone(), token);
+                        self.interned_this_method
+                            .push(Interned::TypeSpec(ty.clone()));
                     }
                     SsaOp::Const {
                         value: ConstValue::DecryptedArray(arr),
                         ..
                     } if !self.interned_arrays.contains_key(&arr.data) => {
-                        if let Some(info) = self.intern_array_data(
+                        let info = self.intern_array_data(
                             &arr.data,
                             arr.element_type_ref.token(),
                             arr.element_size,
                             assembly,
-                        )? {
-                            self.interned_arrays.insert(arr.data.clone(), info);
-                        }
+                        )?;
+                        self.interned_arrays.insert(arr.data.clone(), info);
+                        self.interned_this_method
+                            .push(Interned::Array(arr.data.clone()));
                     }
                     _ => {}
                 }
             }
         }
         Ok(())
+    }
+
+    /// The TypeSpec row whose signature is `ty`: the assembly's own when it
+    /// has one, otherwise a new row.
+    fn intern_type_spec(&mut self, ty: &SsaType, assembly: &mut CilAssembly) -> Result<Token> {
+        let blob = encode_typespec_signature(&SignatureTypeSpec {
+            modifiers: CustomModifiers::default(),
+            base: ty.to_type_signature(),
+        })?;
+        let existing = self.existing_type_specs.get_or_insert_with(|| {
+            let mut rows = HashMap::new();
+            let view = assembly.view();
+            if let (Some(table), Some(blobs)) = (
+                view.tables()
+                    .and_then(|tables| tables.table::<TypeSpecRaw>()),
+                view.blobs(),
+            ) {
+                for row in table.iter().filter_map(skip_unreadable) {
+                    if let Ok(signature) = blobs.get(row.signature as usize) {
+                        rows.entry(signature.to_vec()).or_insert(row.token);
+                    }
+                }
+            }
+            rows
+        });
+        if let Some(&token) = existing.get(&blob) {
+            return Ok(token);
+        }
+        let signature = assembly.blob_add(&blob)?;
+        let row = assembly.table_row_add(
+            TableId::TypeSpec,
+            TableDataOwned::TypeSpec(TypeSpecRaw {
+                rid: 0,
+                token: Token::new(0),
+                offset: 0,
+                signature: signature.placeholder(),
+            }),
+        )?;
+        let token = row.token().ok_or_else(|| {
+            Error::CodegenFailed("table_row_add should resolve the token immediately".into())
+        })?;
+        if self.protected_tokens.insert(token) {
+            self.interned_this_method.push(Interned::Protected(token));
+        }
+        self.interned_this_method
+            .push(Interned::TypeSpecRow(blob.clone()));
+        existing.insert(blob, token);
+        Ok(token)
     }
 
     /// Creates FieldRVA + FieldDef metadata entries for a decrypted array,
@@ -924,19 +1208,17 @@ impl SsaCodeGenerator {
     /// invariant (since it's the last TypeDef, its field range extends to the
     /// end of the Field table).
     ///
-    /// Returns `None` if the assembly lacks `RuntimeHelpers.InitializeArray`.
+    /// # Errors
+    ///
+    /// Returns an error when `RuntimeHelpers.InitializeArray` cannot be named.
     fn intern_array_data(
         &mut self,
         data: &[u8],
         _element_type_token: Token,
         _element_size: usize,
         assembly: &mut CilAssembly,
-    ) -> Result<Option<InternedArrayInfo>> {
-        // Find RuntimeHelpers.InitializeArray MemberRef from raw tables
-        let init_array_token = Self::find_initialize_array_memberref(assembly);
-        let Some(init_array_token) = init_array_token else {
-            return Ok(None);
-        };
+    ) -> Result<InternedArrayInfo> {
+        let init_array_token = self.initialize_array_method(assembly)?;
 
         // Track first field RID — all array-related TypeDefs use this same value
         // for field_list to maintain the monotonic ordering invariant (ECMA-335).
@@ -944,6 +1226,7 @@ impl SsaCodeGenerator {
         // owns [first..end] = all array data fields.
         if self.array_first_field_rid.is_none() {
             self.array_first_field_rid = Some(assembly.next_rid(TableId::Field)?);
+            self.interned_this_method.push(Interned::FirstArrayField);
         }
 
         // Choose field type: get or create a __StaticArrayInitTypeSize=N
@@ -957,9 +1240,10 @@ impl SsaCodeGenerator {
         // Store the raw data as FieldRVA
         let placeholder_rva = assembly.store_field_data(data.to_vec());
 
-        // Add field name to strings heap (use a generated name)
-        let field_name =
-            assembly.string_get_or_add(&format!("__array_init_{:08X}", crc32_hash(data)))?;
+        // Named by the order the session interns arrays in, so the same
+        // methods compiled in the same order name their arrays the same way.
+        let field_name = assembly
+            .string_get_or_add(&format!("__StaticArrayInit_{}", self.interned_arrays.len()))?;
 
         // Create FieldDef row: static, assembly-visible, HasFieldRVA
         let field_ref = assembly.table_row_add(
@@ -981,7 +1265,10 @@ impl SsaCodeGenerator {
         })?;
 
         // Protect this field from cleanup deletion
-        self.protected_tokens.insert(field_token);
+        if self.protected_tokens.insert(field_token) {
+            self.interned_this_method
+                .push(Interned::Protected(field_token));
+        }
 
         // Create FieldRVA row
         assembly.table_row_add(
@@ -995,10 +1282,10 @@ impl SsaCodeGenerator {
             }),
         )?;
 
-        Ok(Some(InternedArrayInfo {
+        Ok(InternedArrayInfo {
             field_token,
             initialize_array_token: init_array_token,
-        }))
+        })
     }
 
     /// Creates a parent TypeDef for interned array fields.
@@ -1007,7 +1294,11 @@ impl SsaCodeGenerator {
     /// TypeDef table. Its `field_list` points to the next Field RID that will be
     /// assigned, and since it's the last TypeDef, its field range extends to the
     /// end of the Field table (covering all subsequently appended fields).
-    fn create_array_parent_type(assembly: &mut CilAssembly, first_field_rid: u32) -> Result<Token> {
+    fn create_array_parent_type(
+        &mut self,
+        assembly: &mut CilAssembly,
+        first_field_rid: u32,
+    ) -> Result<Token> {
         let type_name = assembly.string_get_or_add("<PrivateImplementationDetails>")?;
 
         // field_list points to the first array data field. Since this TypeDef
@@ -1019,9 +1310,7 @@ impl SsaCodeGenerator {
         let next_method_rid = assembly.next_rid(TableId::MethodDef)?;
 
         // ECMA-335 §II.22.37: non-interface types MUST have a non-null extends.
-        // Find System.Object TypeRef for the base class.
-        let extends = Self::find_system_object_typeref(assembly)
-            .unwrap_or_else(|| CodedIndex::new(TableId::TypeDef, 0, CodedIndexType::TypeDefOrRef));
+        let extends = self.corelib_type(assembly, "System", "Object")?;
 
         // Sealed | BeforeFieldInit | AutoLayout | NotPublic
         let flags: u32 = 0x0010_0100;
@@ -1046,51 +1335,154 @@ impl SsaCodeGenerator {
             .ok_or_else(|| Error::ModificationInvalid("Failed to resolve TypeDef token".into()))
     }
 
-    /// Finds the `System.Object` TypeRef in the assembly's TypeRef table.
-    fn find_system_object_typeref(assembly: &CilAssembly) -> Option<CodedIndex> {
-        let view = assembly.view();
-        let tables = view.tables()?;
-        let strings = view.strings()?;
-        let typeref_table = tables.table::<TypeRefRaw>()?;
-
-        for row in typeref_table.iter() {
-            let row = match row {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            let Ok(name) = strings.get(row.type_name as usize) else {
-                continue;
-            };
-            let Ok(ns) = strings.get(row.type_namespace as usize) else {
-                continue;
-            };
-            if name == "Object" && ns == "System" {
-                return Some(CodedIndex::new(
-                    TableId::TypeRef,
-                    row.rid,
-                    CodedIndexType::TypeDefOrRef,
-                ));
-            }
+    /// The core library type `namespace.name`, as the module names it: its
+    /// own reference into the core library, one this session added, or - in
+    /// the core library itself - its own definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the module references no core library and does
+    /// not define the type either.
+    fn corelib_type(
+        &mut self,
+        assembly: &mut CilAssembly,
+        namespace: &'static str,
+        name: &'static str,
+    ) -> Result<CodedIndex> {
+        if let Some(found) = assembly.find_corelib_type(namespace, name) {
+            return Ok(found);
         }
-        None
+        if let Some(added) = self.corelib_types.get(&(namespace, name)) {
+            return Ok(added.clone());
+        }
+        let Some(scope) = assembly.find_core_library_ref() else {
+            return Err(Error::CodegenFailed(format!(
+                "{namespace}.{name} cannot be named: the module references no core library and \
+                 does not define it"
+            )));
+        };
+        let added = TypeRefBuilder::new()
+            .name(name)
+            .namespace(namespace)
+            .resolution_scope(CodedIndex::new(
+                TableId::AssemblyRef,
+                scope.row,
+                CodedIndexType::ResolutionScope,
+            ))
+            .build(assembly)?
+            .token()
+            .ok_or_else(|| {
+                Error::CodegenFailed("table_row_add should resolve the token immediately".into())
+            })?;
+        let index = CodedIndex::new(TableId::TypeRef, added.row(), CodedIndexType::TypeDefOrRef);
+        self.corelib_types.insert((namespace, name), index.clone());
+        self.interned_this_method
+            .push(Interned::CorelibType(namespace, name));
+        if self.protected_tokens.insert(added) {
+            self.interned_this_method.push(Interned::Protected(added));
+        }
+        Ok(index)
     }
 
-    /// Finds the `RuntimeHelpers.InitializeArray` MemberRef token in the assembly.
-    fn find_initialize_array_memberref(assembly: &CilAssembly) -> Option<Token> {
-        let tables = assembly.view().tables()?;
-        let strings = assembly.view().strings()?;
-        let member_refs = tables.table::<MemberRefRaw>()?;
-        for row in member_refs.iter().filter_map(skip_unreadable) {
-            if let Ok(name) = strings.get(row.name as usize) {
-                if name == "InitializeArray" {
-                    return Some(row.token);
-                }
-            }
+    /// The core library's `RuntimeHelpers.InitializeArray(Array,
+    /// RuntimeFieldHandle)`: the module's own reference when it has one with
+    /// that signature, otherwise one added with the type references it needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the core library's types cannot be named.
+    fn initialize_array_method(&mut self, assembly: &mut CilAssembly) -> Result<Token> {
+        if let Some(token) = self.initialize_array {
+            return Ok(token);
         }
-        None
+        let helpers = self.corelib_type(
+            assembly,
+            "System.Runtime.CompilerServices",
+            "RuntimeHelpers",
+        )?;
+        let array = self.corelib_type(assembly, "System", "Array")?;
+        let handle = self.corelib_type(assembly, "System", "RuntimeFieldHandle")?;
+        let signature = SignatureMethod {
+            has_this: false,
+            explicit_this: false,
+            default: true,
+            vararg: false,
+            cdecl: false,
+            stdcall: false,
+            thiscall: false,
+            fastcall: false,
+            unmanaged: false,
+            param_count_generic: 0,
+            param_count: 2,
+            return_type: SignatureParameter {
+                modifiers: Vec::new(),
+                by_ref: false,
+                base: TypeSignature::Void,
+            },
+            params: vec![
+                SignatureParameter {
+                    modifiers: Vec::new(),
+                    by_ref: false,
+                    base: TypeSignature::Class(array.token),
+                },
+                SignatureParameter {
+                    modifiers: Vec::new(),
+                    by_ref: false,
+                    base: TypeSignature::ValueType(handle.token),
+                },
+            ],
+            varargs: Vec::new(),
+        };
+        let wanted = encode_method_signature(&signature)?;
+
+        let existing = {
+            let view = assembly.view();
+            match (view.tables(), view.strings(), view.blobs()) {
+                (Some(tables), Some(strings), Some(blobs)) => tables
+                    .table::<MemberRefRaw>()
+                    .into_iter()
+                    .flat_map(|table| table.iter().filter_map(skip_unreadable))
+                    .find(|row| {
+                        row.class.tag == helpers.tag
+                            && row.class.row == helpers.row
+                            && strings
+                                .get(row.name as usize)
+                                .is_ok_and(|name| name == "InitializeArray")
+                            && blobs
+                                .get(row.signature as usize)
+                                .is_ok_and(|found| found == wanted.as_slice())
+                    })
+                    .map(|row| row.token),
+                _ => None,
+            }
+        };
+        let token = match existing {
+            Some(token) => token,
+            None => {
+                let added = MemberRefBuilder::new()
+                    .name("InitializeArray")
+                    .class(CodedIndex::new(
+                        helpers.tag,
+                        helpers.row,
+                        CodedIndexType::MemberRefParent,
+                    ))
+                    .signature(&wanted)
+                    .build(assembly)?
+                    .token()
+                    .ok_or_else(|| {
+                        Error::CodegenFailed(
+                            "table_row_add should resolve the token immediately".into(),
+                        )
+                    })?;
+                if self.protected_tokens.insert(added) {
+                    self.interned_this_method.push(Interned::Protected(added));
+                }
+                added
+            }
+        };
+        self.initialize_array = Some(token);
+        self.interned_this_method.push(Interned::InitializeArray);
+        Ok(token)
     }
 
     /// Gets or creates a `__StaticArrayInitTypeSize=N` nested valuetype with
@@ -1138,12 +1530,8 @@ impl SsaCodeGenerator {
             let type_name =
                 assembly.string_get_or_add(&format!("__StaticArrayInitTypeSize={size}"))?;
 
-            // Find System.ValueType TypeRef for the extends field
-            let extends = Self::find_system_valuetype_typeref(assembly).unwrap_or_else(|| {
-                Self::find_system_object_typeref(assembly).unwrap_or_else(|| {
-                    CodedIndex::new(TableId::TypeDef, 0, CodedIndexType::TypeDefOrRef)
-                })
-            });
+            // A value type: the runtime reads a type as one by its base.
+            let extends = self.corelib_type(assembly, "System", "ValueType")?;
 
             // field_list: use the SAME value as all other array types to maintain
             // the monotonic ordering invariant. Since size types own no fields,
@@ -1189,8 +1577,12 @@ impl SsaCodeGenerator {
                 }),
             )?;
 
-            self.protected_tokens.insert(new_token);
+            if self.protected_tokens.insert(new_token) {
+                self.interned_this_method
+                    .push(Interned::Protected(new_token));
+            }
             self.array_size_types.insert(size, new_token);
+            self.interned_this_method.push(Interned::SizeType(size));
             new_token
         };
 
@@ -1204,45 +1596,14 @@ impl SsaCodeGenerator {
         Ok(blob_ref.placeholder())
     }
 
-    /// Finds the `System.ValueType` TypeRef in the assembly's TypeRef table.
-    fn find_system_valuetype_typeref(assembly: &CilAssembly) -> Option<CodedIndex> {
-        let view = assembly.view();
-        let tables = view.tables()?;
-        let strings = view.strings()?;
-        let typeref_table = tables.table::<TypeRefRaw>()?;
-
-        for row in typeref_table.iter() {
-            let row = match row {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            let Ok(name) = strings.get(row.type_name as usize) else {
-                continue;
-            };
-            let Ok(ns) = strings.get(row.type_namespace as usize) else {
-                continue;
-            };
-            if name == "ValueType" && ns == "System" {
-                return Some(CodedIndex::new(
-                    TableId::TypeRef,
-                    row.rid,
-                    CodedIndexType::TypeDefOrRef,
-                ));
-            }
-        }
-        None
-    }
-
     /// Collects all branch targets and ensures they have labels.
     fn collect_branch_targets(&mut self, ssa: &SsaFunction) {
         for block in ssa.blocks() {
             for instr in block.instructions() {
                 match instr.op() {
                     SsaOp::Jump { target } => {
-                        self.block_labels
+                        self.method
+                            .block_labels
                             .entry(*target)
                             .or_insert_with(|| format!("block_{target}"));
                     }
@@ -1256,10 +1617,12 @@ impl SsaCodeGenerator {
                         false_target,
                         ..
                     } => {
-                        self.block_labels
+                        self.method
+                            .block_labels
                             .entry(*true_target)
                             .or_insert_with(|| format!("block_{true_target}"));
-                        self.block_labels
+                        self.method
+                            .block_labels
                             .entry(*false_target)
                             .or_insert_with(|| format!("block_{false_target}"));
                     }
@@ -1267,16 +1630,19 @@ impl SsaCodeGenerator {
                         targets, default, ..
                     } => {
                         for target in targets {
-                            self.block_labels
+                            self.method
+                                .block_labels
                                 .entry(*target)
                                 .or_insert_with(|| format!("block_{target}"));
                         }
-                        self.block_labels
+                        self.method
+                            .block_labels
                             .entry(*default)
                             .or_insert_with(|| format!("block_{default}"));
                     }
                     SsaOp::Leave { target } => {
-                        self.block_labels
+                        self.method
+                            .block_labels
                             .entry(*target)
                             .or_insert_with(|| format!("block_{target}"));
                     }
@@ -1286,299 +1652,351 @@ impl SsaCodeGenerator {
         }
     }
 
-    /// Computes optimal block layout to minimize unnecessary branches.
+    /// The blocks control can reach: from the entry along terminator edges,
+    /// and into a clause's filter and handler once its protected code is
+    /// reached, since the runtime enters a handler only from its try.
     ///
-    /// This reorders blocks so that fall-through paths (where one block jumps
-    /// unconditionally to another) don't require explicit branch instructions.
-    /// Uses a greedy approach that follows the most common execution path.
+    /// A clause whose protected region is not known is entered regardless,
+    /// as nothing shows its handler cannot run.
     ///
-    /// # Algorithm
+    /// This is not analyssa's `FunctionRoots::live_blocks`. That follows a
+    /// `leave` into the finallys it runs and on only from their `endfinally`,
+    /// so behind a finally that never ends the leave's target is dead - but the
+    /// `leave` still names it, and a block it names has to be emitted for its
+    /// label to exist.
+    fn reachable_blocks(ssa: &SsaFunction) -> BTreeSet<usize> {
+        let handlers = ssa.exception_handlers();
+        let mut entered = vec![false; handlers.len()];
+        let mut reached = BTreeSet::new();
+        let mut pending = vec![0usize];
+        while !pending.is_empty() {
+            while let Some(block) = pending.pop() {
+                if !reached.insert(block) {
+                    continue;
+                }
+                if let Some(block) = ssa.block(block) {
+                    block.for_each_successor(|successor| pending.push(successor));
+                }
+            }
+            for (handler, entered) in handlers.iter().zip(entered.iter_mut()) {
+                let protects_reached = handler
+                    .protected_range
+                    .is_none_or(|range| reached.range(range.start()..range.end()).next().is_some());
+                if !*entered && protects_reached {
+                    *entered = true;
+                    pending.extend(handler.entry_blocks());
+                }
+            }
+        }
+        reached
+    }
+
+    /// Orders the blocks for emission.
     ///
-    /// 1. Start at block 0 (entry point)
-    /// 2. Follow each block's preferred successor (for Jump: the target;
-    ///    for Branch/Switch: the first target; for others: none)
-    /// 3. When a block has no unvisited successor, pick the next unvisited block
-    /// 4. Continue until all blocks are placed
+    /// # Regions are laid out whole
+    ///
+    /// Every protected, filter and handler range is a run of block indices, and
+    /// [`Self::remap_exception_handlers`] needs each one to occupy one contiguous
+    /// span of the emitted code, entered at its first block. The ranges nest (or
+    /// are disjoint), so they form a tree, and the layout follows it: each level
+    /// is laid out over *units* - a block of that level, or a whole child region -
+    /// and a child region is laid out recursively, starting from its entry block,
+    /// before anything outside it. Contiguity is then a property of the
+    /// construction rather than of the heuristic below.
+    ///
+    /// A clause's protected region is placed before its filter, and its filter
+    /// before its handler, so the offsets run in the order the clause states them.
+    /// Within a filter, the block ending in `endfilter` is placed last: the
+    /// instruction must be the filter's lexically last (ECMA-335 III.3.34).
+    ///
+    /// # Within a level
+    ///
+    /// Greedy fall-through: from the level's entry, follow each block's preferred
+    /// successor (a `Jump`'s target, a two-way branch's false arm, a switch's
+    /// default), so the common path needs no branch. When the chain ends, the
+    /// eligible unit with the lowest block index goes next, which keeps the source
+    /// order wherever the fall-through gives no reason to change it.
     fn compute_block_layout(ssa: &SsaFunction, blocks_to_include: &BTreeSet<usize>) -> Vec<usize> {
-        // Get the preferred successor for a block (the one we'd like to fall through to)
+        /// A region of the layout tree: a block range and its nesting.
+        struct RegionNode {
+            start: usize,
+            end: usize,
+            parent: Option<usize>,
+            children: Vec<usize>,
+            loose_blocks: Vec<usize>,
+        }
+
+        /// What a level of the tree is laid out over.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Unit {
+            Block(usize),
+            Region(usize),
+        }
+
+        // The successor a block would like to fall through to.
         fn preferred_successor(
             ssa: &SsaFunction,
             block_id: usize,
             leave_targets: &BTreeSet<usize>,
         ) -> Option<usize> {
-            let block = ssa.block(block_id)?;
-            // Look at the terminator instruction
-            for instr in block.instructions().iter().rev() {
-                match instr.op() {
-                    // For Leave/Return/Throw/Rethrow/EndFinally/EndFilter, no successors
-                    SsaOp::Leave { .. }
-                    | SsaOp::Return { .. }
-                    | SsaOp::Throw { .. }
-                    | SsaOp::Rethrow
-                    | SsaOp::EndFinally
-                    | SsaOp::EndFilter { .. } => {
-                        return None;
-                    }
-                    // For unconditional jump, the target is the preferred successor
-                    // unless it's a leave target (merge point)
-                    SsaOp::Jump { target } => {
-                        if !leave_targets.contains(target) {
-                            return Some(*target);
-                        }
-                        return None;
-                    }
-                    // For branches, prefer the false branch (often the fall-through case)
-                    SsaOp::Branch { false_target, .. } | SsaOp::BranchCmp { false_target, .. } => {
-                        return Some(*false_target);
-                    }
-                    // For switch, prefer the default case
-                    SsaOp::Switch { default, .. } => {
-                        return Some(*default);
-                    }
-                    _ => {}
+            match ssa.block(block_id)?.control_terminator()? {
+                // A `leave` target is a merge point after the handlers; falling
+                // into it from the try body would pull it inside.
+                SsaOp::Jump { target } => (!leave_targets.contains(target)).then_some(*target),
+                SsaOp::Branch { false_target, .. } | SsaOp::BranchCmp { false_target, .. } => {
+                    Some(*false_target)
                 }
+                SsaOp::Switch { default, .. } => Some(*default),
+                _ => None,
             }
-            None
         }
 
         if blocks_to_include.is_empty() {
             return Vec::new();
         }
 
-        // Build EH ordering constraints: try blocks must be placed before their
-        // handler blocks in the layout. Without this, the linearizer can place a
-        // handler block before its try block, producing inverted byte offsets
-        // (e.g. try=93..60) that violate ECMA-335 EH semantics.
-        //
-        // For each handler entry, collect the protected-region entries that must
-        // precede it (a handler block may serve multiple EH regions).
-        let mut handler_requires_try: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        // Map protected-region entry → handler entry for scheduling handlers
-        // after their try bodies.
-        let mut try_to_handler: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for eh in ssa.exception_handlers() {
-            if let (Some(try_block), Some(handler_block)) = (
-                eh.protected_range.map(|range| range.start()),
-                eh.handler_range.map(|range| range.start()),
-            ) {
-                handler_requires_try
-                    .entry(handler_block)
-                    .or_default()
-                    .push(try_block);
-                try_to_handler
-                    .entry(try_block)
-                    .or_default()
-                    .push(handler_block);
-            }
-        }
-
-        // Collect Leave targets - these are merge points that should come after handlers
         let leave_targets: BTreeSet<usize> = ssa
             .blocks()
             .iter()
-            .filter_map(|b| {
-                if let Some(SsaOp::Leave { target }) = b.control_terminator() {
-                    Some(*target)
-                } else {
-                    None
-                }
+            .filter_map(|b| match b.control_terminator() {
+                Some(SsaOp::Leave { target }) => Some(*target),
+                _ => None,
             })
             .collect();
 
-        // Identify all blocks within EH-protected regions (both try bodies and
-        // handlers). These blocks must be laid out contiguously within their
-        // respective regions. We BFS from each start block, following INTERNAL
-        // control flow only. Leave/EndFinally/EndFilter/Throw/Rethrow exit the
-        // region, so we don't follow their targets.
-        let mut eh_region_blocks: BTreeSet<usize> = BTreeSet::new();
+        // The distinct ranges, outer before inner: by start, then widest first.
+        let mut ranges: Vec<(usize, usize)> = ssa
+            .exception_handlers()
+            .iter()
+            .flat_map(|eh| [eh.protected_range, eh.filter_range, eh.handler_range])
+            .flatten()
+            .map(|range| (range.start(), range.end()))
+            .collect();
+        ranges.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        ranges.dedup();
+
+        // Node 0 is the whole function.
+        let mut nodes = vec![RegionNode {
+            start: 0,
+            end: usize::MAX,
+            parent: None,
+            children: Vec::new(),
+            loose_blocks: Vec::new(),
+        }];
+        let mut open: Vec<usize> = vec![0];
+        for &(start, end) in &ranges {
+            while let Some(&top) = open.last() {
+                if nodes
+                    .get(top)
+                    .is_some_and(|node| node.start <= start && end <= node.end)
+                {
+                    break;
+                }
+                open.pop();
+            }
+            let parent = open.last().copied().unwrap_or(0);
+            let id = nodes.len();
+            nodes.push(RegionNode {
+                start,
+                end,
+                parent: Some(parent),
+                children: Vec::new(),
+                loose_blocks: Vec::new(),
+            });
+            if let Some(node) = nodes.get_mut(parent) {
+                node.children.push(id);
+            }
+            open.push(id);
+        }
+
+        // Each block's innermost region. Outer ranges come first, so an inner
+        // one overwrites.
+        let mut innermost: BTreeMap<usize, usize> = BTreeMap::new();
+        for (id, node) in nodes.iter().enumerate().skip(1) {
+            for &block in blocks_to_include.range(node.start..node.end) {
+                innermost.insert(block, id);
+            }
+        }
+        for &block in blocks_to_include {
+            let id = innermost.get(&block).copied().unwrap_or(0);
+            if let Some(node) = nodes.get_mut(id) {
+                node.loose_blocks.push(block);
+            }
+        }
+        // The first block of region `id` this layout includes.
+        let region_entry = |id: usize| {
+            nodes.get(id).and_then(|node| {
+                blocks_to_include
+                    .range(node.start..node.end)
+                    .next()
+                    .copied()
+            })
+        };
+
+        // The unit `block` is at `level`: itself, or the child region of `level`
+        // holding it. `None` when the block is outside `level`.
+        let unit_at = |block: usize, level: usize| -> Option<Unit> {
+            let mut region = innermost.get(&block).copied().unwrap_or(0);
+            if region == level {
+                return Some(Unit::Block(block));
+            }
+            while let Some(parent) = nodes.get(region).and_then(|node| node.parent) {
+                if parent == level {
+                    return Some(Unit::Region(region));
+                }
+                region = parent;
+            }
+            None
+        };
+
+        // A clause's protected region precedes its filter, and both its handler.
+        let node_of = |start: usize, end: usize| {
+            nodes
+                .iter()
+                .position(|node| node.start == start && node.end == end && node.parent.is_some())
+        };
+        let mut prerequisites: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for eh in ssa.exception_handlers() {
-            let starts: Vec<usize> = [eh.protected_range, eh.handler_range]
-                .into_iter()
-                .flatten()
-                .map(|range| range.start())
-                .collect();
-            for start in starts {
-                let mut bfs_queue = vec![start];
-                while let Some(b) = bfs_queue.pop() {
-                    if !eh_region_blocks.insert(b) || !blocks_to_include.contains(&b) {
-                        continue;
-                    }
-                    if let Some(block) = ssa.block(b) {
-                        if let Some(term) = block.control_terminator() {
-                            // Only follow internal control flow. Leave exits the
-                            // try region, EndFinally/EndFilter exit the handler,
-                            // and Throw/Rethrow/Return exit everything.
-                            match term {
-                                SsaOp::Jump { target } => {
-                                    bfs_queue.push(*target);
-                                }
-                                SsaOp::Branch {
-                                    true_target,
-                                    false_target,
-                                    ..
-                                }
-                                | SsaOp::BranchCmp {
-                                    true_target,
-                                    false_target,
-                                    ..
-                                } => {
-                                    bfs_queue.push(*true_target);
-                                    bfs_queue.push(*false_target);
-                                }
-                                SsaOp::Switch {
-                                    targets, default, ..
-                                } => {
-                                    for &t in targets {
-                                        bfs_queue.push(t);
-                                    }
-                                    bfs_queue.push(*default);
-                                }
-                                _ => {}
-                            }
-                        }
+            let protected = eh
+                .protected_range
+                .and_then(|range| node_of(range.start(), range.end()));
+            let filter = eh
+                .filter_range
+                .and_then(|range| node_of(range.start(), range.end()));
+            let handler = eh
+                .handler_range
+                .and_then(|range| node_of(range.start(), range.end()));
+            for (later, earlier) in [(filter, protected), (handler, protected), (handler, filter)] {
+                if let (Some(later), Some(earlier)) = (later, earlier) {
+                    if later != earlier {
+                        prerequisites.entry(later).or_default().push(earlier);
                     }
                 }
             }
         }
 
-        let mut layout = Vec::with_capacity(blocks_to_include.len());
-        let mut visited = BTreeSet::new();
-
-        // Ensures a block and any prerequisite try blocks are added to the
-        // worklist. If the block is a handler, its try blocks are pushed after
-        // it (LIFO: they'll be popped and processed first), enforcing the
-        // ECMA-335 EH ordering constraint.
-        let enqueue_with_eh_deps =
-            |block_id: usize, worklist: &mut Vec<usize>, visited: &BTreeSet<usize>| {
-                worklist.push(block_id);
-                if let Some(required_try_blocks) = handler_requires_try.get(&block_id) {
-                    for &try_block in required_try_blocks {
-                        if blocks_to_include.contains(&try_block) && !visited.contains(&try_block) {
-                            worklist.push(try_block);
-                        }
-                    }
-                }
-            };
-
-        // Start with block 0 if it's in the set, otherwise pick the first available
-        let start = if blocks_to_include.contains(&0) {
-            0
-        } else {
-            *blocks_to_include.iter().min().unwrap_or(&0)
+        // A filter ends with its `endfilter` (ECMA-335 III.3.34): in a filter's level the block
+        // holding it is placed after every other unit of the filter, whatever the fall-through
+        // order would give
+        let filter_nodes: BTreeSet<usize> = ssa
+            .exception_handlers()
+            .iter()
+            .filter_map(|eh| eh.filter_range)
+            .filter_map(|range| node_of(range.start(), range.end()))
+            .collect();
+        let ends_filter = |block: usize| {
+            matches!(
+                ssa.block(block).and_then(|b| b.control_terminator()),
+                Some(SsaOp::EndFilter { .. })
+            )
         };
 
-        // Use a worklist to process blocks
-        let mut worklist = vec![start];
+        let mut layout = Vec::with_capacity(blocks_to_include.len());
+        let mut placed_blocks: BTreeSet<usize> = BTreeSet::new();
+        let mut placed_regions: BTreeSet<usize> = BTreeSet::new();
 
-        while layout.len() < blocks_to_include.len() {
-            // Process the worklist
-            while let Some(block_id) = worklist.pop() {
-                if !blocks_to_include.contains(&block_id) || visited.contains(&block_id) {
-                    continue;
-                }
+        // Lay out one level, entered at `entry`. Iterative over an explicit
+        // stack of levels so a deeply nested method cannot overflow the stack.
+        struct Level {
+            id: usize,
+            worklist: Vec<Unit>,
+        }
+        let root_entry = if blocks_to_include.contains(&0) {
+            0
+        } else {
+            blocks_to_include.iter().next().copied().unwrap_or(0)
+        };
+        let mut levels = vec![Level {
+            id: 0,
+            worklist: unit_at(root_entry, 0).into_iter().collect(),
+        }];
 
-                visited.insert(block_id);
-                layout.push(block_id);
-
-                // For blocks within EH regions, enqueue ALL internal successors
-                // (not just the preferred one). EH region blocks must be
-                // contiguous. Only follow Jump/Branch/Switch — not Leave/
-                // EndFinally/etc. which exit the region.
-                if eh_region_blocks.contains(&block_id) {
-                    if let Some(block) = ssa.block(block_id) {
-                        if let Some(term) = block.control_terminator() {
-                            let targets: Vec<usize> = match term {
-                                SsaOp::Jump { target } => vec![*target],
-                                SsaOp::Branch {
-                                    true_target,
-                                    false_target,
-                                    ..
-                                }
-                                | SsaOp::BranchCmp {
-                                    true_target,
-                                    false_target,
-                                    ..
-                                } => vec![*true_target, *false_target],
-                                SsaOp::Switch {
-                                    targets, default, ..
-                                } => {
-                                    let mut t = targets.clone();
-                                    t.push(*default);
-                                    t
-                                }
-                                _ => vec![],
-                            };
-                            for target in targets {
-                                if blocks_to_include.contains(&target) && !visited.contains(&target)
-                                {
-                                    worklist.push(target);
-                                }
-                            }
+        while let Some(level) = levels.last_mut() {
+            let id = level.id;
+            if let Some(unit) = level.worklist.pop() {
+                match unit {
+                    Unit::Block(block) => {
+                        if placed_blocks.contains(&block) {
+                            continue;
+                        }
+                        // The filter's end waits for the rest of the filter
+                        let waits = filter_nodes.contains(&id)
+                            && ends_filter(block)
+                            && nodes.get(id).is_some_and(|node| {
+                                node.loose_blocks.iter().any(|&other| {
+                                    other != block
+                                        && !placed_blocks.contains(&other)
+                                        && !ends_filter(other)
+                                }) || node.children.iter().any(|r| !placed_regions.contains(r))
+                            });
+                        if waits {
+                            continue;
+                        }
+                        placed_blocks.insert(block);
+                        layout.push(block);
+                        if let Some(next) = preferred_successor(ssa, block, &leave_targets)
+                            .filter(|next| blocks_to_include.contains(next))
+                            .and_then(|next| unit_at(next, id))
+                        {
+                            level.worklist.push(next);
                         }
                     }
-                } else {
-                    // Normal blocks: follow preferred successor only
-                    if let Some(succ) = preferred_successor(ssa, block_id, &leave_targets) {
-                        if blocks_to_include.contains(&succ) && !visited.contains(&succ) {
-                            enqueue_with_eh_deps(succ, &mut worklist, &visited);
+                    Unit::Region(region) => {
+                        if !placed_regions.insert(region) {
+                            continue;
                         }
+                        // Entered at its first block: control may only enter a
+                        // protected region there.
+                        let entry = region_entry(region);
+                        levels.push(Level {
+                            id: region,
+                            worklist: entry.and_then(|b| unit_at(b, region)).into_iter().collect(),
+                        });
                     }
                 }
+                continue;
             }
 
-            // If worklist is empty but we haven't visited all blocks,
-            // pick blocks in an order that keeps try/handler pairs together.
-            // ECMA-335 requires try_offset < handler_offset, and try_end is
-            // typically the handler's start offset. If handlers are placed far
-            // from their try blocks, the try region expands to cover unrelated
-            // code, producing overlapping/nested EH regions.
-            if layout.len() < blocks_to_include.len() {
-                let next_unvisited = |pred: &dyn Fn(usize) -> bool| -> Option<usize> {
-                    blocks_to_include
+            // The chain ended: the eligible unit with the lowest block index.
+            let Some(node) = nodes.get(id) else {
+                levels.pop();
+                continue;
+            };
+            let mut candidates: Vec<(usize, Unit)> = node
+                .loose_blocks
+                .iter()
+                .filter(|b| !placed_blocks.contains(b))
+                .map(|&b| (b, Unit::Block(b)))
+                .chain(
+                    node.children
                         .iter()
-                        .filter(|&&b| !visited.contains(&b) && pred(b))
-                        .min()
-                        .copied()
-                };
-
-                // 1. Handler blocks whose try_start is already visited.
-                // These must be placed right after their try body so that
-                // try_end (= handler start offset) doesn't span unrelated code.
-                if let Some(block_id) = next_unvisited(&|b| {
-                    handler_requires_try
-                        .get(&b)
-                        .is_some_and(|try_blocks| try_blocks.iter().all(|t| visited.contains(t)))
-                }) {
-                    worklist.push(block_id);
-                    continue;
-                }
-
-                // 2. Leave targets (merge points between sequential EH regions).
-                // These must come after handlers but before new try blocks so
-                // that setup code between sequential try/finally pairs is placed
-                // correctly (e.g., re-loading _syncLock between two lock blocks).
-                if let Some(block_id) = next_unvisited(&|b| leave_targets.contains(&b)) {
-                    worklist.push(block_id);
-                    continue;
-                }
-
-                // 3. Try blocks whose handlers haven't been visited yet
-                if let Some(block_id) =
-                    next_unvisited(&|b| handler_requires_try.values().flatten().any(|&t| t == b))
-                {
-                    worklist.push(block_id);
-                    continue;
-                }
-
-                // 4. Handler blocks (with EH dep enforcement)
-                if let Some(block_id) = next_unvisited(&|b| handler_requires_try.contains_key(&b)) {
-                    enqueue_with_eh_deps(block_id, &mut worklist, &visited);
-                    continue;
-                }
-
-                // 5. Any remaining blocks
-                if let Some(block_id) = next_unvisited(&|_| true) {
-                    worklist.push(block_id);
+                        .filter(|&&r| !placed_regions.contains(&r))
+                        .filter_map(|&r| region_entry(r).map(|first| (first, Unit::Region(r)))),
+                )
+                .collect();
+            // In a filter, the block ending it goes last
+            let in_filter = filter_nodes.contains(&id);
+            candidates.sort_by_key(|&(first, unit)| {
+                (
+                    in_filter && matches!(unit, Unit::Block(block) if ends_filter(block)),
+                    first,
+                )
+            });
+            let eligible = |unit: &Unit| match unit {
+                Unit::Region(r) => prerequisites
+                    .get(r)
+                    .is_none_or(|before| before.iter().all(|p| placed_regions.contains(p))),
+                Unit::Block(_) => true,
+            };
+            let next = candidates
+                .iter()
+                .find(|(_, unit)| eligible(unit))
+                .or_else(|| candidates.first())
+                .map(|(_, unit)| *unit);
+            match next {
+                Some(unit) => level.worklist.push(unit),
+                None => {
+                    levels.pop();
                 }
             }
         }
@@ -1607,14 +2025,11 @@ impl SsaCodeGenerator {
     /// makes [`Self::edge_label`] and [`Self::edge_destination`] agree with the layout: a
     /// branch names the edge block exactly when the layout created one.
     ///
-    /// # Errors
-    ///
-    /// Propagates the storage lookup in [`Self::successor_has_phi_from`].
     fn expand_layout_with_edge_blocks(
         &mut self,
         ssa: &SsaFunction,
         block_ids: &[usize],
-    ) -> Result<Vec<LayoutEntry>> {
+    ) -> Vec<LayoutEntry> {
         let mut layout: Vec<LayoutEntry> = Vec::with_capacity(block_ids.len());
 
         for &block_id in block_ids {
@@ -1653,1856 +2068,286 @@ impl SsaCodeGenerator {
             for to in edge_targets {
                 // A switch may name the same target more than once, and a two-way branch
                 // may name the same block on both edges. One edge, one block.
-                if self.split_edge_labels.contains_key(&(block_id, to)) {
+                if self.method.split_edge_labels.contains_key(&(block_id, to)) {
                     continue;
                 }
-                if !self.successor_has_phi_from(ssa, block_id, to)? {
+                let carries_copies = self
+                    .method
+                    .storage
+                    .as_ref()
+                    .is_some_and(|storage| !storage.copies_on(ssa, block_id, to).is_empty());
+                if !carries_copies {
                     continue;
                 }
 
-                self.split_edge_labels
+                self.method
+                    .split_edge_labels
                     .insert((block_id, to), format!("edge_{block_id}_{to}"));
                 layout.push(LayoutEntry::SplitEdge { from: block_id, to });
             }
         }
 
-        Ok(layout)
+        layout
     }
 
-    /// Allocates storage for all SSA variables using graph coloring.
-    ///
-    /// Arguments get mapped to their original argument slots (ldarg/starg).
-    /// Stack temporaries and phi results are coalesced using an interference
-    /// graph to minimize the number of local slots needed.
-    ///
-    /// Single-use constants are deferred and will be generated inline at their
-    /// use site instead of being stored to a local.
-    fn allocate_storage(&mut self, ssa: &SsaFunction) -> Result<()> {
-        // Phase 1: Classify variables and run register allocation.
-        let coalesced_slots = self.allocate_storage_classify(ssa)?;
-
-        // Collect exception handler entry blocks for Phase 4.
-        let handler_entry_blocks: BTreeSet<usize> = ssa
-            .exception_handlers()
-            .iter()
-            .filter_map(|h| h.handler_range.map(|range| range.start()))
-            .collect();
-
-        // Phase 2: Pre-allocate all live phi results to local slots.
-        self.allocate_phi_results(ssa, &coalesced_slots)?;
-
-        // Phase 3: Allocate remaining variables (stack temps, synthetics, phi operands).
-        self.allocate_remaining_variables(ssa, &coalesced_slots)?;
-
-        // Phase 4: Fix handler entry phi storage so exception handler phi results
-        // share the same local as their operands.
-        self.fixup_handler_phi_storage(ssa, &handler_entry_blocks);
-
-        // Phase 5: Compact local slots to eliminate gaps from coalescer assignments.
-        self.compact_local_slots();
-
-        Ok(())
-    }
-
-    /// Phase 1 of storage allocation: classify variables and run register allocation.
-    ///
-    /// Computes global use counts, identifies deferred constants and stack locals,
-    /// runs the local coalescer, and maps arguments and local-origin variables to
-    /// their storage slots. Returns the coalesced slot assignments for use in
-    /// subsequent phases.
-    fn allocate_storage_classify(&mut self, ssa: &SsaFunction) -> Result<BTreeMap<SsaVarId, u16>> {
-        // First, compute global use counts and identify single-use constants.
-        // This avoids storing constants to locals only to load them back.
-        self.global_use_counts = Self::compute_variable_use_counts(ssa);
-
-        // Pre-compute the set of all phi operands. This replaces per-variable
-        // O(blocks * phis * operands) scans with a single upfront pass and O(1)
-        // lookups during identify_deferred_constants and identify_stack_locals.
-        self.all_phi_operands.clear();
-        for block in ssa.blocks() {
-            for phi in block.phi_nodes() {
-                for operand in phi.operands() {
-                    self.all_phi_operands.insert(operand.value());
-                }
-            }
-        }
-
-        self.identify_deferred_constants(ssa, &self.global_use_counts.clone());
-
-        // Identify stack locals - variables that can live entirely on the eval stack.
-        // These are single-use values defined and consumed in the same block before
-        // any control flow, so they never need a local slot.
-        self.stack_locals = self.identify_stack_locals(ssa);
-
-        // Use register allocation for efficient local usage
-        // Automatically selects graph coloring (≤500 vars) or linear scan (>500 vars)
-        let coalescer = LocalCoalescer::build(ssa);
-        let allocation = coalescer.allocate(ssa)?;
-
-        // Map arguments to their original slots
-        for var in ssa.variables() {
-            if let VariableOrigin::Argument(idx) = var.origin() {
-                self.var_storage.insert(var.id(), VarStorage::Arg(idx));
-            }
-        }
-
-        // Apply the coalesced allocation for Local-origin variables.
-        for (var_id, local_slot) in &allocation.var_to_local {
-            if let Some(ssa_var) = ssa.variable(*var_id) {
-                if matches!(ssa_var.origin(), VariableOrigin::Local(_))
-                    && !self.var_storage.contains_key(var_id)
-                    && !self.deferred_constants.contains_key(var_id)
-                {
-                    self.var_storage
-                        .insert(*var_id, VarStorage::Local(*local_slot));
-                }
-            }
-        }
-
-        self.original_to_compacted
-            .clone_from(&allocation.original_to_compacted);
-
-        // Set next_local to count of compacted original Local-origin variables.
-        // Phase 2/3 will bump this when using coalesced slots for other variables.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            self.next_local = allocation.original_to_compacted.len() as u16;
-        }
-
-        Ok(allocation.var_to_local)
-    }
-
-    /// Phase 2 of storage allocation: pre-allocate all live phi results to locals.
-    ///
-    /// Ensures consistent stack behavior -- phi results are always in locals,
-    /// never on the stack. Dead phi results (use_count == 0) are skipped.
-    fn allocate_phi_results(
-        &mut self,
-        ssa: &SsaFunction,
-        coalesced_slots: &BTreeMap<SsaVarId, u16>,
-    ) -> Result<()> {
-        for block in ssa.blocks() {
-            for phi in block.phi_nodes() {
-                let phi_result = phi.result();
-
-                // Skip if already allocated (shouldn't happen, but be safe)
-                if self.var_storage.contains_key(&phi_result) {
-                    continue;
-                }
-
-                // Skip dead phi results (not used by any instructions)
-                let use_count = self
-                    .global_use_counts
-                    .get(&phi_result)
-                    .copied()
-                    .unwrap_or(0);
-                if use_count == 0 {
-                    continue;
-                }
-
-                // Use the coalescer's slot if available, otherwise allocate fresh
-                let local_idx = if let Some(&slot) = coalesced_slots.get(&phi_result) {
-                    // Bump next_local past any coalesced slot to avoid conflicts
-                    self.next_local = self.next_local.max(slot.saturating_add(1));
-                    slot
-                } else {
-                    let idx = self.next_local;
-                    self.next_local = self.next_local.saturating_add(1);
-                    idx
-                };
-                self.var_storage
-                    .insert(phi_result, VarStorage::Local(local_idx));
-
-                // Record the type for the local variable signature.
-                // Try phi result type first, then infer from operands.
-                let phi_type = ssa
-                    .variable(phi_result)
-                    .map(SsaVariable::var_type)
-                    .filter(|t| !t.is_unknown())
-                    .cloned();
-
-                let final_type = phi_type.or_else(|| {
-                    let mut visited = BTreeSet::new();
-                    visited.insert(phi_result); // prevent self-referential phi loops
-                    for operand in phi.operands() {
-                        if let Ok(ty) =
-                            Self::infer_variable_type_inner(ssa, operand.value(), &mut visited)
-                        {
-                            return Some(ty);
-                        }
-                    }
-                    None
-                });
-
-                let final_type = final_type.ok_or_else(|| {
-                    Error::CodegenFailed(format!(
-                        "cannot determine type for phi result {phi_result:?} \
-                         (local {local_idx}): phi and all operands have unknown types"
-                    ))
-                })?;
-                self.local_types.insert(local_idx, final_type);
-            }
-        }
-        Ok(())
-    }
-
-    /// Phase 3 of storage allocation: allocate remaining variables.
-    ///
-    /// Handles phi-origin variables (stack temps, pass-created synthetics) and
-    /// phi operands that belong to non-dead phi nodes. Phi operand uses are NOT
-    /// counted in `global_use_counts`, so a variable used only as a phi operand
-    /// would have use_count=0 but still needs storage for phi copy emission.
-    fn allocate_remaining_variables(
-        &mut self,
-        ssa: &SsaFunction,
-        coalesced_slots: &BTreeMap<SsaVarId, u16>,
-    ) -> Result<()> {
-        // First, collect all phi operands that need storage (belong to non-dead phi nodes)
-        let mut phi_operands_needing_storage: BTreeSet<SsaVarId> = BTreeSet::new();
-        for block in ssa.blocks() {
-            for phi in block.phi_nodes() {
-                let phi_result = phi.result();
-                let use_count = self
-                    .global_use_counts
-                    .get(&phi_result)
-                    .copied()
-                    .unwrap_or(0);
-                // Skip dead phi nodes
-                if use_count == 0 {
-                    continue;
-                }
-                // This phi node is live - its operands need storage
-                for operand in phi.operands() {
-                    phi_operands_needing_storage.insert(operand.value());
-                }
-            }
-        }
-
-        for var in ssa.variables() {
-            let var_id = var.id();
-
-            // Skip if already allocated
-            if self.var_storage.contains_key(&var_id) {
-                continue;
-            }
-
-            // Only handle non-Local, non-Argument variables here.
-            // Local and Argument origins are handled in Phase 1.
-            match var.origin() {
-                VariableOrigin::Local(_) | VariableOrigin::Argument(_) => continue,
-                _ => {} // Phi, Stack, Compiler origins
-            }
-
-            // Skip if it's a deferred constant
-            if self.deferred_constants.contains_key(&var_id) {
-                continue;
-            }
-
-            // Skip if it's a stack local (can live on eval stack)
-            if self.stack_locals.contains(&var_id) {
-                continue;
-            }
-
-            // Skip dead variables that are not phi operands
-            let use_count = self.global_use_counts.get(&var_id).copied().unwrap_or(0);
-            let is_phi_operand = phi_operands_needing_storage.contains(&var_id);
-            if use_count == 0 && !is_phi_operand {
-                continue;
-            }
-
-            // Skip variables with no definition AND unknown type. These are
-            // runtime-injected values (e.g., exception objects pushed onto the
-            // stack at handler entry blocks) that never need to be loaded from
-            // storage — the codegen handles them specially (e.g., clearing Pop
-            // operands). Variables with a known type but no definition may still
-            // need storage (e.g., after SSA rebuild renaming).
-            if var.var_type().is_unknown()
-                && ssa.get_definition(var_id).is_none()
-                && ssa.find_phi_defining(var_id).is_none()
-            {
-                continue;
-            }
-
-            // Use the coalescer's slot if available, otherwise allocate fresh
-            let local_idx = if let Some(&slot) = coalesced_slots.get(&var_id) {
-                // Bump next_local past any coalesced slot to avoid conflicts
-                self.next_local = self.next_local.max(slot.saturating_add(1));
-                slot
-            } else {
-                let idx = self.next_local;
-                self.next_local = self.next_local.saturating_add(1);
-                idx
-            };
-            self.var_storage
-                .insert(var_id, VarStorage::Local(local_idx));
-
-            // Record the type — try declared type first, then infer from definition
-            let var_type = var.var_type();
-            if var_type.is_unknown() {
-                let inferred = Self::infer_variable_type(ssa, var_id)?;
-                self.local_types.insert(local_idx, inferred);
-            } else {
-                self.local_types.insert(local_idx, var_type.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Phase 4 of storage allocation: fix handler entry phi storage.
-    ///
-    /// Exception dispatch preserves locals but doesn't execute phi copies.
-    /// Phi results in exception handler entry blocks must share storage with
-    /// their operands so the handler reads the same local the try block wrote to.
-    fn fixup_handler_phi_storage(
-        &mut self,
-        ssa: &SsaFunction,
-        handler_entry_blocks: &BTreeSet<usize>,
-    ) {
-        for (block_idx, block) in ssa.blocks().iter().enumerate() {
-            if !handler_entry_blocks.contains(&block_idx) {
-                continue;
-            }
-            for phi in block.phi_nodes() {
-                let phi_result = phi.result();
-                // Skip unallocated or dead phi results
-                if !self.var_storage.contains_key(&phi_result) {
-                    continue;
-                }
-                // Find an operand that has storage allocated
-                if let Some(operand_storage) = phi
-                    .operands()
-                    .iter()
-                    .find_map(|op| self.var_storage.get(&op.value()).copied())
-                {
-                    let current = self.var_storage.get(&phi_result).copied();
-                    if current != Some(operand_storage) {
-                        self.var_storage.insert(phi_result, operand_storage);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Phase 5 of storage allocation: compact local slots.
-    ///
-    /// The coalescer may assign non-contiguous slots because it allocates for
-    /// ALL variables, but codegen skips some (deferred constants, stack locals).
-    /// This method remaps slots to be contiguous so `build_local_signatures`
-    /// produces correct 0..num_locals with types for each.
-    fn compact_local_slots(&mut self) {
-        let mut used_slots: Vec<u16> = self
-            .var_storage
-            .values()
-            .filter_map(|s| match s {
-                VarStorage::Local(idx) => Some(*idx),
-                _ => None,
-            })
-            .collect();
-        // Also include slots from original_to_compacted. These are reserved for
-        // LoadLocal/LoadLocalAddr-referenced locals that may not have SSA variables
-        // in var_storage (their Local-origin variables were optimized away, but
-        // the LoadLocal/LoadLocalAddr instructions still reference the slot).
-        // Without this, slot compaction fills these "gaps" and Phi-origin variables
-        // get remapped into reserved slots, overriding the original local types.
-        used_slots.extend(self.original_to_compacted.values());
-        used_slots.sort_unstable();
-        used_slots.dedup();
-
-        // Build remap: old slot → new contiguous slot
-        let remap: BTreeMap<u16, u16> = used_slots
-            .iter()
-            .enumerate()
-            .filter_map(|(new, &old)| {
-                #[allow(clippy::cast_possible_truncation)]
-                if old != new as u16 {
-                    Some((old, new as u16))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if !remap.is_empty() {
-            // Remap var_storage
-            for storage in self.var_storage.values_mut() {
-                if let VarStorage::Local(idx) = storage {
-                    if let Some(&new_idx) = remap.get(idx) {
-                        *idx = new_idx;
-                    }
-                }
-            }
-
-            // Remap local_types
-            let old_types = std::mem::take(&mut self.local_types);
-            for (old_idx, ty) in old_types {
-                let new_idx = remap.get(&old_idx).copied().unwrap_or(old_idx);
-                self.local_types.insert(new_idx, ty);
-            }
-
-            // Remap original_to_compacted
-            for val in self.original_to_compacted.values_mut() {
-                if let Some(&new_idx) = remap.get(val) {
-                    *val = new_idx;
-                }
-            }
-
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                self.next_local = used_slots.len() as u16;
-            }
-        }
-    }
-
-    /// Computes use counts for all variables in the SSA function.
-    ///
-    /// Two-pass approach:
-    /// 1. Count uses in instructions
-    /// 2. For live phi nodes (result has instruction uses), count operand uses
-    ///
-    /// This ensures variables used only as phi operands get proper storage
-    /// allocation and correct emit handling (cross-block stores, etc.).
-    fn compute_variable_use_counts(ssa: &SsaFunction) -> BTreeMap<SsaVarId, usize> {
-        let mut use_counts: BTreeMap<SsaVarId, usize> = BTreeMap::new();
-
-        // Pass 1: Count instruction uses only
-        for block in ssa.blocks() {
-            for instr in block.instructions() {
-                for var in instr.op().uses() {
-                    let entry = use_counts.entry(var).or_insert(0);
-                    *entry = entry.saturating_add(1);
-                }
-            }
-        }
-
-        // Pass 2: Transitively count phi operand uses. A phi node is "live" if its
-        // result has uses (instruction uses or as an operand of another live phi).
-        // We first collect all live phi results, then propagate through phi chains.
-        //
-        // This handles nested phi chains (e.g., nested if-else where an inner merge
-        // phi feeds an outer merge phi). Without this, variables only used through
-        // a chain of phi nodes would have use_count == 0, causing codegen to treat
-        // them as dead and lose their values.
-        let mut live_phis: BTreeSet<SsaVarId> = BTreeSet::new();
-
-        // Seed: phi results that already have instruction uses
-        for block in ssa.blocks() {
-            for phi in block.phi_nodes() {
-                if use_counts.get(&phi.result()).copied().unwrap_or(0) > 0 {
-                    live_phis.insert(phi.result());
-                }
-            }
-        }
-
-        // Propagate: phi operands that are themselves phi results become live
-        loop {
-            let mut new_live = Vec::new();
-            for block in ssa.blocks() {
-                for phi in block.phi_nodes() {
-                    if live_phis.contains(&phi.result()) {
-                        for operand in phi.operands() {
-                            let val = operand.value();
-                            if !live_phis.contains(&val) {
-                                // Check if this operand is itself a phi result
-                                // (it will be counted as live in the next iteration)
-                                new_live.push(val);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if new_live.is_empty() {
-                break;
-            }
-            for v in new_live {
-                live_phis.insert(v);
-            }
-        }
-
-        // Now count: for each live phi, count its operands as used
-        for block in ssa.blocks() {
-            for phi in block.phi_nodes() {
-                if live_phis.contains(&phi.result()) {
-                    for operand in phi.operands() {
-                        let entry = use_counts.entry(operand.value()).or_insert(0);
-                        *entry = entry.saturating_add(1);
-                    }
-                }
-            }
-        }
-
-        use_counts
-    }
-
-    /// Identifies constants that are only used once and can be generated inline.
-    fn identify_deferred_constants(
-        &mut self,
-        ssa: &SsaFunction,
-        use_counts: &BTreeMap<SsaVarId, usize>,
-    ) {
-        for block in ssa.blocks() {
-            for instr in block.instructions() {
-                if let SsaOp::Const { dest, value } = instr.op() {
-                    // Only defer if used exactly once and not used in phi nodes
-                    // (phi operands need to be available at block boundaries).
-                    // DecryptedArray is not deferrable because it emits multiple
-                    // instructions (newarr + InitializeArray) that don't compose
-                    // well with inline emission at use sites.
-                    let uses = use_counts.get(dest).copied().unwrap_or(0);
-                    let is_compound = matches!(value, ConstValue::DecryptedArray { .. });
-                    if uses == 1 && !self.all_phi_operands.contains(dest) && !is_compound {
-                        self.deferred_constants.insert(*dest, value.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Identifies variables that can live entirely on the evaluation stack.
-    ///
-    /// Stack locals are variables that meet ALL of these criteria:
-    /// 1. Single definition
-    /// 2. All uses in same block as definition
-    /// 3. Not used as a phi operand (phi copies happen at block boundaries)
-    /// 4. Uses are in straight-line code before any control flow
-    /// 5. Value is consumed before any terminator
-    ///
-    /// These variables never need a local slot - they can stay on the eval stack.
-    fn identify_stack_locals(&self, ssa: &SsaFunction) -> BTreeSet<SsaVarId> {
-        let mut candidates = BTreeSet::new();
-
-        for block in ssa.blocks() {
-            let block_id = block.id();
-
-            for instr in block.instructions() {
-                // Only consider ops that produce a value
-                if let Some(dest) = instr.op().dest() {
-                    if self.can_be_stack_local(ssa, dest, block_id) {
-                        candidates.insert(dest);
-                    }
-                }
-            }
-        }
-
-        candidates
-    }
-
-    /// Checks if a variable can be a stack local (no local slot needed).
-    fn can_be_stack_local(&self, ssa: &SsaFunction, var: SsaVarId, def_block: usize) -> bool {
-        // Condition 1: Check use count (should be exactly 1 for stack-only)
-        // Variables with 0 uses are dead and will be skipped anyway.
-        // Variables with >1 uses might need the value multiple times.
-        let use_count = self.global_use_counts.get(&var).copied().unwrap_or(0);
-        if use_count != 1 {
-            return false;
-        }
-
-        // Condition 2: Not used as a phi operand (phi copies happen at block boundaries)
-        if self.all_phi_operands.contains(&var) {
-            return false;
-        }
-
-        // Condition 3: The single use must be in the same block
-        // Find the use site
-        let Some(block) = ssa.blocks().iter().find(|b| b.id() == def_block) else {
-            return false;
-        };
-
-        // Find the definition index and use index within the block
-        let instrs = block.instructions();
-        let mut def_idx: Option<usize> = None;
-        let mut use_idx: Option<usize> = None;
-
-        for (idx, instr) in instrs.iter().enumerate() {
-            let op = instr.op();
-            // Check if this is the definition
-            if op.dest() == Some(var) {
-                def_idx = Some(idx);
-            }
-            // Check if this uses our variable
-            if op.uses().contains(&var) {
-                use_idx = Some(idx);
-            }
-        }
-
-        // Must have both def and use in this block
-        let (Some(d_idx), Some(u_idx)) = (def_idx, use_idx) else {
-            return false;
-        };
-
-        // Condition 4: Use must come after definition (should always be true in SSA)
-        if u_idx <= d_idx {
-            return false;
-        }
-
-        // Condition 5: Use must be IMMEDIATELY after def (no instructions between)
-        // This is required because any instruction between def and use might push
-        // values onto the stack, burying our value and making it inaccessible.
-        // A more sophisticated analysis could check if intervening instructions
-        // consume their values before our use, but that's complex and error-prone.
-        if u_idx != d_idx.saturating_add(1) {
-            return false;
-        }
-
-        // Note: We still check for terminators below, but with the immediate-use
-        // requirement above, there can't be any terminators between def and use.
-
-        // Condition 6: The use itself should not be a terminator operand
-        // (terminators trigger spilling, so the value would be stored anyway)
-        let Some(use_instr) = instrs.get(u_idx) else {
-            return false;
-        };
-        if Self::is_terminator(use_instr.op()) {
-            return false;
-        }
-
-        true
-    }
-
-    /// Gets the storage for an SSA variable, allocating a local if needed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a local must be allocated but its type cannot be determined.
-    fn get_or_allocate_storage(&mut self, ssa: &SsaFunction, var: SsaVarId) -> Result<VarStorage> {
-        if let Some(&storage) = self.var_storage.get(&var) {
-            return Ok(storage);
-        }
-
-        // Stack locals never need a local slot - they're consumed before burial
-        if self.stack_locals.contains(&var) {
-            return Ok(VarStorage::Stack);
-        }
-
-        // Try to look up the variable's origin
-        if let Some(ssa_var) = ssa.variable(var) {
-            match ssa_var.origin() {
-                VariableOrigin::Argument(idx) => {
-                    let storage = VarStorage::Arg(idx);
-                    self.var_storage.insert(var, storage);
-                    return Ok(storage);
-                }
-                VariableOrigin::Local(original_idx) => {
-                    // Use the compacted index from the coalescer's allocation
-                    if let Some(&compacted_idx) = self.original_to_compacted.get(&original_idx) {
-                        let storage = VarStorage::Local(compacted_idx);
-                        self.var_storage.insert(var, storage);
-                        // Record the type for the compacted slot
-                        let var_type = ssa_var.var_type();
-                        if !var_type.is_unknown() {
-                            self.local_types.insert(compacted_idx, var_type.clone());
-                        }
-                        return Ok(storage);
-                    }
-                    // If not in the compacted mapping, fall through to allocate
-                    // (this handles edge cases where a Local var wasn't seen during coalescing)
-                }
-                // `EntryLiveIn` is unreachable here: it is produced only by
-                // machine-code front ends, and a CIL method has no such storage.
-                VariableOrigin::Phi | VariableOrigin::EntryLiveIn => {
-                    // Fall through to allocate a new local
-                }
-            }
-        }
-
-        // Default: allocate a new local
-        let local = self.next_local;
-        self.next_local = self.next_local.saturating_add(1);
-        let storage = VarStorage::Local(local);
-        self.var_storage.insert(var, storage);
-
-        // Record the type of this newly allocated local so it gets included in the signature
-        let var_type = ssa
-            .variable(var)
-            .map(|v| v.var_type().clone())
-            .filter(|t| !t.is_unknown())
-            .ok_or_else(|| {
-                Error::CodegenFailed(format!(
-                    "cannot determine type for variable {var:?} when allocating local {local}"
-                ))
-            })?;
-        self.local_types.insert(local, var_type);
-
-        Ok(storage)
-    }
-
-    /// Force-allocates storage for a variable that must have a real local/arg slot.
-    ///
-    /// Unlike `get_or_allocate_storage`, this method never returns `VarStorage::Stack`.
-    /// It's used when a variable that was expected to stay on the stack needs to be
-    /// stored to a local (e.g., when it gets buried by other values).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the variable's type cannot be determined.
-    fn force_allocate_storage(&mut self, ssa: &SsaFunction, var: SsaVarId) -> Result<VarStorage> {
-        // Check existing storage first
-        if let Some(&storage) = self.var_storage.get(&var) {
-            if !matches!(storage, VarStorage::Stack) {
-                return Ok(storage);
-            }
-            // Stack storage is not allowed - need to allocate a real slot
-            // This can happen if the variable was previously identified as a stack_local
-            // but now needs real storage due to being buried.
-        }
-
-        // Try to look up the variable's origin for arguments
-        if let Some(ssa_var) = ssa.variable(var) {
-            if let VariableOrigin::Argument(idx) = ssa_var.origin() {
-                let storage = VarStorage::Arg(idx);
-                self.var_storage.insert(var, storage);
-                return Ok(storage);
-            }
-        }
-
-        // Determine the type for this local:
-        // 1. Try the variable's type from SSA
-        // 2. Try to infer from the definition operation
-        let var_type = Self::infer_variable_type(ssa, var)?;
-
-        // Allocate a new local slot
-        let local = self.next_local;
-        self.next_local = self.next_local.saturating_add(1);
-        let storage = VarStorage::Local(local);
-        self.var_storage.insert(var, storage);
-
-        // Also remove from stack_locals since it now has real storage
-        self.stack_locals.remove(&var);
-
-        // Record the type of this newly allocated local
-        self.local_types.insert(local, var_type);
-
-        Ok(storage)
-    }
-
-    /// Infers the type of a variable from SSA metadata and its definition.
-    ///
-    /// Delegates to `infer_variable_type_inner` with cycle detection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the type cannot be determined from either the SSA
-    /// variable metadata or the defining operation.
-    fn infer_variable_type(ssa: &SsaFunction, var: SsaVarId) -> Result<SsaType> {
-        let mut visited = BTreeSet::new();
-        Self::infer_variable_type_inner(ssa, var, &mut visited)
-    }
-
-    /// Recursive helper for type inference with cycle detection.
-    ///
-    /// Uses a priority chain:
-    /// 1. Variable's declared type (set during construction/rebuild)
-    /// 2. Defining instruction's result_type (from converter with TypeContext — most precise)
-    /// 3. Defining op's structural infer_result_type() (for Const/Conv/etc.)
-    /// 4. Copy/phi chain tracing
-    /// 5. Error if no type can be determined (no silent fallback)
-    fn infer_variable_type_inner(
-        ssa: &SsaFunction,
-        var: SsaVarId,
-        visited: &mut BTreeSet<SsaVarId>,
-    ) -> Result<SsaType> {
-        if !visited.insert(var) {
-            return Err(Error::CodegenFailed(format!(
-                "circular type dependency for variable {var:?}"
-            )));
-        }
-
-        // 1. Check variable's declared type
-        if let Some(v) = ssa.variable(var) {
-            if !v.var_type().is_unknown() {
-                return Ok(v.var_type().clone());
-            }
-        }
-
-        // 2. Try defining instruction (full SsaInstruction, not just SsaOp)
-        if let Some(def_instr) = ssa.get_definition_instruction(var) {
-            // 2a. Instruction-level result type (from converter — most precise,
-            //     resolved via TypeContext with full metadata)
-            if let Some(rt) = def_instr.result_type() {
-                if !rt.is_unknown() {
-                    return Ok(rt.clone());
-                }
-            }
-            // 2b. Op structural inference (for ops with embedded type info like
-            //     Const, Conv, LoadElement, LoadIndirect, etc.)
-            if let Some(inferred) = def_instr.op().infer_result_type() {
-                return Ok(inferred);
-            }
-            // 2c. Copy chain tracing
-            if let SsaOp::Copy { src, .. } = def_instr.op() {
-                let src = *src;
-                return Self::infer_variable_type_inner(ssa, src, visited);
-            }
-            return Err(Error::CodegenFailed(format!(
-                "cannot determine type for variable {var:?}: defining op has no \
-                 type inference rule: {:?}",
-                def_instr.op()
-            )));
-        }
-
-        // 3. Check if defined by a phi — trace operands
-        if let Some((_block, phi)) = ssa.find_phi_defining(var) {
-            for operand in phi.operands() {
-                if let Ok(ty) = Self::infer_variable_type_inner(ssa, operand.value(), visited) {
-                    return Ok(ty);
-                }
-            }
-            return Err(Error::CodegenFailed(format!(
-                "cannot determine type for phi {var:?}: all operands unknown"
-            )));
-        }
-
-        // 4. No definition found at all — error, not a silent fallback.
-        Err(Error::CodegenFailed(format!(
-            "cannot determine type for variable {var:?}: no definition found"
-        )))
-    }
-
-    /// Gets the storage for an SSA variable.
-    ///
-    /// If the variable doesn't have directly allocated storage, this traces through
-    /// the SSA definition chain to find a source variable that does. This is crucial
-    /// for CFF reconstruction where phi copy variables might be defined in intermediate
-    /// blocks that aren't part of the reconstructed SSA.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no storage can be found for the variable. This indicates
-    /// a bug in SSA construction - all variables referenced in instructions should
-    /// have proper storage allocated or traceable through the SSA graph.
-    fn get_storage(&self, var: SsaVarId, ssa: &SsaFunction) -> Result<VarStorage> {
-        // Check if variable has direct storage allocation
-        if let Some(&storage) = self.var_storage.get(&var) {
-            return Ok(storage);
-        }
-
-        // Check if the variable has Argument or Local origin directly.
-        // This handles cases where a variable wasn't pre-allocated in var_storage
-        // but has an explicit origin that tells us where it should live.
-        if let Some(ssa_var) = ssa.variable(var) {
-            match ssa_var.origin() {
-                VariableOrigin::Argument(idx) => return Ok(VarStorage::Arg(idx)),
-                VariableOrigin::Local(idx) => {
-                    // Use the compacted local slot if available
-                    if let Some(&compacted) = self.original_to_compacted.get(&idx) {
-                        return Ok(VarStorage::Local(compacted));
-                    }
-                    return Ok(VarStorage::Local(idx));
-                }
-                _ => {}
-            }
-        }
-
-        // Variable not found - trace through SSA to find source with storage
-        let traced = self.trace_to_storage(var, ssa, &mut BTreeSet::new());
-        if let Some(storage) = traced {
-            return Ok(storage);
-        }
-
-        // No storage found - this is a bug in SSA construction.
-        // Gather diagnostic information to help identify the root cause.
-        let var_info = if let Some(ssa_var) = ssa.variable(var) {
-            format!(
-                "origin={:?}, type={:?}, version={}",
-                ssa_var.origin(),
-                ssa_var.var_type(),
-                ssa_var.version()
-            )
-        } else {
-            "NOT IN SSA VARIABLE LIST (orphan)".to_string()
-        };
-
-        Err(Error::Deobfuscation(format!(
-            "No storage found for variable {var:?} ({var_info}) - this indicates a bug in SSA construction. \
-             Variables must have proper Argument/Local origins or be traceable through the SSA graph."
-        )))
-    }
-
-    /// Traces through SSA definitions to find a variable with allocated storage.
-    ///
-    /// This handles cases where a Copy instruction references a variable defined
-    /// in an intermediate block. We trace back through Copy chains and phi nodes
-    /// to find the original variable that was allocated storage.
-    ///
-    /// For phi nodes, if all operands trace to the same storage, that storage is
-    /// returned. This correctly handles cases where control flow obfuscation
-    /// creates phi nodes for argument values.
-    fn trace_to_storage(
-        &self,
-        var: SsaVarId,
-        ssa: &SsaFunction,
-        visited: &mut BTreeSet<SsaVarId>,
-    ) -> Option<VarStorage> {
-        // Prevent infinite loops
-        if !visited.insert(var) {
-            return None;
-        }
-
-        // Check if this variable has storage
-        if let Some(&storage) = self.var_storage.get(&var) {
-            return Some(storage);
-        }
-
-        // Look up the definition in instructions
-        if let Some(def_op) = ssa.get_definition(var) {
-            match def_op {
-                // For Copy, trace to the source
-                SsaOp::Copy { src, .. } => {
-                    return self.trace_to_storage(*src, ssa, visited);
-                }
-                // For other ops, try operands
-                _ => {
-                    for operand in def_op.uses() {
-                        if let Some(storage) = self.trace_to_storage(operand, ssa, visited) {
-                            return Some(storage);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check if defined by a phi node
-        // If all phi operands trace to the same storage, return that storage
-        if let Some((_, phi)) = ssa.find_phi_defining(var) {
-            let operands = phi.operands();
-            if let Some(first_op) = operands.first() {
-                // Trace the first operand to get a reference storage
-                let first_storage = self.trace_to_storage(first_op.value(), ssa, visited)?;
-
-                // Check if all other operands trace to the same storage
-                for operand in operands.iter().skip(1) {
-                    // Skip self-references (phi referring to itself in loops)
-                    if operand.value() == var {
-                        continue;
-                    }
-                    let op_storage = self.trace_to_storage(operand.value(), ssa, visited)?;
-                    if op_storage != first_storage {
-                        // Different storage for different operands - can't determine unique storage
-                        return None;
-                    }
-                }
-
-                return Some(first_storage);
-            }
-        }
-
-        None
-    }
-
-    /// Checks if a variable is immediately consumed by the next operation.
-    ///
-    /// This is used to determine if we can leave a value on the stack instead
-    /// of storing it to a local. A value can stay on the stack if:
-    ///
-    /// 1. The next instruction uses it as an operand
-    /// 2. It's either the first operand, OR all prior operands can be loaded
-    ///    without disturbing the stack (i.e., they're simple loads like ldarg/ldloc)
-    ///
-    /// For binary operations where the value is the second operand (like shift amount),
-    /// we check if the first operand is a "simple" load that won't need the stack.
-    fn is_immediately_consumed(&self, var: SsaVarId, next_op: Option<&SsaOp>) -> bool {
-        let Some(next) = next_op else {
-            return false;
-        };
-
-        match next {
-            // Return immediately consumes its value
-            SsaOp::Return { value: Some(v) } if *v == var => true,
-
-            // Branch immediately consumes its condition
-            SsaOp::Branch { condition, .. } if *condition == var => true,
-
-            // BranchCmp consumes left operand first, then right
-            SsaOp::BranchCmp { left, .. } if *left == var => true,
-
-            // These ops consume their first operand (left) immediately
-            SsaOp::Add { left, .. }
-            | SsaOp::Sub { left, .. }
-            | SsaOp::Mul { left, .. }
-            | SsaOp::Div { left, .. }
-            | SsaOp::Rem { left, .. }
-            | SsaOp::And { left, .. }
-            | SsaOp::Or { left, .. }
-            | SsaOp::Xor { left, .. }
-            | SsaOp::Ceq { left, .. }
-            | SsaOp::Clt { left, .. }
-            | SsaOp::Cgt { left, .. }
-                if *left == var =>
-            {
-                true
-            }
-
-            // Binary ops can also consume their second operand (right) if first is simple
-            SsaOp::Add { left, right, .. }
-            | SsaOp::Sub { left, right, .. }
-            | SsaOp::Mul { left, right, .. }
-            | SsaOp::Div { left, right, .. }
-            | SsaOp::Rem { left, right, .. }
-            | SsaOp::And { left, right, .. }
-            | SsaOp::Or { left, right, .. }
-            | SsaOp::Xor { left, right, .. }
-            | SsaOp::Ceq { left, right, .. }
-            | SsaOp::Clt { left, right, .. }
-            | SsaOp::Cgt { left, right, .. }
-            | SsaOp::BranchCmp { left, right, .. }
-                if *right == var && self.is_simple_load(*left) =>
-            {
-                true
-            }
-
-            // Shift ops consume their first operand (value) immediately
-            SsaOp::Shl { value, .. } | SsaOp::Shr { value, .. } if *value == var => true,
-
-            // Shift ops can consume amount if value is a simple load
-            SsaOp::Shl { value, amount, .. } | SsaOp::Shr { value, amount, .. }
-                if *amount == var && self.is_simple_load(*value) =>
-            {
-                true
-            }
-
-            // Unary ops consume their operand
-            SsaOp::Neg { operand, .. }
-            | SsaOp::Not { operand, .. }
-            | SsaOp::IntConv { operand, .. }
-            | SsaOp::IntToPtr { operand, .. }
-            | SsaOp::PtrToInt { operand, .. }
-            | SsaOp::IntToFloat { operand, .. }
-            | SsaOp::FloatToInt { operand, .. }
-            | SsaOp::FloatConv { operand, .. }
-            | SsaOp::Ckfinite { operand, .. }
-                if *operand == var =>
-            {
-                true
-            }
-
-            // Throw consumes its exception
-            SsaOp::Throw { exception } if *exception == var => true,
-
-            // Pop consumes its value
-            SsaOp::Pop { value } if *value == var => true,
-
-            _ => false,
-        }
-    }
-
-    /// Checks if a variable can be loaded with a simple instruction that doesn't
-    /// disturb the evaluation stack. This is true for arguments and locals.
-    fn is_simple_load(&self, var: SsaVarId) -> bool {
-        matches!(
-            self.var_storage.get(&var),
-            Some(VarStorage::Arg(_) | VarStorage::Local(_))
-        )
-    }
-
-    /// Generates code for a single basic block with instruction scheduling.
-    ///
-    /// This method schedules instructions to minimize local variable usage by
-    /// reordering value definitions to occur immediately before their use.
-    /// This is particularly important for stack-based code generation where
-    /// we want to leave values on the stack rather than storing to locals.
-    fn generate_block(
-        &mut self,
-        encoder: &mut InstructionEncoder,
-        ssa: &SsaFunction,
-        block: &SsaBlock,
-        block_idx: usize,
-        next_entry: Option<LayoutEntry>,
-    ) -> Result<()> {
-        // Exception handler entry blocks (catch, filter, finally, fault) are only
-        // entered via CLR exception dispatch — never via fallthrough from the previous
-        // block in the layout. Mark the encoder as unreachable before defining the label
-        // so that define_label resets the stack depth to the expected handler entry depth
-        // (e.g., 1 for catch/filter) rather than conflicting with the previous block's
-        // fallthrough depth.
-        let is_handler_entry = ssa
-            .exception_handlers()
-            .iter()
-            .flat_map(SsaExceptionHandler::entry_blocks)
-            .any(|entry| entry == block_idx);
-        if is_handler_entry {
-            encoder.mark_unreachable();
-        }
-
-        // Define the block label - the encoder validates stack depth consistency
-        // across all control flow paths reaching this label.
-        let label = self
-            .block_labels
-            .get(&block_idx)
-            .ok_or_else(|| Error::SsaError(format!("Missing label for block {block_idx}")))?
-            .clone();
-        encoder.define_label(&label)?;
-
-        // Reset tracked stack variables at block boundary
-        self.stack_vars.clear();
-
-        // Collect actual ops (non-None) for scheduling, filtering out:
-        // - No-op Copy operations (src and dest share same storage due to coalescing)
-        // - Nop operations (produce unnecessary bytecode)
-        // - Deferred Const operations (will be generated inline at use site)
-        let ops: Vec<&SsaOp> = block
-            .instructions()
-            .iter()
-            .map(SsaInstruction::op)
-            .filter(|op| {
-                match op {
-                    SsaOp::Copy { dest, src } => {
-                        // Skip Copy if src and dest are coalesced to same storage
-                        let src_storage = self.var_storage.get(src);
-                        let dest_storage = self.var_storage.get(dest);
-                        src_storage != dest_storage || src_storage.is_none()
-                    }
-                    SsaOp::Const { dest, .. } => {
-                        // Skip deferred constants - generated inline at use site.
-                        // Also skip dead constants (0 uses, not a phi operand) —
-                        // these are CFF state computation artifacts that DCE missed.
-                        // Emitting them would push values onto the CIL stack with
-                        // no consumer, causing stack depth mismatches at merge points.
-                        if self.deferred_constants.contains_key(dest) {
-                            return false;
-                        }
-                        let uses = self.global_use_counts.get(dest).copied().unwrap_or(0);
-                        if uses == 0 && !self.all_phi_operands.contains(dest) {
-                            // Keep stores to address-taken locals: the value is
-                            // read through a pointer (LoadLocalAddr), not via SSA
-                            // uses, so 0 SSA uses doesn't mean the store is dead.
-                            if let Some(var) = ssa.variable(*dest) {
-                                if let VariableOrigin::Local(idx) = var.origin() {
-                                    if self.address_taken_locals.contains(&idx) {
-                                        return true;
-                                    }
-                                }
-                            }
-                            return false;
-                        }
-                        true
-                    }
-                    SsaOp::Nop => false, // Skip Nop - produces unnecessary bytecode
-                    _ => true,
-                }
-            })
-            .collect();
-        if ops.is_empty() {
-            // Block has no decomposed ops - it's an empty block (e.g., a merge point created
-            // by control flow unflattening or other SSA transformations).
-            //
-            // If the original block also has no terminator, there is no meaningful fallthrough —
-            // mark as unreachable so the stack depth doesn't leak to the next block in the layout.
-            // This is critical for empty exception handler entry blocks whose pre-set depth (1 for
-            // catch/filter) would otherwise propagate incorrectly to unrelated successor blocks.
-            if block.control_terminator().is_none() {
-                encoder.mark_unreachable();
-            }
-            return Ok(());
-        }
-
-        // Pre-compute operands for each instruction (avoid repeated calls)
-        let mut operands_cache: Vec<Vec<SsaVarId>> = ops
-            .iter()
-            .map(|op| Self::get_operands_in_stack_order(op))
-            .collect();
-
-        // For exception/filter handler entry blocks, the exception object is already
-        // on the stack when execution enters the handler. Pop instructions that pop
-        // this exception object should NOT try to load it first - it's already there.
-        //
-        // We identify handler entry blocks by checking if this block begins the
-        // handler range of a catch or filter clause.
-        let is_exception_handler_entry = ssa.exception_handlers().iter().any(|h| {
-            h.handler_range.map(|range| range.start()) == Some(block_idx)
-                && matches!(h.kind(), HandlerKind::Catch | HandlerKind::Filter)
-        });
-        let is_filter_entry = ssa
-            .exception_handlers()
-            .iter()
-            .any(|h| h.filter_range.map(|range| range.start()) == Some(block_idx));
-
-        if is_exception_handler_entry || is_filter_entry {
-            // Clear operands for Pop instructions that consume the exception object.
-            // The exception object is already on the stack when entering the handler.
-            // We only clear operands for Pop instructions where the value being popped
-            // is NOT defined in this block (meaning it's the exception object from outside).
-            //
-            // First, collect all variables defined in this block
-            let mut defined_in_block: BTreeSet<SsaVarId> = BTreeSet::new();
-            for op in &ops {
-                if let Some(dest) = op.dest() {
-                    defined_in_block.insert(dest);
-                }
-            }
-
-            // Clear operands for Pop instructions that consume the exception object,
-            // and track whether any such Pop exists.
-            let mut has_exception_pop = false;
-            for (idx, op) in ops.iter().enumerate() {
-                if let SsaOp::Pop { value } = op {
-                    if !defined_in_block.contains(value) {
-                        // This Pop consumes a value not defined in this block
-                        // (the exception object), so clear its operands
-                        if let Some(ops_at_idx) = operands_cache.get_mut(idx) {
-                            ops_at_idx.clear();
-                        }
-                        has_exception_pop = true;
-                    }
-                }
-            }
-
-            // If no Pop instruction consumes the exception object, it remains on
-            // the CIL evaluation stack. This happens when dead code elimination
-            // removes an unused exception object store. Emit an explicit pop to
-            // discard the exception object and maintain stack balance.
-            if !has_exception_pop {
-                encoder.emit_instruction("pop", None)?;
-            }
-        }
-
-        // Build def map: variable -> instruction index
-        let mut def_map: BTreeMap<SsaVarId, usize> = BTreeMap::new();
-        for (idx, op) in ops.iter().enumerate() {
-            if let Some(dest) = op.dest() {
-                def_map.insert(dest, idx);
-            }
-        }
-
-        // Identify which variables are used as operands in this block
-        let mut used_in_block: BTreeSet<SsaVarId> = BTreeSet::new();
-        for operands in &operands_cache {
-            for var in operands {
-                used_in_block.insert(*var);
-            }
-        }
-
-        // Find root ops - those whose results are NOT used by other ops
-        // in this block (they're terminators, have side effects, or export to other blocks)
-        let roots: Vec<usize> = ops
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, op)| {
-                let is_root = match op.dest() {
-                    Some(dest) => !used_in_block.contains(&dest) || Self::is_terminator(op),
-                    None => true, // No dest = side effect only, always a root
-                };
-                if is_root {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Generate code iteratively using explicit work stack
-        let ctx = BlockCodegenContext {
-            ssa,
-            ops: &ops,
-            operands_cache: &operands_cache,
-            def_map: &def_map,
-            current_block_idx: block_idx,
-        };
-        self.generate_ops_iterative(encoder, &ctx, &roots, next_entry)?;
-
-        // Check if the block ends with a non-terminator (falls through to next block)
-        // If so, spill remaining stack values and emit phi stores for the fallthrough
-        let has_terminator = ops.last().is_some_and(|op| Self::is_terminator(op));
-        if !has_terminator {
-            // Spill any remaining stack values before fallthrough
-            self.spill_stack(encoder, ssa)?;
-
-            // A block with no terminator has exactly one successor, so its edge is never
-            // critical and never gets a block of its own — which is also why the next entry
-            // is always a `Block` here: edge blocks are only ever placed directly after a
-            // multi-way terminator.
-            if let Some(LayoutEntry::Block(next_idx)) = next_entry {
-                self.emit_phi_stores_for_successor(encoder, ssa, block_idx, next_idx)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Generates ops iteratively with dependency tracking.
-    ///
-    /// Uses an explicit work stack instead of recursion to avoid stack overflow
-    /// on deep dependency chains and improve cache locality.
-    ///
-    /// The key insight is that operands must be loaded/generated in order.
-    /// We use three phases:
-    /// - `Pending`: Schedule operand loads in reverse order, then Emit
-    /// - `LoadOperand`: Load or generate a specific operand
-    /// - `Emit`: All operands on stack, emit the operation
-    fn generate_ops_iterative(
-        &mut self,
-        encoder: &mut InstructionEncoder,
-        ctx: &BlockCodegenContext<'_>,
-        roots: &[usize],
-        next_entry: Option<LayoutEntry>,
-    ) -> Result<()> {
-        // Use global use counts to determine if variables need storage.
-        // Variables used multiple times (across ANY blocks) must be stored to locals
-        // so subsequent uses can load from them. This is critical for cross-block
-        // data flow where a value is defined in one block and used in another.
-        //
-        // Note: We use the global use_counts computed during allocate_storage().
-        // Phi operand uses are NOT included in global_use_counts, so phi operand
-        // values that are only used as phi operands will have use_count=0 and
-        // remain on the stack until the phi stores consume them.
-        //
-        // If a phi operand value gets "buried" (other operations push values on
-        // top of it), the buried handling in load_var will store it to a local
-        // and the phi stores will load it from there.
-        //
-        // Clone is required here: `generate_op_core` (called via the work loop)
-        // may invoke branch handlers that read `self.global_use_counts` through
-        // `successor_has_phi_from` / `emit_phi_stores_for_successor`. Since those
-        // access `self` directly, we cannot borrow `self.global_use_counts` while
-        // also passing `&mut self` to those methods.
-        let use_counts = self.global_use_counts.clone();
-
-        let mut generated: BTreeSet<usize> = BTreeSet::new();
-        // Track which Pending items are already scheduled to avoid re-pushing
-        let mut scheduled_pending: BTreeSet<usize> = BTreeSet::new();
-        // Track which operations are "in progress" (between Pending and Emit).
-        // Used for cycle detection - if we need a dependency that's in_progress,
-        // we have a cyclic dependency which indicates invalid SSA.
-        let mut in_progress: BTreeSet<usize> = BTreeSet::new();
-        // Track which LoadOperand (idx, operand_idx) pairs are already scheduled
-        let mut scheduled_load: BTreeSet<(usize, usize)> = BTreeSet::new();
-        let mut work_stack: Vec<CodeGenWorkItem> =
-            Vec::with_capacity(ctx.ops.len().saturating_mul(3));
-
-        // Preserve original instruction order as much as possible.
-        // For malware analysis and understanding original intent, the order matters.
-        //
-        // However, Copy roots require special handling with parallel copy semantics.
-        // They may form dependency/storage conflicts like:
-        //   v47 = add(v45, v46)  // reads Local(0), Local(1)
-        //   v49 = v46            // writes Local(0), reads Local(1)
-        //   v50 = v48            // writes Local(1), depends on v47
-        //
-        // Neither processing order works:
-        //   - v49 first: clobbers Local(0) before v47 reads it
-        //   - v50 first: v50 stores to Local(1) before v49 reads it
-        //
-        // Solution: Handle Copy roots with parallel copy semantics AFTER all
-        // non-Copy roots are processed. We'll generate their dependencies, load
-        // all sources, then store all destinations.
-        let mut terminator_roots: Vec<usize> = Vec::new();
-        let mut copy_roots: Vec<usize> = Vec::new();
-        let mut other_roots: Vec<usize> = Vec::new();
-        for &root_idx in roots {
-            let op = ctx
-                .ops
-                .get(root_idx)
-                .ok_or_else(|| Error::CodegenFailed("root index out of bounds".to_string()))?;
-            if Self::is_terminator(op) {
-                terminator_roots.push(root_idx);
-            } else if matches!(op, SsaOp::Copy { .. }) {
-                copy_roots.push(root_idx);
-            } else {
-                other_roots.push(root_idx);
-            }
-        }
-
-        // Push non-Copy roots in reverse priority order (stack is LIFO):
-        // - If there are Copy roots, DON'T push terminators here - they need to come
-        //   AFTER the Copy roots and their dependencies are emitted.
-        // - Other roots (non-Copy, non-terminator) are processed first.
-        // Note: Copy roots are NOT pushed here - they're handled specially below.
-        let defer_terminators = !copy_roots.is_empty();
-        if !defer_terminators {
-            for root_idx in terminator_roots.iter().rev() {
-                work_stack.push(CodeGenWorkItem::Pending(*root_idx));
-                scheduled_pending.insert(*root_idx);
-            }
-        }
-        for root_idx in other_roots.into_iter().rev() {
-            work_stack.push(CodeGenWorkItem::Pending(root_idx));
-            scheduled_pending.insert(root_idx);
-        }
-
-        while let Some(item) = work_stack.pop() {
-            match item {
-                CodeGenWorkItem::Pending(idx) => {
-                    scheduled_pending.remove(&idx);
-                    if generated.contains(&idx) {
-                        continue; // Already done
-                    }
-
-                    // Mark as in_progress for cycle detection
-                    in_progress.insert(idx);
-
-                    // Spill stack_vars that would be buried by operand loads.
-                    //
-                    // When loading operands for an operation, some come from the
-                    // CIL stack (tracked in stack_vars) and some from storage
-                    // (ldloc/ldarg). Loading from storage pushes onto the CIL stack,
-                    // which can bury values in stack_vars.
-                    //
-                    // Optimization: if the first operand (loaded first, bottom of
-                    // CIL stack) matches the stack_vars top, it can stay on the
-                    // stack — the LoadOperand handler will consume it directly.
-                    // Subsequent operands that need storage loads will be pushed on
-                    // top of it, which is the correct CIL evaluation order.
-                    //
-                    // Only spill when the first operand does NOT match the stack
-                    // top, because loading it from storage would bury the tracked
-                    // stack values.
-                    let operands = ctx.operands_cache.get(idx).ok_or_else(|| {
-                        Error::CodegenFailed("operands_cache index out of bounds".to_string())
-                    })?;
-                    let first_operand_on_stack = operands.first().is_some_and(|first_op| {
-                        self.stack_vars.last().is_some_and(|top| *top == *first_op)
-                    });
-
-                    if !first_operand_on_stack && !self.stack_vars.is_empty() {
-                        let needs_storage_load = operands
-                            .iter()
-                            .any(|op_var| self.stack_vars.last().is_none_or(|top| *top != *op_var));
-                        if needs_storage_load {
-                            self.spill_stack(encoder, ctx.ssa)?;
-                        }
-                    }
-
-                    // Schedule: first Emit (pushed first, runs last),
-                    // then LoadOperand for each operand in reverse order
-                    work_stack.push(CodeGenWorkItem::Emit(idx));
-
-                    for (op_idx, _) in operands.iter().enumerate().rev() {
-                        if !scheduled_load.contains(&(idx, op_idx)) {
-                            work_stack.push(CodeGenWorkItem::LoadOperand(idx, op_idx));
-                            scheduled_load.insert((idx, op_idx));
-                        }
-                    }
-                }
-
-                CodeGenWorkItem::LoadOperand(idx, operand_idx) => {
-                    scheduled_load.remove(&(idx, operand_idx));
-                    let operand = *ctx
-                        .operands_cache
-                        .get(idx)
-                        .and_then(|ops| ops.get(operand_idx))
-                        .ok_or_else(|| {
-                            Error::CodegenFailed("operands_cache index out of bounds".to_string())
-                        })?;
-
-                    if let Some(&dep_idx) = ctx.def_map.get(&operand) {
-                        // Operand is defined in this block
-                        if generated.contains(&dep_idx) {
-                            // Already generated - load from storage or stack
-                            self.load_var(encoder, ctx.ssa, operand)?;
-                        } else if let Some(SsaOp::Copy { src, .. }) = ctx.ops.get(dep_idx) {
-                            // Operand is defined by a Copy that hasn't been generated yet.
-                            // This can happen with circular dependencies through Copy chains
-                            // (e.g., Add needs Copy result, Copy needs Add result).
-                            // Load the Copy's SOURCE instead - it should be available from
-                            // storage (from a previous block/iteration) or will be generated
-                            // and stored by the copy_roots handling.
-                            self.load_var(encoder, ctx.ssa, *src)?;
-                        } else {
-                            // Not yet generated - check for cyclic dependency.
-                            // If this dependency is "in progress" (between Pending and Emit),
-                            // we have a cycle - operation A needs B, but B needs A.
-                            if in_progress.contains(&dep_idx) {
-                                // This is a cyclic dependency between non-Copy operations,
-                                // which indicates invalid SSA. All operations within a block
-                                // should have a valid topological order.
-                                let cur_op = ctx.ops.get(idx);
-                                let dep_op = ctx.ops.get(dep_idx);
-                                return Err(Error::Deobfuscation(format!(
-                                    "Cyclic dependency detected in block {}: \
-                                     op {:?} needs {:?} (defined by {:?}), \
-                                     but that definition is already being processed. \
-                                     This indicates invalid SSA form.",
-                                    ctx.current_block_idx, cur_op, operand, dep_op
-                                )));
-                            }
-
-                            // Generate it now.
-                            // Schedule a load AFTER the generation completes.
-                            // This is needed because the value might be stored (if buried by
-                            // other operand loads) and not left on the stack.
-                            if !scheduled_load.contains(&(idx, operand_idx)) {
-                                work_stack.push(CodeGenWorkItem::LoadOperand(idx, operand_idx));
-                                scheduled_load.insert((idx, operand_idx));
-                            }
-                            // Generate the dependency
-                            if !generated.contains(&dep_idx) {
-                                work_stack.push(CodeGenWorkItem::Pending(dep_idx));
-                                scheduled_pending.insert(dep_idx);
-                            }
-                        }
-                    } else {
-                        // External variable - load from arg/local
-                        self.load_var(encoder, ctx.ssa, operand)?;
-                    }
-                }
-
-                CodeGenWorkItem::Emit(idx) => {
-                    // Remove from in_progress (no longer being processed)
-                    in_progress.remove(&idx);
-
-                    if generated.contains(&idx) {
-                        continue; // Already done
-                    }
-
-                    let cur_op = *ctx.ops.get(idx).ok_or_else(|| {
-                        Error::CodegenFailed("ops index out of bounds".to_string())
-                    })?;
-
-                    // Generate the operation (operands should be on stack)
-                    self.generate_op_core(
-                        encoder,
-                        ctx.ssa,
-                        ctx.current_block_idx,
-                        cur_op,
-                        next_entry,
-                    )?;
-                    generated.insert(idx);
-
-                    // If this op produces a value, handle it based on use count
-                    // and whether it's used outside this block (cross-block use).
-                    // Note: Skip Copy instructions - they handle their own storage
-                    // in generate_op_core and don't leave a result on the stack.
-                    let is_copy = matches!(cur_op, SsaOp::Copy { .. });
-                    if !is_copy {
-                        if let Some(dest) = cur_op.dest() {
-                            let uses = use_counts.get(&dest).copied().unwrap_or(0);
-                            // Check if this value is used outside the current block.
-                            // If so, it must be stored because stack values don't
-                            // persist across block boundaries.
-                            let used_outside_block = self.cross_block_uses.contains(&dest);
-
-                            if uses > 1 || used_outside_block {
-                                // Multi-use or cross-block use: must store to a local.
-                                //
-                                // Optimization: if the next pending work item will load
-                                // this same variable, emit `dup; stloc.N` instead of
-                                // `stloc.N` followed by a later `ldloc.N`. The `dup`
-                                // keeps a copy on the evaluation stack for the immediate
-                                // consumer while `stloc` persists it for later uses.
-                                // This avoids a redundant store-then-load round-trip.
-                                let next_loads_dest =
-                                    work_stack.last().is_some_and(|item| match item {
-                                        CodeGenWorkItem::LoadOperand(consumer_idx, op_idx) => ctx
-                                            .operands_cache
-                                            .get(*consumer_idx)
-                                            .and_then(|ops| ops.get(*op_idx))
-                                            .is_some_and(|op| *op == dest),
-                                        _ => false,
-                                    });
-
-                                if next_loads_dest {
-                                    // Emit dup (keeps value on stack) then store.
-                                    encoder.emit_instruction("dup", None)?;
-                                    self.store_var(encoder, ctx.ssa, dest)?;
-                                    // Pop the LoadOperand — the value is already on the
-                                    // stack from dup, so the load is satisfied.
-                                    work_stack.pop();
-                                } else {
-                                    self.store_var(encoder, ctx.ssa, dest)?;
-                                }
-                            } else {
-                                // Single-use value within this block: leave on stack for now.
-                                // The consumer should use it directly. Storage will be allocated
-                                // lazily if this value gets buried and needs to be saved.
-                                self.stack_vars.push(dest);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Handle Copy roots with parallel copy semantics.
-        // This ensures all sources are loaded before any destinations are stored,
-        // preventing read-after-write hazards.
-        if !copy_roots.is_empty() {
-            self.emit_copy_roots_parallel(encoder, ctx, &copy_roots, &mut generated, &use_counts)?;
-
-            // Now process terminators that were deferred.
-            // Terminators must come after Copy roots because:
-            // 1. Copy roots may have dependencies (like Add) that need to be generated
-            // 2. Those dependencies must execute before the terminator
-            // 3. The terminator (e.g., Jump) may emit phi stores that depend on the Copy results
-            for &root_idx in &terminator_roots {
-                if !generated.contains(&root_idx) {
-                    let root_operands = ctx.operands_cache.get(root_idx).ok_or_else(|| {
-                        Error::CodegenFailed("operands_cache index out of bounds".to_string())
-                    })?;
-                    let root_op = *ctx.ops.get(root_idx).ok_or_else(|| {
-                        Error::CodegenFailed("ops index out of bounds".to_string())
-                    })?;
-                    // Load any operands the terminator needs.
-                    // Always use load_var which handles buried values correctly.
-                    for &operand in root_operands {
-                        self.load_var(encoder, ctx.ssa, operand)?;
-                    }
-                    self.generate_op_core(
-                        encoder,
-                        ctx.ssa,
-                        ctx.current_block_idx,
-                        root_op,
-                        next_entry,
-                    )?;
-                    generated.insert(root_idx);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Emits Copy root operations with parallel copy semantics.
-    ///
-    /// Copy roots may have dependencies (other ops that produce their sources)
-    /// and may conflict with each other (one reads a local another writes).
-    /// This function handles these conflicts by:
-    /// 1. Generating all dependencies of all Copy roots
-    /// 2. Loading all source values (using temps for conflicts)
-    /// 3. Storing all destinations
-    fn emit_copy_roots_parallel(
-        &mut self,
-        encoder: &mut InstructionEncoder,
-        ctx: &BlockCodegenContext<'_>,
-        copy_roots: &[usize],
-        generated: &mut BTreeSet<usize>,
-        use_counts: &BTreeMap<SsaVarId, usize>,
-    ) -> Result<()> {
-        struct CopyInfo {
-            src_var: SsaVarId,
-            dest_var: SsaVarId,
-            dest_storage: VarStorage,
-        }
-
-        // Phase 1: Generate all dependencies of all Copy roots.
-        // This ensures operations like Add are completed before any Copy stores.
-        let mut visiting = BTreeSet::new();
-        for &copy_idx in copy_roots {
-            self.generate_copy_deps_recursive(
-                encoder,
-                ctx,
-                copy_idx,
-                generated,
-                &mut visiting,
-                use_counts,
-            )?;
-        }
-
-        // Phase 2: Collect all copy operations and their storage info.
-        // For each Copy root, we need its source value and destination storage.
-        let mut copies: Vec<CopyInfo> = Vec::new();
-
-        for &copy_idx in copy_roots {
-            if generated.contains(&copy_idx) {
-                continue;
-            }
-            let Some(&op) = ctx.ops.get(copy_idx) else {
-                continue;
-            };
-            if let SsaOp::Copy { dest, src } = op {
-                let dest_storage = self.get_or_allocate_storage(ctx.ssa, *dest)?;
-                copies.push(CopyInfo {
-                    src_var: *src,
-                    dest_var: *dest,
-                    dest_storage,
-                });
-            }
-        }
-
-        if copies.is_empty() {
-            return Ok(());
-        }
-
-        // Phase 3: Detect interference - does any copy read from a local that
-        // another copy writes to?
-        let has_interference = copies.iter().any(|copy_a| {
-            // Get the storage of copy_a's source
-            let src_storage = self
-                .var_storage
-                .get(&copy_a.src_var)
-                .copied()
-                .unwrap_or(VarStorage::Stack);
-
-            // Check if any other copy writes to this storage
-            copies
-                .iter()
-                .any(|copy_b| !std::ptr::eq(copy_a, copy_b) && src_storage == copy_b.dest_storage)
-        });
-
-        if has_interference {
-            // Interference detected: use parallel copy semantics.
-            // Load all sources first, storing to temporaries.
-            // Use the temp pool for slot reuse.
-            let mut temps: Vec<(u16, SsaType, VarStorage, SsaVarId)> = Vec::new();
-            for copy_info in &copies {
-                self.load_var(encoder, ctx.ssa, copy_info.src_var)?;
-
-                // Determine the type for this temporary
-                let var_type = Self::infer_variable_type(ctx.ssa, copy_info.src_var)?;
-
-                // Allocate from pool or fresh
-                let temp_idx = self.allocate_temp_local(&var_type);
-
-                self.used_locals.insert(temp_idx);
-                emitter::emit_stloc(encoder, temp_idx)?;
-                self.last_load = None;
-                temps.push((
-                    temp_idx,
-                    var_type,
-                    copy_info.dest_storage,
-                    copy_info.dest_var,
-                ));
-            }
-
-            // Now store from temporaries to destinations, then release temps
-            for (temp_idx, var_type, dest_storage, dest_var) in temps {
-                self.used_locals.insert(temp_idx);
-                emitter::emit_ldloc(encoder, temp_idx)?;
-                match dest_storage {
-                    VarStorage::Local(idx) => {
-                        self.used_locals.insert(idx);
-                        emitter::emit_stloc(encoder, idx)?;
-                    }
-                    VarStorage::Arg(idx) => emitter::emit_starg(encoder, idx)?,
-                    VarStorage::Stack => {
-                        return Err(Error::Deobfuscation(format!(
-                            "emit_copy_roots_parallel: copy destination {dest_var:?} has Stack storage - this indicates a bug in storage allocation"
-                        )));
-                    }
-                }
-                self.last_load = None;
-
-                // Release temp back to pool for reuse
-                self.release_temp_local(temp_idx, &var_type);
-            }
-        } else {
-            // Simple case: no interference, emit load-store pairs directly
-            for copy_info in &copies {
-                self.load_var(encoder, ctx.ssa, copy_info.src_var)?;
-                match copy_info.dest_storage {
-                    VarStorage::Local(idx) => {
-                        self.used_locals.insert(idx);
-                        emitter::emit_stloc(encoder, idx)?;
-                    }
-                    VarStorage::Arg(idx) => emitter::emit_starg(encoder, idx)?,
-                    VarStorage::Stack => {
-                        return Err(Error::Deobfuscation(format!(
-                            "emit_copy_roots_parallel: copy destination {:?} has Stack storage - this indicates a bug in storage allocation",
-                            copy_info.dest_var
-                        )));
-                    }
-                }
-                self.last_load = None;
-            }
-        }
-
-        // Mark all Copy roots as generated
-        for &copy_idx in copy_roots {
-            generated.insert(copy_idx);
-        }
-
-        Ok(())
-    }
-
-    /// Recursively generates dependencies of a Copy root.
-    ///
-    /// Uses a `visiting` set for cycle detection: if a dependency is already
-    /// being visited (but not yet fully generated), we have a circular
-    /// dependency chain and break it by skipping the recursion. The variable
-    /// will be loaded from its existing storage location instead.
-    fn generate_copy_deps_recursive(
-        &mut self,
-        encoder: &mut InstructionEncoder,
-        ctx: &BlockCodegenContext<'_>,
-        idx: usize,
-        generated: &mut BTreeSet<usize>,
-        visiting: &mut BTreeSet<usize>,
-        use_counts: &BTreeMap<SsaVarId, usize>,
-    ) -> Result<()> {
-        if !visiting.insert(idx) {
-            return Ok(());
-        }
-
-        let operands = ctx.operands_cache.get(idx).ok_or_else(|| {
-            Error::CodegenFailed("operands_cache index out of bounds".to_string())
-        })?;
-
-        for &operand in operands {
-            if let Some(&dep_idx) = ctx.def_map.get(&operand) {
-                if !generated.contains(&dep_idx) {
-                    self.generate_copy_deps_recursive(
-                        encoder, ctx, dep_idx, generated, visiting, use_counts,
-                    )?;
-
-                    let dep_op = *ctx.ops.get(dep_idx).ok_or_else(|| {
-                        Error::CodegenFailed("ops index out of bounds".to_string())
-                    })?;
-
-                    // Skip Copy ops - they'll be handled in the parallel copy phase
-                    if matches!(dep_op, SsaOp::Copy { .. }) {
-                        continue;
-                    }
-
-                    // Spill all stack_vars BEFORE loading operands to avoid the issue where
-                    // loading some operands from storage buries stack_vars values, causing
-                    // subsequent spills to store the wrong values.
-                    if !self.stack_vars.is_empty() {
-                        self.spill_stack(encoder, ctx.ssa)?;
-                    }
-
-                    let dep_operands = ctx.operands_cache.get(dep_idx).ok_or_else(|| {
-                        Error::CodegenFailed("operands_cache index out of bounds".to_string())
-                    })?;
-
-                    // Generate operands for this dependency
-                    for &dep_operand in dep_operands {
-                        if let Some(&dep_dep_idx) = ctx.def_map.get(&dep_operand) {
-                            let dep_dep_op = ctx.ops.get(dep_dep_idx).copied();
-                            if generated.contains(&dep_dep_idx) {
-                                // Operand's defining op is generated, load it
-                                self.load_var(encoder, ctx.ssa, dep_operand)?;
-                            } else if matches!(dep_dep_op, Some(SsaOp::Copy { .. })) {
-                                // Operand is a Copy result that hasn't been generated.
-                                // Load the Copy's source instead - it should be available.
-                                let Some(SsaOp::Copy { src, .. }) = dep_dep_op else {
-                                    return Err(Error::CodegenFailed(
-                                        "Copy op pattern mismatch".to_string(),
-                                    ));
-                                };
-                                self.load_var(encoder, ctx.ssa, *src)?;
-                            } else {
-                                // The operand's defining op should have been generated
-                                // by the recursive call above. If we get here, something
-                                // unexpected happened - load it anyway to avoid stack underflow.
-                                self.load_var(encoder, ctx.ssa, dep_operand)?;
-                            }
-                        } else {
-                            // External operand
-                            self.load_var(encoder, ctx.ssa, dep_operand)?;
-                        }
-                    }
-
-                    self.generate_op_core(encoder, ctx.ssa, ctx.current_block_idx, dep_op, None)?;
-                    generated.insert(dep_idx);
-
-                    // Handle storage for the result
-                    if let Some(dest) = dep_op.dest() {
-                        let uses = use_counts.get(&dest).copied().unwrap_or(0);
-                        let used_outside_block = self.cross_block_uses.contains(&dest);
-
-                        if uses > 1 || used_outside_block {
-                            self.store_var(encoder, ctx.ssa, dest)?;
-                        } else {
-                            self.stack_vars.push(dest);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Generates just the core operation, assuming operands are already on the stack.
+    /// Emits the instruction `tag` names, assuming its operands are on the
+    /// stack, preceded by the prefixes it states ([`CilPrefix::of`]), and
+    /// records the instructions as implementing it, for the translation
+    /// validator.
     fn generate_op_core(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        tag: OpTag,
+        next_entry: Option<LayoutEntry>,
+    ) -> Result<()> {
+        let op = Self::op_at(ssa, tag)?;
+        let start = encoder.instruction_count();
+        self.read_narrow_operands(encoder, ssa, op)?;
+        for prefix in CilPrefix::of(op) {
+            Self::generate_prefix(encoder, &prefix)?;
+        }
+        self.generate_op_core_untracked(encoder, ssa, tag.block, op, next_entry)?;
+        Self::normalize_narrow_result(encoder, ssa, op)?;
+        self.record_group(start, encoder.instruction_count(), tag);
+        Ok(())
+    }
+
+    /// Re-extends the operands of `op`, already on the stack, that it reads at a narrow width
+    /// differently from how the stack holds them.
+    ///
+    /// The stack holds a narrow value extended by its own type's signedness. An operation
+    /// computing at a narrow width (a pass narrows `(short)(a / b)` to a 16-bit division)
+    /// whose result depends on its operands' high bits - a right shift, a division or
+    /// remainder, an overflow-checked operation, a comparison - reads them extended by its
+    /// own signedness instead, and CIL computes at 32 bits: an `int16` -1 shifted right
+    /// unsigned at 16 bits is `0x7FFF`, the stack's `0xFFFFFFFF` shifted is not. Each such
+    /// operand is re-extended as the operation reads it: in place on top of the stack, and
+    /// through temporaries below it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a temporary cannot be declared.
+    fn read_narrow_operands(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        let form = |var: &SsaVarId| ssa.variable(*var).and_then(|v| narrow_form(v.var_type()));
+        let dest_form = op.dest().as_ref().and_then(form);
+        // The operands in stack order, and the narrow reading the operation makes of them.
+        let (operands, reading): (Vec<SsaVarId>, Option<(u32, bool)>) = match op {
+            SsaOp::Shr {
+                value,
+                amount,
+                unsigned,
+                ..
+            } => (
+                vec![*value, *amount],
+                dest_form.map(|(width, _)| (width, *unsigned)),
+            ),
+            SsaOp::Div {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::Rem {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::AddOvf {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::SubOvf {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::MulOvf {
+                left,
+                right,
+                unsigned,
+                ..
+            } => (
+                vec![*left, *right],
+                dest_form.map(|(width, _)| (width, *unsigned)),
+            ),
+            SsaOp::Clt {
+                left,
+                right,
+                unsigned,
+                ..
+            }
+            | SsaOp::Cgt {
+                left,
+                right,
+                unsigned,
+                ..
+            } => (
+                vec![*left, *right],
+                form(left).map(|(width, _)| (width, *unsigned)),
+            ),
+            SsaOp::BranchCmp {
+                left,
+                right,
+                cmp,
+                unsigned,
+                ..
+            } if !matches!(cmp, CmpKind::Eq | CmpKind::Ne) => (
+                vec![*left, *right],
+                form(left).map(|(width, _)| (width, *unsigned)),
+            ),
+            // An equality reads both alike; operands held alike already are.
+            SsaOp::Ceq { left, right, .. } | SsaOp::BranchCmp { left, right, .. } => {
+                let alike = form(left) == form(right);
+                (
+                    vec![*left, *right],
+                    form(left)
+                        .filter(|_| !alike)
+                        .map(|(width, _)| (width, true)),
+                )
+            }
+            _ => return Ok(()),
+        };
+        let Some((width, unsigned)) = reading else {
+            return Ok(());
+        };
+        // A shift reads its count as a count, in no window: only the shifted value is read.
+        let counted = matches!(op, SsaOp::Shr { .. });
+        let needs: Vec<bool> = operands
+            .iter()
+            .enumerate()
+            .map(|(index, operand)| {
+                !(counted && index == 1)
+                    && form(operand).is_some_and(|(own_width, own_unsigned)| {
+                        own_width == width && own_unsigned != unsigned
+                    })
+            })
+            .collect();
+        let Some(lowest) = needs.iter().position(|need| *need) else {
+            return Ok(());
+        };
+        // Everything above the lowest operand to re-extend is set aside, top first.
+        let mut aside: Vec<(u16, SsaType)> = Vec::new();
+        for operand in operands.iter().skip(lowest.saturating_add(1)).rev() {
+            let class = ssa
+                .variable(*operand)
+                .map_or(SsaType::I32, |var| var.var_type().stack_type());
+            let slot = self.allocate_temp_local(&class)?;
+            emitter::emit_stloc(encoder, slot)?;
+            aside.push((slot, class));
+        }
+        Self::emit_subword_normalize(encoder, width, !unsigned)?;
+        for (index, (slot, class)) in (lowest.saturating_add(1)..).zip(aside.into_iter().rev()) {
+            emitter::emit_ldloc(encoder, slot)?;
+            if needs.get(index).copied().unwrap_or(false) {
+                Self::emit_subword_normalize(encoder, width, !unsigned)?;
+            }
+            self.release_temp_local(slot, &class);
+        }
+        Ok(())
+    }
+
+    /// Re-establishes the stack form of a narrow result of `op`.
+    ///
+    /// CIL computes every integer operation at 32 bits, so an operation the IR computes at a
+    /// narrow width (a pass narrows `(byte)(a ^ b)` to an 8-bit `xor`) leaves bits above its
+    /// width the stack's form of its type does not have: the sum of two `ushort`s carries
+    /// into bit 16. The result is truncated and extended as its type is held; an
+    /// overflow-checked operation instead checks that its 32-bit result fits its type, which
+    /// is the overflow at its width.
+    fn normalize_narrow_result(
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        let checked = match op {
+            SsaOp::Add { .. }
+            | SsaOp::Sub { .. }
+            | SsaOp::Mul { .. }
+            | SsaOp::Div { .. }
+            | SsaOp::Rem { .. }
+            | SsaOp::And { .. }
+            | SsaOp::Or { .. }
+            | SsaOp::Xor { .. }
+            | SsaOp::Neg { .. }
+            | SsaOp::Not { .. }
+            | SsaOp::Shl { .. }
+            | SsaOp::Shr { .. } => None,
+            SsaOp::AddOvf { unsigned, .. }
+            | SsaOp::SubOvf { unsigned, .. }
+            | SsaOp::MulOvf { unsigned, .. } => Some(*unsigned),
+            _ => return Ok(()),
+        };
+        let Some((width, unsigned)) = op
+            .dest()
+            .and_then(|dest| ssa.variable(dest))
+            .and_then(|var| narrow_form(var.var_type()))
+        else {
+            return Ok(());
+        };
+        match checked {
+            None => Self::emit_subword_normalize(encoder, width, !unsigned),
+            Some(reads_unsigned) => {
+                let base = match (width, unsigned) {
+                    (8, true) => "u1",
+                    (8, false) => "i1",
+                    (_, true) => "u2",
+                    (_, false) => "i2",
+                };
+                let mnemonic = if reads_unsigned {
+                    format!("conv.ovf.{base}.un")
+                } else {
+                    format!("conv.ovf.{base}")
+                };
+                encoder.emit_instruction(&mnemonic, None)
+            }
+        }
+    }
+
+    /// The operation at `tag`.
+    fn op_at(ssa: &SsaFunction, tag: OpTag) -> Result<&SsaOp> {
+        ssa.block(tag.block)
+            .and_then(|block| block.instructions().get(tag.instr))
+            .map(|instr| instr.op())
+            .ok_or_else(|| {
+                Error::CodegenFailed(format!("B{}:{} does not exist", tag.block, tag.instr))
+            })
+    }
+
+    /// Records instructions `[start, end)` as implementing `tag`.
+    fn record_group(&mut self, start: usize, end: usize, tag: OpTag) {
+        if start < end {
+            self.method.emit_groups.push(EmitGroup { start, end, tag });
+        }
+    }
+
+    /// Materialises the constant `var` is defined as, recording it as that
+    /// definition.
+    fn emit_constant_of(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        var: SsaVarId,
+        value: &ConstValue,
+    ) -> Result<()> {
+        let start = encoder.instruction_count();
+        self.generate_const(encoder, value)?;
+        if let Some(&tag) = self.method.def_sites.get(&var) {
+            self.record_group(start, encoder.instruction_count(), tag);
+        }
+        Ok(())
+    }
+
+    /// [`Self::generate_op_core`] without the record.
+    fn generate_op_core_untracked(
         &mut self,
         encoder: &mut InstructionEncoder,
         ssa: &SsaFunction,
@@ -3510,10 +2355,6 @@ impl SsaCodeGenerator {
         op: &SsaOp,
         next_entry: Option<LayoutEntry>,
     ) -> Result<()> {
-        // Clear last_load tracking - after any operation, the stack state changes
-        // and the "last loaded" value may no longer be on top of the stack.
-        self.last_load = None;
-
         match op {
             SsaOp::Const { dest, value } => {
                 self.generate_const(encoder, value)?;
@@ -3537,7 +2378,7 @@ impl SsaCodeGenerator {
             | SsaOp::Shl { .. }
             | SsaOp::Shr { .. }
             | SsaOp::Neg { .. }
-            | SsaOp::Not { .. } => Self::generate_arithmetic_op(encoder, op)?,
+            | SsaOp::Not { .. } => Self::generate_arithmetic_op(encoder, ssa, op)?,
 
             // Conversion operations
             SsaOp::IntConv { .. }
@@ -3547,7 +2388,7 @@ impl SsaCodeGenerator {
             | SsaOp::FloatToInt { .. }
             | SsaOp::FloatConv { .. }
             | SsaOp::Ckfinite { .. } => {
-                Self::generate_conversion_op(encoder, op)?;
+                Self::generate_conversion_op(encoder, ssa, op)?;
             }
 
             // Comparison operations
@@ -3556,10 +2397,7 @@ impl SsaCodeGenerator {
             }
 
             // Call operations
-            SsaOp::Call { .. }
-            | SsaOp::CallVirt { .. }
-            | SsaOp::CallIndirect { .. }
-            | SsaOp::NewObj { .. } => Self::generate_call_op(encoder, op)?,
+            SsaOp::Call(_) | SsaOp::NewObj { .. } => Self::generate_call_op(encoder, op)?,
 
             // Load, store, and memory operations
             SsaOp::Copy { .. }
@@ -3595,7 +2433,11 @@ impl SsaCodeGenerator {
             | SsaOp::LoadElementAddr { .. }
             | SsaOp::InitBlk { .. }
             | SsaOp::CopyBlk { .. }
-            | SsaOp::CopyObj { .. } => self.generate_load_store_op(encoder, ssa, op)?,
+            | SsaOp::CopyObj { .. }
+            | SsaOp::ArgList { .. }
+            | SsaOp::MakeTypedRef { .. }
+            | SsaOp::TypedRefValue { .. }
+            | SsaOp::TypedRefType { .. } => self.generate_load_store_op(encoder, op)?,
 
             // Branch and control flow operations
             SsaOp::Return { .. }
@@ -3607,8 +2449,7 @@ impl SsaCodeGenerator {
             | SsaOp::Leave { .. }
             | SsaOp::EndFinally
             | SsaOp::EndFilter { .. }
-            | SsaOp::BranchCmp { .. }
-            | SsaOp::BranchFlags { .. } => {
+            | SsaOp::BranchCmp { .. } => {
                 self.generate_branch_op(encoder, ssa, current_block_idx, op, next_entry)?;
             }
 
@@ -3625,33 +2466,27 @@ impl SsaCodeGenerator {
                 encoder.emit_instruction("break", None)?;
             }
 
-            // Prefix instructions
-            SsaOp::Constrained {
-                constraint_type, ..
-            } => {
-                encoder.emit_instruction(
-                    "constrained.",
-                    Some(Operand::Token(constraint_type.token())),
-                )?;
-            }
+            // CIL has no rotate or byte-swap instruction, but both are what the
+            // algebraic pass folds a shift-and-or idiom into, and what the x86
+            // lift produces for `rol`/`ror`/`bswap`. They are spelled back out
+            // in shifts.
+            SsaOp::Rol {
+                dest,
+                value,
+                amount,
+            } => self.generate_rotate(encoder, ssa, *dest, *value, *amount, true)?,
+            SsaOp::Ror {
+                dest,
+                value,
+                amount,
+            } => self.generate_rotate(encoder, ssa, *dest, *value, *amount, false)?,
+            SsaOp::BSwap { dest, src } => self.generate_byte_swap(encoder, ssa, *dest, *src)?,
 
-            SsaOp::Volatile => {
-                encoder.emit_instruction("volatile.", None)?;
-            }
-
-            SsaOp::Unaligned { alignment } => {
-                encoder.emit_instruction(
-                    "unaligned.",
-                    Some(Operand::Immediate(Immediate::UInt8(*alignment))),
-                )?;
-            }
-
-            SsaOp::TailPrefix => {
-                encoder.emit_instruction("tail.", None)?;
-            }
-
-            SsaOp::Readonly => {
-                encoder.emit_instruction("readonly.", None)?;
+            // Settled at the entry of the block it leads, before scheduling.
+            SsaOp::RuntimeValue { dest, .. } => {
+                return Err(Error::CodegenFailed(format!(
+                    "runtime value {dest} was not settled at its block's entry"
+                )));
             }
 
             SsaOp::Phi { .. }
@@ -3660,11 +2495,215 @@ impl SsaCodeGenerator {
             | SsaOp::Unreachable => {
                 // Phi nodes are eliminated during code generation - no instruction emitted
             }
-            // Native architecture ops (x86/arm/riscv intrinsics, system, vector
-            // crypto/SVE/SME, BCD, …) are never produced by dotscope's CIL
-            // lifter and are not expressible in CIL; nothing to emit.
-            _ => {}
+
+            // Anything else has no CIL spelling. Emitting nothing for it would
+            // drop a computation - its result never pushed, its effect never
+            // made - so the method fails to compile instead and keeps its
+            // original body.
+            _ => {
+                return Err(Error::CodegenFailed(format!("no CIL lowering for {op:?}")));
+            }
         }
+        Ok(())
+    }
+
+    /// The integer width an operation on a value of `var` is taken at, and
+    /// whether the value is signed.
+    ///
+    /// Reads the variable's own type, falling back to `fallback`'s when it has
+    /// none. A native integer has no width known here, so it has none.
+    fn integer_width(ssa: &SsaFunction, var: SsaVarId, fallback: SsaVarId) -> Option<(u32, bool)> {
+        let width_of = |id: SsaVarId| {
+            let var_type = ssa.variable(id)?.var_type();
+            match var_type {
+                SsaType::I8 => Some((8, true)),
+                SsaType::U8 | SsaType::Bool => Some((8, false)),
+                SsaType::I16 => Some((16, true)),
+                SsaType::U16 | SsaType::Char => Some((16, false)),
+                SsaType::I32 => Some((32, true)),
+                SsaType::U32 => Some((32, false)),
+                SsaType::I64 => Some((64, true)),
+                SsaType::U64 => Some((64, false)),
+                _ => None,
+            }
+        };
+        width_of(var).or_else(|| width_of(fallback))
+    }
+
+    /// Emits a constant of the evaluation-stack type a `width`-bit integer
+    /// occupies: `int64` for 64 bits, `int32` below.
+    fn emit_width_const(encoder: &mut InstructionEncoder, width: u32, value: u64) -> Result<()> {
+        if width == 64 {
+            #[allow(clippy::cast_possible_wrap)] // The bit pattern is the constant.
+            let value = value as i64;
+            encoder
+                .emit_instruction("ldc.i8", Some(Operand::Immediate(Immediate::Int64(value))))?;
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            // Below 64 bits the constant fits the low 32 bits of its pattern.
+            let value = value as u32 as i32;
+            emitter::emit_ldc_i4(encoder, value)?;
+        }
+        Ok(())
+    }
+
+    /// Re-establishes a sub-word result in the form its type is held on the
+    /// evaluation stack: sign-extended for a signed type, zero-extended for an
+    /// unsigned one. Full-width results need nothing.
+    fn emit_subword_normalize(
+        encoder: &mut InstructionEncoder,
+        width: u32,
+        signed: bool,
+    ) -> Result<()> {
+        let conv = match (width, signed) {
+            (8, true) => "conv.i1",
+            (8, false) => "conv.u1",
+            (16, true) => "conv.i2",
+            (16, false) => "conv.u2",
+            _ => return Ok(()),
+        };
+        encoder.emit_instruction(conv, None)
+    }
+
+    /// Emits a rotate of the two operands on the stack (value, then amount).
+    ///
+    /// A rotate by `r` at width `w` is `(x << (r & (w-1))) | (x >>> (-r & (w-1)))`
+    /// with the right shift logical. The count is reduced modulo the width as
+    /// every ISA's rotate reduces it, and the masked negation makes a count of
+    /// zero shift both halves by zero rather than one of them by the full width,
+    /// which CIL leaves unspecified. A sub-word value is zero-extended first so
+    /// the right shift brings in its own bits rather than the stack's sign
+    /// extension, and the result is narrowed back to its type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value's width is not known, as for a native
+    /// integer, whose width depends on the platform the method runs on.
+    fn generate_rotate(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        dest: SsaVarId,
+        value: SsaVarId,
+        amount: SsaVarId,
+        left: bool,
+    ) -> Result<()> {
+        let (width, signed) = Self::integer_width(ssa, dest, value).ok_or_else(|| {
+            Error::CodegenFailed(format!(
+                "rotate of {value} has no fixed integer width to lower it at"
+            ))
+        })?;
+        let mask = u64::from(width.saturating_sub(1));
+        let value_type = if width == 64 {
+            SsaType::I64
+        } else {
+            SsaType::I32
+        };
+
+        // A shift count is an `int32` on the CIL stack; a 64-bit amount is
+        // narrowed, which keeps every bit the mask below reads.
+        let amount_is_wide = ssa
+            .variable(amount)
+            .is_some_and(|var| matches!(var.var_type(), SsaType::I64 | SsaType::U64));
+        if amount_is_wide {
+            encoder.emit_instruction("conv.i4", None)?;
+        }
+        let amount_slot = self.allocate_temp_local(&SsaType::I32)?;
+        emitter::emit_stloc(encoder, amount_slot)?;
+
+        if width < 32 {
+            Self::emit_width_const(encoder, 32, (1u64 << width).saturating_sub(1))?;
+            encoder.emit_instruction("and", None)?;
+        }
+        let value_slot = self.allocate_temp_local(&value_type)?;
+        emitter::emit_stloc(encoder, value_slot)?;
+
+        let (first, second) = if left {
+            ("shl", "shr.un")
+        } else {
+            ("shr.un", "shl")
+        };
+
+        emitter::emit_ldloc(encoder, value_slot)?;
+        emitter::emit_ldloc(encoder, amount_slot)?;
+        Self::emit_width_const(encoder, 32, mask)?;
+        encoder.emit_instruction("and", None)?;
+        encoder.emit_instruction(first, None)?;
+
+        emitter::emit_ldloc(encoder, value_slot)?;
+        emitter::emit_ldloc(encoder, amount_slot)?;
+        encoder.emit_instruction("neg", None)?;
+        Self::emit_width_const(encoder, 32, mask)?;
+        encoder.emit_instruction("and", None)?;
+        encoder.emit_instruction(second, None)?;
+
+        encoder.emit_instruction("or", None)?;
+        Self::emit_subword_normalize(encoder, width, signed)?;
+
+        self.release_temp_local(value_slot, &value_type);
+        self.release_temp_local(amount_slot, &SsaType::I32);
+        Ok(())
+    }
+
+    /// Emits a byte swap of the operand on the stack.
+    ///
+    /// Each byte lane is shifted down to the bottom, masked, and shifted up to
+    /// its mirrored position, and the lanes are or-ed together. The right shifts
+    /// are logical so a lane never picks up the value's sign.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value's width is not a whole number of bytes of
+    /// at least two, or is not known.
+    fn generate_byte_swap(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        dest: SsaVarId,
+        src: SsaVarId,
+    ) -> Result<()> {
+        let (width, signed) = Self::integer_width(ssa, dest, src)
+            .filter(|&(width, _)| width >= 16)
+            .ok_or_else(|| {
+                Error::CodegenFailed(format!(
+                    "byte swap of {src} has no fixed width of two bytes or more to lower it at"
+                ))
+            })?;
+        let value_type = if width == 64 {
+            SsaType::I64
+        } else {
+            SsaType::I32
+        };
+        let value_slot = self.allocate_temp_local(&value_type)?;
+        emitter::emit_stloc(encoder, value_slot)?;
+
+        let lanes = width / 8;
+        for lane in 0..lanes {
+            let from = lane.saturating_mul(8);
+            let to = lanes
+                .saturating_sub(1)
+                .saturating_sub(lane)
+                .saturating_mul(8);
+            emitter::emit_ldloc(encoder, value_slot)?;
+            if from > 0 {
+                #[allow(clippy::cast_possible_wrap)] // At most 56.
+                emitter::emit_ldc_i4(encoder, from as i32)?;
+                encoder.emit_instruction("shr.un", None)?;
+            }
+            Self::emit_width_const(encoder, width, 0xff)?;
+            encoder.emit_instruction("and", None)?;
+            if to > 0 {
+                #[allow(clippy::cast_possible_wrap)] // At most 56.
+                emitter::emit_ldc_i4(encoder, to as i32)?;
+                encoder.emit_instruction("shl", None)?;
+            }
+            if lane > 0 {
+                encoder.emit_instruction("or", None)?;
+            }
+        }
+        Self::emit_subword_normalize(encoder, width, signed)?;
+
+        self.release_temp_local(value_slot, &value_type);
         Ok(())
     }
 
@@ -3673,7 +2712,23 @@ impl SsaCodeGenerator {
     /// Handles: `Add`, `Sub`, `Mul`, `Div`, `Rem`, overflow-checked variants,
     /// `And`, `Or`, `Xor`, `Shl`, `Shr`, `Neg`, `Not`.
     /// Operands are already on the evaluation stack.
-    fn generate_arithmetic_op(encoder: &mut InstructionEncoder, op: &SsaOp) -> Result<()> {
+    ///
+    /// A shift count is an `int32` or a native integer in CIL (ECMA-335 III.3.58, III.3.59);
+    /// one the IR states as 64 bits, as strength reduction states `x * 2^32` over an
+    /// `int64`, is narrowed first: a count that fits the shift fits an `int32`.
+    fn generate_arithmetic_op(
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        if let SsaOp::Shl { amount, .. } | SsaOp::Shr { amount, .. } = op {
+            if ssa
+                .variable(*amount)
+                .is_some_and(|count| matches!(count.var_type(), SsaType::I64 | SsaType::U64))
+            {
+                encoder.emit_instruction("conv.i4", None)?;
+            }
+        }
         match op {
             SsaOp::Add { dest, .. } => {
                 encoder.emit_instruction("add", None)?;
@@ -3817,41 +2872,53 @@ impl SsaCodeGenerator {
     ///
     /// Handles: `Conv` (with overflow check and unsigned variants), `Ckfinite`.
     /// Operand is already on the evaluation stack.
-    fn generate_conversion_op(encoder: &mut InstructionEncoder, op: &SsaOp) -> Result<()> {
+    fn generate_conversion_op(
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        op: &SsaOp,
+    ) -> Result<()> {
+        let source = |operand: &SsaVarId| ssa.variable(*operand).map(|var| var.var_type());
         match op {
-            // Integer and float→integer conversions carry both an overflow-check
-            // and a signedness; integer→float carries only signedness; the
-            // pointer and float-width conversions carry neither.
+            // An integer conversion carries an overflow check and whether its
+            // source is read unsigned (`.un`); integer→float carries only the
+            // latter; the pointer and float-width conversions carry neither.
+            SsaOp::IntConv { .. } if CilTarget::is_stack_widening(ssa, op) => {}
             SsaOp::IntConv {
                 dest,
+                operand,
                 target,
                 overflow_check,
                 unsigned,
-                ..
+            } => {
+                emitter::emit_conv(encoder, source(operand), target, *overflow_check, *unsigned)?;
+                let _ = dest;
             }
-            | SsaOp::FloatToInt {
+            // A float→integer conversion's flag is the destination's sign, which
+            // the opcode already names (`conv.ovf.u4`); `.un` reads a source as
+            // unsigned, which a float source cannot be.
+            SsaOp::FloatToInt {
                 dest,
                 target,
                 overflow_check,
-                unsigned,
                 ..
             } => {
-                emitter::emit_conv(encoder, target, *overflow_check, *unsigned)?;
+                emitter::emit_conv(encoder, None, target, *overflow_check, false)?;
                 let _ = dest;
             }
             SsaOp::IntToFloat {
                 dest,
+                operand,
                 target,
                 unsigned,
                 ..
             } => {
-                emitter::emit_conv(encoder, target, false, *unsigned)?;
+                emitter::emit_conv(encoder, source(operand), target, false, *unsigned)?;
                 let _ = dest;
             }
             SsaOp::IntToPtr { dest, target, .. }
             | SsaOp::PtrToInt { dest, target, .. }
             | SsaOp::FloatConv { dest, target, .. } => {
-                emitter::emit_conv(encoder, target, false, false)?;
+                emitter::emit_conv(encoder, None, target, false, false)?;
                 let _ = dest;
             }
 
@@ -3867,58 +2934,45 @@ impl SsaCodeGenerator {
 
     /// Generates CIL for call operations.
     ///
-    /// Handles: `Call`, `CallVirt`, `CallIndirect`, `NewObj`.
-    /// Arguments are already on the evaluation stack.
+    /// Handles `Call`, as `call`, `callvirt` or `calli` by its callee, and
+    /// `NewObj`. Arguments are already on the evaluation stack.
     fn generate_call_op(encoder: &mut InstructionEncoder, op: &SsaOp) -> Result<()> {
         match op {
-            SsaOp::Call { dest, method, args } => {
-                // num_args: the method arguments that were pushed on stack
-                let num_args = u8::try_from(args.len()).unwrap_or(u8::MAX);
-                let has_result = dest.is_some();
+            SsaOp::Call(call) => {
+                // The stack holds the method arguments, and after them an
+                // indirect call's function pointer. The result, if any, is
+                // left on the stack for the caller.
+                let (mnemonic, token, pushed) = match &call.callee {
+                    // A static virtual method's constrained call is a `call`.
+                    Callee::Direct(method)
+                    | Callee::Constrained {
+                        method,
+                        instance: false,
+                        ..
+                    } => ("call", method.token(), call.args.len()),
+                    Callee::Virtual(method)
+                    | Callee::Constrained {
+                        method,
+                        instance: true,
+                        ..
+                    } => ("callvirt", method.token(), call.args.len()),
+                    Callee::Indirect { signature, .. } => (
+                        "calli",
+                        signature.token(),
+                        call.args.len().saturating_add(1),
+                    ),
+                };
                 encoder.emit_call(
-                    "call",
-                    Some(Operand::Token(method.token())),
-                    num_args,
-                    has_result,
+                    mnemonic,
+                    Some(Operand::Token(token)),
+                    call_arity(pushed)?,
+                    call.dest.is_some(),
                 )?;
-                // Result left on stack - handled by caller
-                let _ = dest;
-            }
-
-            SsaOp::CallVirt { dest, method, args } => {
-                // num_args: the method arguments that were pushed on stack
-                let num_args = u8::try_from(args.len()).unwrap_or(u8::MAX);
-                let has_result = dest.is_some();
-                encoder.emit_call(
-                    "callvirt",
-                    Some(Operand::Token(method.token())),
-                    num_args,
-                    has_result,
-                )?;
-                let _ = dest;
-            }
-
-            SsaOp::CallIndirect {
-                dest,
-                signature,
-                args,
-                ..
-            } => {
-                // num_args: function pointer + the method arguments
-                let num_args = u8::try_from(args.len().saturating_add(1)).unwrap_or(u8::MAX);
-                let has_result = dest.is_some();
-                encoder.emit_call(
-                    "calli",
-                    Some(Operand::Token(signature.token())),
-                    num_args,
-                    has_result,
-                )?;
-                let _ = dest;
             }
 
             SsaOp::NewObj { dest, ctor, args } => {
                 // num_args: constructor arguments (newobj always returns the new object)
-                let num_args = u8::try_from(args.len()).unwrap_or(u8::MAX);
+                let num_args = call_arity(args.len())?;
                 encoder.emit_call("newobj", Some(Operand::Token(ctor.token())), num_args, true)?;
                 let _ = dest;
             }
@@ -3939,28 +2993,15 @@ impl SsaCodeGenerator {
     fn generate_load_store_op(
         &mut self,
         encoder: &mut InstructionEncoder,
-        ssa: &SsaFunction,
         op: &SsaOp,
     ) -> Result<()> {
         match op {
-            SsaOp::Copy { dest, src } => {
-                // Copy instruction: src is loaded by scheduler via get_operands_in_stack_order.
-                // We just need to emit the store to dest's location.
-                // Note: Copy instructions where src and dest have the same storage
-                // are filtered out earlier (in generate_block_instructions), so we
-                // always need to do the store here.
-                let dest_storage = self.get_or_allocate_storage(ssa, *dest)?;
-                match dest_storage {
-                    VarStorage::Local(idx) => {
-                        self.used_locals.insert(idx);
-                        emitter::emit_stloc(encoder, idx)?;
-                    }
-                    VarStorage::Arg(idx) => emitter::emit_starg(encoder, idx)?,
-                    VarStorage::Stack => {
-                        // Can't store to stack, value already there
-                    }
-                }
-                let _ = src;
+            SsaOp::Copy { .. } => {
+                // A copy is a move between places, which block emission makes
+                // itself; it has no instruction of its own.
+                return Err(Error::CodegenFailed(format!(
+                    "copy {op} reached operation lowering"
+                )));
             }
             SsaOp::LoadField { dest, field, .. } => {
                 // object is loaded by scheduler via get_operands_in_stack_order
@@ -3972,9 +3013,8 @@ impl SsaCodeGenerator {
                 encoder.emit_instruction("stfld", Some(Operand::Token(field.token())))?;
             }
 
-            SsaOp::LoadStaticField { dest, field } => {
+            SsaOp::LoadStaticField { field, .. } => {
                 encoder.emit_instruction("ldsfld", Some(Operand::Token(field.token())))?;
-                let _ = dest;
             }
 
             SsaOp::StoreStaticField { field, .. } => {
@@ -3985,12 +3025,12 @@ impl SsaCodeGenerator {
                 dest, elem_type, ..
             } => {
                 // array and index are loaded by scheduler via get_operands_in_stack_order
-                emitter::emit_ldelem(encoder, elem_type)?;
+                emitter::emit_ldelem(encoder, elem_type, self.type_specs.get(elem_type).copied())?;
                 let _ = dest;
             }
             SsaOp::StoreElement { elem_type, .. } => {
                 // array, index, and value are loaded by scheduler via get_operands_in_stack_order
-                emitter::emit_stelem(encoder, elem_type)?;
+                emitter::emit_stelem(encoder, elem_type, self.type_specs.get(elem_type).copied())?;
             }
             SsaOp::ArrayLength { dest, .. } => {
                 // array is loaded by scheduler via get_operands_in_stack_order
@@ -4052,19 +3092,40 @@ impl SsaCodeGenerator {
                 let _ = dest;
             }
 
+            SsaOp::ArgList { dest } => {
+                encoder.emit_instruction("arglist", None)?;
+                let _ = dest;
+            }
+
+            SsaOp::MakeTypedRef {
+                dest, value_type, ..
+            } => {
+                // address is loaded by scheduler via get_operands_in_stack_order
+                encoder.emit_instruction("mkrefany", Some(Operand::Token(value_type.token())))?;
+                let _ = dest;
+            }
+
+            SsaOp::TypedRefValue {
+                dest, value_type, ..
+            } => {
+                // typed_ref is loaded by scheduler via get_operands_in_stack_order
+                encoder.emit_instruction("refanyval", Some(Operand::Token(value_type.token())))?;
+                let _ = dest;
+            }
+
+            SsaOp::TypedRefType { dest, .. } => {
+                // typed_ref is loaded by scheduler via get_operands_in_stack_order
+                encoder.emit_instruction("refanytype", None)?;
+                let _ = dest;
+            }
+
             SsaOp::LoadArg { dest, arg_index } => {
                 emitter::emit_ldarg(encoder, *arg_index)?;
                 let _ = dest;
             }
 
             SsaOp::LoadLocal { dest, local_index } => {
-                let actual_index = self
-                    .original_to_compacted
-                    .get(local_index)
-                    .copied()
-                    .unwrap_or(*local_index);
-                self.used_locals.insert(actual_index);
-                emitter::emit_ldloc(encoder, actual_index)?;
+                emitter::emit_ldloc(encoder, self.declared_slot(*local_index)?)?;
                 let _ = dest;
             }
 
@@ -4074,13 +3135,7 @@ impl SsaCodeGenerator {
             }
 
             SsaOp::LoadLocalAddr { dest, local_index } => {
-                let actual_index = self
-                    .original_to_compacted
-                    .get(local_index)
-                    .copied()
-                    .unwrap_or(*local_index);
-                self.used_locals.insert(actual_index);
-                emitter::emit_ldloca(encoder, actual_index)?;
+                emitter::emit_ldloca(encoder, self.declared_slot(*local_index)?)?;
                 let _ = dest;
             }
 
@@ -4094,9 +3149,9 @@ impl SsaCodeGenerator {
                 let _ = dest;
             }
 
-            SsaOp::LoadFunctionPtr { dest, method } => {
+            // A constraint is written before it as `constrained.`.
+            SsaOp::LoadFunctionPtr { method, .. } => {
                 encoder.emit_instruction("ldftn", Some(Operand::Token(method.token())))?;
-                let _ = dest;
             }
 
             SsaOp::LoadVirtFunctionPtr { dest, method, .. } => {
@@ -4124,38 +3179,20 @@ impl SsaCodeGenerator {
                 encoder.emit_instruction("stobj", Some(Operand::Token(value_type.token())))?;
             }
 
-            SsaOp::LoadIndirect {
-                dest, value_type, ..
-            } => {
-                let mnemonic = match value_type {
-                    SsaType::I8 => "ldind.i1",
-                    SsaType::U8 => "ldind.u1",
-                    SsaType::I16 => "ldind.i2",
-                    SsaType::U16 => "ldind.u2",
-                    SsaType::U32 => "ldind.u4",
-                    SsaType::I64 | SsaType::U64 => "ldind.i8",
-                    SsaType::F32 => "ldind.r4",
-                    SsaType::F64 => "ldind.r8",
-                    SsaType::NativeInt | SsaType::NativeUInt => "ldind.i",
-                    SsaType::Object => "ldind.ref",
-                    _ => "ldind.i4", // I32 and other types default to i4
-                };
-                encoder.emit_instruction(mnemonic, None)?;
-                let _ = dest;
+            SsaOp::LoadIndirect { value_type, .. } => {
+                emitter::emit_ldind(
+                    encoder,
+                    value_type,
+                    self.type_specs.get(value_type).copied(),
+                )?;
             }
 
             SsaOp::StoreIndirect { value_type, .. } => {
-                let mnemonic = match value_type {
-                    SsaType::I8 | SsaType::U8 => "stind.i1",
-                    SsaType::I16 | SsaType::U16 => "stind.i2",
-                    SsaType::I64 | SsaType::U64 => "stind.i8",
-                    SsaType::F32 => "stind.r4",
-                    SsaType::F64 => "stind.r8",
-                    SsaType::NativeInt | SsaType::NativeUInt => "stind.i",
-                    SsaType::Object => "stind.ref",
-                    _ => "stind.i4", // I32, U32, and other types default to i4
-                };
-                encoder.emit_instruction(mnemonic, None)?;
+                emitter::emit_stind(
+                    encoder,
+                    value_type,
+                    self.type_specs.get(value_type).copied(),
+                )?;
             }
 
             SsaOp::LoadElementAddr {
@@ -4198,24 +3235,13 @@ impl SsaCodeGenerator {
     ) -> Result<()> {
         match op {
             SsaOp::Return { .. } => {
-                // Spill any remaining stack values before return.
-                // The return value (if any) is already on the stack from operand loading.
-                // We need to spill OTHER values that might be lingering on stack_vars.
-                //
-                // Note: If there's a return value, it's already been consumed from stack_vars
-                // during operand loading, so spilling here won't affect it.
-                self.spill_stack(encoder, ssa)?;
-
                 encoder.emit_instruction("ret", None)?;
             }
 
             SsaOp::Jump { target } => {
-                // Spill remaining stack values before control flow transfer
-                self.spill_stack(encoder, ssa)?;
-
                 // A jump has one successor, so its copies have a place already: right here,
                 // before the branch. No edge block is created for it.
-                self.emit_phi_stores_for_successor(encoder, ssa, current_block_idx, *target)?;
+                self.emit_copies_from(encoder, ssa, current_block_idx)?;
 
                 if next_entry != Some(LayoutEntry::Block(*target)) {
                     let label = self.block_label(*target);
@@ -4229,10 +3255,6 @@ impl SsaCodeGenerator {
                 false_target,
                 ..
             } => {
-                // Spill any remaining stack values except the condition.
-                // The condition is already on the stack from operand loading.
-                self.spill_stack(encoder, ssa)?;
-
                 self.emit_conditional_branch(
                     encoder,
                     current_block_idx,
@@ -4245,48 +3267,46 @@ impl SsaCodeGenerator {
             SsaOp::Switch {
                 targets, default, ..
             } => {
-                // Spill any remaining stack values except the switch value.
-                self.spill_stack(encoder, ssa)?;
-
                 self.emit_switch_branch(encoder, current_block_idx, targets, *default, next_entry)?;
             }
 
             SsaOp::Throw { .. } => {
-                // Spill any remaining stack values except the exception.
-                self.spill_stack(encoder, ssa)?;
-
                 encoder.emit_instruction("throw", None)?;
             }
 
             SsaOp::Rethrow => {
-                // Spill any remaining stack values.
-                self.spill_stack(encoder, ssa)?;
-
                 encoder.emit_instruction("rethrow", None)?;
             }
 
             SsaOp::Leave { target } => {
-                // Spill any remaining stack values before leaving protected region.
-                self.spill_stack(encoder, ssa)?;
-
-                // A leave has one successor, so its copies go here, before the transfer.
-                self.emit_phi_stores_for_successor(encoder, ssa, current_block_idx, *target)?;
+                // A leave has one successor, so its copies go here, before the
+                // transfer. Which block that is, the phis say: a leave that
+                // exits a region with a finally reaches the finally first, and
+                // the finally's phis take this block's value on that edge -
+                // the target's take theirs from the finally's `endfinally`.
+                self.emit_copies_from(encoder, ssa, current_block_idx)?;
 
                 let label = self.block_label(*target);
                 encoder.emit_branch("leave", &label)?;
             }
 
             SsaOp::EndFinally => {
-                // Spill any remaining stack values.
-                self.spill_stack(encoder, ssa)?;
+                // `endfinally` resumes where the `leave` that ran the finally
+                // was going, and the phis there take their operand on that edge
+                // from this block - the `leave` itself names no phi operand of
+                // them. Their copies go here, before the transfer, which is
+                // where the slot allocator puts a predecessor's phi copies.
+                //
+                // Every such phi has a slot of its own (see
+                // `finally_resume_phis`), so the copies are sound on every way
+                // out of the finally: to any of the places it resumes, and while
+                // an exception unwinds through it.
+                self.emit_copies_from(encoder, ssa, current_block_idx)?;
 
                 encoder.emit_instruction("endfinally", None)?;
             }
 
             SsaOp::EndFilter { .. } => {
-                // Spill any remaining stack values except the filter result.
-                self.spill_stack(encoder, ssa)?;
-
                 encoder.emit_instruction("endfilter", None)?;
             }
 
@@ -4297,9 +3317,6 @@ impl SsaCodeGenerator {
                 false_target,
                 ..
             } => {
-                // Spill any remaining stack values except the comparison operands.
-                self.spill_stack(encoder, ssa)?;
-
                 // Operands are already on the stack.
                 self.emit_comparison_branch(
                     encoder,
@@ -4341,10 +3358,15 @@ impl SsaCodeGenerator {
             | SsaOp::Clt { left, right, .. }
             | SsaOp::Cgt { left, right, .. } => vec![*left, *right],
 
-            // Shift operations: value on bottom, amount on top
-            SsaOp::Shl { value, amount, .. } | SsaOp::Shr { value, amount, .. } => {
+            // Shift and rotate operations: value on bottom, amount on top
+            SsaOp::Shl { value, amount, .. }
+            | SsaOp::Shr { value, amount, .. }
+            | SsaOp::Rol { value, amount, .. }
+            | SsaOp::Ror { value, amount, .. } => {
                 vec![*value, *amount]
             }
+
+            SsaOp::BSwap { src, .. } => vec![*src],
 
             // Unary operations: single operand
             SsaOp::Neg { operand, .. }
@@ -4358,7 +3380,7 @@ impl SsaCodeGenerator {
             | SsaOp::Ckfinite { operand, .. } => vec![*operand],
 
             // Return with value
-            SsaOp::Return { value: Some(v) } => vec![*v],
+            SsaOp::Return { value: Some(v), .. } => vec![*v],
 
             // Branch condition
             SsaOp::Branch { condition, .. } => vec![*condition],
@@ -4408,6 +3430,12 @@ impl SsaCodeGenerator {
             | SsaOp::CastClass { object, .. }
             | SsaOp::IsInst { object, .. } => vec![*object],
 
+            // Typed references: the one value each takes
+            SsaOp::MakeTypedRef { address, .. } => vec![*address],
+            SsaOp::TypedRefValue { typed_ref, .. } | SsaOp::TypedRefType { typed_ref, .. } => {
+                vec![*typed_ref]
+            }
+
             // Copy operation
             SsaOp::Copy { src, .. } => vec![*src],
 
@@ -4438,25 +3466,30 @@ impl SsaCodeGenerator {
                 dest_addr,
                 value,
                 size,
-                reverse: _,
+                ..
             } => vec![*dest_addr, *value, *size],
             SsaOp::CopyBlk {
                 dest_addr,
                 src_addr,
                 size,
-                reverse: _,
+                ..
             } => vec![*dest_addr, *src_addr, *size],
 
             // Exception handling
             SsaOp::EndFilter { result } => vec![*result],
 
-            // Call operations: use the op's uses() method
-            SsaOp::Call { .. }
-            | SsaOp::CallVirt { .. }
-            | SsaOp::CallIndirect { .. }
-            | SsaOp::NewObj { .. } => op.uses(),
+            // A call takes its arguments in order, and `calli` the function
+            // pointer on top of them.
+            SsaOp::Call(call) => {
+                let mut operands = call.args.clone();
+                operands.extend(call.callee.fptr());
+                operands
+            }
+            SsaOp::NewObj { args, .. } => args.clone(),
 
-            // Operations with no operands or operands from outside the block
+            // Operations with no operands. An operation with operands that is
+            // missing above has no lowering either, and `generate_op_core`
+            // rejects it before its operands would matter.
             _ => Vec::new(),
         }
     }
@@ -4560,17 +3593,19 @@ impl SsaCodeGenerator {
                 encoder.emit_instruction("conv.u", None)?;
             }
 
-            // Floating point
-            ConstValue::F32(_) => {
+            // Floating point: CIL loads binary32 and binary64 constants
+            ConstValue::Float(float) => {
+                let opcode = match float.format() {
+                    FloatFormat::Single => "ldc.r4",
+                    FloatFormat::Double => "ldc.r8",
+                    _ => {
+                        return Err(Error::CodegenFailed(format!(
+                            "{float:?} has a float format CIL cannot load"
+                        )));
+                    }
+                };
                 encoder.emit_instruction(
-                    "ldc.r4",
-                    Some(Operand::Immediate(Immediate::try_from(value)?)),
-                )?;
-            }
-
-            ConstValue::F64(_) => {
-                encoder.emit_instruction(
-                    "ldc.r8",
+                    opcode,
                     Some(Operand::Immediate(Immediate::try_from(value)?)),
                 )?;
             }
@@ -4587,8 +3622,9 @@ impl SsaCodeGenerator {
                     let token = Token::new(0x7000_0000 | idx);
                     encoder.emit_instruction("ldstr", Some(Operand::Token(token)))?;
                 } else {
-                    // String wasn't pre-interned - fall back to ldnull
-                    encoder.emit_instruction("ldnull", None)?;
+                    return Err(Error::CodegenFailed(format!(
+                        "decrypted string {s:?} was not interned before generation"
+                    )));
                 }
             }
 
@@ -4620,7 +3656,6 @@ impl SsaCodeGenerator {
             }
             // Uninhabited for this target: CIL has no symbol space.
             ConstValue::Symbol(symbol) => match *symbol {},
-            // Decrypted arrays: emit newarr + individual element stores.
             // Decrypted arrays: emit newarr + InitializeArray using FieldRVA data.
             // Produces the same compact pattern as the C# compiler:
             //   ldc.i4 <num_elements>
@@ -4639,22 +3674,23 @@ impl SsaCodeGenerator {
                     Some(Operand::Token(arr.element_type_ref.token())),
                 )?;
 
-                if let Some(info) = self.interned_arrays.get(&arr.data) {
-                    // Compact: dup + ldtoken + call InitializeArray
-                    // Stack: [array] → [array, array] → [array, array, handle] → [array]
-                    encoder.emit_instruction("dup", None)?;
-                    encoder.emit_instruction("ldtoken", Some(Operand::Token(info.field_token)))?;
+                let Some(info) = self.interned_arrays.get(&arr.data) else {
+                    return Err(Error::CodegenFailed(
+                        "decrypted array was not interned before generation".to_string(),
+                    ));
+                };
+                // Compact: dup + ldtoken + call InitializeArray
+                // Stack: [array] → [array, array] → [array, array, handle] → [array]
+                encoder.emit_instruction("dup", None)?;
+                encoder.emit_instruction("ldtoken", Some(Operand::Token(info.field_token)))?;
 
-                    // InitializeArray(Array, RuntimeFieldHandle) → void: pops 2, pushes 0
-                    encoder.emit_call(
-                        "call",
-                        Some(Operand::Token(info.initialize_array_token)),
-                        2,
-                        false,
-                    )?;
-                }
-                // If interning failed, array is left uninitialized (zeroed).
-                // This is still valid IL — the values will just be default(T).
+                // InitializeArray(Array, RuntimeFieldHandle) → void: pops 2, pushes 0
+                encoder.emit_call(
+                    "call",
+                    Some(Operand::Token(info.initialize_array_token)),
+                    2,
+                    false,
+                )?;
             }
 
             // SIMD vector constants come from the native SSA substrate and have
@@ -4668,252 +3704,40 @@ impl SsaCodeGenerator {
         Ok(())
     }
 
-    /// Emits a load instruction for an SSA variable (argument, local, or stack).
-    ///
-    /// This method implements dup optimization: if we're loading the same storage
-    /// location that was just loaded, we emit `dup` instead of another load.
-    /// This saves code size (dup is 1 byte vs 2-4 bytes for ldloc/ldarg).
-    fn load_var(
-        &mut self,
-        encoder: &mut InstructionEncoder,
-        ssa: &SsaFunction,
-        var: SsaVarId,
-    ) -> Result<()> {
-        // Check if the variable is on the stack (from optimization)
-        // Check if this is a deferred constant that should be generated inline
-        if let Some(value) = self.deferred_constants.remove(&var) {
-            // Generate the constant inline instead of loading from storage
-            self.generate_const(encoder, &value)?;
-            self.last_load = None;
-            return Ok(());
-        }
-
-        // Only use stack optimization if the variable is on TOP of the tracked stack.
-        // Variables anywhere else in stack_vars have been "buried" by subsequent values.
-        if let Some(last) = self.stack_vars.last() {
-            if *last == var {
-                // Value is on top of the stack - no load needed
-                self.stack_vars.pop();
-                self.last_load = None;
-                return Ok(());
-            }
-        }
-
-        // If we're about to push a new value and there are stack_vars values that
-        // will be buried, we need to save them first so they can be loaded later.
-        // This handles the case where a single-use value was left on the stack but
-        // other operands need to be loaded first.
-        while let Some(buried_var) = self.stack_vars.pop() {
-            // Get or force-allocate storage for the buried variable.
-            // We use force_allocate_storage here because the variable MUST be
-            // stored to a local - it's being buried and will need to be loaded later.
-            // This handles stack_locals that unexpectedly need real storage.
-            let storage = self.force_allocate_storage(ssa, buried_var)?;
-            match storage {
-                VarStorage::Local(idx) => {
-                    self.used_locals.insert(idx);
-                    emitter::emit_stloc(encoder, idx)?;
-                }
-                VarStorage::Arg(idx) => emitter::emit_starg(encoder, idx)?,
-                VarStorage::Stack => {
-                    // This should not happen with force_allocate_storage
-                    return Err(Error::Deobfuscation(format!(
-                        "load_var: buried variable {buried_var:?} still has Stack storage after force allocation - this indicates a bug"
-                    )));
-                }
-            }
-        }
-
-        // Check if this variable is defined by a Const but wasn't deferred.
-        // This handles constants that are used multiple times or defined in
-        // non-dominating blocks (e.g., constants defined in initialization
-        // paths that are used in loop back-edges).
-        if !self.var_storage.contains_key(&var) {
-            if let Some(SsaOp::Const { value, .. }) = ssa.get_definition(var) {
-                self.generate_const(encoder, value)?;
-                self.last_load = None;
-                return Ok(());
-            }
-        }
-
-        let storage = self.get_storage(var, ssa)?;
-
-        // Dup optimization: if we're loading the same location we just loaded,
-        // emit dup instead. This works because the previous value is still on
-        // the stack and we can duplicate it.
-        if self.last_load == Some(storage) {
-            encoder.emit_instruction("dup", None)?;
-            // Keep last_load the same - the duplicated value is conceptually
-            // the same as the original, so another dup would still be valid
-            return Ok(());
-        }
-
-        // Emit the actual load and track it
-        match storage {
-            VarStorage::Arg(idx) => {
-                emitter::emit_ldarg(encoder, idx)?;
-                self.last_load = Some(storage);
-            }
-            VarStorage::Local(idx) => {
-                self.used_locals.insert(idx);
-                emitter::emit_ldloc(encoder, idx)?;
-                self.last_load = Some(storage);
-            }
-            VarStorage::Stack => {
-                // This happens when a variable was identified as a stack_local
-                // (expected to be consumed immediately after definition), but
-                // we're trying to load it in a different context. The value
-                // should already be on the stack from the producer operation.
-                self.last_load = None;
-            }
-        }
-        Ok(())
-    }
-
-    /// Emits a store instruction for an SSA variable (argument or local).
-    ///
-    /// This also clears the `last_load` tracking since a store consumes the top of
-    /// the stack, invalidating any previous load state used for dup optimization.
-    fn store_var(
-        &mut self,
-        encoder: &mut InstructionEncoder,
-        ssa: &SsaFunction,
-        var: SsaVarId,
-    ) -> Result<()> {
-        // A store consumes the top of the stack, so clear last_load to prevent
-        // incorrect dup optimizations. Without this, sequences like:
-        //   load X, store Y, load X
-        // would incorrectly emit: ldloc.X, stloc.Y, dup
-        // when they should emit: ldloc.X, stloc.Y, ldloc.X
-        self.last_load = None;
-
-        // Use get_or_allocate_storage to ensure we have a valid slot.
-        // This handles the case where a variable doesn't have pre-allocated storage
-        // (e.g., a deferred constant that got buried and needs to be stored).
-        let storage = self.get_or_allocate_storage(ssa, var)?;
-
-        match storage {
-            VarStorage::Arg(idx) => emitter::emit_starg(encoder, idx),
-            VarStorage::Local(idx) => {
-                self.used_locals.insert(idx);
-                emitter::emit_stloc(encoder, idx)
-            }
-            VarStorage::Stack => {
-                // Should not happen - can't store to stack
-                Ok(())
-            }
-        }
-    }
-
-    /// Spills all values currently on the stack to local variables.
-    ///
-    /// This must be called before any control flow instruction (branch, jump, switch,
-    /// return, throw, leave) to ensure the stack is at a consistent depth at block
-    /// boundaries. All paths to a label must have the same stack depth.
-    ///
-    /// Values in `stack_vars` are stored to their allocated local slots. This ensures
-    /// they can be loaded again if needed in successor blocks.
-    fn spill_stack(&mut self, encoder: &mut InstructionEncoder, ssa: &SsaFunction) -> Result<()> {
-        // Store all tracked stack values to locals, in order (bottom to top)
-        // so the stores happen in the correct stack order.
-        while let Some(var) = self.stack_vars.pop() {
-            // Use force_allocate_storage instead of get_or_allocate_storage.
-            // This handles the case where a variable was identified as a stack_local
-            // (expected to be consumed before any spill) but actually needs to be
-            // spilled due to control flow (e.g., terminator before consumer).
-            let storage = self.force_allocate_storage(ssa, var)?;
-            match storage {
-                VarStorage::Local(idx) => {
-                    self.used_locals.insert(idx);
-                    emitter::emit_stloc(encoder, idx)?;
-                }
-                VarStorage::Arg(idx) => emitter::emit_starg(encoder, idx)?,
-                VarStorage::Stack => {
-                    // Should never happen with force_allocate_storage
-                    return Err(Error::Deobfuscation(format!(
-                        "spill_stack: variable {var:?} still has Stack storage after force allocation - this indicates a bug"
-                    )));
-                }
-            }
-        }
-        self.last_load = None;
-        Ok(())
-    }
-
     /// Allocates a temporary local slot, reusing from the pool if available.
     ///
-    /// This is used for phi copy temporaries and other short-lived values.
     /// When the temporary is no longer needed, call `release_temp_local` to
     /// return it to the pool for reuse.
-    fn allocate_temp_local(&mut self, var_type: &SsaType) -> u16 {
-        // Try to reuse a pooled slot of the same type
-        if let Some(slot) = self.temp_pool.try_allocate(var_type) {
-            return slot;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CodegenFailed`] for a type no local can be declared
+    /// with, or when the method already has 65536 locals.
+    fn allocate_temp_local(&mut self, var_type: &SsaType) -> Result<u16> {
+        if !is_slot_type(var_type) {
+            return Err(Error::CodegenFailed(format!(
+                "a temporary of type {var_type:?}, which no local can be declared with"
+            )));
         }
-
-        // No pooled slot available - allocate a fresh one
-        let slot = self.next_local;
-        self.next_local = self.next_local.saturating_add(1);
-        self.local_types.insert(slot, var_type.clone());
-        slot
+        if let Some(slot) = self.method.temp_pool.try_allocate(var_type) {
+            return Ok(slot);
+        }
+        let slot = u16::try_from(self.method.slot_types.len()).map_err(|_| {
+            Error::CodegenFailed("the method needs more than 65535 locals".to_string())
+        })?;
+        self.method.slot_types.push(var_type.clone());
+        Ok(slot)
     }
 
     /// Releases a temporary local slot back to the pool for reuse.
     fn release_temp_local(&mut self, slot: u16, var_type: &SsaType) {
-        self.temp_pool.release(slot, var_type.clone());
-    }
-
-    /// Checks if a successor block has phi nodes with operands from the current block.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if storage cannot be found for phi variables, indicating
-    /// a bug in SSA construction.
-    fn successor_has_phi_from(
-        &self,
-        ssa: &SsaFunction,
-        current_block: usize,
-        successor: usize,
-    ) -> Result<bool> {
-        let Some(succ_block) = ssa.block(successor) else {
-            return Ok(false);
-        };
-
-        for phi in succ_block.phi_nodes() {
-            if let Some(operand) = phi.operand_from(current_block) {
-                // Skip dead phi results (not used by any instructions).
-                // These are not pre-allocated during storage allocation.
-                let phi_result = phi.result();
-                let use_count = self
-                    .global_use_counts
-                    .get(&phi_result)
-                    .copied()
-                    .unwrap_or(0);
-                if use_count == 0 {
-                    continue;
-                }
-
-                // Check if phi store would actually do something.
-                // IMPORTANT: If the operand doesn't have actual storage (e.g., a constant
-                // defined in a non-dominating block), we need phi stores.
-                let operand_has_storage = self.var_storage.contains_key(&operand.value());
-                if !operand_has_storage {
-                    // Operand has no storage - we need to emit it (constant inline)
-                    return Ok(true);
-                }
-                let operand_storage = self.get_storage(operand.value(), ssa)?;
-                let result_storage = self.get_storage(phi_result, ssa)?;
-                if operand_storage != result_storage {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        self.method.temp_pool.release(slot, var_type.clone());
     }
 
     /// Label of a real block.
     fn block_label(&self, block_id: usize) -> String {
-        self.block_labels
+        self.method
+            .block_labels
             .get(&block_id)
             .cloned()
             .unwrap_or_else(|| format!("block_{block_id}"))
@@ -4926,7 +3750,7 @@ impl SsaCodeGenerator {
     /// edge blocks are entries, "is there code in between" is answered by looking at the
     /// layout rather than by each emitter re-deriving what the others will emit after it.
     fn edge_destination(&self, from: usize, to: usize) -> LayoutEntry {
-        if self.split_edge_labels.contains_key(&(from, to)) {
+        if self.method.split_edge_labels.contains_key(&(from, to)) {
             LayoutEntry::SplitEdge { from, to }
         } else {
             LayoutEntry::Block(to)
@@ -4936,7 +3760,8 @@ impl SsaCodeGenerator {
     /// Label a branch along the edge `from → to` must name: the edge's own block when it has
     /// one, otherwise the target block directly.
     fn edge_label(&self, from: usize, to: usize) -> String {
-        self.split_edge_labels
+        self.method
+            .split_edge_labels
             .get(&(from, to))
             .cloned()
             .unwrap_or_else(|| self.block_label(to))
@@ -4949,8 +3774,8 @@ impl SsaCodeGenerator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the edge has no registered label — which would mean the layout
-    /// and [`Self::edge_destination`] disagree — or if emission fails.
+    /// Returns an error if the edge has no registered label - which would mean the layout
+    /// and [`Self::edge_destination`] disagree - or if emission fails.
     fn generate_edge_block(
         &mut self,
         encoder: &mut InstructionEncoder,
@@ -4960,6 +3785,7 @@ impl SsaCodeGenerator {
         next_entry: Option<LayoutEntry>,
     ) -> Result<()> {
         let label = self
+            .method
             .split_edge_labels
             .get(&(from, to))
             .cloned()
@@ -4968,13 +3794,15 @@ impl SsaCodeGenerator {
             })?;
 
         encoder.define_label(&label)?;
+        self.method.last_load = None;
 
-        // An edge block is reached by a branch or by falling out of its source block, and in
-        // both cases the source has already spilled: the evaluation stack is empty here, so
-        // nothing the source left in `stack_vars` is still on it.
-        self.stack_vars.clear();
-
-        self.emit_phi_stores_for_successor(encoder, ssa, from, to)?;
+        let copies = self
+            .method
+            .storage
+            .as_ref()
+            .map(|storage| storage.copies_on(ssa, from, to))
+            .unwrap_or_default();
+        self.emit_copies(encoder, ssa, from, &copies)?;
 
         if next_entry != Some(LayoutEntry::Block(to)) {
             let target_label = self.block_label(to);
@@ -5123,265 +3951,652 @@ impl SsaCodeGenerator {
         Ok(())
     }
 
-    /// Emits phi stores for a successor block.
+    /// Emits copies that take effect together: every source is read before any
+    /// destination is written, with a temporary breaking each cycle.
     ///
-    /// This implements phi elimination by converting SSA phi nodes to explicit stores
-    /// at the end of predecessor blocks. The key challenge is handling "parallel copy"
-    /// semantics correctly - all phi operands must be read BEFORE any are written,
-    /// since phi nodes conceptually execute simultaneously.
+    /// A source with no place (a constant, or a value folded into the copy) is
+    /// produced in place and reads no slot the sequencing has to protect, apart
+    /// from the slots its own operands are read from.
     ///
-    /// For example, consider:
-    ///   PHI prev = phi(..., curr)    // prev gets old value of curr
-    ///   PHI curr = phi(..., new_val) // curr gets new value
+    /// # Arguments
     ///
-    /// Naive interleaved load/store would fail if curr is processed first:
-    ///   1. Load new_val, store to curr (overwrites old curr!)
-    ///   2. Load curr (now wrong!), store to prev
+    /// * `encoder` - The instruction encoder.
+    /// * `ssa` - The function being generated.
+    /// * `copies` - `(destination, source)` pairs; destinations must differ.
     ///
-    /// We solve this by:
-    /// 1. Building a dependency graph of the parallel copies
-    /// 2. Processing non-cyclic dependencies in topological order
-    /// 3. Breaking cycles with a temporary variable
-    fn emit_phi_stores_for_successor(
+    /// # Errors
+    ///
+    /// Returns an error if two copies name one destination, or if a load or a
+    /// temporary's type fails.
+    fn emit_parallel_copies(
         &mut self,
         encoder: &mut InstructionEncoder,
         ssa: &SsaFunction,
-        current_block_idx: usize,
-        successor_idx: usize,
+        copies: &[(Place, SsaVarId)],
     ) -> Result<()> {
-        // Get the successor block
-        let Some(successor) = ssa.block(successor_idx) else {
-            return Ok(());
-        };
-
-        // Collect phi copies: (operand_storage, result_storage, operand_var)
-        // We track operand_var to use load_var which handles constants correctly.
-        //
-        // Since Phase 2 pre-allocates all phi results to locals, we can directly
-        // build the copies list without a two-phase approach.
-        let mut copies: Vec<(VarStorage, VarStorage, SsaVarId)> = Vec::new();
-
-        for phi in successor.phi_nodes() {
-            if let Some(operand) = phi.operand_from(current_block_idx) {
-                let operand_value = operand.value();
-                let phi_result = phi.result();
-
-                // Skip dead phi results (not used by any instructions).
-                // These were also skipped during pre-allocation.
-                let use_count = self
-                    .global_use_counts
-                    .get(&phi_result)
-                    .copied()
-                    .unwrap_or(0);
-                if use_count == 0 {
-                    continue;
-                }
-
-                // Get storage for both operand and result.
-                // Phi results are pre-allocated to locals in allocate_storage().
-                // Operands may be in args, locals, or need to be loaded (constants).
-                let operand_storage = self
-                    .var_storage
-                    .get(&operand_value)
-                    .copied()
-                    .unwrap_or(VarStorage::Stack); // Will be loaded via load_var
-
-                let result_storage =
-                    self.var_storage.get(&phi_result).copied().ok_or_else(|| {
-                        Error::CodegenFailed("Phi result should be pre-allocated".into())
-                    })?;
-
-                // Skip if coalesced (both have same storage) AND operand is not on stack.
-                // If operand is on stack, we need to emit a store even for same storage.
-                let operand_on_stack = self.stack_vars.contains(&operand_value);
-                if operand_storage == result_storage && !operand_on_stack {
-                    continue;
-                }
-
-                // Update type info: use operand's type if more specific than phi's
-                if let VarStorage::Local(idx) = result_storage {
-                    if let Some(operand_var) = ssa.variable(operand_value) {
-                        let operand_type = operand_var.var_type();
-                        if !operand_type.is_unknown() && !matches!(operand_type, SsaType::I32) {
-                            self.local_types.insert(idx, operand_type.clone());
-                        }
-                    }
-                }
-
-                copies.push((operand_storage, result_storage, operand_value));
-            }
+        /// Where a sequenced copy writes.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Dest {
+            Place(Place),
+            Temp(usize),
+        }
+        /// What a sequenced copy reads.
+        #[derive(Debug, Clone, Copy)]
+        enum Src {
+            Var(SsaVarId),
+            Temp(usize),
         }
 
         if copies.is_empty() {
             return Ok(());
         }
+        for (i, (dest, _)) in copies.iter().enumerate() {
+            if copies
+                .iter()
+                .skip(i.saturating_add(1))
+                .any(|(other, _)| other == dest)
+            {
+                return Err(Error::CodegenFailed(format!(
+                    "two copies taking effect together both write {dest:?}"
+                )));
+            }
+        }
 
-        // Deduplicate copies with the same source and destination
-        let mut seen: HashSet<(VarStorage, VarStorage)> = HashSet::new();
-        copies.retain(|(src, dst, _)| seen.insert((*src, *dst)));
+        let mut sequencer = Vec::with_capacity(copies.len());
+        for &(dest, var) in copies {
+            let reads: Vec<Dest> = self
+                .places_read(ssa, var)
+                .into_iter()
+                .map(Dest::Place)
+                .collect();
+            sequencer.push((Dest::Place(dest), Src::Var(var), reads));
+        }
+        let mut temps_needed = 0usize;
+        let ordered = ParallelCopy::new(sequencer).sequence(
+            || {
+                let temp = Dest::Temp(temps_needed);
+                temps_needed = temps_needed.saturating_add(1);
+                temp
+            },
+            |temp| match temp {
+                Dest::Temp(index) => Src::Temp(index),
+                // `fresh` only ever hands out temporaries.
+                Dest::Place(_) => Src::Temp(usize::MAX),
+            },
+        );
 
-        // For correct parallel copy semantics, we must load ALL values before storing ANY.
-        // This ensures that reads see the original values, not values modified by other copies.
-        //
-        // However, we can't just load all values onto the stack because:
-        // 1. The stack depth could become large
-        // 2. We need to pair loads with the correct stores
-        //
-        // Solution: Use a simple approach that handles the common cases efficiently:
-        // - For non-interfering copies (no copy reads another's destination), do load-store pairs
-        // - For interfering copies, use topological order with cycle breaking via temporaries
-        //
-        // Detect if any copy reads a location that another copy writes
-        let has_interference = copies
-            .iter()
-            .any(|(src, _, _)| copies.iter().any(|(_, dst, _)| src == dst));
+        let mut temps: BTreeMap<usize, (u16, SsaType)> = BTreeMap::new();
+        for (dest, src) in ordered {
+            let temp_type = match src {
+                Src::Var(var) => {
+                    self.emit_value(encoder, ssa, var)?;
+                    matches!(dest, Dest::Temp(_))
+                        .then(|| infer_type(ssa, var))
+                        .transpose()?
+                }
+                Src::Temp(index) => {
+                    let (slot, var_type) = temps.remove(&index).ok_or_else(|| {
+                        Error::CodegenFailed(format!("parallel copy read unwritten temp {index}"))
+                    })?;
+                    emitter::emit_ldloc(encoder, slot)?;
+                    self.release_temp_local(slot, &var_type);
+                    None
+                }
+            };
+            match dest {
+                Dest::Place(place) => Self::store_place(encoder, place)?,
+                Dest::Temp(index) => {
+                    let var_type = temp_type.ok_or_else(|| {
+                        Error::CodegenFailed(format!("parallel copy temp {index} has no type"))
+                    })?;
+                    let slot = self.allocate_temp_local(&var_type)?;
+                    emitter::emit_stloc(encoder, slot)?;
+                    temps.insert(index, (slot, var_type));
+                }
+            }
+        }
+        Ok(())
+    }
 
-        if !has_interference {
-            // Simple case: no interference, emit load-store pairs directly
-            for (_, result_storage, operand_var) in &copies {
-                self.load_var(encoder, ssa, *operand_var)?;
-                match result_storage {
-                    VarStorage::Local(idx) => {
-                        self.used_locals.insert(*idx);
-                        emitter::emit_stloc(encoder, *idx)?;
-                    }
-                    VarStorage::Arg(idx) => emitter::emit_starg(encoder, *idx)?,
-                    VarStorage::Stack => {
-                        return Err(Error::Deobfuscation(format!(
-                            "emit_phi_stores_for_successor: phi result has Stack storage (operand={operand_var:?}) - this indicates a bug in phi pre-allocation"
-                        )));
+    /// The places producing `var` reads: its own place, or the places of the
+    /// values a folded tree producing it loads.
+    fn places_read(&self, ssa: &SsaFunction, var: SsaVarId) -> Vec<Place> {
+        let Some(storage) = self.method.storage.as_ref() else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let mut stack = vec![var];
+        let mut seen = BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            match storage.materialise(current) {
+                Some(Materialise::Folded) => {
+                    if let Some(op) = self
+                        .method
+                        .def_sites
+                        .get(&current)
+                        .and_then(|tag| Self::op_at(ssa, *tag).ok())
+                    {
+                        stack.extend(op.uses());
                     }
                 }
-                // Clear last_load after store to prevent incorrect dup optimization.
-                // Without this, a subsequent load from the same local would emit dup
-                // instead of ldloc, but the stack is now empty after the store.
-                self.last_load = None;
+                Some(Materialise::Constant) => {}
+                None => found.extend(storage.place(current)),
+            }
+        }
+        found
+    }
+
+    /// Emits the phi copies owed on every edge leaving `from`, before its
+    /// single-successor terminator or at the end of a block that falls
+    /// through.
+    fn emit_copies_from(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        from: usize,
+    ) -> Result<()> {
+        let Some(block) = ssa.block(from) else {
+            return Ok(());
+        };
+        let mut successors: Vec<usize> = Vec::new();
+        block.for_each_successor(|succ| successors.push(succ));
+        // A leave's copies include those of the finally it runs, and an
+        // `endfinally`'s those of every block it resumes: every block whose
+        // phis take an operand on an edge from here.
+        for &candidate in self
+            .method
+            .index
+            .phi_successors
+            .get(&from)
+            .into_iter()
+            .flatten()
+        {
+            if !successors.contains(&candidate) {
+                successors.push(candidate);
+            }
+        }
+        let mut copies = Vec::new();
+        if let Some(storage) = self.method.storage.as_ref() {
+            for successor in successors {
+                for copy in storage.copies_on(ssa, from, successor) {
+                    if !copies.contains(&copy) {
+                        copies.push(copy);
+                    }
+                }
+            }
+        }
+        self.emit_copies(encoder, ssa, from, &copies)
+    }
+
+    /// Emits `(phi result, operand)` copies for an edge leaving `from` as one
+    /// parallel copy. A staged result is written to its temporary.
+    fn emit_copies(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        from: usize,
+        copies: &[(SsaVarId, SsaVarId)],
+    ) -> Result<()> {
+        let Some(storage) = self.method.storage.as_ref() else {
+            return Ok(());
+        };
+        let mut moves: Vec<(Place, SsaVarId)> = Vec::with_capacity(copies.len());
+        for &(result, operand) in copies {
+            let dest = match storage.staged(result) {
+                Some(temp) => Place::Local(temp),
+                None => storage.place(result).ok_or_else(|| {
+                    Error::CodegenFailed(format!(
+                        "phi {result} copied on the edge from B{from} has no place"
+                    ))
+                })?,
+            };
+            // The address-taken slot a shadowed result is also written to.
+            if let Some(slot) = storage.also_store(result) {
+                if storage.staged(result).is_none()
+                    && !moves.iter().any(|(existing, _)| *existing == slot)
+                {
+                    moves.push((slot, operand));
+                }
+            }
+            // An operand already in the result's place needs no copy.
+            if storage.materialise(operand).is_none() && storage.place(operand) == Some(dest) {
+                continue;
+            }
+            if !moves.iter().any(|(existing, _)| *existing == dest) {
+                moves.push((dest, operand));
+            }
+        }
+        self.emit_parallel_copies(encoder, ssa, &moves)
+    }
+
+    /// Generates one block: its operations in SSA order.
+    ///
+    /// An operation's operands are loaded from their places or produced in
+    /// place; its result is stored to its place, left for the consumer it is
+    /// folded into, or dropped. A copy is a move between places, and nothing
+    /// when both are one. Phi copies go before a single-successor terminator,
+    /// at the end of a block that falls through, or in edge blocks.
+    fn generate_block(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        block_idx: usize,
+        next_entry: Option<LayoutEntry>,
+    ) -> Result<()> {
+        let Some(block) = ssa.block(block_idx) else {
+            return Ok(());
+        };
+
+        // Exception handler entry blocks are only entered via CLR exception
+        // dispatch, never by falling through from the previous block in the
+        // layout, so the label resets the stack depth to the handler's.
+        if self.method.index.dispatch_entries.contains(&block_idx) {
+            encoder.mark_unreachable();
+        }
+        let label = self.block_label(block_idx);
+        encoder.define_label(&label)?;
+        self.method.last_load = None;
+        let emitted_before = encoder.instruction_count();
+
+        let instructions = block.instructions();
+        let mut settled: BTreeSet<usize> = BTreeSet::new();
+
+        // A catch or filter is entered with the exception object on the stack.
+        // It is settled before anything else, since the first instruction
+        // emitted would bury it: stored to its variable's place, or dropped.
+        if self.method.index.object_entries.contains(&block_idx) {
+            self.settle_exception_object(encoder, ssa, block_idx, &mut settled)?;
+        }
+
+        // A staged phi result moves from its temporary into its place where
+        // the phi stands.
+        let staged = self
+            .method
+            .storage
+            .as_ref()
+            .map(|storage| storage.staged_in(ssa, block_idx))
+            .unwrap_or_default();
+        for (result, temp) in staged {
+            emitter::emit_ldloc(encoder, temp)?;
+            self.store_value(encoder, result)?;
+        }
+
+        let mut terminated = false;
+        for (instr_idx, instr) in instructions.iter().enumerate() {
+            if settled.contains(&instr_idx) {
+                continue;
+            }
+            let op = instr.op();
+            let tag = OpTag {
+                block: block_idx,
+                instr: instr_idx,
+            };
+            if matches!(op, SsaOp::Nop | SsaOp::Phi { .. }) {
+                continue;
+            }
+            if let SsaOp::Copy { dest, src } = op {
+                let converts = converting_copy(ssa, op);
+                self.emit_copy_row(encoder, ssa, (*dest, *src), converts, tag)?;
+                continue;
+            }
+            let materialised = op
+                .dest()
+                .is_some_and(|dest| self.materialise_of(dest).is_some());
+            if materialised {
+                continue;
+            }
+            if Self::is_terminator(op) {
+                terminated = true;
+            }
+            self.emit_row(encoder, ssa, tag, next_entry)?;
+        }
+
+        // A block with no terminator has exactly one successor, so its copies
+        // go at its end.
+        if !terminated {
+            self.emit_copies_from(encoder, ssa, block_idx)?;
+        }
+
+        // A block that emitted nothing starts where the next one does. When
+        // that one opens a region this block is not in, the block's offset
+        // would be the region's first instruction, and a `leave` to it would
+        // stay inside the region instead of leaving it, skipping the finally
+        // it has to run. A `nop` gives the block an offset of its own.
+        if encoder.instruction_count() == emitted_before {
+            if let Some(LayoutEntry::Block(next)) = next_entry {
+                let opens_other_region = ssa.exception_handlers().iter().any(|handler| {
+                    [
+                        handler.protected_range,
+                        handler.handler_range,
+                        handler.filter_range,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|range| range.start() == next && !range.contains(block_idx))
+                });
+                if opens_other_region {
+                    encoder.emit_instruction("nop", None)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores or drops the exception object a catch or filter is entered with.
+    fn settle_exception_object(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        block_idx: usize,
+        settled: &mut BTreeSet<usize>,
+    ) -> Result<()> {
+        let Some(block) = ssa.block(block_idx) else {
+            return Ok(());
+        };
+        let instructions = block.instructions();
+        if let Some((index, dest, kind)) =
+            instructions
+                .iter()
+                .enumerate()
+                .find_map(|(index, instr)| match instr.op() {
+                    SsaOp::RuntimeValue { dest, kind } => Some((index, *dest, *kind)),
+                    _ => None,
+                })
+        {
+            if kind != RuntimeValueKind::ExceptionObject {
+                return Err(Error::CodegenFailed(format!(
+                    "{dest} = runtime {kind:?} in block {block_idx}, which the runtime does not \
+                     enter holding an exception object"
+                )));
+            }
+            settled.insert(index);
+            if self
+                .method
+                .storage
+                .as_ref()
+                .is_some_and(|storage| storage.discarded(dest))
+            {
+                // Dropped on arrival; the `Pop`s that discard it are this.
+                settled.extend(
+                    instructions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, instr)| {
+                            matches!(instr.op(), SsaOp::Pop { value } if *value == dest)
+                                .then_some(index)
+                        }),
+                );
+                encoder.emit_instruction("pop", None)?;
+                return Ok(());
+            }
+            match self
+                .method
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.place(dest))
+            {
+                Some(_) => self.store_value(encoder, dest)?,
+                None => encoder.emit_instruction("pop", None)?,
             }
             return Ok(());
         }
-
-        // Complex case: there's interference. Use topological ordering with cycle breaking.
-        // Build dependency graph: copy A depends on copy B if A's source = B's destination
-        // (i.e., A needs to read before B writes)
-        let mut ordered_copies: Vec<(VarStorage, VarStorage, SsaVarId)> = Vec::new();
-        let mut pending: Vec<Option<(VarStorage, VarStorage, SsaVarId)>> =
-            copies.into_iter().map(Some).collect();
-        let mut cycle_copies: Vec<(VarStorage, VarStorage, SsaVarId)> = Vec::new();
-
-        // Iterate until all copies are scheduled
-        loop {
-            let mut made_progress = false;
-
-            // Find copies whose destination is not read by any other pending copy
-            for i in 0..pending.len() {
-                let Some((_, dst, _)) = pending.get(i).and_then(|p| p.as_ref()) else {
-                    continue;
-                };
-                let dst = *dst;
-
-                // Check if this destination is read by any other pending copy
-                let dst_is_read = pending.iter().enumerate().any(|(j, opt)| {
-                    if i == j {
-                        return false;
-                    }
-                    if let Some((src, _, _)) = opt {
-                        *src == dst
-                    } else {
-                        false
-                    }
-                });
-
-                if !dst_is_read {
-                    // Safe to schedule this copy
-                    if let Some(copy) = pending.get_mut(i).and_then(Option::take) {
-                        ordered_copies.push(copy);
-                        made_progress = true;
-                    }
+        // IR built without `RuntimeValue` names the object by a value nothing
+        // defines, consumed by a `Pop`.
+        let discarding_pop = instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, instr)| match instr.op() {
+                SsaOp::Pop { value }
+                    if ssa.get_definition(*value).is_none()
+                        && ssa.find_phi_defining(*value).is_none() =>
+                {
+                    Some(index)
                 }
-            }
-
-            // Count remaining copies
-            let remaining: usize = pending.iter().filter(|o| o.is_some()).count();
-
-            if remaining == 0 {
-                break;
-            }
-
-            if !made_progress {
-                // Cycle detected - move all remaining copies to cycle_copies
-                for opt in &mut pending {
-                    if let Some(copy) = opt.take() {
-                        cycle_copies.push(copy);
-                    }
-                }
-                break;
-            }
+                _ => None,
+            });
+        let start = encoder.instruction_count();
+        encoder.emit_instruction("pop", None)?;
+        if let Some(index) = discarding_pop {
+            settled.insert(index);
+            self.record_group(
+                start,
+                encoder.instruction_count(),
+                OpTag {
+                    block: block_idx,
+                    instr: index,
+                },
+            );
         }
-
-        // Emit non-cyclic copies in order (these are safe as load-store pairs)
-        for (_, result_storage, operand_var) in &ordered_copies {
-            self.load_var(encoder, ssa, *operand_var)?;
-            match result_storage {
-                VarStorage::Local(idx) => {
-                    self.used_locals.insert(*idx);
-                    emitter::emit_stloc(encoder, *idx)?;
-                }
-                VarStorage::Arg(idx) => emitter::emit_starg(encoder, *idx)?,
-                VarStorage::Stack => {
-                    return Err(Error::Deobfuscation(format!(
-                        "emit_phi_stores_for_successor: phi result has Stack storage (operand={operand_var:?}) - this indicates a bug in phi pre-allocation"
-                    )));
-                }
-            }
-            // Clear last_load after store to prevent incorrect dup optimization
-            self.last_load = None;
-        }
-
-        // Handle cyclic copies using temporaries
-        // For a cycle like: A -> B -> C -> A
-        // We need to: save A to temp, do B->A, C->B, temp->C
-        // Use the temp pool for slot reuse.
-        if !cycle_copies.is_empty() {
-            // Load all cycle sources first, storing to temporaries
-            let mut temps: Vec<(u16, SsaType, VarStorage)> = Vec::new();
-            for (_, result_storage, operand_var) in &cycle_copies {
-                self.load_var(encoder, ssa, *operand_var)?;
-
-                // Determine the type for this temporary
-                let var_type = Self::infer_variable_type(ssa, *operand_var)?;
-
-                // Allocate from pool or fresh
-                let temp_idx = self.allocate_temp_local(&var_type);
-
-                self.used_locals.insert(temp_idx);
-                emitter::emit_stloc(encoder, temp_idx)?;
-                self.last_load = None; // Clear after store
-                temps.push((temp_idx, var_type, *result_storage));
-            }
-
-            // Now store from temporaries to destinations, then release temps
-            for (temp_idx, var_type, result_storage) in temps {
-                self.used_locals.insert(temp_idx);
-                emitter::emit_ldloc(encoder, temp_idx)?;
-                match result_storage {
-                    VarStorage::Local(idx) => {
-                        self.used_locals.insert(idx);
-                        emitter::emit_stloc(encoder, idx)?;
-                    }
-                    VarStorage::Arg(idx) => emitter::emit_starg(encoder, idx)?,
-                    VarStorage::Stack => {
-                        return Err(Error::Deobfuscation(
-                            "emit_phi_stores_for_successor: phi result has Stack storage in cycle handling - this indicates a bug in phi pre-allocation".to_string()
-                        ));
-                    }
-                }
-                self.last_load = None; // Clear after store
-
-                // Release temp back to pool for reuse
-                self.release_temp_local(temp_idx, &var_type);
-            }
-        }
-
         Ok(())
+    }
+
+    /// Emits the operation at `tag` as a row: operands, then the operation,
+    /// then its result stored to its place or dropped.
+    fn emit_row(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        tag: OpTag,
+        next_entry: Option<LayoutEntry>,
+    ) -> Result<()> {
+        let op = Self::op_at(ssa, tag)?;
+        let dest = op.dest();
+        // A pure value nothing reads and nothing stores computes nothing -
+        // unless an operand is produced in place, since a call or a load folded
+        // into it still has to run.
+        if op.is_pure() && !op.may_throw() && !Self::is_terminator(op) {
+            if let Some(dest) = dest {
+                let read =
+                    self.method.storage.as_ref().is_some_and(|storage| {
+                        storage.uses(dest) > 0 || storage.place(dest).is_some()
+                    });
+                let carries = Self::get_operands_in_stack_order(op)
+                    .into_iter()
+                    .any(|operand| self.materialise_of(operand) == Some(Materialise::Folded));
+                if !read && !carries {
+                    return Ok(());
+                }
+            }
+        }
+        for operand in Self::get_operands_in_stack_order(op) {
+            self.emit_value(encoder, ssa, operand)?;
+        }
+        self.generate_op_core(encoder, ssa, tag, next_entry)?;
+        if Self::is_terminator(op) {
+            return Ok(());
+        }
+        if op.defs().count() > 1 {
+            return Err(Error::CodegenFailed(format!(
+                "{op} defines more than one value"
+            )));
+        }
+        if let Some(dest) = dest {
+            match self
+                .method
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.place(dest))
+            {
+                Some(_) => self.store_value(encoder, dest)?,
+                None => encoder.emit_instruction("pop", None)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits a copy that keeps its row: the source into the destination's
+    /// place, or nothing when the two share one or nothing reads the copy.
+    ///
+    /// A copy that `converts` (see [`converting_copy`]) re-extends the source into the
+    /// destination's stack form on the way, as the copy's own run of instructions, and is
+    /// made even when the two share a place.
+    fn emit_copy_row(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        (dest, src): (SsaVarId, SsaVarId),
+        converts: Option<(u32, bool)>,
+        tag: OpTag,
+    ) -> Result<()> {
+        let Some(storage) = self.method.storage.as_ref() else {
+            return Ok(());
+        };
+        if storage.materialise(dest).is_some() {
+            return Ok(());
+        }
+        let Some(place) = storage.place(dest) else {
+            // Nothing reads the copy; what its source computes in place still
+            // has to run.
+            if storage.materialise(src) == Some(Materialise::Folded) {
+                self.emit_value(encoder, ssa, src)?;
+                encoder.emit_instruction("pop", None)?;
+            }
+            return Ok(());
+        };
+        if converts.is_none()
+            && storage.materialise(src).is_none()
+            && storage.place(src) == Some(place)
+            && storage.also_store(dest).is_none()
+        {
+            return Ok(());
+        }
+        self.emit_value(encoder, ssa, src)?;
+        if let Some((width, unsigned)) = converts {
+            let start = encoder.instruction_count();
+            Self::emit_subword_normalize(encoder, width, !unsigned)?;
+            self.record_group(start, encoder.instruction_count(), tag);
+        }
+        self.store_value(encoder, dest)
+    }
+
+    /// Stores the top of the stack as `var`: to its place, and to the
+    /// address-taken slot its place shadows, when it has one.
+    fn store_value(&mut self, encoder: &mut InstructionEncoder, var: SsaVarId) -> Result<()> {
+        let place = self.place_of(var)?;
+        if let Some(slot) = self
+            .method
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.also_store(var))
+        {
+            encoder.emit_instruction("dup", None)?;
+            Self::store_place(encoder, slot)?;
+        }
+        Self::store_place(encoder, place)
+    }
+
+    /// Pushes `var`'s value: loaded from its place, or produced in place when
+    /// it has none.
+    fn emit_value(
+        &mut self,
+        encoder: &mut InstructionEncoder,
+        ssa: &SsaFunction,
+        var: SsaVarId,
+    ) -> Result<()> {
+        match self.materialise_of(var) {
+            Some(Materialise::Constant) => {
+                let value = match ssa.get_definition(var) {
+                    Some(SsaOp::Const { value, .. }) => value.clone(),
+                    _ => {
+                        return Err(Error::CodegenFailed(format!(
+                            "{var} is materialised as a constant but defined otherwise"
+                        )))
+                    }
+                };
+                self.emit_constant_of(encoder, var, &value)
+            }
+            Some(Materialise::Folded) => {
+                let tag = *self.method.def_sites.get(&var).ok_or_else(|| {
+                    Error::CodegenFailed(format!("folded {var} has no definition"))
+                })?;
+                let op = Self::op_at(ssa, tag)?;
+                if let SsaOp::Copy { src, .. } = op {
+                    let src = *src;
+                    let converts = converting_copy(ssa, op);
+                    self.emit_value(encoder, ssa, src)?;
+                    if let Some((width, unsigned)) = converts {
+                        let start = encoder.instruction_count();
+                        Self::emit_subword_normalize(encoder, width, !unsigned)?;
+                        self.record_group(start, encoder.instruction_count(), tag);
+                    }
+                    return Ok(());
+                }
+                for operand in Self::get_operands_in_stack_order(op) {
+                    self.emit_value(encoder, ssa, operand)?;
+                }
+                self.generate_op_core(encoder, ssa, tag, None)
+            }
+            None => {
+                let place = self.place_of(var)?;
+                self.load_place(encoder, place)
+            }
+        }
+    }
+
+    /// How `var` is produced when it has no place.
+    fn materialise_of(&self, var: SsaVarId) -> Option<Materialise> {
+        self.method
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.materialise(var))
+    }
+
+    /// The place `var` lives in.
+    fn place_of(&self, var: SsaVarId) -> Result<Place> {
+        self.method
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.place(var))
+            .ok_or_else(|| {
+                Error::CodegenFailed(format!(
+                    "{var} is read but has no place and is not produced in place"
+                ))
+            })
+    }
+
+    /// Loads a place, as a `dup` when the instruction just emitted loaded it.
+    ///
+    /// Only within a run of straight-line code: every label resets the
+    /// record, since control arriving at a label did not run the load before
+    /// it.
+    fn load_place(&mut self, encoder: &mut InstructionEncoder, place: Place) -> Result<()> {
+        if self.method.last_load == Some((place, encoder.instruction_count())) {
+            encoder.emit_instruction("dup", None)?;
+        } else {
+            match place {
+                Place::Arg(idx) => emitter::emit_ldarg(encoder, idx)?,
+                Place::Local(idx) => emitter::emit_ldloc(encoder, idx)?,
+            }
+        }
+        self.method.last_load = Some((place, encoder.instruction_count()));
+        Ok(())
+    }
+
+    /// Stores the top of the stack to a place.
+    fn store_place(encoder: &mut InstructionEncoder, place: Place) -> Result<()> {
+        match place {
+            Place::Arg(idx) => emitter::emit_starg(encoder, idx),
+            Place::Local(idx) => emitter::emit_stloc(encoder, idx),
+        }
+    }
+
+    /// Emits the prefix instruction `prefix`.
+    fn generate_prefix(encoder: &mut InstructionEncoder, prefix: &CilPrefix) -> Result<()> {
+        match prefix {
+            CilPrefix::Unaligned(bytes) => encoder.emit_instruction(
+                "unaligned.",
+                Some(Operand::Immediate(Immediate::UInt8(bytes.get()))),
+            ),
+            CilPrefix::Volatile => encoder.emit_instruction("volatile.", None),
+            CilPrefix::Readonly => encoder.emit_instruction("readonly.", None),
+            CilPrefix::Constrained(constraint_type) => encoder.emit_instruction(
+                "constrained.",
+                Some(Operand::Token(constraint_type.token())),
+            ),
+            CilPrefix::Tail => encoder.emit_instruction("tail.", None),
+        }
     }
 }

@@ -22,7 +22,7 @@
 //!
 //! - [`MethodSpecRaw`] - Raw table data with unresolved indexes for initial parsing
 //! - [`MethodSpec`] - Processed data with resolved references and parsed signatures
-//! - [`MethodSpecLoader`] - Handles conversion between raw and processed representations
+//! - [`MethodSpecLoader`](crate::metadata::loader::tables::MethodSpecLoader) - Handles conversion between raw and processed representations
 //! - [`MethodSpecMap`] - Thread-safe storage mapping tokens to processed entries
 //! - [`MethodSpecList`] - Thread-safe collection of all method spec entries
 //!
@@ -61,19 +61,17 @@ use std::sync::Arc;
 use crossbeam_skiplist::SkipMap;
 
 use crate::{
-    metadata::{token::Token, typesystem::CilTypeReference},
+    metadata::{streams::SharedStr, token::Token, typesystem::CilTypeReference},
     utils::LazyList,
 };
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 
@@ -115,7 +113,7 @@ pub type MethodSpecRc = Arc<MethodSpec>;
 ///
 /// The underlying method name as a `String` if the spec exists and its inner method
 /// reference can be resolved, `None` otherwise.
-pub fn method_spec_name_by_token(map: &MethodSpecMap, token: &Token) -> Option<String> {
+pub fn method_spec_name_by_token(map: &MethodSpecMap, token: &Token) -> Option<SharedStr> {
     let spec = map.get(token)?;
     match &spec.value().method {
         CilTypeReference::MethodDef(method_ref) => method_ref.name(),

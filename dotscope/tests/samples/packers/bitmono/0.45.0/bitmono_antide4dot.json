@@ -1,0 +1,6 @@
+{
+  "Protections": [
+    { "Name": "AntiDe4dot", "Enabled": true },
+    { "Name": "AntiILdasm", "Enabled": true }
+  ]
+}

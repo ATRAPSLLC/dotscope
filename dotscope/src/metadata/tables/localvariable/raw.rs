@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        streams::Strings,
+        streams::{SharedStr, Strings},
         tables::{LocalVariable, LocalVariableRc, TableInfoRef, TableRow},
         token::Token,
     },
@@ -80,10 +80,10 @@ impl LocalVariableRaw {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// # use dotscope::metadata::tables::localvariable::LocalVariableRaw;
+    /// ```no_run
+    /// # use dotscope::metadata::tables::LocalVariableRaw;
     /// # use dotscope::metadata::token::Token;
-    /// # fn example() -> dotscope::Result<()> {
+    /// # fn example(strings: &dotscope::metadata::streams::Strings) -> dotscope::Result<()> {
     /// let variable_raw = LocalVariableRaw {
     ///     rid: 1,
     ///     token: Token::new(0x33000001),
@@ -96,12 +96,13 @@ impl LocalVariableRaw {
     /// let variable = variable_raw.to_owned(strings)?;
     /// # Ok(())
     /// # }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_owned(&self, strings: &Strings) -> Result<LocalVariableRc> {
         let name = if self.name == 0 {
-            String::new()
+            SharedStr::default()
         } else {
-            strings.get(self.name as usize)?.to_string()
+            strings.get_shared(self.name as usize)?
         };
 
         let variable = LocalVariable {

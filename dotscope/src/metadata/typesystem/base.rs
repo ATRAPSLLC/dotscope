@@ -92,14 +92,16 @@ use crate::{
     metadata::{
         method::MethodRef,
         signatures::{SignatureMethod, TypeSignature},
+        streams::SharedStr,
         tables::{
             AssemblyRc, AssemblyRefRc, DeclSecurityRc, EventRc, ExportedTypeRc, FieldRc, FileRc,
             GenericParamConstraintRc, GenericParamRc, InterfaceImplRc, MemberRefRc, MethodSpecList,
             MethodSpecRc, ModuleRc, ModuleRefRc, ParamRc, PropertyRc, StandAloneSigRc,
         },
-        typesystem::{CilPrimitive, CilPrimitiveKind, CilType, CilTypeRc},
+        typesystem::{CilPrimitive, CilPrimitiveKind, CilType, CilTypeRc, FullName},
     },
     prelude::{GenericParamList, Token},
+    utils::RowList,
 };
 
 /// A vector that holds [`CilTypeRef`] instances (weak references).
@@ -331,19 +333,19 @@ impl CilTypeRef {
         self.upgrade().map(|t| t.token)
     }
 
-    /// Gets a clone of the name, or [`None`] if dropped.
+    /// Gets the name, shared with the type, or [`None`] if dropped.
     ///
     /// See the [Convenience Accessors](#convenience-accessors) section above for performance notes.
     #[must_use]
-    pub fn name(&self) -> Option<String> {
+    pub fn name(&self) -> Option<SharedStr> {
         self.upgrade().map(|t| t.name.clone())
     }
 
-    /// Gets a clone of the namespace, or [`None`] if dropped.
+    /// Gets the namespace, shared with the type, or [`None`] if dropped.
     ///
     /// See the [Convenience Accessors](#convenience-accessors) section above for performance notes.
     #[must_use]
-    pub fn namespace(&self) -> Option<String> {
+    pub fn namespace(&self) -> Option<SharedStr> {
         self.upgrade().map(|t| t.namespace.clone())
     }
 
@@ -351,15 +353,15 @@ impl CilTypeRef {
     ///
     /// See the [Convenience Accessors](#convenience-accessors) section above for performance notes.
     #[must_use]
-    pub fn fullname(&self) -> Option<String> {
-        self.upgrade().map(|t| t.fullname().to_string())
+    pub fn fullname(&self) -> Option<FullName> {
+        self.upgrade().map(|t| t.fullname())
     }
 
     /// Gets a clone of the nested types collection, or [`None`] if dropped.
     ///
     /// See the [Convenience Accessors](#convenience-accessors) section above for performance notes.
     #[must_use]
-    pub fn nested_types(&self) -> Option<CilTypeRefList> {
+    pub fn nested_types(&self) -> Option<RowList<CilTypeRef>> {
         self.upgrade().map(|t| t.nested_types.clone())
     }
 
@@ -472,9 +474,10 @@ impl From<CilTypeRc> for CilTypeRef {
 ///
 /// ## Example
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::typesystem::CilTypeRefListIter;
+/// ```no_run
+/// use dotscope::metadata::typesystem::{CilTypeRefList, CilTypeRefListIter};
 ///
+/// # fn example(nested_types: &CilTypeRefList, types: &CilTypeRefList) {
 /// // Iterate over nested types
 /// for type_ref in CilTypeRefListIter::new(&nested_types) {
 ///     if let Some(resolved) = type_ref.upgrade() {
@@ -486,6 +489,7 @@ impl From<CilTypeRc> for CilTypeRef {
 /// let valid_types: Vec<_> = CilTypeRefListIter::new(&types)
 ///     .filter_map(|r| r.upgrade())
 ///     .collect();
+/// # }
 /// ```
 pub struct CilTypeRefListIter<'a> {
     list: &'a CilTypeRefList,
@@ -568,8 +572,9 @@ pub struct ArrayDimensions {
     /// The lower bound of this dimension (lowest index that can be used to access an element).
     ///
     /// Most .NET arrays use 0-based indexing, but the runtime supports arbitrary lower bounds.
-    /// `None` typically means the lower bound is 0.
-    pub lower_bound: Option<u32>,
+    /// `None` typically means the lower bound is 0. Signed: a bound may be
+    /// negative (ECMA-335 II.23.2.13).
+    pub lower_bound: Option<i32>,
 }
 
 /// Represents a unified reference to various metadata table entries in the .NET runtime.
@@ -752,7 +757,7 @@ impl CilTypeReference {
     /// that field directly. Returns `None` for variants without a meaningful
     /// name or if the weak reference has been dropped.
     #[must_use]
-    pub fn name(&self) -> Option<String> {
+    pub fn name(&self) -> Option<SharedStr> {
         match self {
             Self::TypeRef(r) | Self::TypeDef(r) | Self::TypeSpec(r) => r.name(),
             Self::Field(r) => Some(r.name.clone()),
@@ -778,10 +783,12 @@ impl CilTypeReference {
     /// For type variants (`TypeRef`, `TypeDef`, `TypeSpec`), delegates to
     /// [`CilTypeRef::fullname()`]. For other variants, falls back to [`name()`](Self::name).
     #[must_use]
-    pub fn fullname(&self) -> Option<String> {
+    pub fn fullname(&self) -> Option<FullName> {
         match self {
             Self::TypeRef(r) | Self::TypeDef(r) | Self::TypeSpec(r) => r.fullname(),
-            _ => self.name(),
+            _ => self
+                .name()
+                .map(|name| FullName::top_level(SharedStr::default(), name)),
         }
     }
 }
@@ -1104,7 +1111,7 @@ pub enum CilFlavor {
         ///
         /// Boxed deliberately, matching [`TypeSignature::FnPtr`]. An inline `SignatureMethod`
         /// is ~144 bytes and, as the widest variant, sets the size of `CilFlavor` and
-        /// everything built on it — `SymbolicValue`, and through it every `EmValue` moved on
+        /// everything built on it - `SymbolicValue`, and through it every `EmValue` moved on
         /// the interpreter's evaluation stack, local slot, argument slot and array element.
         /// Function pointers are rare in real assemblies, so the indirection is off the hot
         /// path while the size saving applies to every value. See the `EmValue` size
@@ -1600,7 +1607,7 @@ impl CilFlavor {
             | CilFlavor::Pointer
             | CilFlavor::ByRef
             | CilFlavor::GenericInstance => Some(ptr_size.bytes()),
-            // ValueType, FnPtr, GenericParameter, Pinned, Unknown — context-dependent
+            // ValueType, FnPtr, GenericParameter, Pinned, Unknown - context-dependent
             _ => None,
         }
     }
@@ -1753,10 +1760,9 @@ impl From<&TypeSignature> for CilFlavor {
                 }
             }
 
-            // Custom modifiers - these don't carry the base type, just modifier metadata
-            // They appear in signature parsing context where the actual type comes separately
-            TypeSignature::ModifiedRequired(_) | TypeSignature::ModifiedOptional(_) => {
-                CilFlavor::Unknown
+            // A modifier does not change the flavor of the type it modifies
+            TypeSignature::ModifiedRequired(_, base) | TypeSignature::ModifiedOptional(_, base) => {
+                CilFlavor::from(base.as_ref())
             }
 
             // Fallback/unknown: Unknown, Internal CLI types, Modifier marker,

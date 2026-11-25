@@ -3,7 +3,7 @@
 //! This module provides the `ProjectContext` which manages barrier synchronization
 //! during parallel assembly loading to handle circular dependencies safely.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use boxcar::Vec as BoxcarVec;
 
@@ -30,7 +30,7 @@ use crate::{
 ///
 /// `ProjectContext` is designed for safe concurrent access across multiple loading threads.
 /// It uses atomic counters and fail-fast barriers for coordination.
-pub(crate) struct ProjectContext {
+pub struct ProjectContext {
     /// Total number of assemblies being loaded in parallel
     total_count: usize,
 
@@ -49,6 +49,12 @@ pub(crate) struct ProjectContext {
     /// Lock-free storage for assembly identities and their TypeRegistries
     /// Used for cross-registry linking after stage 1
     registries: BoxcarVec<(AssemblyIdentity, Arc<TypeRegistry>)>,
+
+    /// The assembly whose failure broke the barriers, set once by the first [`Self::abort`].
+    ///
+    /// Every other assembly that fails afterwards may have failed only because the barriers
+    /// broke under it, so this one is the only failure of the round known to be its own.
+    first_failure: OnceLock<AssemblyIdentity>,
 }
 
 impl ProjectContext {
@@ -70,6 +76,7 @@ impl ProjectContext {
             stage3_barrier: Arc::new(FailFastBarrier::new(total_count)?),
             stage4_barrier: Arc::new(FailFastBarrier::new(total_count)?),
             registries: BoxcarVec::new(),
+            first_failure: OnceLock::new(),
         })
     }
 
@@ -163,19 +170,31 @@ impl ProjectContext {
         self.total_count
     }
 
-    /// Break all barriers to prevent deadlocks when any assembly fails.
+    /// Abort the round because `identity` failed: break every barrier so no other loading
+    /// thread waits for it.
     ///
-    /// This method should be called when any assembly loading thread encounters
-    /// a failure that should abort the entire loading process. It breaks all
-    /// synchronization barriers to prevent other threads from waiting indefinitely.
+    /// Each loading thread calls this when its load ends in an error or a panic. The first
+    /// caller is recorded as the round's root failure ([`Self::first_failure`]): the peers
+    /// that fail after it may have failed only because the barriers broke under them.
     ///
     /// # Arguments
-    /// * `error_message` - Description of the failure that triggered the barrier break
-    pub fn break_all_barriers(&self, error_message: &str) {
+    /// * `identity` - The assembly whose load failed
+    /// * `error_message` - Description of the failure, reported to the waiting threads
+    pub fn abort(&self, identity: &AssemblyIdentity, error_message: &str) {
+        // Only the first failure is recorded; a later one finds the slot taken.
+        let _ = self.first_failure.set(identity.clone());
         self.stage1_barrier.break_barrier(error_message);
         self.stage2_barrier.break_barrier(error_message);
         self.stage3_barrier.break_barrier(error_message);
         self.stage4_barrier.break_barrier(error_message);
+    }
+
+    /// The assembly whose failure first broke the barriers, if any did.
+    ///
+    /// Its error is its own; any other assembly of the round that failed may only have
+    /// been aborted by the broken barriers.
+    pub fn first_failure(&self) -> Option<&AssemblyIdentity> {
+        self.first_failure.get()
     }
 
     /// Register a TypeRegistry and wait for stage 1 completion.
@@ -200,8 +219,8 @@ impl ProjectContext {
     /// Link all registries for cross-assembly type resolution.
     ///
     /// This method connects all registered TypeRegistries to enable
-    /// cross-assembly type resolution and dependency tracking. Each registry
-    /// gets linked to all other registries in the project context.
+    /// cross-assembly type resolution. Each registry gets linked to all other
+    /// registries in the project context.
     ///
     /// # Arguments
     /// * `current_registry` - The current TypeRegistry to link with others
@@ -210,7 +229,7 @@ impl ProjectContext {
         for (_, (other_identity, other_registry)) in &self.registries {
             // Don't link a registry to itself
             if !Arc::ptr_eq(current_registry, other_registry) {
-                current_registry.registry_link(other_identity.clone(), other_registry.clone());
+                current_registry.registry_link(other_identity.clone(), other_registry);
             }
         }
     }

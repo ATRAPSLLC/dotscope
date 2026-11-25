@@ -22,27 +22,7 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! use std::sync::Arc;
-//! use dotscope::utils::VisitedMap;
-//!
-//! // Create a visited map for tracking 1024 bytes
-//! let visited = Arc::new(VisitedMap::new(1024));
-//!
-//! // Mark byte 100 as visited
-//! visited.set(100, true);
-//!
-//! // Check if byte 100 has been visited
-//! assert!(visited.get(100));
-//!
-//! // Mark a range of bytes as visited
-//! visited.set_range(200, true, 10);
-//!
-//! // Find unvisited regions
-//! let unvisited_count = visited.get_range(0);
-//! println!("Found {} consecutive unvisited bytes", unvisited_count);
-//! # Ok::<(), dotscope::Error>(())
-//! ```
+//! The `examples::module_example` test in this module runs this example.
 //!
 //! # Thread Safety
 //!
@@ -53,8 +33,8 @@
 //! # Integration
 //!
 //! This module integrates with:
-//! - [`crate::assembly::decoder`] - Uses visited maps to coordinate parallel disassembly
-//! - [`crate::assembly::block`] - Tracks which instruction regions have been processed
+//! - [`crate::assembly::decode_blocks`] - Uses visited maps to coordinate parallel disassembly
+//! - [`crate::assembly::BasicBlock`] - Tracks which instruction regions have been processed
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -72,23 +52,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use std::sync::Arc;
-/// use dotscope::utils::VisitedMap;
-///
-/// // Create a visited map for tracking 1024 bytes
-/// let visited = Arc::new(VisitedMap::new(1024));
-///
-/// // Mark byte 100 as visited
-/// visited.set(100, true);
-///
-/// // Check if byte 100 has been visited
-/// assert!(visited.get(100));
-///
-/// // Check if byte 101 has been visited
-/// assert!(!visited.get(101));
-/// # Ok::<(), dotscope::Error>(())
-/// ```
+/// The `examples::visited_map_example` test in this module runs this example.
 #[derive(Debug)]
 pub struct VisitedMap {
     /// Atomic bitfield data storing visit status
@@ -112,15 +76,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// // Create a map for tracking 8192 bytes
-    /// let visited_map = VisitedMap::new(8192);
-    /// assert_eq!(visited_map.len(), 8192);
-    /// assert!(!visited_map.get(0)); // Initially unvisited
-    /// # Ok::<(), dotscope::Error>(())
-    /// ```
+    /// The `examples::new_example` test in this module runs this example.
     pub fn new(elements: usize) -> VisitedMap {
         let num_bitfields = elements.div_ceil(BITFIELD_SIZE);
 
@@ -139,12 +95,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(1024);
-    /// assert_eq!(visited_map.len(), 1024);
-    /// ```
+    /// The `examples::len_example` test in this module runs this example.
     pub fn len(&self) -> usize {
         self.elements
     }
@@ -156,16 +107,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let empty_map = VisitedMap::new(0);
-    /// assert!(empty_map.is_empty());
-    ///
-    /// let normal_map = VisitedMap::new(100);
-    /// assert!(!normal_map.is_empty());
-    /// # Ok::<(), dotscope::Error>(())
-    /// ```
+    /// The `examples::is_empty_example` test in this module runs this example.
     pub fn is_empty(&self) -> bool {
         self.elements == 0
     }
@@ -185,22 +127,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(100);
-    ///
-    /// // Initially unvisited
-    /// assert!(!visited_map.get(50));
-    ///
-    /// // Mark as visited
-    /// visited_map.set(50, true);
-    /// assert!(visited_map.get(50));
-    ///
-    /// // Out of bounds returns false
-    /// assert!(!visited_map.get(200));
-    /// # Ok::<(), dotscope::Error>(())
-    /// ```
+    /// The `examples::get_example` test in this module runs this example.
     pub fn get(&self, element: usize) -> bool {
         if element > self.elements {
             return false;
@@ -231,23 +158,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(100);
-    ///
-    /// // Mark some bytes as visited
-    /// visited_map.set(10, true);
-    /// visited_map.set(11, true);
-    ///
-    /// // Check unvisited range from start
-    /// let unvisited_count = visited_map.get_range(0);
-    /// assert_eq!(unvisited_count, 10); // Bytes 0-9 are unvisited
-    ///
-    /// // Check from a visited position
-    /// assert_eq!(visited_map.get_range(10), 0); // Position 10 is visited
-    /// # Ok::<(), dotscope::Error>(())
-    /// ```
+    /// The `examples::get_range_example` test in this module runs this example.
     pub fn get_range(&self, element: usize) -> usize {
         if element > self.elements {
             return 0;
@@ -292,23 +203,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(100);
-    ///
-    /// // Initially, first unvisited byte is at index 0
-    /// assert_eq!(visited_map.get_first(false), 0);
-    ///
-    /// // Mark first few bytes as visited
-    /// visited_map.set_range(0, true, 5);
-    ///
-    /// // Now first unvisited byte is at index 5
-    /// assert_eq!(visited_map.get_first(false), 5);
-    ///
-    /// // First visited byte is at index 0
-    /// assert_eq!(visited_map.get_first(true), 0);
-    /// ```
+    /// The `examples::get_first_example` test in this module runs this example.
     pub fn get_first(&self, visited: bool) -> usize {
         let mut counter = 0;
 
@@ -357,19 +252,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(100);
-    ///
-    /// // Mark byte 42 as visited
-    /// visited_map.set(42, true);
-    /// assert!(visited_map.get(42));
-    ///
-    /// // Mark it as unvisited again
-    /// visited_map.set(42, false);
-    /// assert!(!visited_map.get(42));
-    /// ```
+    /// The `examples::set_example` test in this module runs this example.
     pub fn set(&self, element: usize, visited: bool) {
         self.set_range(element, visited, 1);
     }
@@ -392,23 +275,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(100);
-    ///
-    /// // Mark bytes 10-14 as visited (5 bytes total)
-    /// visited_map.set_range(10, true, 5);
-    ///
-    /// // Verify the range was set
-    /// for i in 10..15 {
-    ///     assert!(visited_map.get(i));
-    /// }
-    ///
-    /// // Bytes outside the range remain unvisited
-    /// assert!(!visited_map.get(9));
-    /// assert!(!visited_map.get(15));
-    /// ```
+    /// The `examples::set_range_example` test in this module runs this example.
     pub fn set_range(&self, element: usize, state: bool, len: usize) {
         let Some(end) = element.checked_add(len) else {
             debug_assert!(false, "Invalid element!");
@@ -466,19 +333,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(100);
-    ///
-    /// // Mark a byte as visited
-    /// visited_map.set(25, true);
-    /// assert!(visited_map.get(25));
-    ///
-    /// // Clear it back to unvisited
-    /// visited_map.clear(25);
-    /// assert!(!visited_map.get(25));
-    /// ```
+    /// The `examples::clear_example` test in this module runs this example.
     pub fn clear(&self, element: usize) {
         self.set(element, false);
     }
@@ -491,22 +346,7 @@ impl VisitedMap {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::VisitedMap;
-    ///
-    /// let visited_map = VisitedMap::new(100);
-    ///
-    /// // Mark some bytes as visited
-    /// visited_map.set_range(0, true, 50);
-    ///
-    /// // Clear everything
-    /// visited_map.clear_all();
-    ///
-    /// // Verify all bytes are now unvisited
-    /// for i in 0..100 {
-    ///     assert!(!visited_map.get(i));
-    /// }
-    /// ```
+    /// The `examples::clear_all_example` test in this module runs this example.
     pub fn clear_all(&self) {
         self.set_range(0, false, self.elements);
     }
@@ -740,5 +580,189 @@ mod tests {
         for i in (start + len)..(bitfield_size * 3) {
             assert!(!map.get(i), "Byte {} after range should NOT be visited", i);
         }
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn module_example() -> Result<()> {
+        // Create a visited map for tracking 1024 bytes
+        let visited = Arc::new(VisitedMap::new(1024));
+
+        // Mark byte 100 as visited
+        visited.set(100, true);
+
+        // Check if byte 100 has been visited
+        assert!(visited.get(100));
+
+        // Mark a range of bytes as visited
+        visited.set_range(200, true, 10);
+
+        // Find unvisited regions
+        let unvisited_count = visited.get_range(0);
+        println!("Found {} consecutive unvisited bytes", unvisited_count);
+        Ok(())
+    }
+
+    #[test]
+    fn visited_map_example() -> Result<()> {
+        // Create a visited map for tracking 1024 bytes
+        let visited = Arc::new(VisitedMap::new(1024));
+
+        // Mark byte 100 as visited
+        visited.set(100, true);
+
+        // Check if byte 100 has been visited
+        assert!(visited.get(100));
+
+        // Check if byte 101 has been visited
+        assert!(!visited.get(101));
+        Ok(())
+    }
+
+    #[test]
+    fn new_example() -> Result<()> {
+        // Create a map for tracking 8192 bytes
+        let visited_map = VisitedMap::new(8192);
+        assert_eq!(visited_map.len(), 8192);
+        assert!(!visited_map.get(0)); // Initially unvisited
+        Ok(())
+    }
+
+    #[test]
+    fn len_example() -> Result<()> {
+        let visited_map = VisitedMap::new(1024);
+        assert_eq!(visited_map.len(), 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn is_empty_example() -> Result<()> {
+        let empty_map = VisitedMap::new(0);
+        assert!(empty_map.is_empty());
+
+        let normal_map = VisitedMap::new(100);
+        assert!(!normal_map.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn get_example() -> Result<()> {
+        let visited_map = VisitedMap::new(100);
+
+        // Initially unvisited
+        assert!(!visited_map.get(50));
+
+        // Mark as visited
+        visited_map.set(50, true);
+        assert!(visited_map.get(50));
+
+        // Out of bounds returns false
+        assert!(!visited_map.get(200));
+        Ok(())
+    }
+
+    #[test]
+    fn get_range_example() -> Result<()> {
+        let visited_map = VisitedMap::new(100);
+
+        // Mark some bytes as visited
+        visited_map.set(10, true);
+        visited_map.set(11, true);
+
+        // Check unvisited range from start
+        let unvisited_count = visited_map.get_range(0);
+        assert_eq!(unvisited_count, 10); // Bytes 0-9 are unvisited
+
+        // Check from a visited position
+        assert_eq!(visited_map.get_range(10), 0); // Position 10 is visited
+        Ok(())
+    }
+
+    #[test]
+    fn get_first_example() -> Result<()> {
+        let visited_map = VisitedMap::new(100);
+
+        // Initially, first unvisited byte is at index 0
+        assert_eq!(visited_map.get_first(false), 0);
+
+        // Mark first few bytes as visited
+        visited_map.set_range(0, true, 5);
+
+        // Now first unvisited byte is at index 5
+        assert_eq!(visited_map.get_first(false), 5);
+
+        // First visited byte is at index 0
+        assert_eq!(visited_map.get_first(true), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn set_example() -> Result<()> {
+        let visited_map = VisitedMap::new(100);
+
+        // Mark byte 42 as visited
+        visited_map.set(42, true);
+        assert!(visited_map.get(42));
+
+        // Mark it as unvisited again
+        visited_map.set(42, false);
+        assert!(!visited_map.get(42));
+        Ok(())
+    }
+
+    #[test]
+    fn set_range_example() -> Result<()> {
+        let visited_map = VisitedMap::new(100);
+
+        // Mark bytes 10-14 as visited (5 bytes total)
+        visited_map.set_range(10, true, 5);
+
+        // Verify the range was set
+        for i in 10..15 {
+            assert!(visited_map.get(i));
+        }
+
+        // Bytes outside the range remain unvisited
+        assert!(!visited_map.get(9));
+        assert!(!visited_map.get(15));
+        Ok(())
+    }
+
+    #[test]
+    fn clear_example() -> Result<()> {
+        let visited_map = VisitedMap::new(100);
+
+        // Mark a byte as visited
+        visited_map.set(25, true);
+        assert!(visited_map.get(25));
+
+        // Clear it back to unvisited
+        visited_map.clear(25);
+        assert!(!visited_map.get(25));
+        Ok(())
+    }
+
+    #[test]
+    fn clear_all_example() -> Result<()> {
+        let visited_map = VisitedMap::new(100);
+
+        // Mark some bytes as visited
+        visited_map.set_range(0, true, 50);
+
+        // Clear everything
+        visited_map.clear_all();
+
+        // Verify all bytes are now unvisited
+        for i in 0..100 {
+            assert!(!visited_map.get(i));
+        }
+        Ok(())
     }
 }

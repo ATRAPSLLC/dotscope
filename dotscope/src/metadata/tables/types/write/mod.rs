@@ -16,10 +16,10 @@
 //! During PE generation, each row goes through a multi-stage pipeline before
 //! being written to the output stream:
 //!
-//! 1. **Placeholder resolution** — heap offsets are resolved from [`crate::cilassembly::ChangeRefRc`] values
-//! 2. **RID remapping** — row references are adjusted for deletions via [`crate::cilassembly::writer::RidRemapper`]
-//! 3. **Row serialization** — [`RowWritable::row_write()`] encodes the row into ECMA-335 binary format
-//! 4. **RVA fixups** — method body and field RVA values are patched to final addresses
+//! 1. **Placeholder resolution** - heap offsets are resolved from [`crate::cilassembly::ChangeRefRc`] values
+//! 2. **RID remapping** - row references are adjusted for deletions via [`crate::cilassembly::writer::remapper::RidRemapper`]
+//! 3. **Row serialization** - [`RowWritable::row_write()`] encodes the row into ECMA-335 binary format
+//! 4. **RVA fixups** - method body and field RVA values are patched to final addresses
 //!
 //! The streaming generator in [`crate::cilassembly::writer`] orchestrates this pipeline,
 //! handling the tables stream header, dynamic `TableInfo` recalculation, and three

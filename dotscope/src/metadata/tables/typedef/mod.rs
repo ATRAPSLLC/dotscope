@@ -14,7 +14,7 @@
 //! # Key Components
 //!
 //! - [`crate::metadata::tables::typedef::TypeDefRaw`] - Raw table entry representation
-//! - [`crate::metadata::tables::typedef::loader::TypeDefLoader`] - Table loading functionality  
+//! - [`crate::metadata::loader::tables::TypeDefLoader`] - Table loading functionality  
 //! - [`crate::metadata::tables::typedef::TypeAttributes`] - Type attribute flag constants
 //!
 //! # Table Structure
@@ -72,13 +72,11 @@
 //! **Table ID**: `0x02`
 
 mod builder;
-mod loader;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use raw::*;
 
 metadata_flags! {

@@ -461,6 +461,7 @@ impl InterfaceBuilder {
                 stdcall: false,
                 thiscall: false,
                 fastcall: false,
+                unmanaged: false,
                 param_count_generic: 0,
                 param_count: u32::try_from(method_def.parameters.len())
                     .map_err(|_| malformed_error!("Method parameter count exceeds u32 range"))?,
@@ -503,6 +504,7 @@ impl InterfaceBuilder {
                     stdcall: false,
                     thiscall: false,
                     fastcall: false,
+                    unmanaged: false,
                     param_count_generic: 0,
                     param_count: 0,
                     return_type: SignatureParameter {
@@ -544,6 +546,7 @@ impl InterfaceBuilder {
                     stdcall: false,
                     thiscall: false,
                     fastcall: false,
+                    unmanaged: false,
                     param_count_generic: 0,
                     param_count: 1,
                     return_type: SignatureParameter {
@@ -618,16 +621,16 @@ impl Default for InterfaceBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::{cilassemblyview::CilAssemblyView, signatures::TypeSignature, tables::TableId},
+        testkit::fixture,
     };
 
     fn get_test_assembly() -> Result<CilAssembly> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path)?;
         Ok(CilAssembly::new(view))
     }

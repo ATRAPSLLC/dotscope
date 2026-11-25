@@ -30,7 +30,6 @@ use crate::{
         token::Token,
         typesystem::TypeRegistry,
     },
-    utils::LazyList,
     Result,
 };
 
@@ -142,7 +141,10 @@ impl GenericParamConstraintRaw {
 
         match generic_params.get(&Token::new(self.owner | 0x2A00_0000)) {
             Some(owner) => {
-                owner.value().constraints.push(constraint.into());
+                owner
+                    .value()
+                    .constraints
+                    .push_row(self.token, constraint.into());
                 Ok(())
             }
             None => Err(malformed_error!(
@@ -213,7 +215,7 @@ impl GenericParamConstraintRaw {
                     ))
                 }
             },
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         }))
     }
 }

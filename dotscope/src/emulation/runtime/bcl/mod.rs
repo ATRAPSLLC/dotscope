@@ -45,14 +45,7 @@
 //! Register all BCL hooks with a [`HookManager`] to enable method interception during
 //! emulation:
 //!
-//! ```rust,ignore
-//! use dotscope::emulation::runtime::{HookManager, bcl};
-//!
-//! let manager = HookManager::new();
-//! bcl::register(&manager);
-//!
-//! // The manager can then be used with an emulation controller
-//! ```
+//! The `examples::register_example` test in this module runs this example.
 //!
 //! # Deobfuscation Support
 //!
@@ -98,23 +91,7 @@ use crate::{emulation::runtime::hook::HookManager, Result};
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use dotscope::emulation::runtime::{HookManager, bcl};
-///
-/// let manager = HookManager::new();
-/// bcl::register(&manager)?;
-///
-/// // Manager now contains hooks for:
-/// // - System.Array, System.Buffer, System.String, System.Math
-/// // - System.Convert, System.Enum, System.Nullable<T>
-/// // - System.Collections.Generic.Dictionary, List, Stack, Queue, HashSet
-/// // - System.IO.MemoryStream, BinaryReader, FileStream
-/// // - System.Reflection.Type, MethodBase, FieldInfo, Module, Assembly
-/// // - System.Security.Cryptography.MD5, SHA*, AES, DES, RSA
-/// // - System.Text.Encoding, StringBuilder
-/// // - System.Runtime.InteropServices.Marshal, GCHandle
-/// // - And more...
-/// ```
+/// The `examples::register_example` test in this module runs this example.
 ///
 /// [`HookManager`]: crate::emulation::runtime::HookManager
 pub fn register(manager: &HookManager) -> Result<()> {
@@ -136,7 +113,7 @@ mod tests {
     use crate::{
         emulation::{memory::DictionaryKey, EmValue},
         metadata::{token::Token, typesystem::CilFlavor},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     /// List → add elements → verify via get, then verify count.
@@ -391,5 +368,30 @@ mod tests {
             Some(EmValue::I32(2))
         );
         assert_eq!(thread.heap().dictionary_count(dict).unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::{emulation::HookManager, Result};
+
+    #[test]
+    fn register_example() -> Result<()> {
+        let manager = HookManager::new();
+        register(&manager)?;
+        assert!(!manager.is_empty());
+
+        // Manager now contains hooks for:
+        // - System.Array, System.Buffer, System.String, System.Math
+        // - System.Convert, System.Enum, System.Nullable<T>
+        // - System.Collections.Generic.Dictionary, List, Stack, Queue, HashSet
+        // - System.IO.MemoryStream, BinaryReader, FileStream
+        // - System.Reflection.Type, MethodBase, FieldInfo, Module, Assembly
+        // - System.Security.Cryptography.MD5, SHA*, AES, DES, RSA
+        // - System.Text.Encoding, StringBuilder
+        // - System.Runtime.InteropServices.Marshal, GCHandle
+        // - And more...
+        Ok(())
     }
 }

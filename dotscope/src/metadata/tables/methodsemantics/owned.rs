@@ -109,10 +109,12 @@ impl MethodSemantics {
                     .fn_getter
                     .set(self.method.clone().into())
                     .map_err(|_| malformed_error!("Property getter already set".to_string())),
-                MethodSemanticsAttributes::OTHER => property
-                    .fn_other
-                    .set(self.method.clone().into())
-                    .map_err(|_| malformed_error!("Property other already set".to_string())),
+                MethodSemanticsAttributes::OTHER => {
+                    property
+                        .fn_other
+                        .push_row(self.token, self.method.clone().into());
+                    Ok(())
+                }
                 _ => Err(malformed_error!("Invalid property semantics".to_string())),
             },
             CilTypeReference::Event(event) => match self.semantics {
@@ -128,10 +130,12 @@ impl MethodSemantics {
                     .fn_on_raise
                     .set(self.method.clone().into())
                     .map_err(|_| malformed_error!("Event raise method already set".to_string())),
-                MethodSemanticsAttributes::OTHER => event
-                    .fn_on_other
-                    .set(self.method.clone().into())
-                    .map_err(|_| malformed_error!("Event other method already set".to_string())),
+                MethodSemanticsAttributes::OTHER => {
+                    event
+                        .fn_on_other
+                        .push_row(self.token, self.method.clone().into());
+                    Ok(())
+                }
                 _ => Err(malformed_error!("Invalid event semantics".to_string())),
             },
             _ => Err(malformed_error!("Invalid association".to_string())),

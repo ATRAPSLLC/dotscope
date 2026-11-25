@@ -340,7 +340,7 @@ macro_rules! raw_validators {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```text
 /// use crate::owned_validators;
 ///
 /// let validators = owned_validators![
@@ -365,14 +365,14 @@ macro_rules! owned_validators {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use rayon::ThreadPoolBuilder;
 
     use super::*;
-    use crate::metadata::{
-        cilassemblyview::CilAssemblyView,
-        validation::{config::ValidationConfig, context::factory, scanner::ReferenceScanner},
+    use crate::{
+        metadata::{
+            cilassemblyview::CilAssemblyView,
+            validation::{config::ValidationConfig, context::factory, scanner::ReferenceScanner},
+        },
+        testkit::fixture,
     };
 
     struct TestRawValidator {
@@ -415,23 +415,21 @@ mod tests {
 
     #[test]
     fn test_raw_validator_trait() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let scanner = ReferenceScanner::from_view(&view).unwrap();
-            let config = ValidationConfig::minimal();
-            let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
-            let context = factory::raw_loading_context(&view, &scanner, &config, &thread_pool);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).unwrap();
+        let config = ValidationConfig::minimal();
+        let context = factory::raw_loading_context(&view, &scanner, &config);
 
-            let validator = TestRawValidator {
-                name: "TestValidator",
-                priority: 150,
-            };
+        let validator = TestRawValidator {
+            name: "TestValidator",
+            priority: 150,
+        };
 
-            assert_eq!(validator.name(), "TestValidator");
-            assert_eq!(validator.priority(), 150);
-            assert!(validator.should_run(&context));
-            assert!(validator.validate_raw(&context).is_ok());
-        }
+        assert_eq!(validator.name(), "TestValidator");
+        assert_eq!(validator.priority(), 150);
+        assert!(validator.should_run(&context));
+        assert!(validator.validate_raw(&context).is_ok());
     }
 
     #[test]

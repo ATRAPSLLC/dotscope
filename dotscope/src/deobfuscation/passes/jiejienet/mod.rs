@@ -18,8 +18,8 @@ mod arrays;
 mod resources;
 mod typeofs;
 
-pub(crate) use self::resources::ResourceTarget;
 pub use self::{
-    arrays::ArrayInitRestorationPass, resources::ResourceRestorationPass,
+    arrays::ArrayInitRestorationPass,
+    resources::{ResourceRestorationPass, ResourceTarget},
     typeofs::TypeOfRestorationPass,
 };

@@ -50,8 +50,9 @@
 //!
 //! ## Basic Value Reading
 //!
-//! ```rust,ignore
-//! use dotscope::utils::{read_le, read_be};
+//! ```no_run
+//! use dotscope::io::read_le;
+//! use dotscope::io::read_be;
 //!
 //! // Little-endian reading (most common for PE files)
 //! let data = [0x01, 0x00, 0x00, 0x00]; // u32 value: 1
@@ -67,8 +68,9 @@
 //!
 //! ## Basic Value Writing
 //!
-//! ```rust,ignore
-//! use dotscope::utils::{write_le, write_be};
+//! ```no_run
+//! use dotscope::io::write_le;
+//! use dotscope::io::write_be;
 //!
 //! // Little-endian writing (most common for PE files)
 //! let mut data = [0u8; 4];
@@ -84,8 +86,8 @@
 //!
 //! ## Sequential Reading with Offset Tracking
 //!
-//! ```rust,ignore
-//! use dotscope::utils::read_le_at;
+//! ```no_run
+//! use dotscope::io::read_le_at;
 //!
 //! let data = [0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00];
 //! let mut offset = 0;
@@ -104,8 +106,8 @@
 //!
 //! ## Sequential Writing with Offset Tracking
 //!
-//! ```rust,ignore
-//! use dotscope::utils::write_le_at;
+//! ```no_run
+//! use dotscope::io::write_le_at;
 //!
 //! let mut data = [0u8; 8];
 //! let mut offset = 0;
@@ -122,8 +124,9 @@
 //!
 //! ## Dynamic Size Reading/Writing
 //!
-//! ```rust,ignore
-//! use dotscope::utils::{read_le_at_dyn, write_le_at_dyn};
+//! ```no_run
+//! use dotscope::io::read_le_at_dyn;
+//! use dotscope::io::write_le_at_dyn;
 //!
 //! let mut data = [0u8; 6];
 //! let mut offset = 0;
@@ -186,8 +189,8 @@ fn io_oob() -> Error {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::CilIO;
+/// ```no_run
+/// use dotscope::io::CilIO;
 ///
 /// // The trait is used internally by the reading functions
 /// let bytes = [0x01, 0x00, 0x00, 0x00];
@@ -489,8 +492,8 @@ impl CilIO for isize {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_le;
+/// ```no_run
+/// use dotscope::io::read_le;
 ///
 /// let data = [0x01, 0x00, 0x00, 0x00]; // Little-endian u32: 1
 /// let value: u32 = read_le(&data)?;
@@ -522,8 +525,8 @@ pub fn read_le<T: CilIO>(data: &[u8]) -> Result<T> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_le_at;
+/// ```no_run
+/// use dotscope::io::read_le_at;
 ///
 /// let data = [0x01, 0x00, 0x02, 0x00]; // Two u16 values: 1, 2
 /// let mut offset = 0;
@@ -573,8 +576,8 @@ pub fn read_le_at<T: CilIO>(data: &[u8], offset: &mut usize) -> Result<T> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_le_at_dyn;
+/// ```no_run
+/// use dotscope::io::read_le_at_dyn;
 ///
 /// let data = [0x01, 0x00, 0x02, 0x00, 0x00, 0x00];
 /// let mut offset = 0;
@@ -621,8 +624,8 @@ pub fn read_le_at_dyn(data: &[u8], offset: &mut usize, is_large: bool) -> Result
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_be;
+/// ```no_run
+/// use dotscope::io::read_be;
 ///
 /// let data = [0x00, 0x00, 0x00, 0x01]; // Big-endian u32: 1
 /// let value: u32 = read_be(&data)?;
@@ -655,8 +658,8 @@ pub fn read_be<T: CilIO>(data: &[u8]) -> Result<T> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_be_at;
+/// ```no_run
+/// use dotscope::io::read_be_at;
 ///
 /// let data = [0x00, 0x01, 0x00, 0x02]; // Two big-endian u16 values: 1, 2
 /// let mut offset = 0;
@@ -707,8 +710,8 @@ pub fn read_be_at<T: CilIO>(data: &[u8], offset: &mut usize) -> Result<T> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_be_at_dyn;
+/// ```no_run
+/// use dotscope::io::read_be_at_dyn;
 ///
 /// let data = [0x00, 0x01, 0x00, 0x00, 0x00, 0x02];
 /// let mut offset = 0;
@@ -755,8 +758,8 @@ pub fn read_be_at_dyn(data: &[u8], offset: &mut usize, is_large: bool) -> Result
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::write_le;
+/// ```no_run
+/// use dotscope::io::write_le;
 ///
 /// let mut data = [0u8; 4];
 /// let value: u32 = 1;
@@ -790,8 +793,8 @@ pub fn write_le<T: CilIO>(data: &mut [u8], value: T) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::write_le_at;
+/// ```no_run
+/// use dotscope::io::write_le_at;
 ///
 /// let mut data = [0u8; 4];
 /// let mut offset = 0;
@@ -832,22 +835,28 @@ pub fn write_le_at<T: CilIO>(data: &mut [u8], offset: &mut usize, value: T) -> R
 ///
 /// * `data` - The mutable byte buffer to write to
 /// * `offset` - Mutable reference to the offset position (will be advanced after writing)
-/// * `value` - The u32 value to write (may be truncated to u16)
-/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, truncates to u16 and writes 2 bytes
+/// * `value` - The u32 value to write
+/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, writes 2 bytes as u16
 ///
 /// # Returns
 ///
 /// Returns `Ok(())` on success or [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] if there are insufficient bytes.
 ///
+/// # Errors
+///
+/// When there are too few bytes, and when `is_large` is `false` and `value` does not fit two
+/// bytes: an index too wide for its column is refused rather than cut to its low bytes, which
+/// would point at another row or heap entry.
+///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::write_le_at_dyn;
+/// ```no_run
+/// use dotscope::io::write_le_at_dyn;
 ///
 /// let mut data = [0u8; 6];
 /// let mut offset = 0;
 ///
-/// // Write 2 bytes (truncated from u32)
+/// // Write 2 bytes
 /// write_le_at_dyn(&mut data, &mut offset, 1, false)?;
 /// assert_eq!(offset, 2);
 ///
@@ -871,8 +880,9 @@ pub fn write_le_at_dyn(
     if is_large {
         write_le_at::<u32>(data, offset, value)?;
     } else {
-        #[allow(clippy::cast_possible_truncation)]
-        write_le_at::<u16>(data, offset, value as u16)?;
+        let narrow = u16::try_from(value)
+            .map_err(|_| malformed_error!("{value:#x} does not fit a two-byte index column"))?;
+        write_le_at::<u16>(data, offset, narrow)?;
     }
 
     Ok(())
@@ -895,8 +905,8 @@ pub fn write_le_at_dyn(
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::write_be;
+/// ```no_run
+/// use dotscope::io::write_be;
 ///
 /// let mut data = [0u8; 4];
 /// let value: u32 = 1;
@@ -931,8 +941,8 @@ pub fn write_be<T: CilIO>(data: &mut [u8], value: T) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::write_be_at;
+/// ```no_run
+/// use dotscope::io::write_be_at;
 ///
 /// let mut data = [0u8; 4];
 /// let mut offset = 0;
@@ -974,22 +984,28 @@ pub fn write_be_at<T: CilIO>(data: &mut [u8], offset: &mut usize, value: T) -> R
 ///
 /// * `data` - The mutable byte buffer to write to
 /// * `offset` - Mutable reference to the offset position (will be advanced after writing)
-/// * `value` - The u32 value to write (may be truncated to u16)
-/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, truncates to u16 and writes 2 bytes
+/// * `value` - The u32 value to write
+/// * `is_large` - If `true`, writes 4 bytes as u32; if `false`, writes 2 bytes as u16
 ///
 /// # Returns
 ///
 /// Returns `Ok(())` on success or [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] if there are insufficient bytes.
 ///
+/// # Errors
+///
+/// When there are too few bytes, and when `is_large` is `false` and `value` does not fit two
+/// bytes: an index too wide for its column is refused rather than cut to its low bytes, which
+/// would point at another row or heap entry.
+///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::write_be_at_dyn;
+/// ```no_run
+/// use dotscope::io::write_be_at_dyn;
 ///
 /// let mut data = [0u8; 6];
 /// let mut offset = 0;
 ///
-/// // Write 2 bytes (truncated from u32)
+/// // Write 2 bytes
 /// write_be_at_dyn(&mut data, &mut offset, 1, false)?;
 /// assert_eq!(offset, 2);
 ///
@@ -1013,8 +1029,9 @@ pub fn write_be_at_dyn(
     if is_large {
         write_be_at::<u32>(data, offset, value)?;
     } else {
-        #[allow(clippy::cast_possible_truncation)]
-        write_be_at::<u16>(data, offset, value as u16)?;
+        let narrow = u16::try_from(value)
+            .map_err(|_| malformed_error!("{value:#x} does not fit a two-byte index column"))?;
+        write_be_at::<u16>(data, offset, narrow)?;
     }
 
     Ok(())
@@ -1024,11 +1041,7 @@ pub fn write_be_at_dyn(
 ///
 /// These methods provide the counterpart to the read methods, enabling binary
 /// data serialization using the same formats and encodings.
-/// Write a compressed unsigned integer using ECMA-335 format.
-///
-/// Encodes an unsigned integer using .NET's compressed integer format.
-/// This format uses variable-length encoding to minimize space usage
-/// for small values while supporting the full 32-bit range.
+/// Write a compressed unsigned integer using ECMA-335 format (II.23.2).
 ///
 /// # Encoding Format
 ///
@@ -1038,70 +1051,107 @@ pub fn write_be_at_dyn(
 ///
 /// # Arguments
 ///
-/// * `value` - The unsigned integer to encode
+/// * `value` - The unsigned integer to encode, at most `0x1FFF_FFFF`
 /// * `buffer` - The output buffer to write encoded bytes to
+///
+/// # Errors
+///
+/// When `value` exceeds `0x1FFF_FFFF`, which the format cannot state; nothing is written.
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// # use dotscope::utils::write_compressed_uint;
+/// ```rust
+/// # use dotscope::io::write_compressed_uint;
 /// let mut buffer = Vec::new();
-/// write_compressed_uint(127, &mut buffer);
+/// write_compressed_uint(127, &mut buffer)?;
 /// assert_eq!(buffer, vec![127]);
 ///
 /// let mut buffer = Vec::new();
-/// write_compressed_uint(128, &mut buffer);
+/// write_compressed_uint(128, &mut buffer)?;
 /// assert_eq!(buffer, vec![0x80, 0x80]);
+///
+/// assert!(write_compressed_uint(0x2000_0000, &mut buffer).is_err());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[allow(clippy::cast_possible_truncation)]
-pub fn write_compressed_uint(value: u32, buffer: &mut Vec<u8>) {
+pub fn write_compressed_uint(value: u32, buffer: &mut Vec<u8>) -> Result<()> {
     if value < 0x80 {
         buffer.push(value as u8);
     } else if value < 0x4000 {
         buffer.push(0x80 | ((value >> 8) as u8));
         buffer.push(value as u8);
-    } else {
+    } else if value <= 0x1FFF_FFFF {
         buffer.push(0xC0 | ((value >> 24) as u8));
         buffer.push((value >> 16) as u8);
         buffer.push((value >> 8) as u8);
         buffer.push(value as u8);
+    } else {
+        return Err(malformed_error!(
+            "{value:#x} is outside the range of a compressed unsigned integer"
+        ));
     }
+    Ok(())
 }
 
-/// Write a compressed signed integer using ECMA-335 format.
+/// Write a compressed signed integer using ECMA-335 format (II.23.2).
 ///
-/// Encodes a signed integer using .NET's compressed integer format.
-/// This format uses variable-length encoding to minimize space usage
-/// for small values while supporting the full 32-bit signed range.
+/// The value is taken as a two's complement number of the narrowest width
+/// that holds it (7, 14 or 29 bits), rotated left by one bit so the sign lands
+/// in the lowest bit, and written in the 1, 2 or 4 byte unsigned form.
 ///
 /// # Arguments
 ///
-/// * `value` - The signed integer to encode
+/// * `value` - The signed integer to encode, in `-2^28..2^28`
 /// * `buffer` - The output buffer to write encoded bytes to
+///
+/// # Errors
+///
+/// Returns an error for a value outside `-2^28..2^28`, which the format
+/// cannot represent.
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// # use dotscope::utils::write_compressed_int;
+/// ```no_run
+/// # use dotscope::io::write_compressed_int;
 /// let mut buffer = Vec::new();
-/// write_compressed_int(10, &mut buffer);
-/// assert_eq!(buffer, vec![20]); // 10 << 1 | 0
+/// write_compressed_int(3, &mut buffer)?;
+/// assert_eq!(buffer, vec![0x06]);
 ///
 /// let mut buffer = Vec::new();
-/// write_compressed_int(-5, &mut buffer);
-/// assert_eq!(buffer, vec![9]); // (5-1) << 1 | 1
+/// write_compressed_int(-3, &mut buffer)?;
+/// assert_eq!(buffer, vec![0x7B]);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[allow(clippy::cast_sign_loss)]
-pub fn write_compressed_int(value: i32, buffer: &mut Vec<u8>) {
-    let unsigned_value = if value >= 0 {
-        (value as u32).wrapping_shl(1)
+pub fn write_compressed_int(value: i32, buffer: &mut Vec<u8>) -> Result<()> {
+    let bits: u32 = if (-(1 << 6)..(1 << 6)).contains(&value) {
+        7
+    } else if (-(1 << 13)..(1 << 13)).contains(&value) {
+        14
+    } else if (-(1 << 28)..(1 << 28)).contains(&value) {
+        29
     } else {
-        // value is negative, so -value-1 fits in u32 without overflow
-        // (covers i32::MIN: -i32::MIN - 1 == i32::MAX, fits in u32)
-        let magnitude = value.wrapping_neg().wrapping_sub(1) as u32;
-        magnitude.wrapping_shl(1) | 1
+        return Err(malformed_error!(
+            "{value} is outside the range of a compressed signed integer"
+        ));
     };
-    write_compressed_uint(unsigned_value, buffer);
+    // The encoding's mask and the shift that brings its top bit to bit 0.
+    let (mask, top_shift): (u32, u32) = match bits {
+        7 => (0x7F, 6),
+        14 => (0x3FFF, 13),
+        _ => (0x1FFF_FFFF, 28),
+    };
+    let twos = (value as u32) & mask;
+    let rotated = ((twos << 1) & mask) | (twos >> top_shift);
+    // The width is the value's, not the rotated bits': -8192 rotates to 1
+    // and is still written in two bytes.
+    #[allow(clippy::cast_possible_truncation)]
+    match bits {
+        7 => buffer.push(rotated as u8),
+        14 => buffer.extend_from_slice(&((0x8000 | rotated) as u16).to_be_bytes()),
+        _ => buffer.extend_from_slice(&(0xC000_0000 | rotated).to_be_bytes()),
+    }
+    Ok(())
 }
 
 /// Write a 7-bit encoded integer.
@@ -1116,8 +1166,8 @@ pub fn write_compressed_int(value: i32, buffer: &mut Vec<u8>) {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// # use dotscope::utils::write_7bit_encoded_int;
+/// ```no_run
+/// # use dotscope::io::write_7bit_encoded_int;
 /// let mut buffer = Vec::new();
 /// write_7bit_encoded_int(127, &mut buffer);
 /// assert_eq!(buffer, vec![0x7F]);
@@ -1146,8 +1196,8 @@ pub fn write_7bit_encoded_int(mut value: u32, buffer: &mut Vec<u8>) {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// # use dotscope::utils::write_string_utf8;
+/// ```no_run
+/// # use dotscope::io::write_string_utf8;
 /// let mut buffer = Vec::new();
 /// write_string_utf8("Hello", &mut buffer);
 /// assert_eq!(buffer, b"Hello\0");
@@ -1169,8 +1219,8 @@ pub fn write_string_utf8(value: &str, buffer: &mut Vec<u8>) {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// # use dotscope::utils::write_prefixed_string_utf8;
+/// ```no_run
+/// # use dotscope::io::write_prefixed_string_utf8;
 /// let mut buffer = Vec::new();
 /// write_prefixed_string_utf8("Hello", &mut buffer);
 /// assert_eq!(buffer, vec![5, b'H', b'e', b'l', b'l', b'o']);
@@ -1194,8 +1244,8 @@ pub fn write_prefixed_string_utf8(value: &str, buffer: &mut Vec<u8>) {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// # use dotscope::utils::write_prefixed_string_utf16;
+/// ```no_run
+/// # use dotscope::io::write_prefixed_string_utf16;
 /// let mut buffer = Vec::new();
 /// write_prefixed_string_utf16("Hello", &mut buffer);
 /// // Length 10 bytes (5 UTF-16 chars), followed by "Hello" in UTF-16 LE
@@ -1226,6 +1276,7 @@ pub fn write_prefixed_string_utf16(value: &str, buffer: &mut Vec<u8>) {
 ///
 /// `Some(String)` on success, `None` if the input is too short or contains
 /// only a null terminator.
+#[cfg(feature = "deobfuscation")]
 #[must_use]
 pub fn decode_utf16le(bytes: &[u8]) -> Option<String> {
     let mut utf16_chars = Vec::new();
@@ -1263,8 +1314,8 @@ pub fn decode_utf16le(bytes: &[u8]) -> Option<String> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::write_string_at;
+/// ```no_run
+/// use dotscope::io::write_string_at;
 ///
 /// let mut buffer = [0u8; 10];
 /// let mut offset = 0;
@@ -1314,8 +1365,8 @@ pub fn write_string_at(data: &mut [u8], offset: &mut usize, value: &str) -> Resu
 /// * `Err(OutOfBounds)` - If there are insufficient bytes in the buffer
 ///
 /// # Examples
-/// ```rust,ignore
-/// use dotscope::utils::read_compressed_int;
+/// ```no_run
+/// use dotscope::io::read_compressed_int;
 ///
 /// let data = [0x7F, 0x80, 0x80, 0xC0, 0x00, 0x00, 0x40];
 /// let mut offset = 0;
@@ -1378,8 +1429,8 @@ pub fn read_compressed_int(data: &[u8], offset: &mut usize) -> Result<(usize, us
 /// * `Err(OutOfBounds)` - If there are insufficient bytes in the buffer
 ///
 /// # Examples
-/// ```rust,ignore
-/// use dotscope::utils::read_compressed_int_at;
+/// ```no_run
+/// use dotscope::io::read_compressed_int_at;
 ///
 /// let data = [0x7F, 0x80, 0x80];
 ///
@@ -1409,6 +1460,7 @@ pub fn read_compressed_int_at(data: &[u8], offset: usize) -> Result<(usize, usiz
 ///
 /// `Some((length, bytes_consumed))` on success, `None` for null strings
 /// (`0xFF`), empty input, or truncated data.
+#[cfg(feature = "deobfuscation")]
 #[must_use]
 pub fn read_packed_len(data: &[u8]) -> Option<(usize, usize)> {
     if *data.first()? == 0xFF {
@@ -1433,8 +1485,8 @@ pub fn read_packed_len(data: &[u8]) -> Option<(usize, usize)> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_compressed_uint;
+/// ```no_run
+/// use dotscope::io::read_compressed_uint;
 ///
 /// let data = [0x2A]; // Single byte: 42
 /// let mut offset = 0;
@@ -1463,8 +1515,8 @@ pub fn read_compressed_uint(data: &[u8], offset: &mut usize) -> Result<u32> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::read_compressed_uint_at;
+/// ```no_run
+/// use dotscope::io::read_compressed_uint_at;
 ///
 /// let data = [0x81, 0x2C]; // Two bytes: 300
 /// let value = read_compressed_uint_at(&data, 0)?;
@@ -1939,6 +1991,20 @@ mod tests {
         assert_eq!(buffer, [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]);
     }
 
+    /// A value past two bytes is refused for a two-byte write, in either byte order, and
+    /// nothing is written: it was cut to its low two bytes, which name another row.
+    #[test]
+    fn a_value_too_wide_for_two_bytes_is_refused() {
+        for write in [write_le_at_dyn, write_be_at_dyn] {
+            let mut buffer = [0xAAu8; 4];
+            let mut offset = 0;
+            assert!(write(&mut buffer, &mut offset, 0x1_0000, false).is_err());
+            assert_eq!((buffer, offset), ([0xAA; 4], 0));
+            write(&mut buffer, &mut offset, 0xFFFF, false).unwrap();
+            assert_eq!(offset, 2);
+        }
+    }
+
     #[test]
     fn write_errors() {
         let mut buffer = [0u8; 2];
@@ -2002,7 +2068,7 @@ mod tests {
 
         for (value, expected) in test_cases {
             let mut buffer = Vec::new();
-            write_compressed_uint(value, &mut buffer);
+            write_compressed_uint(value, &mut buffer).unwrap();
             assert_eq!(buffer, expected, "Failed for value {value}");
         }
     }
@@ -2017,7 +2083,7 @@ mod tests {
 
         for (value, expected) in test_cases {
             let mut buffer = Vec::new();
-            write_compressed_uint(value, &mut buffer);
+            write_compressed_uint(value, &mut buffer).unwrap();
             assert_eq!(buffer, expected, "Failed for value {value}");
         }
     }
@@ -2031,39 +2097,57 @@ mod tests {
 
         for (value, expected) in test_cases {
             let mut buffer = Vec::new();
-            write_compressed_uint(value, &mut buffer);
+            write_compressed_uint(value, &mut buffer).unwrap();
             assert_eq!(buffer, expected, "Failed for value {value}");
         }
     }
 
+    /// A value past 29 bits has no compressed form: it is refused, where it was written as
+    /// four bytes whose top bits named another length.
     #[test]
-    fn test_write_compressed_int_positive() {
-        let test_cases = vec![
-            (0, vec![0]),    // 0 << 1 | 0
-            (1, vec![2]),    // 1 << 1 | 0
-            (10, vec![20]),  // 10 << 1 | 0
-            (63, vec![126]), // 63 << 1 | 0 (max single byte positive)
-        ];
+    fn a_value_past_29_bits_is_refused() {
+        for value in [0x2000_0000, 0x8000_0000, u32::MAX] {
+            let mut buffer = vec![0xAA];
+            assert!(
+                write_compressed_uint(value, &mut buffer).is_err(),
+                "{value:#x}"
+            );
+            assert_eq!(buffer, vec![0xAA], "nothing is written for {value:#x}");
+        }
+    }
 
-        for (value, expected) in test_cases {
+    /// The signed examples of ECMA-335 II.23.2, with the ends of each width.
+    const ECMA_SIGNED: &[(i32, &[u8])] = &[
+        (0, &[0x00]),
+        (3, &[0x06]),
+        (-3, &[0x7B]),
+        (63, &[0x7E]),
+        (-1, &[0x7F]),
+        (64, &[0x80, 0x80]),
+        (-64, &[0x01]),
+        (-65, &[0xBF, 0x7F]),
+        (8192, &[0xC0, 0x00, 0x40, 0x00]),
+        (-8192, &[0x80, 0x01]),
+        (268_435_455, &[0xDF, 0xFF, 0xFF, 0xFE]),
+        (-268_435_456, &[0xC0, 0x00, 0x00, 0x01]),
+    ];
+
+    #[test]
+    fn test_write_compressed_int_matches_ecma() {
+        for (value, expected) in ECMA_SIGNED {
             let mut buffer = Vec::new();
-            write_compressed_int(value, &mut buffer);
-            assert_eq!(buffer, expected, "Failed for value {value}");
+            write_compressed_int(*value, &mut buffer).unwrap();
+            assert_eq!(buffer, *expected, "Failed for value {value}");
         }
     }
 
     #[test]
-    fn test_write_compressed_int_negative() {
-        let test_cases = vec![
-            (-1, vec![1]),   // (1-1) << 1 | 1
-            (-5, vec![9]),   // (5-1) << 1 | 1
-            (-10, vec![19]), // (10-1) << 1 | 1
-        ];
-
-        for (value, expected) in test_cases {
-            let mut buffer = Vec::new();
-            write_compressed_int(value, &mut buffer);
-            assert_eq!(buffer, expected, "Failed for value {value}");
+    fn test_write_compressed_int_out_of_range() {
+        for value in [268_435_456, -268_435_457, i32::MAX, i32::MIN] {
+            assert!(
+                write_compressed_int(value, &mut Vec::new()).is_err(),
+                "{value}"
+            );
         }
     }
 
@@ -2227,16 +2311,19 @@ mod tests {
         assert_eq!(&buffer[0..6], "café\0".as_bytes());
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_read_packed_len_empty() {
         assert_eq!(read_packed_len(&[]), None);
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_read_packed_len_null_sentinel() {
         assert_eq!(read_packed_len(&[0xFF]), None);
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_read_packed_len_one_byte() {
         assert_eq!(read_packed_len(&[0x00]), Some((0, 1)));
@@ -2244,17 +2331,20 @@ mod tests {
         assert_eq!(read_packed_len(&[0x7F]), Some((127, 1)));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_read_packed_len_two_bytes() {
         assert_eq!(read_packed_len(&[0x80, 0x80]), Some((0x0080, 2)));
         assert_eq!(read_packed_len(&[0xBF, 0xFF]), Some((0x3FFF, 2)));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_read_packed_len_two_bytes_truncated() {
         assert_eq!(read_packed_len(&[0x80]), None);
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_read_packed_len_four_bytes() {
         assert_eq!(
@@ -2263,11 +2353,13 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_read_packed_len_four_bytes_truncated() {
         assert_eq!(read_packed_len(&[0xC0, 0x00, 0x40]), None);
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_decode_utf16le_basic() {
         // "Hi" in UTF-16LE with null terminator
@@ -2275,6 +2367,7 @@ mod tests {
         assert_eq!(decode_utf16le(&data), Some("Hi".to_string()));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_decode_utf16le_no_terminator() {
         // "Hi" in UTF-16LE without null terminator
@@ -2282,12 +2375,14 @@ mod tests {
         assert_eq!(decode_utf16le(&data), Some("Hi".to_string()));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_decode_utf16le_empty() {
         assert_eq!(decode_utf16le(&[]), None);
         assert_eq!(decode_utf16le(&[0x00]), None);
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_decode_utf16le_null_only() {
         assert_eq!(decode_utf16le(&[0x00, 0x00]), None);

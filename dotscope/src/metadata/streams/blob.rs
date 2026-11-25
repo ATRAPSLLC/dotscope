@@ -146,7 +146,18 @@
 //! - **ECMA-335 II.24.2.4**: `#Blob` heap specification
 //! - **ECMA-335 II.23.2**: Signature encoding formats stored in blobs
 
-use crate::{file::parser::Parser, Error, HeapKind, ParseFailure, Result};
+use std::sync::{Arc, OnceLock};
+
+use dashmap::DashMap;
+
+use crate::{
+    file::parser::Parser,
+    metadata::{
+        pdb::DocumentName,
+        streams::{sentinel_heap, SharedBytes},
+    },
+    Error, HeapKind, ParseFailure, Result,
+};
 
 /// ECMA-335 binary blob heap providing indexed access to variable-length data.
 ///
@@ -289,6 +300,12 @@ use crate::{file::parser::Parser, Error, HeapKind, ParseFailure, Result};
 pub struct Blob<'a> {
     /// Raw bytes of the blob heap
     data: &'a [u8],
+    /// A copy of the heap shared by every [`SharedBytes`] taken from it, made on the first
+    /// [`Self::get_shared`]
+    shared: OnceLock<Arc<[u8]>>,
+    /// Each Portable PDB document name read through [`Self::document_name`], by its blob's
+    /// index: a name blob is checked once, however many Document rows name it
+    document_names: DashMap<u32, Result<DocumentName>>,
 }
 
 impl<'a> Blob<'a> {
@@ -338,9 +355,9 @@ impl<'a> Blob<'a> {
     /// let invalid_data = &[0x01, 0x02, 0x03];
     /// assert!(Blob::from(invalid_data).is_err());
     ///
-    /// // Empty data
-    /// let empty_data = &[];
-    /// assert!(Blob::from(empty_data).is_err());
+    /// // A stream of no bytes is a heap with no entries
+    /// let empty_heap = Blob::from(&[]).unwrap();
+    /// assert!(empty_heap.get(0).unwrap().is_empty());
     /// ```
     ///
     /// # Safety
@@ -352,14 +369,11 @@ impl<'a> Blob<'a> {
     /// - [`iter`](Self::iter): Iterate over all blobs in the heap
     /// - [ECMA-335 II.24.2.4](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Blob heap specification
     pub fn from(data: &'a [u8]) -> Result<Blob<'a>> {
-        match data.first() {
-            Some(0) => Ok(Blob { data }),
-            _ => Err(ParseFailure::HeapCorrupt {
-                heap: HeapKind::Blob,
-                reason: "first byte must be 0 (empty blob sentinel)".into(),
-            }
-            .into()),
-        }
+        Ok(Blob {
+            data: sentinel_heap(data, HeapKind::Blob)?,
+            shared: OnceLock::new(),
+            document_names: DashMap::new(),
+        })
     }
 
     /// Retrieves a blob from the heap by its offset.
@@ -440,6 +454,21 @@ impl<'a> Blob<'a> {
     /// - [`crate::file::parser::Parser`]: For compressed integer parsing
     /// - [ECMA-335 II.23.2](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Compressed integer format
     pub fn get(&self, index: usize) -> Result<&'a [u8]> {
+        let (start, end) = self.range(index)?;
+        self.data.get(start..end).ok_or_else(|| {
+            Error::from(ParseFailure::HeapOutOfBounds {
+                heap: HeapKind::Blob,
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+            })
+        })
+    }
+
+    /// The byte range in the heap of the blob whose length prefix is at `index`.
+    ///
+    /// # Errors
+    /// Returns an error when `index` is past the heap, its length prefix does not read, or the
+    /// blob runs past the heap's end.
+    fn range(&self, index: usize) -> Result<(usize, usize)> {
         let oob = || ParseFailure::HeapOutOfBounds {
             heap: HeapKind::Blob,
             index: u32::try_from(index).unwrap_or(u32::MAX),
@@ -459,10 +488,55 @@ impl<'a> Blob<'a> {
         let Some(data_end) = data_start.checked_add(len) else {
             return Err(oob().into());
         };
+        if data_end > self.data.len() {
+            return Err(oob().into());
+        }
+        Ok((data_start, data_end))
+    }
 
-        self.data
-            .get(data_start..data_end)
-            .ok_or_else(|| Error::from(oob()))
+    /// Retrieves a blob from the heap as [`SharedBytes`].
+    ///
+    /// Resolves the same blob as [`Self::get`], and fails where it fails, but returns a view
+    /// of one copy of the heap shared by every blob taken this way: a metadata row keeps its
+    /// blob for the cost of a reference, however long the blob is and however many rows name
+    /// it. The first call copies the heap once.
+    ///
+    /// # Arguments
+    /// * `index` - Byte offset of the blob's length prefix within the heap
+    ///
+    /// # Errors
+    /// Returns an error when `index` is past the heap, its length prefix does not read, or the
+    /// blob runs past the heap's end.
+    pub fn get_shared(&self, index: usize) -> Result<SharedBytes> {
+        let (start, end) = self.range(index)?;
+        SharedBytes::view(self.shared_heap(), start, end.saturating_sub(start)).ok_or_else(|| {
+            Error::from(ParseFailure::HeapOutOfBounds {
+                heap: HeapKind::Blob,
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+            })
+        })
+    }
+
+    /// The Portable PDB document name whose DocumentNameBlob is at `index`.
+    ///
+    /// Checks the name blob and its parts once per index, however many Document rows name
+    /// it, and returns a [`DocumentName`] that shares the heap's copy (see
+    /// [`Self::get_shared`]), so a row costs the same whatever its name's length.
+    ///
+    /// # Errors
+    /// Returns an error when the name blob does not read, its separator is not ASCII, or a
+    /// part's index names no blob.
+    pub fn document_name(&self, index: u32) -> Result<DocumentName> {
+        self.document_names
+            .entry(index)
+            .or_insert_with(|| DocumentName::read(self, index))
+            .clone()
+    }
+
+    /// The copy of the heap shared by [`Self::get_shared`] and the views built on it, made on
+    /// the first call.
+    pub fn shared_heap(&self) -> Arc<[u8]> {
+        Arc::clone(self.shared.get_or_init(|| Arc::from(self.data)))
     }
 
     /// Returns an iterator over all blobs in the heap.
@@ -812,7 +886,7 @@ impl<'a> BlobIterator<'a> {
     /// # Note
     /// This method is internal and called by [`Blob::iter`]. Users should
     /// prefer the public `iter()` method for creating iterators.
-    pub(crate) fn new(blob: &'a Blob<'a>) -> Self {
+    pub fn new(blob: &'a Blob<'a>) -> Self {
         Self {
             blob,
             position: 1, // Skip the initial null byte at position 0
@@ -852,6 +926,24 @@ impl<'a> Iterator for BlobIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `#Blob` stream of no bytes (Mono's `ilasm`, an assembly with no method) is a heap with
+    /// no entries: index 0 is the empty blob, any other index out of bounds.
+    #[test]
+    fn a_stream_of_no_bytes_is_a_heap_of_no_entries() {
+        let heap = Blob::from(&[]).unwrap();
+
+        assert_eq!(heap.get(0).unwrap(), &[] as &[u8]);
+        assert!(heap.get(1).is_err());
+        assert_eq!(heap.iter().count(), 0);
+    }
+
+    /// Bytes that do not begin with the sentinel stay corrupt: only the stream of no bytes
+    /// changes meaning.
+    #[test]
+    fn bytes_without_the_sentinel_are_corrupt() {
+        assert!(Blob::from(&[0x01, 0x02]).is_err());
+    }
 
     #[test]
     fn crafted() {

@@ -83,6 +83,7 @@ use crate::{
         traits::OwnedValidator,
     },
     prelude::CilTypeRc,
+    utils::TryForEachInOrder,
     Error, Result,
 };
 
@@ -144,7 +145,7 @@ impl OwnedTypeDependencyValidator {
     /// - Type dependencies violate accessibility constraints
     /// - Base type dependencies are invalid or inaccessible
     fn validate_type_dependency_resolution(&self, context: &OwnedValidationContext) -> Result<()> {
-        context.target_assembly_types().par_iter().try_for_each(|type_rc| -> Result<()> {
+        context.target_assembly_types().par_iter().try_for_each_in_order(|type_rc| -> Result<()> {
             let token = type_rc.token;
 
             // Validate base type dependency if it exists
@@ -249,6 +250,23 @@ impl OwnedTypeDependencyValidator {
                 if let Some(method_token) = method_ref.token() {
                     if let Some(method_entry) = methods.get(&method_token) {
                         let method = method_entry.value();
+
+                        // Every parameter's type must resolve, whether or not a Param row describes it.
+                        for (index, param) in method.signature.params.iter().enumerate() {
+                            if let Some(token) =
+                                context.unresolved_type(|out| param.type_tokens(out))
+                            {
+                                return Err(Error::ValidationOwnedFailed {
+                                    validator: self.name().to_string(),
+                                    message: format!(
+                                        "Method '{}' parameter {} has unresolved type dependency 0x{:08X}",
+                                        method.name,
+                                        index,
+                                        token.value()
+                                    ),
+                                });
+                            }
+                        }
 
                         // Validate parameter type dependencies
                         for (index, (_, param)) in method.params.iter().enumerate() {
@@ -486,19 +504,17 @@ impl Default for OwnedTypeDependencyValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::type_dependency::owned_type_dependency_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_type_dependency_validator() -> Result<()> {
         let validator = OwnedTypeDependencyValidator::new();
         let config = ValidationConfig {
@@ -509,7 +525,6 @@ mod tests {
         owned_validator_test(
             owned_type_dependency_validator_file_factory,
             "OwnedTypeDependencyValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

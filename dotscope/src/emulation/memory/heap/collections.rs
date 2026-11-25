@@ -6,7 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet as StdHashSet, VecDeque},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
 };
 
 use crate::{
@@ -53,7 +53,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             if entries.contains_key(&key) {
                 return Ok(false);
             }
@@ -76,7 +78,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(entries.contains_key(key))
         } else {
             Ok(false)
@@ -101,7 +105,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(entries.get(key).cloned())
         } else {
             Ok(None)
@@ -125,7 +131,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             entries.insert(key, value);
         }
         Ok(())
@@ -145,7 +153,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             Ok(entries.remove(key).is_some())
         } else {
             Ok(false)
@@ -164,7 +174,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             entries.clear();
         }
         Ok(())
@@ -182,7 +194,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(entries.len())
         } else {
             Ok(0)
@@ -201,7 +215,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(entries.keys().cloned().collect())
         } else {
             Ok(Vec::new())
@@ -220,7 +236,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(entries.values().cloned().collect())
         } else {
             Ok(Vec::new())
@@ -249,7 +267,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Dictionary { entries }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Dictionary { entries }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(entries
                 .iter()
                 .nth(index)
@@ -274,7 +294,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        match state.objects.get(&heap_ref.id()) {
+        match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::List { elements }) => Ok(elements.len()),
             Some(HeapObject::Dictionary { entries }) => Ok(entries.len()),
             _ => Ok(0),
@@ -294,7 +314,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         Ok(matches!(
-            state.objects.get(&heap_ref.id()),
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref),
             Some(HeapObject::Dictionary { .. })
         ))
     }
@@ -319,9 +339,9 @@ impl ManagedHeap {
         if state.objects.contains_key(&id) {
             state.objects.insert(
                 id,
-                HeapObject::Dictionary {
+                Arc::new(HeapObject::Dictionary {
                     entries: HashMap::new(),
-                },
+                }),
             );
         }
         Ok(())
@@ -347,9 +367,9 @@ impl ManagedHeap {
         if state.objects.contains_key(&id) {
             state.objects.insert(
                 id,
-                HeapObject::List {
+                Arc::new(HeapObject::List {
                     elements: Vec::new(),
-                },
+                }),
             );
         }
         Ok(())
@@ -376,7 +396,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.push(value);
             // Only charge when the push actually happened — a mismatched or missing reference
             // leaves the footprint unchanged.
@@ -399,7 +421,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.get(index).cloned())
         } else {
             Ok(None)
@@ -418,7 +442,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             if let Some(slot) = elements.get_mut(index) {
                 *slot = value;
             }
@@ -438,7 +464,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.len())
         } else {
             Ok(0)
@@ -457,7 +485,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             if index <= elements.len() {
                 elements.insert(index, value);
             }
@@ -477,7 +507,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             if index < elements.len() {
                 elements.remove(index);
             }
@@ -497,7 +529,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.clear();
         }
         Ok(())
@@ -517,7 +551,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             if index < elements.len() {
                 return Ok(Some(elements.remove(index)));
             }
@@ -539,7 +575,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.clone())
         } else {
             Ok(Vec::new())
@@ -558,7 +596,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::List { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::List { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.reverse();
         }
         Ok(())
@@ -592,9 +632,9 @@ impl ManagedHeap {
         if state.objects.contains_key(&id) {
             state.objects.insert(
                 id,
-                HeapObject::Stack {
+                Arc::new(HeapObject::Stack {
                     elements: Vec::new(),
-                },
+                }),
             );
         }
         Ok(())
@@ -612,7 +652,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stack { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stack { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.push(value);
         }
         Ok(())
@@ -632,7 +674,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stack { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stack { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             Ok(elements.pop())
         } else {
             Ok(None)
@@ -651,7 +695,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stack { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Stack { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.last().cloned())
         } else {
             Ok(None)
@@ -670,7 +716,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stack { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Stack { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.len())
         } else {
             Ok(0)
@@ -689,7 +737,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stack { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stack { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.clear();
         }
         Ok(())
@@ -707,7 +757,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stack { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Stack { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             let mut result = elements.clone();
             result.reverse(); // LIFO order: last pushed = first in output
             Ok(result)
@@ -733,9 +785,9 @@ impl ManagedHeap {
         if state.objects.contains_key(&id) {
             state.objects.insert(
                 id,
-                HeapObject::Queue {
+                Arc::new(HeapObject::Queue {
                     elements: VecDeque::new(),
-                },
+                }),
             );
         }
         Ok(())
@@ -753,7 +805,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Queue { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Queue { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.push_back(value);
         }
         Ok(())
@@ -773,7 +827,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Queue { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Queue { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             Ok(elements.pop_front())
         } else {
             Ok(None)
@@ -792,7 +848,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Queue { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Queue { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.front().cloned())
         } else {
             Ok(None)
@@ -811,7 +869,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Queue { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Queue { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.len())
         } else {
             Ok(0)
@@ -830,7 +890,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Queue { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Queue { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.clear();
         }
         Ok(())
@@ -848,7 +910,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Queue { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Queue { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.iter().cloned().collect())
         } else {
             Ok(Vec::new())
@@ -872,9 +936,9 @@ impl ManagedHeap {
         if state.objects.contains_key(&id) {
             state.objects.insert(
                 id,
-                HeapObject::HashSet {
+                Arc::new(HeapObject::HashSet {
                     elements: StdHashSet::new(),
-                },
+                }),
             );
         }
         Ok(())
@@ -892,7 +956,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::HashSet { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::HashSet { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             Ok(elements.insert(key))
         } else {
             Ok(false)
@@ -911,7 +977,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::HashSet { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::HashSet { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             Ok(elements.remove(key))
         } else {
             Ok(false)
@@ -930,7 +998,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::HashSet { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::HashSet { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.contains(key))
         } else {
             Ok(false)
@@ -949,7 +1019,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::HashSet { elements }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::HashSet { elements }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             Ok(elements.len())
         } else {
             Ok(0)
@@ -968,7 +1040,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::HashSet { elements }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::HashSet { elements }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             elements.clear();
         }
         Ok(())

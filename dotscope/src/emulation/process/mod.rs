@@ -78,7 +78,7 @@
 //!
 //! - [`crate::emulation::engine`] - Low-level execution engine
 //! - [`crate::emulation::memory`] - Memory subsystem
-//! - [`crate::emulation::stubs`] - Method stub implementations
+//! - [`crate::emulation::runtime`] - Method stub implementations (BCL hooks)
 
 mod builder;
 mod config;

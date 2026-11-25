@@ -2,28 +2,25 @@
 //!
 //! This validator provides comprehensive validation of assembly-level metadata within the context
 //! of fully resolved .NET metadata. It operates on resolved assembly structures to validate
-//! cross-assembly references, version compatibility, and assembly integrity constraints.
+//! the assembly's identity, its references, and its module.
 //! This validator ensures that assemblies are properly formed and don't violate ECMA-335
 //! assembly model requirements. This validator runs with priority 110 in the owned validation stage.
 //!
 //! # Architecture
 //!
 //! The assembly validation system implements comprehensive assembly-level validation in sequential order:
-//! 1. **Assembly Metadata Consistency Validation** - Ensures assembly-level metadata is properly formed and complete
-//! 2. **Cross-Assembly Reference Validation** - Validates external assembly references and resolution
-//! 3. **Assembly Version Compatibility Validation** - Ensures version dependencies are compatible and consistent
-//! 4. **Module File Consistency Validation** - Validates modules and files are properly registered within assemblies
+//! 1. **Assembly Metadata Consistency Validation** - The assembly has a name and a version in range
+//! 2. **Cross-Assembly Reference Validation** - References have names, defined flags and well-formed keys
+//! 3. **Module File Consistency Validation** - Defined assembly flags and hash algorithm, a named module with a non-null MVID
 //!
-//! The implementation validates assembly constraints according to ECMA-335 specifications,
-//! ensuring proper assembly formation and dependency management.
-//! All validation includes reference checking and version compatibility verification.
+//! Every rule is an ECMA-335 requirement or a value the runtime defines; names, versions,
+//! cultures, keys and file sizes are not judged by any limit of the validator's own.
 //!
 //! # Key Components
 //!
 //! - [`crate::metadata::validation::validators::owned::system::assembly::OwnedAssemblyValidator`] - Main validator implementation providing comprehensive assembly validation
 //! - [`crate::metadata::validation::validators::owned::system::assembly::OwnedAssemblyValidator::validate_assembly_metadata_consistency`] - Assembly metadata consistency and completeness validation
 //! - [`crate::metadata::validation::validators::owned::system::assembly::OwnedAssemblyValidator::validate_cross_assembly_references`] - Cross-assembly reference validation and resolution checking
-//! - [`crate::metadata::validation::validators::owned::system::assembly::OwnedAssemblyValidator::validate_assembly_version_compatibility`] - Assembly version compatibility and dependency validation
 //! - [`crate::metadata::validation::validators::owned::system::assembly::OwnedAssemblyValidator::validate_module_file_consistency`] - Module and file consistency validation within assemblies
 //!
 //! # Usage Examples
@@ -45,12 +42,10 @@
 //! # Error Handling
 //!
 //! This validator returns [`crate::Error::ValidationOwnedFailed`] for:
-//! - Assembly metadata consistency violations (empty names, invalid formats, excessive lengths)
-//! - Cross-assembly reference failures (unresolved references, invalid public keys, malformed identities)
-//! - Version compatibility issues (suspicious version numbers, all-zero versions, excessive values)
-//! - Module file consistency violations (invalid modules, corrupted PE files, suspicious sizes)
-//! - Strong name validation failures (invalid public keys, zero tokens, malformed signatures)
-//! - Custom attribute violations (excessive arguments, malformed attribute data)
+//! - An assembly, assembly reference, type reference, member reference or module without a name
+//! - Undefined assembly or assembly reference flags, or an undefined hash algorithm
+//! - An empty public key, or an ECMA key that is not 16 bytes
+//! - A module whose MVID is null
 //!
 //! # Thread Safety
 //!
@@ -81,7 +76,7 @@ use std::sync::Arc;
 use crate::{
     metadata::{
         identity::Identity,
-        tables::HashAlgorithmId,
+        tables::{HashAlgorithmId, TableId},
         validation::{
             context::{OwnedValidationContext, ValidationContext},
             traits::OwnedValidator,
@@ -90,11 +85,16 @@ use crate::{
     Error, Result,
 };
 
+/// The `CorAssemblyFlags` bits the runtime defines (corhdr.h): PublicKey, the processor
+/// architecture field and its Specified bit, Retargetable, the content type field and the
+/// two JIT flags.
+const DEFINED_ASSEMBLY_FLAGS: u32 = 0xCFF1;
+
 /// Foundation validator for assembly-level metadata, references, and integrity constraints.
 ///
 /// Ensures the structural integrity and consistency of assembly-level metadata in resolved .NET metadata,
-/// validating assembly metadata completeness, cross-assembly reference resolution, version compatibility,
-/// and module file consistency. This validator operates on resolved assembly structures to provide
+/// validating assembly metadata completeness, cross-assembly references and module file
+/// consistency. This validator operates on resolved assembly structures to provide
 /// essential guarantees about assembly integrity and ECMA-335 compliance.
 ///
 /// The validator implements comprehensive coverage of assembly validation according to
@@ -132,7 +132,7 @@ impl OwnedAssemblyValidator {
     ///
     /// Ensures that assembly-level metadata is properly formed and contains
     /// all required information according to ECMA-335 specifications.
-    /// Validates assembly names, versions, cultures, public keys, and custom attributes.
+    /// Validates the assembly name and version.
     ///
     /// # Arguments
     ///
@@ -146,11 +146,8 @@ impl OwnedAssemblyValidator {
     /// # Errors
     ///
     /// Returns [`crate::Error::ValidationOwnedFailed`] if:
-    /// - Assembly has empty or invalid name format
-    /// - Assembly version components are invalid or excessive
-    /// - Culture format is malformed
-    /// - Public key has invalid size or suspicious patterns
-    /// - Custom attributes have excessive argument counts
+    /// - Assembly has an empty name
+    /// - Assembly version components exceed their 16-bit columns
     fn validate_assembly_metadata_consistency(
         &self,
         context: &OwnedValidationContext,
@@ -166,58 +163,11 @@ impl OwnedAssemblyValidator {
                 });
             }
 
-            // Validate assembly name format
-            if !Self::is_valid_assembly_name(&assembly.name) {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!("Assembly has invalid name format: '{}'", assembly.name),
-                });
-            }
-
             // Validate version information
             self.validate_assembly_version(assembly)?;
-
-            // Validate culture information
-            if let Some(culture) = &assembly.culture {
-                if !Self::is_valid_culture_format(culture) {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!("Assembly has invalid culture format: '{culture}'"),
-                    });
-                }
-            }
-
-            // Validate public key information
-            if let Some(public_key) = &assembly.public_key {
-                self.validate_assembly_public_key(public_key)?;
-            }
-
-            // Validate custom attributes
-            self.validate_assembly_custom_attributes(assembly)?;
         }
 
         Ok(())
-    }
-
-    /// Validates assembly name format.
-    fn is_valid_assembly_name(name: &str) -> bool {
-        // Assembly names must be valid identifiers
-        if name.is_empty() || name.len() > 260 {
-            return false;
-        }
-
-        // Check for invalid characters
-        let invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
-        if name.chars().any(|c| invalid_chars.contains(&c)) {
-            return false;
-        }
-
-        // Must not start with whitespace or dot
-        if name.starts_with(' ') || name.starts_with('.') {
-            return false;
-        }
-
-        true
     }
 
     /// Validates assembly version information.
@@ -247,108 +197,6 @@ impl OwnedAssemblyValidator {
         Ok(())
     }
 
-    /// Validates culture format.
-    fn is_valid_culture_format(culture: &str) -> bool {
-        if culture.is_empty() || culture == "neutral" {
-            return true;
-        }
-
-        // Standard culture format validation
-        let parts: Vec<&str> = culture.split('-').collect();
-        match parts.len() {
-            1 => {
-                // Language only (e.g., "en", "fr")
-                let Some(lang) = parts.first() else {
-                    return false;
-                };
-                lang.len() == 2 && lang.chars().all(|c| c.is_ascii_lowercase())
-            }
-            2 => {
-                // Language-Country (e.g., "en-US", "fr-FR")
-                let (Some(lang), Some(country)) = (parts.first(), parts.get(1)) else {
-                    return false;
-                };
-                lang.len() == 2
-                    && lang.chars().all(|c| c.is_ascii_lowercase())
-                    && country.len() == 2
-                    && country.chars().all(|c| c.is_ascii_uppercase())
-            }
-            _ => false,
-        }
-    }
-
-    /// Validates assembly public key format.
-    fn validate_assembly_public_key(&self, public_key: &[u8]) -> Result<()> {
-        // Public key should be reasonable size
-        if public_key.is_empty() {
-            return Ok(()); // Empty public key is valid (no strong name)
-        }
-
-        // Valid public key sizes per ECMA-335:
-        // - 16 bytes: ECMA keys for framework assemblies
-        // - 160+ bytes: Full RSA public keys for strong-named assemblies
-        if public_key.len() != 16 && (public_key.len() < 160 || public_key.len() > 2048) {
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: format!(
-                    "Assembly public key has invalid size: {} bytes. Expected 16 bytes (ECMA key) or 160-2048 bytes (RSA key)",
-                    public_key.len()
-                ),
-
-            });
-        }
-
-        // Check for suspicious patterns (all zeros, all ones, etc.)
-        if public_key.iter().all(|&b| b == 0) {
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: "Assembly public key consists entirely of zero bytes".to_string(),
-            });
-        }
-
-        if public_key.iter().all(|&b| b == 0xFF) {
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: "Assembly public key consists entirely of 0xFF bytes".to_string(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Validates assembly custom attributes.
-    fn validate_assembly_custom_attributes(
-        &self,
-        assembly: &Arc<crate::metadata::tables::Assembly>,
-    ) -> Result<()> {
-        for (_, custom_attr) in assembly.custom_attributes.iter() {
-            // Check for reasonable number of arguments
-            if custom_attr.fixed_args.len() > 20 {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Assembly '{}' has custom attribute with excessive fixed arguments ({})",
-                        assembly.name,
-                        custom_attr.fixed_args.len()
-                    ),
-                });
-            }
-
-            if custom_attr.named_args.len() > 50 {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Assembly '{}' has custom attribute with excessive named arguments ({})",
-                        assembly.name,
-                        custom_attr.named_args.len()
-                    ),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
     /// Validates cross-assembly reference validation and resolution.
     ///
     /// Ensures that all assembly references can be resolved and that
@@ -367,36 +215,10 @@ impl OwnedAssemblyValidator {
     /// # Errors
     ///
     /// Returns [`crate::Error::ValidationOwnedFailed`] if:
-    /// - Assembly references have empty names or excessive lengths
-    /// - Culture formats are invalid in references
-    /// - Public key tokens or keys are malformed
-    /// - Type references have empty names or excessive namespace lengths
-    /// - Member references have empty or excessively long names
+    /// - Assembly references have empty names or undefined flags
+    /// - Public keys are empty, or ECMA keys are not 16 bytes
+    /// - Type references or member references have empty names
     fn validate_cross_assembly_references(&self, context: &OwnedValidationContext) -> Result<()> {
-        // Check that the assembly object itself is valid
-        if let Some(assembly) = context.object().assembly() {
-            // Validate assembly name is not excessively long
-            if assembly.name.len() > 1024 {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Assembly name is excessively long: {} characters",
-                        assembly.name.len()
-                    ),
-                });
-            }
-
-            // Validate culture format if present
-            if let Some(culture) = &assembly.culture {
-                if !Self::is_valid_culture_format(culture) {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!("Assembly has invalid culture format: '{culture}'"),
-                    });
-                }
-            }
-        }
-
         // Validate external assembly references
         let assembly_refs = context.object().refs_assembly();
         for (index, entry) in assembly_refs.iter().enumerate() {
@@ -409,45 +231,21 @@ impl OwnedAssemblyValidator {
                 });
             }
 
-            // Validate assembly reference name length
-            if assembly_ref.name.len() > 1024 {
+            if assembly_ref.flags.bits() & !DEFINED_ASSEMBLY_FLAGS != 0 {
                 return Err(Error::ValidationOwnedFailed {
                     validator: self.name().to_string(),
                     message: format!(
-                        "Assembly reference '{}' has excessively long name: {} characters",
+                        "Assembly reference '{}' has undefined flags: 0x{:08X}",
                         assembly_ref.name,
-                        assembly_ref.name.len()
+                        assembly_ref.flags.bits()
                     ),
                 });
-            }
-
-            // Validate culture format if present
-            if let Some(culture) = &assembly_ref.culture {
-                if !Self::is_valid_culture_format(culture) {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!(
-                            "Assembly reference '{}' has invalid culture format: '{}'",
-                            assembly_ref.name, culture
-                        ),
-                    });
-                }
             }
 
             // Validate identity (public key/token) if present
             if let Some(identity) = &assembly_ref.identifier {
                 match identity {
-                    Identity::Token(token) => {
-                        if *token == 0 {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Assembly reference '{}' has empty public key token",
-                                    assembly_ref.name
-                                ),
-                            });
-                        }
-                    }
+                    Identity::Token(_) => {}
                     Identity::PubKey(public_key) => {
                         if public_key.is_empty() {
                             return Err(Error::ValidationOwnedFailed {
@@ -456,22 +254,6 @@ impl OwnedAssemblyValidator {
                                     "Assembly reference '{}' has empty public key",
                                     assembly_ref.name
                                 ),
-                            });
-                        }
-                        // Valid public key sizes per ECMA-335:
-                        // - 16 bytes: ECMA keys for framework assemblies
-                        // - 160+ bytes: Full RSA public keys for strong-named assemblies
-                        if public_key.len() != 16
-                            && (public_key.len() < 160 || public_key.len() > 2048)
-                        {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Assembly reference '{}' has invalid public key size: {} bytes. Expected 16 bytes (ECMA key) or 160-2048 bytes (RSA key)",
-                                    assembly_ref.name,
-                                    public_key.len()
-                                ),
-
                             });
                         }
                     }
@@ -487,15 +269,6 @@ impl OwnedAssemblyValidator {
 
                             });
                         }
-                        if ecma_key.is_empty() || ecma_key.iter().all(|&b| b == 0) {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Assembly reference '{}' has empty or invalid ECMA key",
-                                    assembly_ref.name
-                                ),
-                            });
-                        }
                     }
                 }
             }
@@ -504,25 +277,13 @@ impl OwnedAssemblyValidator {
         // Validate cross-assembly type references
         for type_entry in context.target_assembly_types() {
             let type_ref = type_entry.as_ref();
-            // Only validate external type references
-            if let Some(_external) = type_ref.external() {
+            // Only validate type references
+            if type_ref.token.is_table(TableId::TypeRef) {
                 // Validate type reference has valid name
                 if type_ref.name.is_empty() {
                     return Err(Error::ValidationOwnedFailed {
                         validator: self.name().to_string(),
                         message: "Cross-assembly type reference has empty name".to_string(),
-                    });
-                }
-
-                // Validate namespace is reasonable
-                if type_ref.namespace.len() > 512 {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!(
-                            "Type reference '{}' has excessively long namespace: {} characters",
-                            type_ref.name,
-                            type_ref.namespace.len()
-                        ),
                     });
                 }
             }
@@ -537,151 +298,6 @@ impl OwnedAssemblyValidator {
                 return Err(Error::ValidationOwnedFailed {
                     validator: self.name().to_string(),
                     message: "Cross-assembly member reference has empty name".to_string(),
-                });
-            }
-
-            // Validate member name length
-            if member_ref.name.len() > 512 {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Member reference '{}' has excessively long name: {} characters",
-                        member_ref.name,
-                        member_ref.name.len()
-                    ),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Validates assembly version compatibility and dependency validation.
-    ///
-    /// Ensures that assembly version dependencies are compatible and don't
-    /// create impossible resolution scenarios or version conflicts.
-    /// Validates version numbers and strong name consistency.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - Owned validation context containing resolved assembly structures via [`crate::metadata::validation::context::OwnedValidationContext`]
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - All assembly versions are compatible and consistent
-    /// * `Err(`[`crate::Error::ValidationOwnedFailed`]`)` - Version compatibility violations found
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::ValidationOwnedFailed`] if:
-    /// - Assembly or reference versions are excessively high
-    /// - Strong name tokens or public keys are malformed
-    /// - Assembly reference flags contain unknown values
-    fn validate_assembly_version_compatibility(
-        &self,
-        context: &OwnedValidationContext,
-    ) -> Result<()> {
-        // Validate the current assembly's version information
-        if let Some(assembly) = context.object().assembly() {
-            // Note: All-zero version (0.0.0.0) is valid and common for development assemblies
-            // or assemblies that don't specify version information. We don't reject these.
-
-            // Check for excessively high version numbers that might indicate corruption
-            if assembly.major_version > 999
-                || assembly.minor_version > 999
-                || assembly.build_number > 65535
-                || assembly.revision_number > 65535
-            {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Assembly '{}' has suspicious version numbers: {}.{}.{}.{}",
-                        assembly.name,
-                        assembly.major_version,
-                        assembly.minor_version,
-                        assembly.build_number,
-                        assembly.revision_number
-                    ),
-                });
-            }
-        }
-
-        // Validate assembly reference versions for compatibility
-        let assembly_refs = context.object().refs_assembly();
-        for entry in assembly_refs {
-            let assembly_ref = entry.value();
-            // Note: All-zero version (0.0.0.0) is valid for assembly references
-            // Some assemblies don't specify version requirements for their dependencies.
-
-            // Check for excessively high version numbers in dependencies
-            if assembly_ref.major_version > 999
-                || assembly_ref.minor_version > 999
-                || assembly_ref.build_number > 65535
-                || assembly_ref.revision_number > 65535
-            {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Assembly reference '{}' has suspicious version numbers: {}.{}.{}.{}",
-                        assembly_ref.name,
-                        assembly_ref.major_version,
-                        assembly_ref.minor_version,
-                        assembly_ref.build_number,
-                        assembly_ref.revision_number
-                    ),
-                });
-            }
-
-            // Validate strong name consistency
-            if let Some(identity) = &assembly_ref.identifier {
-                match identity {
-                    Identity::Token(token) => {
-                        if *token == 0 {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Assembly reference '{}' has zero public key token",
-                                    assembly_ref.name
-                                ),
-                            });
-                        }
-                    }
-                    Identity::PubKey(public_key) => {
-                        if public_key.iter().all(|&b| b == 0) {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Assembly reference '{}' public key consists entirely of zero bytes",
-                                    assembly_ref.name
-                                ),
-
-                            });
-                        }
-                    }
-                    Identity::EcmaKey(ecma_key) => {
-                        if ecma_key.iter().all(|&b| b == 0) {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Assembly reference '{}' ECMA key consists entirely of zero bytes",
-                                    assembly_ref.name
-                                ),
-
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Validate flags are reasonable
-            if assembly_ref.flags.bits() > 0x0001 {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Assembly reference '{}' has unknown flags: 0x{:08X}",
-                        assembly_ref.name,
-                        assembly_ref.flags.bits()
-                    ),
                 });
             }
         }
@@ -706,30 +322,33 @@ impl OwnedAssemblyValidator {
     /// # Errors
     ///
     /// Returns [`crate::Error::ValidationOwnedFailed`] if:
-    /// - Assembly flags or hash algorithm IDs are unknown
-    /// - Module names are empty, excessively long, or have suspicious generation numbers
-    /// - Module IDs (MVIDs) are all-zero
-    /// - PE file size is suspiciously small or excessively large
+    /// - Assembly flags or hash algorithm IDs are undefined
+    /// - The module name is empty
+    /// - The module ID (MVID) is all-zero (ECMA-335 II.22.30)
     fn validate_module_file_consistency(&self, context: &OwnedValidationContext) -> Result<()> {
         // Validate basic assembly structure
         if let Some(assembly) = context.object().assembly() {
-            // Check that assembly has reasonable flags
-            if assembly.flags.bits() > 0x0001 {
+            if assembly.flags.bits() & !DEFINED_ASSEMBLY_FLAGS != 0 {
                 return Err(Error::ValidationOwnedFailed {
                     validator: self.name().to_string(),
                     message: format!(
-                        "Assembly '{}' has unknown flags: 0x{:08X}",
+                        "Assembly '{}' has undefined flags: 0x{:08X}",
                         assembly.name,
                         assembly.flags.bits()
                     ),
                 });
             }
 
-            // Validate hash algorithm is reasonable
-            if assembly.hash_alg_id != HashAlgorithmId::NONE
-                && assembly.hash_alg_id != HashAlgorithmId::MD5
-                && assembly.hash_alg_id != HashAlgorithmId::SHA1
-                && assembly.hash_alg_id != HashAlgorithmId::SHA256
+            // The hash algorithms ECMA-335 II.23.1.1 and .NET define
+            if ![
+                HashAlgorithmId::NONE,
+                HashAlgorithmId::MD5,
+                HashAlgorithmId::SHA1,
+                HashAlgorithmId::SHA256,
+                HashAlgorithmId::SHA384,
+                HashAlgorithmId::SHA512,
+            ]
+            .contains(&assembly.hash_alg_id)
             {
                 return Err(Error::ValidationOwnedFailed {
                     validator: self.name().to_string(),
@@ -752,29 +371,6 @@ impl OwnedAssemblyValidator {
                 });
             }
 
-            // Validate module name length
-            if module.name.len() > 260 {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Module '{}' has excessively long name: {} characters",
-                        module.name,
-                        module.name.len()
-                    ),
-                });
-            }
-
-            // Validate module generation is reasonable
-            if module.generation > 65535 {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Module '{}' has suspicious generation number: {}",
-                        module.name, module.generation
-                    ),
-                });
-            }
-
             // Validate module ID is not all zeros
             if module.mvid.to_bytes().iter().all(|&b| b == 0) {
                 return Err(Error::ValidationOwnedFailed {
@@ -787,30 +383,6 @@ impl OwnedAssemblyValidator {
             }
         }
 
-        // Validate PE file structure
-        let file = context.object().file();
-        let file_data = file.data();
-
-        // Basic PE file validation
-        if file_data.len() < 1024 {
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: "Assembly file is suspiciously small (< 1024 bytes)".to_string(),
-            });
-        }
-
-        // Check for reasonable PE file size (not corrupted)
-        if file_data.len() > 100_000_000 {
-            // 100MB limit
-            return Err(Error::ValidationOwnedFailed {
-                validator: self.name().to_string(),
-                message: format!(
-                    "Assembly file is excessively large: {} bytes",
-                    file_data.len()
-                ),
-            });
-        }
-
         Ok(())
     }
 }
@@ -819,7 +391,6 @@ impl OwnedValidator for OwnedAssemblyValidator {
     fn validate_owned(&self, context: &OwnedValidationContext) -> Result<()> {
         self.validate_assembly_metadata_consistency(context)?;
         self.validate_cross_assembly_references(context)?;
-        self.validate_assembly_version_compatibility(context)?;
         self.validate_module_file_consistency(context)?;
 
         Ok(())
@@ -845,19 +416,17 @@ impl Default for OwnedAssemblyValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::system_assembly::owned_assembly_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_assembly_validator() -> Result<()> {
         let validator = OwnedAssemblyValidator::new();
         let config = ValidationConfig {
@@ -868,7 +437,6 @@ mod tests {
         owned_validator_test(
             owned_assembly_validator_file_factory,
             "OwnedAssemblyValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

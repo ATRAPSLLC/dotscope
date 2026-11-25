@@ -24,6 +24,7 @@ use std::{
 
 use clap::Parser;
 use dotscope::{
+    analysis::Budget,
     deobfuscation::{DeobfuscationEngine, DeobfuscationResult, EngineConfig},
     emulation::TracingConfig,
     CilObject,
@@ -101,12 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config = if aggressive {
                 // Aggressive mode: inlining enabled, unused method removal enabled
                 let mut c = EngineConfig::aggressive();
-                c.iterations.max_ssa_iterations = max_iterations;
+                c.budget = c.budget.with_limit(Budget::PipelineRounds, max_iterations);
                 c
             } else {
                 // Default mode: preserve original structure for analysis
                 let mut c = EngineConfig::default();
-                c.iterations.max_ssa_iterations = max_iterations;
+                c.budget = c.budget.with_limit(Budget::PipelineRounds, max_iterations);
                 c
             };
 

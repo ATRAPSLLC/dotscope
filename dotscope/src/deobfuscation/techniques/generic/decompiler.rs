@@ -23,7 +23,7 @@ use crate::{
     compiler::{EventKind, EventLog},
     deobfuscation::{
         techniques::{
-            Detection, Detections, Evidence, Technique, TechniqueCategory, WorkingAssembly,
+            Detection, Evidence, Technique, TechniqueCapability, TechniqueCategory, WorkingAssembly,
         },
         utils::resolve_custom_attr_type,
     },
@@ -94,6 +94,10 @@ impl Technique for GenericDecompiler {
         TechniqueCategory::Metadata
     }
 
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![TechniqueCapability::ByteTransform]
+    }
+
     fn detect(&self, assembly: &CilObject) -> Detection {
         let mut findings = DecompilerFindings {
             anti_decompiler_types: Vec::new(),
@@ -133,8 +137,7 @@ impl Technique for GenericDecompiler {
     fn byte_transform(
         &self,
         _assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
 
@@ -287,11 +290,11 @@ fn detect_fake_attributes(
 
 #[cfg(test)]
 mod tests {
-    use crate::{deobfuscation::techniques::Technique, test::helpers::load_sample};
+    use crate::{deobfuscation::techniques::Technique, testkit::helpers::load_sample};
 
     #[test]
     fn test_detect_positive() {
-        let asm = load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_antide4dot.exe");
+        let asm = load_sample("packers/bitmono/0.39.0/bitmono_antide4dot.exe");
         let technique = super::GenericDecompiler;
         let detection = technique.detect(&asm);
         assert!(detection.is_detected());
@@ -300,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
         let technique = super::GenericDecompiler;
         let detection = technique.detect(&asm);
         assert!(!detection.is_detected());

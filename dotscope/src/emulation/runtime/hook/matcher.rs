@@ -17,9 +17,27 @@
 //! Multiple matchers can be added to a single hook. All matchers must match for
 //! the hook to be applied (AND semantics).
 //!
-//! ```rust,ignore
-//! use dotscope::emulation::{Hook, HookPriority};
-//! use dotscope::metadata::typesystem::CilFlavor;
+//! ```
+//! use dotscope::emulation::{EmValue, EmulationThread, Hook, HookContext};
+//! use dotscope::metadata::typesystem::{CilFlavor, PointerSize};
+//!
+//!/// Whether the first argument is a byte array that opens as LZMA does.
+//!fn is_lzma_header(ctx: &HookContext<'_>, thread: &EmulationThread) -> bool {
+//!    let Some(EmValue::ObjectRef(array)) = ctx.args.first() else {
+//!        return false;
+//!    };
+//!    matches!(
+//!        thread.heap().get_array_as_bytes(*array, PointerSize::Bit64),
+//!        Ok(Some(bytes)) if bytes.len() >= 5 && bytes[0] == 0x5D
+//!    )
+//!}
+//!
+//!// `byte[]`, the parameter and the result the hook matches
+//!let byte_array = || CilFlavor::Array {
+//!    element_type: Box::new(CilFlavor::U1),
+//!    rank: 1,
+//!    dimensions: Vec::new(),
+//!};
 //!
 //! // This hook requires ALL conditions to be true:
 //! // 1. Internal method
@@ -28,7 +46,7 @@
 //! // 4. First argument looks like LZMA header
 //! let hook = Hook::new("lzma-decompressor")
 //!     .match_internal_method()
-//!     .match_signature(vec![CilFlavor::Array { .. }], Some(CilFlavor::Array { .. }))
+//!     .match_signature(vec![byte_array()], Some(byte_array()))
 //!     .match_runtime("lzma-header", |ctx, thread| {
 //!         // Custom runtime check
 //!         is_lzma_header(ctx, thread)
@@ -427,13 +445,14 @@ impl HookMatcher for SignatureMatcher {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::emulation::RuntimeMatcher;
+/// ```
+/// use dotscope::emulation::{EmValue, RuntimeMatcher};
+/// use dotscope::metadata::typesystem::PointerSize;
 ///
 /// // Match methods where first argument is a byte[] starting with LZMA header
 /// let matcher = RuntimeMatcher::new("lzma-header", |ctx, thread| {
-///     if let Some(EmValue::Reference(r)) = ctx.args.first() {
-///         if let Some(bytes) = thread.heap().get_array_as_bytes(*r) {
+///     if let Some(EmValue::ObjectRef(r)) = ctx.args.first() {
+///         if let Ok(Some(bytes)) = thread.heap().get_array_as_bytes(*r, PointerSize::Bit64) {
 ///             return bytes.len() >= 5 && bytes[0] == 0x5D;
 ///         }
 ///     }
@@ -455,7 +474,7 @@ impl RuntimeMatcher {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use dotscope::emulation::RuntimeMatcher;
     ///
     /// let matcher = RuntimeMatcher::new("has-three-args", |ctx, _thread| {
@@ -626,17 +645,6 @@ impl HookMatcher for NativeMethodMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::{token::Token, typesystem::PointerSize};
-
-    fn create_test_context<'a>() -> HookContext<'a> {
-        HookContext::new(
-            Token::new(0x06000001),
-            "System",
-            "String",
-            "Concat",
-            PointerSize::Bit64,
-        )
-    }
 
     #[test]
     fn test_name_matcher_full() {

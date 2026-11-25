@@ -48,7 +48,7 @@ impl Interpreter {
     /// # Returns
     ///
     /// An error indicating the operand type mismatch.
-    pub(super) fn invalid_operand(instruction: &Instruction, expected: &'static str) -> Error {
+    pub fn invalid_operand(instruction: &Instruction, expected: &'static str) -> Error {
         EmulationError::InvalidOperand {
             instruction: instruction.mnemonic,
             expected,
@@ -66,7 +66,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the local index is out of bounds.
-    pub(super) fn load_local(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
+    pub fn load_local(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
         let value = thread.get_local(usize::from(index))?.clone();
         thread.push(value)?;
         Ok(StepResult::Continue)
@@ -82,10 +82,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is full.
-    pub(super) fn load_local_address(
-        thread: &mut EmulationThread,
-        index: u16,
-    ) -> Result<StepResult> {
+    pub fn load_local_address(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
         let depth = thread.call_depth().saturating_sub(1);
         let ptr = EmValue::ManagedPtr(ManagedPointer::to_local(index, depth));
         thread.push(ptr)?;
@@ -102,7 +99,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is empty or the local index is out of bounds.
-    pub(super) fn store_local(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
+    pub fn store_local(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
         let value = thread.pop()?;
         thread.set_local(usize::from(index), value)?;
         Ok(StepResult::Continue)
@@ -118,7 +115,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the argument index is out of bounds.
-    pub(super) fn load_argument(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
+    pub fn load_argument(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
         let value = thread.get_arg(usize::from(index))?.clone();
         thread.push(value)?;
         Ok(StepResult::Continue)
@@ -134,10 +131,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is full.
-    pub(super) fn load_argument_address(
-        thread: &mut EmulationThread,
-        index: u16,
-    ) -> Result<StepResult> {
+    pub fn load_argument_address(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
         let depth = thread.call_depth().saturating_sub(1);
         let ptr = EmValue::ManagedPtr(ManagedPointer::to_argument(index, depth));
         thread.push(ptr)?;
@@ -154,7 +148,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is empty or the argument index is out of bounds.
-    pub(super) fn store_argument(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
+    pub fn store_argument(thread: &mut EmulationThread, index: u16) -> Result<StepResult> {
         let value = thread.pop()?;
         thread.set_arg(usize::from(index), value)?;
         Ok(StepResult::Continue)
@@ -172,7 +166,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack has fewer than two values or type mismatch occurs.
-    pub(super) fn binary_op(
+    pub fn binary_op(
         thread: &mut EmulationThread,
         op: BinaryOp,
         ptr_size: PointerSize,
@@ -196,7 +190,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is empty or type mismatch occurs.
-    pub(super) fn unary_op(
+    pub fn unary_op(
         thread: &mut EmulationThread,
         op: UnaryOp,
         ptr_size: PointerSize,
@@ -219,7 +213,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack has fewer than two values or type mismatch occurs.
-    pub(super) fn compare(thread: &mut EmulationThread, op: CompareOp) -> Result<StepResult> {
+    pub fn compare(thread: &mut EmulationThread, op: CompareOp) -> Result<StepResult> {
         let right = thread.pop()?;
         let left = thread.pop()?;
         let result = left.compare(&right, op)?;
@@ -240,7 +234,7 @@ impl Interpreter {
     ///
     /// Returns an error if the stack is empty, conversion fails, or overflow occurs
     /// (for overflow-checked conversions).
-    pub(super) fn convert(
+    pub fn convert(
         thread: &mut EmulationThread,
         conv_type: ConversionType,
         ptr_size: PointerSize,
@@ -294,7 +288,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is empty or contains an unsupported type.
-    pub(super) fn branch_if_true(thread: &mut EmulationThread, target: u64) -> Result<StepResult> {
+    pub fn branch_if_true(thread: &mut EmulationThread, target: u64) -> Result<StepResult> {
         let value = thread.pop()?;
         let is_true = match value {
             EmValue::I32(v) => v != 0,
@@ -337,7 +331,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is empty or contains an unsupported type.
-    pub(super) fn branch_if_false(thread: &mut EmulationThread, target: u64) -> Result<StepResult> {
+    pub fn branch_if_false(thread: &mut EmulationThread, target: u64) -> Result<StepResult> {
         let value = thread.pop()?;
         let is_false = match value {
             EmValue::I32(v) => v == 0,
@@ -384,7 +378,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack has fewer than two values or type mismatch occurs.
-    pub(super) fn branch_compare(
+    pub fn branch_compare(
         thread: &mut EmulationThread,
         target: u64,
         op: CompareOp,
@@ -421,7 +415,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack has fewer than two values or type mismatch occurs.
-    pub(super) fn branch_compare_unsigned(
+    pub fn branch_compare_unsigned(
         thread: &mut EmulationThread,
         target: u64,
         op: CompareOp,
@@ -448,7 +442,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the stack is empty or contains an unsupported type.
-    pub(super) fn execute_switch(
+    pub fn execute_switch(
         thread: &mut EmulationThread,
         instruction: &Instruction,
     ) -> Result<StepResult> {
@@ -504,7 +498,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the token operand is missing.
-    pub(super) fn load_string(instruction: &Instruction) -> Result<StepResult> {
+    pub fn load_string(instruction: &Instruction) -> Result<StepResult> {
         let token = instruction
             .get_token_operand()
             .ok_or_else(|| Self::invalid_operand(instruction, "token"))?;
@@ -530,7 +524,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the length is negative or the operand is missing.
-    pub(super) fn new_array(
+    pub fn new_array(
         thread: &mut EmulationThread,
         instruction: &Instruction,
     ) -> Result<StepResult> {
@@ -595,25 +589,23 @@ impl Interpreter {
     ///
     /// Returns an error if the value is null or not an array reference.
     #[allow(clippy::cast_possible_truncation)]
-    pub(super) fn load_array_length(thread: &mut EmulationThread) -> Result<StepResult> {
+    pub fn load_array_length(thread: &mut EmulationThread) -> Result<StepResult> {
         let array_ref = thread.pop()?;
 
         match array_ref {
             EmValue::ObjectRef(href) => {
-                let obj = thread.get_heap_object(href)?;
-                let length = match obj {
-                    HeapObject::Array { elements, .. } => elements.len(),
-                    HeapObject::MultiArray { dimensions, .. } => dimensions.iter().product(),
-                    HeapObject::String(s) => s.len(),
-                    _ => {
-                        return Err(EmulationError::TypeMismatch {
-                            operation: "ldlen",
-                            expected: "array",
-                            found: "non-array object",
-                        }
-                        .into())
+                let length = thread.heap().with_object(href, |obj| match obj {
+                    HeapObject::Array { elements, .. } => Ok(elements.len()),
+                    HeapObject::MultiArray { dimensions, .. } => Ok(dimensions.iter().product()),
+                    // A string's length in UTF-16 code units, as `String.Length` counts it
+                    HeapObject::String(s) => Ok(s.utf16_len()),
+                    _ => Err(EmulationError::TypeMismatch {
+                        operation: "ldlen",
+                        expected: "array",
+                        found: "non-array object",
                     }
-                };
+                    .into()),
+                })?;
                 thread.push(EmValue::NativeUInt(length as u64))?;
                 Ok(StepResult::Continue)
             }
@@ -636,106 +628,22 @@ impl Interpreter {
         }
     }
 
-    /// Extracts an integer value from a heap object reference.
-    ///
-    /// This helper function tries to extract an integer index from an ObjectRef
-    /// by examining the heap object. It supports:
-    /// - Object with integer fields (common in obfuscated code with struct wrappers)
-    /// - Object with nested ObjectRef fields (recursively checks up to 2 levels)
-    /// - Single-element arrays containing integers
-    /// - Multi-dimensional arrays with a single element
-    fn extract_integer_from_object(thread: &EmulationThread, href: HeapRef) -> Option<i64> {
-        if let Ok(obj) = thread.get_heap_object(href) {
-            match obj {
-                HeapObject::BoxedValue { value, .. } => {
-                    // This shouldn't happen (get_boxed_value should have caught it)
-                    // but handle it anyway
-                    return value.try_to_i64();
-                }
-                HeapObject::Object { fields, .. } => {
-                    // Try to find any integer-like value in the fields
-                    for field_value in fields.values() {
-                        if let Some(int_val) = field_value.try_to_i64() {
-                            return Some(int_val);
-                        }
-                        // Check nested ObjectRef (one level of indirection)
-                        if let EmValue::ObjectRef(nested_href) = field_value {
-                            if let Ok(boxed) = thread.heap().get_boxed_value(*nested_href) {
-                                if let Some(int_val) = boxed.try_to_i64() {
-                                    return Some(int_val);
-                                }
-                            }
-                            // Also try recursively extracting from nested object
-                            if let Some(int_val) =
-                                Self::extract_integer_from_object(thread, *nested_href)
-                            {
-                                return Some(int_val);
-                            }
-                        }
-                    }
-                }
-                HeapObject::Array { elements, .. } if elements.len() == 1 => {
-                    // Check if it's a single-element array containing an integer
-                    if let Some(int_val) = elements.first().and_then(EmValue::try_to_i64) {
-                        return Some(int_val);
-                    }
-                }
-                HeapObject::MultiArray { elements, .. } if elements.len() == 1 => {
-                    // Check if it's a single-element multi-array
-                    if let Some(int_val) = elements.first().and_then(EmValue::try_to_i64) {
-                        return Some(int_val);
-                    }
-                }
-                HeapObject::String(s) => {
-                    // Try to parse the string as an integer (some obfuscators do this)
-                    if let Ok(v) = s.parse::<i64>() {
-                        return Some(v);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
     /// Extracts an integer index from an EmValue for array operations.
     ///
-    /// This function handles various ways an index might be represented:
-    /// - Direct integer types (I32, I64, NativeInt, NativeUInt)
-    /// - Boxed integers (ObjectRef -> BoxedValue)
-    /// - Object wrappers with integer fields
-    /// - Single-element arrays containing integers
-    fn extract_array_index(
-        thread: &EmulationThread,
-        index: &EmValue,
-        operation: &'static str,
-    ) -> Result<i64> {
-        // First, try direct conversion for all integer-like types
-        if let Some(v) = index.try_to_i64() {
-            return Ok(v);
-        }
-
-        // Handle ObjectRef - could be boxed value or wrapper object
-        if let EmValue::ObjectRef(href) = index {
-            // Try boxed value first
-            if let Ok(boxed_value) = thread.heap().get_boxed_value(*href) {
-                if let Some(v) = boxed_value.try_to_i64() {
-                    return Ok(v);
-                }
+    /// ECMA-335 (III.4.7, III.4.8, III.4.26) takes the index of `ldelem`, `ldelema` and `stelem`
+    /// as an `int32` or a `native int`, and the runtime rejects anything else as an invalid
+    /// program. An integer of either width is the index; any other value, an object reference
+    /// among them, is a type mismatch. Reading an index out of an object (a boxed integer, or
+    /// the first integer among an object's fields) made one up where the program supplied none.
+    fn extract_array_index(index: &EmValue, operation: &'static str) -> Result<i64> {
+        index.try_to_i64().ok_or_else(|| {
+            EmulationError::TypeMismatch {
+                operation,
+                expected: "integer index",
+                found: index.cil_flavor().as_str(),
             }
-
-            // Try extracting from object/array structure
-            if let Some(v) = Self::extract_integer_from_object(thread, *href) {
-                return Ok(v);
-            }
-        }
-
-        Err(EmulationError::TypeMismatch {
-            operation,
-            expected: "integer index",
-            found: index.cil_flavor().as_str(),
-        }
-        .into())
+            .into()
+        })
     }
 
     /// Loads an element from an array onto the stack.
@@ -752,19 +660,18 @@ impl Interpreter {
     ///
     /// Returns an error if the array is null, the index is out of bounds,
     /// or the value is not an array reference.
-    pub(super) fn load_element(
+    pub fn load_element(
         thread: &mut EmulationThread,
         expected_type: &CilFlavor,
     ) -> Result<StepResult> {
         let index = thread.pop()?;
         let array_ref = thread.pop()?;
 
-        let idx = Self::extract_array_index(thread, &index, "ldelem")?;
+        let idx = Self::extract_array_index(&index, "ldelem")?;
 
         match array_ref {
             EmValue::ObjectRef(href) => {
-                let obj = thread.get_heap_object(href)?;
-                let element = match obj {
+                let element = thread.heap().with_object(href, |obj| match obj {
                     HeapObject::Array {
                         element_type,
                         elements,
@@ -773,7 +680,7 @@ impl Interpreter {
                         // E.g., ldelem.ref (expected=Object) on string[] (element=String)
                         // should succeed since String is assignable to Object.
                         if !element_type.is_compatible_with(expected_type)
-                            && !expected_type.is_compatible_with(&element_type)
+                            && !expected_type.is_compatible_with(element_type)
                         {
                             return Err(EmulationError::TypeMismatch {
                                 operation: "ldelem",
@@ -784,26 +691,24 @@ impl Interpreter {
                         }
 
                         let array_idx = usize::try_from(idx).ok();
-                        match array_idx.and_then(|i| elements.get(i)) {
-                            Some(v) => v.clone(),
-                            None => {
-                                return Err(EmulationError::ArrayIndexOutOfBounds {
+                        array_idx
+                            .and_then(|i| elements.get(i))
+                            .cloned()
+                            .ok_or_else(|| {
+                                EmulationError::ArrayIndexOutOfBounds {
                                     index: idx,
                                     length: elements.len(),
                                 }
-                                .into());
-                            }
-                        }
+                                .into()
+                            })
                     }
-                    _ => {
-                        return Err(EmulationError::TypeMismatch {
-                            operation: "ldelem",
-                            expected: "array",
-                            found: "non-array object",
-                        }
-                        .into())
+                    _ => Err(EmulationError::TypeMismatch {
+                        operation: "ldelem",
+                        expected: "array",
+                        found: "non-array object",
                     }
-                };
+                    .into()),
+                })?;
                 thread.push(element)?;
                 Ok(StepResult::Continue)
             }
@@ -839,7 +744,7 @@ impl Interpreter {
     ///
     /// Returns an error if the array is null, the index is out of bounds,
     /// or the value is not an array reference.
-    pub(super) fn store_element(
+    pub fn store_element(
         thread: &mut EmulationThread,
         expected_type: &CilFlavor,
     ) -> Result<StepResult> {
@@ -847,7 +752,7 @@ impl Interpreter {
         let index = thread.pop()?;
         let array_ref = thread.pop()?;
 
-        let idx = Self::extract_array_index(thread, &index, "stelem")?;
+        let idx = Self::extract_array_index(&index, "stelem")?;
 
         let array_idx = usize::try_from(idx).map_err(|_| {
             Error::from(EmulationError::ArrayIndexOutOfBounds {
@@ -870,20 +775,15 @@ impl Interpreter {
         match array_ref {
             EmValue::ObjectRef(href) => {
                 // Also verify against the array's declared element type
-                let array_element_type = {
-                    let obj = thread.get_heap_object(href)?;
-                    match obj {
-                        HeapObject::Array { element_type, .. } => element_type,
-                        _ => {
-                            return Err(EmulationError::TypeMismatch {
-                                operation: "stelem",
-                                expected: "array",
-                                found: "non-array object",
-                            }
-                            .into())
-                        }
+                let array_element_type = thread.heap().with_object(href, |obj| match obj {
+                    HeapObject::Array { element_type, .. } => Ok(element_type.clone()),
+                    _ => Err(EmulationError::TypeMismatch {
+                        operation: "stelem",
+                        expected: "array",
+                        found: "non-array object",
                     }
-                };
+                    .into()),
+                })?;
 
                 // Check type compatibility
                 // Note: We allow flexible type checking for reference types because:
@@ -943,7 +843,7 @@ impl Interpreter {
     ///
     /// Returns an error if the array is null, the index is negative,
     /// or the value is not an array reference.
-    pub(super) fn load_element_address(thread: &mut EmulationThread) -> Result<StepResult> {
+    pub fn load_element_address(thread: &mut EmulationThread) -> Result<StepResult> {
         let index = thread.pop()?;
         let array_ref = thread.pop()?;
 
@@ -951,7 +851,7 @@ impl Interpreter {
         // matching a narrower set here. `native uint` is a legal array index and
         // appears in ConfuserEx's constants `Initialize()`; accepting only
         // `I32`/`NativeInt` rejected it and aborted the whole emulation.
-        let idx_i64 = Self::extract_array_index(thread, &index, "ldelema")?;
+        let idx_i64 = Self::extract_array_index(&index, "ldelema")?;
 
         let idx = usize::try_from(idx_i64).map_err(|_| {
             Error::from(EmulationError::ArrayIndexOutOfBounds {
@@ -995,7 +895,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the array is null or the index is out of bounds.
-    pub(super) fn load_element_typed(thread: &mut EmulationThread) -> Result<StepResult> {
+    pub fn load_element_typed(thread: &mut EmulationThread) -> Result<StepResult> {
         // ldelem <type> - same as ldelem.* but with explicit type token
         Self::load_element(thread, &CilFlavor::Object)
     }
@@ -1011,7 +911,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the array is null or the index is out of bounds.
-    pub(super) fn store_element_typed(thread: &mut EmulationThread) -> Result<StepResult> {
+    pub fn store_element_typed(thread: &mut EmulationThread) -> Result<StepResult> {
         // stelem <type> - same as stelem.* but with explicit type token
         Self::store_element(thread, &CilFlavor::Object)
     }
@@ -1032,7 +932,7 @@ impl Interpreter {
     /// Returns an error if the object is null or not an object reference.
     ///
     /// [`TaintSource::Field`]: crate::emulation::TaintSource::Field
-    pub(super) fn load_field(
+    pub fn load_field(
         thread: &mut EmulationThread,
         instruction: &Instruction,
     ) -> Result<StepResult> {
@@ -1043,12 +943,9 @@ impl Interpreter {
 
         // Helper to load field from heap reference
         let load_from_href = |thread: &mut EmulationThread, href: HeapRef| -> Result<StepResult> {
-            let obj = thread.get_heap_object(href)?;
-            match obj {
+            let value = thread.heap().with_object(href, |obj| match obj {
                 HeapObject::Object { fields, .. } => {
-                    let value = fields.get(&field_token).cloned().unwrap_or(EmValue::Null);
-                    thread.push(value)?;
-                    Ok(StepResult::Continue)
+                    Ok(fields.get(&field_token).cloned().unwrap_or(EmValue::Null))
                 }
                 _ => Err(EmulationError::TypeMismatch {
                     operation: "ldfld",
@@ -1056,7 +953,9 @@ impl Interpreter {
                     found: "non-object",
                 }
                 .into()),
-            }
+            })?;
+            thread.push(value)?;
+            Ok(StepResult::Continue)
         };
 
         // Helper to extract a field from a ValueType
@@ -1103,9 +1002,24 @@ impl Interpreter {
             // CIL allows ldfld with a managed pointer to the object
             EmValue::ManagedPtr(ptr) => {
                 match &ptr.target {
-                    PointerTarget::ObjectField { object, .. } => {
-                        // Pointer to an object's field - use that object
-                        load_from_href(thread, *object)
+                    PointerTarget::ObjectField { .. } => {
+                        // A pointer to an object's field (`ldflda`) points at the value the
+                        // field holds: the field read is one of that value's, a struct's, or
+                        // of the object a reference-typed field holds. Reading it from the
+                        // object holding the field read a field of the wrong instance.
+                        match thread.deref_pointer(&ptr)? {
+                            EmValue::ObjectRef(href) => load_from_href(thread, href),
+                            value @ (EmValue::ValueType { .. } | EmValue::Void) => {
+                                load_from_valuetype(thread, value)
+                            }
+                            EmValue::Null => Err(EmulationError::NullReference.into()),
+                            other => Err(EmulationError::TypeMismatch {
+                                operation: "ldfld",
+                                expected: "a struct or object behind the field pointer",
+                                found: other.cil_flavor().as_str(),
+                            }
+                            .into()),
+                        }
                     }
                     PointerTarget::Local(idx) => {
                         let frame = thread
@@ -1196,7 +1110,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the object is null or not an object reference.
-    pub(super) fn load_field_address(
+    pub fn load_field_address(
         thread: &mut EmulationThread,
         instruction: &Instruction,
     ) -> Result<StepResult> {
@@ -1234,7 +1148,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the object is null or not an object reference.
-    pub(super) fn store_field(
+    pub fn store_field(
         thread: &mut EmulationThread,
         instruction: &Instruction,
     ) -> Result<StepResult> {
@@ -1288,11 +1202,34 @@ impl Interpreter {
                 // If pointing to an object, use the object's heap reference
                 // Otherwise store through the pointer (for value types)
                 match &ptr.target {
-                    PointerTarget::ObjectField { object, .. } => {
-                        // Pointer to an object's field - use the object ref to set the field
-                        let heap = thread.heap_mut();
-                        heap.set_field(*object, field_token, value)?;
-                        Ok(StepResult::Continue)
+                    PointerTarget::ObjectField { .. } => {
+                        // A pointer to an object's field (`ldflda`) points at the value the
+                        // field holds: the store goes into that value, a struct written back
+                        // into the field, or the object a reference-typed field holds. Storing
+                        // into the object holding the field set a field of the wrong instance.
+                        match thread.deref_pointer(&ptr)? {
+                            EmValue::ObjectRef(href) => {
+                                thread.heap_mut().set_field(href, field_token, value)?;
+                                Ok(StepResult::Continue)
+                            }
+                            vt @ EmValue::ValueType { .. } => {
+                                let updated = store_into_valuetype(thread, vt, field_token, value)
+                                    .ok_or_else(|| EmulationError::TypeMismatch {
+                                        operation: "stfld",
+                                        expected: "a field of the struct behind the pointer",
+                                        found: "a field of another type",
+                                    })?;
+                                thread.store_through_pointer(&ptr, updated)?;
+                                Ok(StepResult::Continue)
+                            }
+                            EmValue::Null => Err(EmulationError::NullReference.into()),
+                            other => Err(EmulationError::TypeMismatch {
+                                operation: "stfld",
+                                expected: "a struct or object behind the field pointer",
+                                found: other.cil_flavor().as_str(),
+                            }
+                            .into()),
+                        }
                     }
                     PointerTarget::Local(idx) => {
                         // Pointer to a local variable — resolve against owning frame
@@ -1434,7 +1371,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the field token operand is missing.
-    pub(super) fn load_static_field(instruction: &Instruction) -> Result<StepResult> {
+    pub fn load_static_field(instruction: &Instruction) -> Result<StepResult> {
         let field = instruction
             .get_token_operand()
             .ok_or_else(|| Self::invalid_operand(instruction, "token"))?;
@@ -1455,7 +1392,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the field token operand is missing.
-    pub(super) fn load_static_field_address(
+    pub fn load_static_field_address(
         thread: &mut EmulationThread,
         instruction: &Instruction,
     ) -> Result<StepResult> {
@@ -1484,7 +1421,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the field token operand is missing.
-    pub(super) fn store_static_field(
+    pub fn store_static_field(
         thread: &mut EmulationThread,
         instruction: &Instruction,
     ) -> Result<StepResult> {
@@ -1513,7 +1450,7 @@ impl Interpreter {
     ///
     /// Returns an error if the pointer is null, unmanaged (not supported),
     /// or not a pointer type.
-    pub(super) fn load_indirect_sized(
+    pub fn load_indirect_sized(
         thread: &mut EmulationThread,
         address_space: &Arc<AddressSpace>,
         expected_type: &CilFlavor,
@@ -1675,7 +1612,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the pointer is null or not a pointer type.
-    pub(super) fn store_indirect_sized(
+    pub fn store_indirect_sized(
         thread: &mut EmulationThread,
         address_space: &Arc<AddressSpace>,
         expected_type: &CilFlavor,
@@ -1907,10 +1844,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the pointer is null or not a pointer type.
-    pub(super) fn load_object(
-        thread: &mut EmulationThread,
-        type_token: Token,
-    ) -> Result<StepResult> {
+    pub fn load_object(thread: &mut EmulationThread, type_token: Token) -> Result<StepResult> {
         let addr = thread.pop()?;
 
         match addr {
@@ -1963,10 +1897,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the pointer is null or not a pointer type.
-    pub(super) fn store_object(
-        thread: &mut EmulationThread,
-        type_token: Token,
-    ) -> Result<StepResult> {
+    pub fn store_object(thread: &mut EmulationThread, type_token: Token) -> Result<StepResult> {
         let value = thread.pop()?;
         let addr = thread.pop()?;
 
@@ -2017,7 +1948,7 @@ impl Interpreter {
     /// # Errors
     ///
     /// Returns an error if the value is NaN, infinity, or not a float type.
-    pub(super) fn check_finite(thread: &mut EmulationThread) -> Result<StepResult> {
+    pub fn check_finite(thread: &mut EmulationThread) -> Result<StepResult> {
         let value = thread.pop()?;
 
         match value {

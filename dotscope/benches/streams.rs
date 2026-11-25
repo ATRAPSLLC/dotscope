@@ -8,42 +8,31 @@
 //!
 //! Includes both construction/parsing and access pattern benchmarks.
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
-use std::{fs, hint::black_box, path::PathBuf};
+use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use dotscope::metadata::streams::{Blob, Guid, Strings, UserStrings};
-
-/// Read a sample file from the workspace samples directory. Returns `None`
-/// (with a stderr diagnostic) if the file is missing, so benchmarks can be
-/// skipped without panicking.
-fn read_sample(name: &str) -> Option<Vec<u8>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name);
-    match fs::read(&path) {
-        Ok(data) => Some(data),
-        Err(err) => {
-            eprintln!(
-                "Skipping benchmark: failed to read {}: {err}",
-                path.display()
-            );
-            None
-        }
-    }
-}
+use dotscope::{
+    metadata::streams::{Blob, Guid, Strings, UserStrings},
+    testkit::fixture_bytes,
+};
 
 /// Benchmark parsing the complete #Strings heap.
 fn bench_strings_heap_parse(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_STRINGS.bin") else {
-        return;
-    };
+    let data = fixture_bytes("WB_STRINGS.bin");
     let file_size = data.len();
 
     let mut group = c.benchmark_group("strings_heap");
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(Strings::from(black_box(&data)).ok());
+            black_box(
+                Strings::from(black_box(data)).expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -51,10 +40,8 @@ fn bench_strings_heap_parse(c: &mut Criterion) {
 
 /// Benchmark iterating over all strings in the heap.
 fn bench_strings_heap_iterate(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_STRINGS.bin") else {
-        return;
-    };
-    let Ok(strings) = Strings::from(&data) else {
+    let data = fixture_bytes("WB_STRINGS.bin");
+    let Ok(strings) = Strings::from(data) else {
         eprintln!("Skipping iterate: failed to parse strings heap");
         return;
     };
@@ -74,10 +61,8 @@ fn bench_strings_heap_iterate(c: &mut Criterion) {
 
 /// Benchmark random access to strings by offset.
 fn bench_strings_heap_random_access(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_STRINGS.bin") else {
-        return;
-    };
-    let Ok(strings) = Strings::from(&data) else {
+    let data = fixture_bytes("WB_STRINGS.bin");
+    let Ok(strings) = Strings::from(data) else {
         eprintln!("Skipping random_access: failed to parse strings heap");
         return;
     };
@@ -89,7 +74,11 @@ fn bench_strings_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &offset in black_box(&offsets) {
-                let _ = black_box(strings.get(offset));
+                black_box(
+                    strings
+                        .get(offset)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });
@@ -98,16 +87,16 @@ fn bench_strings_heap_random_access(c: &mut Criterion) {
 
 /// Benchmark parsing the complete #Blob heap.
 fn bench_blob_heap_parse(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_BLOB.bin") else {
-        return;
-    };
+    let data = fixture_bytes("WB_BLOB.bin");
     let file_size = data.len();
 
     let mut group = c.benchmark_group("blob_heap");
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(Blob::from(black_box(&data)).ok());
+            black_box(
+                Blob::from(black_box(data)).expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -115,10 +104,8 @@ fn bench_blob_heap_parse(c: &mut Criterion) {
 
 /// Benchmark iterating over all blobs in the heap.
 fn bench_blob_heap_iterate(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_BLOB.bin") else {
-        return;
-    };
-    let Ok(blob) = Blob::from(&data) else {
+    let data = fixture_bytes("WB_BLOB.bin");
+    let Ok(blob) = Blob::from(data) else {
         eprintln!("Skipping iterate: failed to parse blob heap");
         return;
     };
@@ -138,10 +125,8 @@ fn bench_blob_heap_iterate(c: &mut Criterion) {
 
 /// Benchmark random access to blobs by offset.
 fn bench_blob_heap_random_access(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_BLOB.bin") else {
-        return;
-    };
-    let Ok(blob) = Blob::from(&data) else {
+    let data = fixture_bytes("WB_BLOB.bin");
+    let Ok(blob) = Blob::from(data) else {
         eprintln!("Skipping random_access: failed to parse blob heap");
         return;
     };
@@ -153,7 +138,10 @@ fn bench_blob_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &offset in black_box(&offsets) {
-                let _ = black_box(blob.get(offset));
+                black_box(
+                    blob.get(offset)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });
@@ -162,16 +150,17 @@ fn bench_blob_heap_random_access(c: &mut Criterion) {
 
 /// Benchmark parsing the complete #US (User Strings) heap.
 fn bench_userstrings_heap_parse(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_US.bin") else {
-        return;
-    };
+    let data = fixture_bytes("WB_US.bin");
     let file_size = data.len();
 
     let mut group = c.benchmark_group("userstrings_heap");
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(UserStrings::from(black_box(&data)).ok());
+            black_box(
+                UserStrings::from(black_box(data))
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -179,10 +168,8 @@ fn bench_userstrings_heap_parse(c: &mut Criterion) {
 
 /// Benchmark iterating over all user strings in the heap.
 fn bench_userstrings_heap_iterate(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_US.bin") else {
-        return;
-    };
-    let Ok(us) = UserStrings::from(&data) else {
+    let data = fixture_bytes("WB_US.bin");
+    let Ok(us) = UserStrings::from(data) else {
         eprintln!("Skipping iterate: failed to parse user strings heap");
         return;
     };
@@ -202,10 +189,8 @@ fn bench_userstrings_heap_iterate(c: &mut Criterion) {
 
 /// Benchmark random access to user strings by offset.
 fn bench_userstrings_heap_random_access(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_US.bin") else {
-        return;
-    };
-    let Ok(us) = UserStrings::from(&data) else {
+    let data = fixture_bytes("WB_US.bin");
+    let Ok(us) = UserStrings::from(data) else {
         eprintln!("Skipping random_access: failed to parse user strings heap");
         return;
     };
@@ -217,7 +202,10 @@ fn bench_userstrings_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &offset in black_box(&offsets) {
-                let _ = black_box(us.get(offset));
+                black_box(
+                    us.get(offset)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });
@@ -226,16 +214,16 @@ fn bench_userstrings_heap_random_access(c: &mut Criterion) {
 
 /// Benchmark parsing the complete #GUID heap.
 fn bench_guid_heap_parse(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_GUID.bin") else {
-        return;
-    };
+    let data = fixture_bytes("WB_GUID.bin");
     let file_size = data.len();
 
     let mut group = c.benchmark_group("guid_heap");
     group.throughput(Throughput::Bytes(file_size as u64));
     group.bench_function("parse", |b| {
         b.iter(|| {
-            black_box(Guid::from(black_box(&data)).ok());
+            black_box(
+                Guid::from(black_box(data)).expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
     group.finish();
@@ -243,10 +231,8 @@ fn bench_guid_heap_parse(c: &mut Criterion) {
 
 /// Benchmark iterating over all GUIDs in the heap.
 fn bench_guid_heap_iterate(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_GUID.bin") else {
-        return;
-    };
-    let Ok(guid) = Guid::from(&data) else {
+    let data = fixture_bytes("WB_GUID.bin");
+    let Ok(guid) = Guid::from(data) else {
         eprintln!("Skipping iterate: failed to parse GUID heap");
         return;
     };
@@ -266,10 +252,8 @@ fn bench_guid_heap_iterate(c: &mut Criterion) {
 
 /// Benchmark random access to GUIDs by index (1-based as per ECMA-335).
 fn bench_guid_heap_random_access(c: &mut Criterion) {
-    let Some(data) = read_sample("tests/samples/WB_GUID.bin") else {
-        return;
-    };
-    let Ok(guid) = Guid::from(&data) else {
+    let data = fixture_bytes("WB_GUID.bin");
+    let Ok(guid) = Guid::from(data) else {
         eprintln!("Skipping random_access: failed to parse GUID heap");
         return;
     };
@@ -281,7 +265,10 @@ fn bench_guid_heap_random_access(c: &mut Criterion) {
     group.bench_function("random_access", |b| {
         b.iter(|| {
             for &index in black_box(&indices) {
-                let _ = black_box(guid.get(index));
+                black_box(
+                    guid.get(index)
+                        .expect("the benchmarked work succeeds on its input"),
+                );
             }
         });
     });

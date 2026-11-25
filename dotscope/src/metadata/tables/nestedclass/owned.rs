@@ -107,7 +107,7 @@ impl NestedClass {
     pub fn apply(&self) -> Result<()> {
         self.enclosing_class
             .nested_types
-            .push(self.nested_class.clone().into());
+            .push_row(self.token, self.nested_class.clone().into());
 
         self.nested_class
             .set_enclosing_type(&self.enclosing_class.clone().into())?;

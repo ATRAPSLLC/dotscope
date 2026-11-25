@@ -24,6 +24,7 @@ use crate::{
     assembly::{Instruction, Operand},
     metadata::{
         method::Method,
+        streams::SharedStr,
         tables::MemberRefSignature,
         token::Token,
         typesystem::{CilTypeReference, TypeRegistry},
@@ -44,16 +45,22 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```ignore
-/// let assembly = CilObject::open("sample.dll")?;
+/// ```
+/// use dotscope::{analysis::CallGraph, CilObject};
+///
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
 /// let call_graph = CallGraph::build(&assembly)?;
 ///
 /// // Get statistics about the call graph
 /// let stats = call_graph.stats();
 /// println!("Methods: {}, Edges: {}", stats.method_count, stats.edge_count);
 ///
-/// // Find methods called by a specific method
-/// let callees = call_graph.callees(method_token);
+/// // Find the methods an entry point calls
+/// if let Some(&method) = call_graph.entry_points().first() {
+///     let callees = call_graph.callees(method);
+///     println!("{} callees", callees.len());
+/// }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Debug)]
 pub struct CallGraph {
@@ -160,7 +167,9 @@ impl CallGraph {
                         node_id
                     } else {
                         // External reference - create node for it
-                        if let Some(node) = Self::create_external_node(assembly, callee_token) {
+                        if let Some(node) =
+                            Self::create_external_node(assembly, &resolver, callee_token)
+                        {
                             let node_id = graph.add_node(node);
                             token_to_node.insert(callee_token, node_id);
                             node_id
@@ -286,7 +295,7 @@ impl CallGraph {
                 }
             } else if table_id == 0x0A || table_id == 0x2B {
                 // MemberRef or MethodSpec - external reference
-                if let Some(node) = Self::create_external_node(assembly, current_token) {
+                if let Some(node) = Self::create_external_node(assembly, &resolver, current_token) {
                     let node_id = graph.add_node(node);
                     token_to_node.insert(current_token, node_id);
                 }
@@ -374,7 +383,11 @@ impl CallGraph {
     }
 
     /// Creates a call graph node for an external method reference (MemberRef or MethodSpec).
-    fn create_external_node(assembly: &CilObject, callee_token: Token) -> Option<CallGraphNode> {
+    fn create_external_node(
+        assembly: &CilObject,
+        resolver: &CallResolver,
+        callee_token: Token,
+    ) -> Option<CallGraphNode> {
         let table_id = callee_token.table();
 
         match table_id {
@@ -387,7 +400,7 @@ impl CallGraph {
                     // Get the declaring type name
                     let type_name = Self::get_external_type_name(&member_ref.declaredby);
                     let full_name = if type_name.is_empty() {
-                        member_ref.name.clone()
+                        member_ref.name.to_string()
                     } else {
                         format!("{}::{}", type_name, member_ref.name)
                     };
@@ -416,7 +429,7 @@ impl CallGraph {
 
                     // Get information from the underlying method
                     let (name, full_name, signature, is_constructor) =
-                        Self::get_method_spec_info(assembly, &method_spec.method);
+                        Self::get_method_spec_info(assembly, resolver, &method_spec.method);
 
                     let mut node = CallGraphNode::new(callee_token, name, full_name, signature);
                     node.is_external_ref = true;
@@ -435,12 +448,15 @@ impl CallGraph {
         match type_ref {
             CilTypeReference::TypeRef(t)
             | CilTypeReference::TypeDef(t)
-            | CilTypeReference::TypeSpec(t) => t.fullname().unwrap_or_default(),
+            | CilTypeReference::TypeSpec(t) => t
+                .fullname()
+                .map(|name| name.to_string())
+                .unwrap_or_default(),
             CilTypeReference::MemberRef(mr) => {
                 // For MemberRef as parent, recurse to get its declaring type
                 Self::get_external_type_name(&mr.declaredby)
             }
-            CilTypeReference::ModuleRef(m) => m.name.clone(),
+            CilTypeReference::ModuleRef(m) => m.name.to_string(),
             _ => String::new(),
         }
     }
@@ -448,15 +464,15 @@ impl CallGraph {
     /// Gets method information from a MethodSpec's underlying method reference.
     fn get_method_spec_info(
         assembly: &CilObject,
+        resolver: &CallResolver,
         method_ref: &CilTypeReference,
-    ) -> (String, String, String, bool) {
+    ) -> (SharedStr, String, String, bool) {
         match method_ref {
             CilTypeReference::MethodDef(mr) => {
                 if let Some(method) = mr.upgrade() {
                     let types = assembly.types();
-                    let resolver = CallResolver::new(assembly);
                     let full_name =
-                        Self::get_method_full_name(&types, &resolver, method.token, &method.name);
+                        Self::get_method_full_name(&types, resolver, method.token, &method.name);
                     (
                         method.name.clone(),
                         full_name,
@@ -465,7 +481,7 @@ impl CallGraph {
                     )
                 } else {
                     (
-                        "unknown".to_string(),
+                        SharedStr::from("unknown"),
                         "unknown".to_string(),
                         String::new(),
                         false,
@@ -475,7 +491,7 @@ impl CallGraph {
             CilTypeReference::MemberRef(mr) => {
                 let type_name = Self::get_external_type_name(&mr.declaredby);
                 let full_name = if type_name.is_empty() {
-                    mr.name.clone()
+                    mr.name.to_string()
                 } else {
                     format!("{}::{}", type_name, mr.name)
                 };
@@ -486,7 +502,7 @@ impl CallGraph {
                 (mr.name.clone(), full_name, signature, mr.is_constructor())
             }
             _ => (
-                "unknown".to_string(),
+                SharedStr::from("unknown"),
                 "unknown".to_string(),
                 String::new(),
                 false,
@@ -555,7 +571,9 @@ impl CallGraph {
         call_type: CallType,
         token: Token,
     ) -> CallTarget {
-        // Check if method is in current assembly
+        // A MemberRef or MethodSpec naming a method of this assembly calls that method: a
+        // generic method's instantiation, or a method of a generic type, is called through one.
+        let token = assembly.resolver().resolve_method(token).unwrap_or(token);
         if assembly.methods().contains_key(&token) {
             if call_type.is_virtual() {
                 // Virtual call - use CHA
@@ -743,8 +761,10 @@ impl CallGraph {
 
     /// Returns method tokens in topological order (callees before callers).
     ///
-    /// For methods in SCCs (cycles), the order within the SCC is arbitrary.
-    /// The result is lazily computed and cached on first access.
+    /// The order is the same with and without recursion: a method comes after every method
+    /// it calls, except within a strongly connected component (mutual recursion), whose
+    /// methods come in an arbitrary order. The result is lazily computed and cached on first
+    /// access.
     ///
     /// # Returns
     ///
@@ -752,14 +772,16 @@ impl CallGraph {
     #[must_use]
     pub fn topological_order(&self) -> &[Token] {
         self.topo_order.get_or_init(|| {
-            // Try topological sort first (works for DAGs)
+            // Without cycles, a topological sort: it puts callers first (edges run from a
+            // caller to its callees), so it is reversed
             if let Some(order) = algorithms::topological_sort(&self.graph) {
                 order
                     .into_iter()
+                    .rev()
                     .filter_map(|node_id| self.graph.node(node_id).map(|n| n.token))
                     .collect()
             } else {
-                // Graph has cycles - use SCC-based ordering
+                // With cycles, the strongly connected components, which come leaves first
                 let sccs = self.sccs();
                 sccs.iter()
                     .flatten()
@@ -1046,7 +1068,118 @@ impl CallGraphStats {
 
 #[cfg(test)]
 mod tests {
-    use crate::analysis::callgraph::CallGraphStats;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        analysis::callgraph::CallGraphStats,
+        metadata::tables::TableId,
+        testkit::{
+            helpers::load_sample,
+            mono::compilation::compile,
+            tools::{require_tool, ToolKind},
+        },
+    };
+
+    /// A chain of calls, with or without a recursive method elsewhere: recursion makes the
+    /// graph cyclic, which the order was computed differently for.
+    fn chain(recursive: bool) -> String {
+        let recursion = if recursive {
+            "public static int Rec(int n) { return n == 0 ? 0 : Rec(n - 1); }"
+        } else {
+            ""
+        };
+        format!(
+            "public static class Program {{
+                public static int Leaf() {{ return 1; }}
+                public static int Mid() {{ return Leaf() + 1; }}
+                public static int Top() {{ return Mid() + 1; }}
+                {recursion}
+                public static void Main() {{ Top(); }}
+            }}"
+        )
+    }
+
+    #[test]
+    fn the_topological_order_puts_callees_first_with_or_without_recursion() {
+        let Some(caps) = require_tool(ToolKind::Toolchain) else {
+            return;
+        };
+        let arch = caps.supported_architectures.first().unwrap();
+        for recursive in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let compiled = compile(caps, &chain(recursive), dir.path(), "chain", arch).unwrap();
+            assert!(compiled.is_success(), "{:?}", compiled.error);
+            let assembly = CilObject::from_path(compiled.assembly_path()).unwrap();
+            let graph = CallGraph::build(&assembly).unwrap();
+            assert_eq!(graph.has_recursion(), recursive);
+
+            let order = graph.topological_order();
+            let position = |name: &str| {
+                let token = assembly
+                    .methods()
+                    .iter()
+                    .find(|entry| entry.value().name == name)
+                    .map(|entry| *entry.key())
+                    .unwrap();
+                order.iter().position(|&t| t == token).unwrap()
+            };
+            assert!(
+                position("Leaf") < position("Mid") && position("Mid") < position("Top"),
+                "recursive: {recursive}: {order:?}"
+            );
+            for _ in 0..10 {
+                let again = CallGraph::build(&assembly).unwrap();
+                assert_eq!(
+                    again.topological_order(),
+                    order,
+                    "the order is deterministic"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_through_a_member_ref_or_method_spec_naming_a_local_method_is_an_edge_to_it() {
+        // WindowsBase calls methods of its own generic types through MemberRefs; ConfuserEx's
+        // type scrambler calls `BuildMessage<string>` through a MethodSpec.
+        for (path, through) in [
+            ("WindowsBase.dll", TableId::MemberRef),
+            (
+                "packers/confuserex/1.6.0/mkaring_typescramble.exe",
+                TableId::MethodSpec,
+            ),
+        ] {
+            let assembly = load_sample(path);
+            let graph = CallGraph::build(&assembly).expect("built");
+            let resolver = assembly.resolver();
+            let mut calls = 0usize;
+            for entry in assembly.methods().iter() {
+                let caller = entry.value();
+                for instr in caller.instructions() {
+                    if !matches!(instr.mnemonic, "call" | "newobj" | "ldftn") {
+                        continue;
+                    }
+                    let Some(token) = instr.get_token_operand() else {
+                        continue;
+                    };
+                    let Some(local) = resolver.resolve_method(token) else {
+                        continue;
+                    };
+                    if !token.is_table(through) {
+                        continue;
+                    }
+                    calls = calls.saturating_add(1);
+                    assert!(
+                        graph.callees(caller.token).contains(&local),
+                        "{path}: {} calls {local} through {token}",
+                        caller.token
+                    );
+                }
+            }
+            assert!(calls > 0, "{path}: calls through {through:?}");
+        }
+    }
 
     #[test]
     fn test_call_graph_stats_resolution_rate() {

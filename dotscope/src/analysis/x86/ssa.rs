@@ -8,25 +8,24 @@
 //! The translation pipeline:
 //!
 //! ```text
-//! X86Function (CFG) → analyze dominance → place phi nodes → translate blocks → SsaFunction
+//! X86Function (CFG) → translate blocks → construct SSA at the boundaries → SsaFunction
 //! ```
 //!
 //! # Register Versioning
 //!
 //! Each x86 register is tracked as a versioned SSA variable. When a register
-//! is written, a new SSA variable is created. At control flow join points,
-//! phi nodes merge the different versions.
+//! is written, a new SSA variable is created. Each block is translated on its
+//! own, entered with one placeholder per register; analyssa's
+//! [`BoundaryRecorder`] then answers every placeholder with the definition
+//! that reaches the block and places the phis the joins need.
 //!
-//! # Phi Node Placement
-//!
-//! Phi nodes are placed using the dominance frontier algorithm:
-//! 1. Compute dominance frontiers for the CFG
-//! 2. For each register defined in a block, place phi nodes at its dominance frontier
-//! 3. Iterate until fixed point (phi nodes can themselves require more phi nodes)
+//! A register read on some path before anything writes it is an error: these
+//! stubs are entered with their one argument on the stack, and no register
+//! holds anything the translation could name.
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::analysis::{x86_decode_all, X86Function, X86ToSsaTranslator};
 //!
 //! // Decode x86 code
@@ -37,20 +36,28 @@
 //! // Translate to SSA
 //! let translator = X86ToSsaTranslator::new(&cfg);
 //! let ssa_function = translator.translate()?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
-use analyssa::graph::NodeId;
-use rustc_hash::{FxHashMap, FxHashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    num::NonZeroU16,
+};
+
+use analyssa::{
+    analysis::VerifyLevel,
+    ir::function::{BoundaryRecorder, SsaConstructOptions},
+};
 
 use crate::{
     analysis::{
         ssa::{
-            CmpKind, ConstValue, DefSite, PhiNode, PhiOperand, SsaBlock, SsaFunction,
-            SsaInstruction, SsaOp, SsaType, SsaVarId, SsaVariable, VariableOrigin,
+            AccessQualifiers, CmpKind, ConstValue, DefSite, SsaBlock, SsaFunction, SsaInstruction,
+            SsaOp, SsaType, SsaVarId, SsaVariable, VariableOrigin,
         },
         x86::{
             cfg::X86Function,
-            flags::{ArithmeticKind, ConditionEval, FlagProducer, FlagState, FlagTestSource},
+            flags::{condition_formula, FlagFormula, FlagProducer, FlagState, ResultKind},
             types::{
                 X86Condition, X86DecodedInstruction, X86Instruction, X86Memory, X86Operand,
                 X86Register,
@@ -74,11 +81,12 @@ const MAX_REGISTERS: usize = 22;
 ///
 /// The numbering follows LLVM's x86 convention (256 = `gs`, 257 = `fs`) so a
 /// dump is readable against existing tooling. The values themselves are opaque
-/// to analyssa — it only ever compares them for equality.
-const ADDRESS_SPACE_GS: u16 = 256;
+/// to analyssa: it only ever compares them for equality. Address space 0 is the flat
+/// default, which analyssa spells `None`, so the ids are non-zero.
+const ADDRESS_SPACE_GS: NonZeroU16 = NonZeroU16::new(256).unwrap();
 
 /// Address space id for `fs:`-qualified accesses. See [`ADDRESS_SPACE_GS`].
-const ADDRESS_SPACE_FS: u16 = 257;
+const ADDRESS_SPACE_FS: NonZeroU16 = NonZeroU16::new(257).unwrap();
 
 /// Maps a memory operand's segment override to an SSA address space.
 ///
@@ -88,7 +96,7 @@ const ADDRESS_SPACE_FS: u16 = 257;
 /// analysis prove two names for the *same* cell disjoint — the one direction
 /// that is unsound. `fs:`/`gs:` genuinely have their own bases (TEB/PEB access,
 /// stack cookies, TLS), which is exactly the distinction worth keeping.
-fn address_space_for(mem: &X86Memory) -> Option<u16> {
+fn address_space_for(mem: &X86Memory) -> Option<NonZeroU16> {
     match mem.segment {
         Some(X86Register::Fs) => Some(ADDRESS_SPACE_FS),
         Some(X86Register::Gs) => Some(ADDRESS_SPACE_GS),
@@ -104,16 +112,13 @@ fn address_space_for(mem: &X86Memory) -> Option<u16> {
 struct RegisterState {
     /// Current SSA variable for each register (indexed by `X86Register::base_index()`).
     registers: [Option<SsaVarId>; MAX_REGISTERS],
-    /// The bitness (32 or 64) - affects which registers are valid.
-    bitness: u32,
 }
 
 impl RegisterState {
     /// Creates a new register state with all registers undefined.
-    fn new(bitness: u32) -> Self {
+    fn new() -> Self {
         Self {
             registers: [None; MAX_REGISTERS],
-            bitness,
         }
     }
 
@@ -130,83 +135,101 @@ impl RegisterState {
             *slot = Some(var);
         }
     }
-
-    /// Returns an iterator over all defined registers and their SSA variables.
-    fn defined_registers(&self) -> impl Iterator<Item = (usize, SsaVarId)> + '_ {
-        self.registers
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, var)| var.map(|v| (idx, v)))
-    }
-
-    /// Returns the number of valid registers for this bitness.
-    fn register_count(&self) -> usize {
-        if self.bitness == 64 {
-            16
-        } else {
-            8
-        }
-    }
-}
-
-/// Tracks phi nodes needed at each block for each register.
-#[derive(Debug, Default)]
-struct PhiPlacement {
-    /// Maps block index → register index → phi node result variable.
-    phis: FxHashMap<usize, FxHashMap<usize, SsaVarId>>,
-}
-
-impl PhiPlacement {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the phi variable for a register at a block, if one exists.
-    fn get(&self, block: usize, reg_idx: usize) -> Option<SsaVarId> {
-        self.phis.get(&block).and_then(|m| m.get(&reg_idx).copied())
-    }
-
-    /// Sets the phi variable for a register at a block.
-    fn set(&mut self, block: usize, reg_idx: usize, var: SsaVarId) {
-        self.phis.entry(block).or_default().insert(reg_idx, var);
-    }
-
-    /// Returns true if a phi exists for the given block and register.
-    fn has(&self, block: usize, reg_idx: usize) -> bool {
-        self.phis
-            .get(&block)
-            .is_some_and(|m| m.contains_key(&reg_idx))
-    }
 }
 
 /// Translates an x86 function to SSA form.
+///
+/// # Exactness
+///
+/// The translation models each instruction exactly or refuses the function: the
+/// caller keeps the native stub on an error, and the stub still runs on its
+/// platform, whereas a lift that approximates an instruction would compute wrong
+/// values silently. In particular:
+///
+/// - Only 32-bit code is translated. 64-bit registers, RIP-relative addressing and
+///   the 64-bit operand forms are not modelled.
+/// - An 8- or 16-bit register is read as its bits zero-extended and written by
+///   inserting its bits into the full register, so `mov al, 5` keeps EAX's upper
+///   bits and `ah` is bits 8-15 of EAX.
+/// - The flags are known only when the instruction that set them is modelled at
+///   the full register width; a condition that reads an unknown flag refuses the
+///   function ([`Error::X86Error`]).
 pub struct X86ToSsaTranslator<'a> {
     /// The x86 function to translate.
     func: &'a X86Function,
-    /// Register state at the end of each block (for computing phi operands).
-    block_exit_states: Vec<RegisterState>,
-    /// Phi placement information.
-    phi_placement: PhiPlacement,
-    /// Blocks that define each register (for phi placement).
-    reg_def_blocks: Vec<FxHashSet<usize>>,
     /// SSA variables created during translation.
     variables: Vec<SsaVariable>,
-    /// Zero constant variable (lazily created).
-    zero_const: Option<SsaVarId>,
+    /// The zero constant of the block being translated, created the first time the
+    /// block needs one. A constant defined in one block does not reach a block it
+    /// does not dominate, so each block has its own.
+    zero_const: Option<(usize, SsaVarId)>,
+    /// Each block's index, by the offset of its first instruction.
+    block_by_offset: HashMap<u64, usize>,
+    /// The values a pop with nothing pushed reads: what the caller's frame held, which
+    /// this translation does not follow. A stub's epilogue pops the registers its
+    /// prologue saved and never reads them; a function whose computation reads one is
+    /// refused.
+    undefined: BTreeSet<SsaVarId>,
+}
+
+/// The bits of the full register an 8- or 16-bit register names: its shift and its
+/// mask. `None` for a register that is its own full slot (a 32-bit register, a
+/// segment register).
+fn sub_register(reg: X86Register) -> Option<(i64, i64)> {
+    match reg {
+        X86Register::Al | X86Register::Cl | X86Register::Dl | X86Register::Bl => Some((0, 0xFF)),
+        X86Register::Ah | X86Register::Ch | X86Register::Dh | X86Register::Bh => Some((8, 0xFF)),
+        X86Register::Ax
+        | X86Register::Cx
+        | X86Register::Dx
+        | X86Register::Bx
+        | X86Register::Sp
+        | X86Register::Bp
+        | X86Register::Si
+        | X86Register::Di => Some((0, 0xFFFF)),
+        _ => None,
+    }
+}
+
+/// The operand's width in bits when it is narrower than the 32-bit registers this
+/// translator models; `None` at the full width, and for an immediate, which takes
+/// the width of the operand it is combined with.
+fn narrow_bits(operand: &X86Operand) -> Option<u32> {
+    let bytes = match operand {
+        X86Operand::Register(reg) => sub_register(*reg).map(|_| reg.size())?,
+        X86Operand::Memory(mem) => mem.size,
+        X86Operand::Immediate(_) => return None,
+    };
+    (bytes < 4).then_some(u32::from(bytes) * 8)
+}
+
+/// The count of a shift or rotate as the processor uses it: an immediate count
+/// masked to five bits, or `None` for a count in a register, which is known only at
+/// run time.
+fn immediate_count(count: &X86Operand) -> Option<i64> {
+    match count {
+        X86Operand::Immediate(value) => Some(value & 31),
+        _ => None,
+    }
 }
 
 impl<'a> X86ToSsaTranslator<'a> {
     /// Creates a new translator for the given x86 function.
     #[must_use]
     pub fn new(func: &'a X86Function) -> Self {
-        let block_count = func.block_count();
+        let block_by_offset = func
+            .node_ids()
+            .filter_map(|node| {
+                func.block(node.index())
+                    .map(|block| (block.start_offset, node.index()))
+            })
+            .collect();
         Self {
             func,
-            block_exit_states: vec![RegisterState::new(func.bitness); block_count],
-            phi_placement: PhiPlacement::new(),
-            reg_def_blocks: vec![FxHashSet::default(); MAX_REGISTERS],
             variables: Vec::new(),
             zero_const: None,
+            block_by_offset,
+            undefined: BTreeSet::new(),
         }
     }
 
@@ -220,19 +243,29 @@ impl<'a> X86ToSsaTranslator<'a> {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The function is empty
-    /// - The CFG is irreducible
-    /// - An unsupported instruction is encountered
-    /// - A flag pattern cannot be translated
+    /// - The function is empty, or is not 32-bit code
+    /// - An unsupported instruction is encountered, or an instruction in a form
+    ///   this translation does not model exactly
+    /// - A condition reads a flag that is not known
+    /// - A register is read on some path before anything writes it
+    /// - The SSA the translation builds does not verify
     pub fn translate(mut self) -> Result<SsaFunction> {
         if self.func.block_count() == 0 {
             return Err(Error::X86Error("Empty function".to_string()));
         }
+        if self.func.bitness != 32 {
+            return Err(Error::X86Error(format!(
+                "{}-bit code is not translated: only the 32-bit registers and addressing are \
+                 modelled",
+                self.func.bitness
+            )));
+        }
 
-        // Translation allocates per-block register state and runs a worklist per register, so
-        // cost grows with block count — and block count comes from decoding a region derived
-        // from attacker-controlled file headers. The decoder's instruction budget bounds this
-        // indirectly; this is the direct statement of the limit.
+        // Translation allocates per-block register state, so cost grows with
+        // block count - and block count comes from decoding a region derived
+        // from attacker-controlled file headers. The decoder's instruction
+        // budget bounds this indirectly; this is the direct statement of the
+        // limit.
         if self.func.block_count() > MAX_TRANSLATABLE_BLOCKS {
             return Err(Error::X86Error(format!(
                 "x86 function has {} blocks, exceeding the {} block translation limit",
@@ -241,25 +274,22 @@ impl<'a> X86ToSsaTranslator<'a> {
             )));
         }
 
-        // Step 1: Analyze which blocks define which registers
-        self.analyze_definitions();
+        let block_count = self.func.block_count();
+        let mut record = BoundaryRecorder::<usize>::new(block_count);
+        // The first pop loads the argument.
+        let arg_var = self.create_variable(VariableOrigin::Argument(0), DefSite::entry());
+        let mut ssa_blocks = Vec::with_capacity(block_count);
+        for block_idx in 0..block_count {
+            ssa_blocks.push(self.translate_block(block_idx, arg_var, &mut record)?);
+        }
 
-        // Step 2: Place phi nodes using dominance frontiers
-        self.place_phi_nodes()?;
-
-        // Step 3: Translate blocks in dominator tree order
-        let ssa_blocks = self.translate_blocks()?;
-
-        // Step 4: Build the SSA function
         // DynCipher functions take one argument (the input value)
         let mut ssa_func = SsaFunction::new(1, 0);
-
-        // Add blocks
         for block in ssa_blocks {
             ssa_func.add_block(block);
         }
-
-        // Transfer variables — they already have dense IDs from our local allocator
+        // The variables already have dense ids from this translator's own
+        // allocator, which the blocks above name.
         for var in &self.variables {
             ssa_func.create_variable(
                 var.origin(),
@@ -269,150 +299,116 @@ impl<'a> X86ToSsaTranslator<'a> {
             );
         }
 
+        let recorded = record.construct(&mut ssa_func, |_| SsaType::I32);
+        let constructed = &recorded.construction;
+        // What a register holds when the function is entered: a placeholder
+        // that became its register's entry value, or one construction minted
+        // for a path no write reaches. These stubs are entered with nothing in
+        // their registers, so any of them the code uses is a read of nothing.
+        let mut entry_values: BTreeMap<SsaVarId, usize> = record
+            .reads()
+            .iter()
+            .filter(|read| !constructed.replacements.contains_key(&read.var))
+            .map(|read| (read.var, read.key))
+            .collect();
+        for (group, value) in &constructed.minted_entry_values {
+            if let Some(key) = recorded.key(*group) {
+                entry_values.insert(*value, key);
+            }
+        }
+        let used = Self::used_values(&ssa_func);
+        if let Some(register) = used.iter().find_map(|value| entry_values.get(value)) {
+            return Err(Error::X86Error(format!(
+                "Register index {register} is read before anything writes it"
+            )));
+        }
+        if used.iter().any(|value| self.undefined.contains(value)) {
+            return Err(Error::X86Error(
+                "a value popped with nothing pushed is read, and what it holds is not followed"
+                    .to_string(),
+            ));
+        }
+
+        // The finishing sequence, from the crate that owns it: stamp
+        // instruction identities, refresh definition sites, prune what control
+        // cannot reach, rebuild the use index, and drop the placeholders no
+        // read needed. The use index matters most - a function handed on with
+        // every use list empty tells a dead-code pass that nobody reads a live
+        // definition.
+        // At the full level, which checks that every definition dominates its uses: a
+        // value read on a path that does not define it is a wrong translation like any
+        // other, and the functions translated here are small
+        let options = SsaConstructOptions::default().verified_at(VerifyLevel::Full);
+        let report = ssa_func
+            .finish_construction(&options)
+            .map_err(|e| Error::SsaError(e.to_string()))?;
+
+        // A finding means the translation is wrong. The caller then keeps the
+        // native stub, which still computes what it always did; SSA that does not
+        // verify would be turned into code that computes something else.
+        if !report.findings.is_empty() {
+            return Err(Error::X86Error(format!(
+                "x86 translation produced invalid SSA: {:?}",
+                report.findings
+            )));
+        }
+
         Ok(ssa_func)
     }
 
-    /// Analyzes which blocks define which registers.
-    fn analyze_definitions(&mut self) {
-        for node_id in self.func.node_ids() {
-            let block_idx = node_id.index();
-            if let Some(block) = self.func.block(block_idx) {
-                for instr in &block.instructions {
-                    if let Some(reg_idx) = get_defined_register(&instr.instruction) {
-                        if let Some(set) = self.reg_def_blocks.get_mut(reg_idx) {
-                            set.insert(block_idx);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Places phi nodes at dominance frontiers.
-    fn place_phi_nodes(&mut self) -> Result<()> {
-        let doms = self.func.dominators();
-        let block_count = self.func.block_count();
-        let bitness = self.func.bitness;
-        let register_count = self
-            .block_exit_states
-            .first()
-            .ok_or_else(|| Error::SsaError("place_phi_nodes: block_exit_states is empty".into()))?
-            .register_count();
-
-        // Precompute the dominance frontier once (Cytron et al.), rather than rediscovering it
-        // by scanning every block for every register on every worklist pop.
-        //
-        // The previous shape was O(registers × blocks² × in-degree) with two `dominates` queries
-        // per candidate, over input whose block count is attacker-controlled — the x86 subsystem
-        // decodes regions derived from file headers. This is one pass over the join points.
-        //
-        // DF[runner] gains `b` for every runner on the idom chain from each predecessor of a
-        // join point `b` up to (but excluding) idom(b).
-        let mut frontier: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); block_count];
-        for block_idx in 0..block_count {
-            let node = NodeId::new(block_idx);
-            let preds: Vec<NodeId> = self.func.predecessors(node).collect();
-            if preds.len() < 2 {
-                continue;
-            }
-
-            let idom_of_node = doms.immediate_dominator(node);
-            for pred in preds {
-                let mut runner = pred;
-                while Some(runner) != idom_of_node {
-                    let Some(slot) = frontier.get_mut(runner.index()) else {
-                        break;
-                    };
-                    slot.insert(block_idx);
-
-                    let Some(next) = doms.immediate_dominator(runner) else {
-                        break;
-                    };
-                    if next == runner {
-                        break;
-                    }
-                    runner = next;
-                }
-            }
-        }
-
-        // For each register that is defined somewhere
-        for reg_idx in 0..register_count {
-            // Clone the def_blocks to avoid borrow issues
-            let def_blocks: FxHashSet<usize> = self
-                .reg_def_blocks
-                .get(reg_idx)
-                .ok_or_else(|| {
-                    Error::SsaError("place_phi_nodes: reg_def_blocks index out of bounds".into())
-                })?
-                .clone();
-            if def_blocks.is_empty() {
-                continue;
-            }
-
-            // Worklist of blocks where we might need phi nodes
-            let mut worklist: Vec<usize> = def_blocks.iter().copied().collect();
-            let mut phi_blocks: FxHashSet<usize> = FxHashSet::default();
-
-            while let Some(def_block) = worklist.pop() {
-                let Some(df) = frontier.get(def_block) else {
+    /// The values the function uses: read by an instruction, or merged by a phi
+    /// whose result is used.
+    fn used_values(ssa: &SsaFunction) -> BTreeSet<SsaVarId> {
+        let mut used: BTreeSet<SsaVarId> = ssa
+            .blocks()
+            .iter()
+            .flat_map(|block| block.instructions())
+            .flat_map(SsaInstruction::uses)
+            .collect();
+        let mut pending: Vec<SsaVarId> = used.iter().copied().collect();
+        while let Some(value) = pending.pop() {
+            for phi in ssa.blocks().iter().flat_map(|block| block.phi_nodes()) {
+                if phi.result() != value {
                     continue;
-                };
-
-                for &block_idx in df {
-                    if phi_blocks.contains(&block_idx) {
-                        continue;
-                    }
-                    phi_blocks.insert(block_idx);
-
-                    // Create phi variable
-                    let phi_var =
-                        self.create_variable(VariableOrigin::Phi, DefSite::phi(block_idx), bitness);
-                    self.phi_placement.set(block_idx, reg_idx, phi_var);
-
-                    // Phi defines the register, so add to worklist
-                    if !def_blocks.contains(&block_idx) {
-                        worklist.push(block_idx);
+                }
+                for operand in phi.operands() {
+                    if used.insert(operand.value()) {
+                        pending.push(operand.value());
                     }
                 }
             }
         }
-        Ok(())
+        used
     }
 
-    /// Translates all blocks to SSA form.
-    fn translate_blocks(&mut self) -> Result<Vec<SsaBlock>> {
-        let block_count = self.func.block_count();
-        let mut ssa_blocks = Vec::with_capacity(block_count);
-
-        // Initialize argument variable (first pop loads the argument)
-        let arg_var = self.create_variable(
-            VariableOrigin::Argument(0),
-            DefSite::entry(),
-            self.func.bitness,
-        );
-
-        // Process blocks in order
-        for block_idx in 0..block_count {
-            let ssa_block = self.translate_block(block_idx, arg_var)?;
-            ssa_blocks.push(ssa_block);
-        }
-
-        // Fill in phi operands now that we know exit states
-        self.fill_phi_operands(&mut ssa_blocks);
-
-        Ok(ssa_blocks)
-    }
-
-    /// Translates a single block to SSA form.
-    fn translate_block(&mut self, block_idx: usize, arg_var: SsaVarId) -> Result<SsaBlock> {
+    /// Translates one block, entered with a placeholder for every register.
+    ///
+    /// Each placeholder is recorded as a read the block makes before writing,
+    /// and what the block leaves in each register as its write; construction
+    /// answers the placeholders afterwards. A placeholder nothing reads costs a
+    /// variable that finishing drops.
+    ///
+    /// A block that does not end in a jump or a return falls through to the block
+    /// starting where it ends, and is given that jump as its terminator.
+    fn translate_block(
+        &mut self,
+        block_idx: usize,
+        arg_var: SsaVarId,
+        record: &mut BoundaryRecorder<usize>,
+    ) -> Result<SsaBlock> {
         let mut ssa_block = SsaBlock::new(block_idx);
 
-        // Initialize register state from predecessors
-        let mut reg_state = self.compute_entry_state(block_idx);
+        let mut reg_state = RegisterState::new();
+        let mut entered = [None; MAX_REGISTERS];
+        for (index, slot) in entered.iter_mut().enumerate() {
+            let placeholder = self.create_variable(VariableOrigin::Phi, DefSite::entry());
+            record.record_read(block_idx, index, placeholder, true);
+            *slot = Some(placeholder);
+        }
+        reg_state.registers = entered;
 
-        // Initialize segment registers with constant 0 for the entry block
-        // (segment registers are constant selectors in user-mode code)
+        // Segment registers are constant selectors in user-mode code: the
+        // entry block defines them, and every other block reads that.
         if block_idx == 0 {
             let seg_regs = [
                 X86Register::Es,
@@ -423,38 +419,24 @@ impl<'a> X86ToSsaTranslator<'a> {
                 X86Register::Gs,
             ];
             for seg in seg_regs {
-                if reg_state.get(seg).is_none() {
-                    let seg_var = self.create_variable(
-                        VariableOrigin::Phi,
-                        DefSite::entry(),
-                        self.func.bitness,
-                    );
-                    reg_state.set(seg, seg_var);
-                }
-            }
-        }
-
-        // Add phi nodes for this block
-        if let Some(block_phis) = self.phi_placement.phis.get(&block_idx) {
-            for (&reg_idx, &phi_var) in block_phis {
-                let origin = VariableOrigin::Phi;
-                let phi = PhiNode::new(phi_var, origin);
-                ssa_block.add_phi(phi);
-
-                // Phi defines this register at block entry
-                if let Some(reg) = index_to_register(reg_idx, self.func.bitness) {
-                    reg_state.set(reg, phi_var);
-                }
+                let seg_var = self.create_variable(VariableOrigin::Phi, DefSite::entry());
+                reg_state.set(seg, seg_var);
             }
         }
 
         // Track flags for CMP/TEST + Jcc fusion
         let mut flags = FlagState::new();
 
-        // Track if we've seen the first POP (which loads the argument)
-        let mut first_pop = true;
+        // The machine stack this block starts with. The entry block is entered
+        // with the caller's argument on it, which is the calling convention
+        // these stubs are built to; every other block starts with the stack
+        // this translation can see nothing on, and a pop there is refused.
+        let mut stack: Vec<SsaVarId> = if block_idx == 0 {
+            vec![arg_var]
+        } else {
+            Vec::new()
+        };
 
-        // Translate each instruction
         let block = self
             .func
             .block(block_idx)
@@ -465,8 +447,7 @@ impl<'a> X86ToSsaTranslator<'a> {
                 decoded,
                 &mut reg_state,
                 &mut flags,
-                arg_var,
-                &mut first_pop,
+                &mut stack,
                 block_idx,
             )?;
 
@@ -475,716 +456,516 @@ impl<'a> X86ToSsaTranslator<'a> {
             }
         }
 
-        // Save exit state for phi operand computation
-        let slot = self.block_exit_states.get_mut(block_idx).ok_or_else(|| {
-            Error::SsaError(format!(
-                "translate_block: block_exit_states out of bounds at {block_idx}"
-            ))
-        })?;
-        *slot = reg_state;
+        let terminated = matches!(
+            block.terminator(),
+            Some(X86Instruction::Jmp { .. } | X86Instruction::Jcc { .. } | X86Instruction::Ret)
+        );
+        if !terminated {
+            let next = self.block_at_offset(block.end_offset)?;
+            ssa_block.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: next }));
+        }
+
+        for (index, (exit, entry)) in reg_state.registers.iter().zip(entered).enumerate() {
+            if let Some(exit) = *exit {
+                if Some(exit) != entry {
+                    record.write(block_idx, index, exit);
+                }
+            }
+        }
 
         Ok(ssa_block)
     }
 
-    /// Computes the register state at block entry from phi nodes and predecessors.
-    fn compute_entry_state(&self, block_idx: usize) -> RegisterState {
-        let mut state = RegisterState::new(self.func.bitness);
-
-        // If this block has phi nodes, use them
-        if let Some(block_phis) = self.phi_placement.phis.get(&block_idx) {
-            for (&reg_idx, &phi_var) in block_phis {
-                if let Some(reg) = index_to_register(reg_idx, self.func.bitness) {
-                    state.set(reg, phi_var);
-                }
-            }
-        }
-
-        // For entry block, registers start undefined (will be set by instructions)
-        if block_idx == 0 {
-            return state;
-        }
-
-        // For non-entry blocks without phis, try to get value from single predecessor
-        let node = NodeId::new(block_idx);
-        let preds: Vec<_> = self.func.predecessors(node).collect();
-
-        if preds.len() == 1 {
-            if let Some(pred) = preds.first() {
-                let pred_idx = pred.index();
-                // Copy predecessor's exit state for registers without phi nodes
-                if let Some(pred_state) = self.block_exit_states.get(pred_idx) {
-                    for reg_idx in 0..state.register_count() {
-                        if !self.phi_placement.has(block_idx, reg_idx) {
-                            if let Some(Some(var)) = pred_state.registers.get(reg_idx) {
-                                if let Some(slot) = state.registers.get_mut(reg_idx) {
-                                    *slot = Some(*var);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        state
-    }
-
-    /// Fills in phi operands after all blocks have been translated.
-    fn fill_phi_operands(&self, ssa_blocks: &mut [SsaBlock]) {
-        for (block_idx, ssa_block) in ssa_blocks.iter_mut().enumerate() {
-            let node = NodeId::new(block_idx);
-
-            for phi in ssa_block.phi_nodes_mut() {
-                // Find which register this phi is for
-                let phi_var = phi.result();
-                let reg_idx = self.find_phi_register(block_idx, phi_var);
-
-                if let Some(reg_idx) = reg_idx {
-                    // Add operand from each predecessor
-                    for pred in self.func.predecessors(node) {
-                        let pred_idx = pred.index();
-                        if let Some(pred_state) = self.block_exit_states.get(pred_idx) {
-                            if let Some(Some(var)) = pred_state.registers.get(reg_idx) {
-                                phi.add_operand(PhiOperand::new(*var, pred_idx));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Finds which register index a phi variable is for.
-    fn find_phi_register(&self, block_idx: usize, phi_var: SsaVarId) -> Option<usize> {
-        if let Some(block_phis) = self.phi_placement.phis.get(&block_idx) {
-            for (&reg_idx, &var) in block_phis {
-                if var == phi_var {
-                    return Some(reg_idx);
-                }
-            }
-        }
-        None
-    }
-
     /// Translates a single x86 instruction to SSA operations.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn translate_instruction(
         &mut self,
         decoded: &X86DecodedInstruction,
         reg_state: &mut RegisterState,
         flags: &mut FlagState,
-        arg_var: SsaVarId,
-        first_pop: &mut bool,
+        stack: &mut Vec<SsaVarId>,
         block_idx: usize,
     ) -> Result<Vec<SsaInstruction>> {
         let mut result = Vec::new();
+        let out = &mut result;
 
         match &decoded.instruction {
-            // Data movement
+            // Data movement: none of these touch the flags
             X86Instruction::Mov { dst, src } => {
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                self.set_operand_value(dst, src_var, reg_state, &mut result, block_idx)?;
-                flags.clear(); // MOV doesn't set flags
+                let value = self.read_operand(src, reg_state, out, block_idx)?;
+                self.write_operand(dst, value, reg_state, out, block_idx)?;
             }
 
-            X86Instruction::Movzx { dst, src } | X86Instruction::Movsx { dst, src } => {
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                // For SSA purposes, we treat zero/sign extension as a simple move
-                // The type system will handle the extension semantics
-                self.set_operand_value(dst, src_var, reg_state, &mut result, block_idx)?;
-                flags.clear();
+            X86Instruction::Movzx { dst, src } => {
+                // A narrow operand reads zero-extended already
+                let value = self.read_operand(src, reg_state, out, block_idx)?;
+                self.write_operand(dst, value, reg_state, out, block_idx)?;
+            }
+
+            X86Instruction::Movsx { dst, src } => {
+                let value = self.read_operand(src, reg_state, out, block_idx)?;
+                let bits = narrow_bits(src).unwrap_or(32);
+                let extended = self.sign_extend(value, bits, out, block_idx);
+                self.write_operand(dst, extended, reg_state, out, block_idx)?;
             }
 
             X86Instruction::Lea { dst, src } => {
                 // LEA computes an address without dereferencing
-                let addr_var =
-                    self.compute_memory_address(src, reg_state, &mut result, block_idx)?;
-                reg_state.set(*dst, addr_var);
-                flags.clear();
+                let addr = self.compute_memory_address(src, reg_state, out, block_idx)?;
+                self.write_register(*dst, addr, reg_state, out, block_idx)?;
             }
 
-            X86Instruction::Push { .. } => {
-                // In our simplified model, we don't track stack explicitly
-                // PUSH is used in prologues which we skip
-                flags.clear();
+            X86Instruction::Push { src } => {
+                // The machine stack, as the values on it. A push is the only
+                // thing that puts one there and a pop is the only thing that
+                // takes one off, so the pair is what carries a value across a
+                // save-and-restore - the shape every one of these stubs uses
+                // around the computation it protects. Its slots are 32 bits.
+                if narrow_bits(src).is_some() {
+                    return Err(self.unmodelled(decoded, "a 16-bit push"));
+                }
+                let value = self.read_operand(src, reg_state, out, block_idx)?;
+                stack.push(value);
             }
 
             X86Instruction::Pop { dst } => {
-                // First POP in DynCipher code loads the argument
-                if *first_pop {
-                    *first_pop = false;
-                    reg_state.set(*dst, arg_var);
-                } else {
-                    // Subsequent POPs restore saved registers (prologue handling)
-                    // We create an undefined value
-                    let var = self.create_variable(
-                        VariableOrigin::Phi,
-                        DefSite::instruction(block_idx, result.len()),
-                        self.func.bitness,
-                    );
-                    reg_state.set(*dst, var);
+                // A pop takes back what the matching push left. The entry
+                // block's stack starts holding the caller's argument, which is
+                // how that argument reaches the first pop, so no rule about
+                // which pop is special is needed here.
+                if narrow_bits(&X86Operand::Register(*dst)).is_some() {
+                    return Err(self.unmodelled(decoded, "a 16-bit pop"));
                 }
-                flags.clear();
+                // A pop with nothing pushed reads a value from outside what this
+                // translation follows: a push in another block, or a frame the
+                // caller built. It is named by a placeholder definition, and the
+                // function is refused if anything reads it.
+                let value = match stack.pop() {
+                    Some(value) => value,
+                    None => {
+                        let placeholder = self.get_constant(0, out, block_idx);
+                        self.undefined.insert(placeholder);
+                        placeholder
+                    }
+                };
+                self.write_register(*dst, value, reg_state, out, block_idx)?;
             }
 
             X86Instruction::Xchg { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                self.set_operand_value(dst, src_var, reg_state, &mut result, block_idx)?;
-                self.set_operand_value(src, dst_var, reg_state, &mut result, block_idx)?;
-                flags.clear();
+                let dst_value = self.read_operand(dst, reg_state, out, block_idx)?;
+                let src_value = self.read_operand(src, reg_state, out, block_idx)?;
+                self.write_operand(dst, src_value, reg_state, out, block_idx)?;
+                self.write_operand(src, dst_value, reg_state, out, block_idx)?;
+            }
+
+            X86Instruction::Xor { dst, src } | X86Instruction::Sub { dst, src }
+                if dst.is_register() && dst == src =>
+            {
+                // `xor r, r` and `sub r, r` are zero whatever r held: the idiom that
+                // clears a register reads nothing
+                let zero = self.get_zero_constant(out, block_idx);
+                self.write_operand(dst, zero, reg_state, out, block_idx)?;
+                if narrow_bits(dst).is_some() {
+                    flags.clear();
+                } else if matches!(decoded.instruction, X86Instruction::Xor { .. }) {
+                    self.set_logic_flags(flags, zero, zero, zero, None, out, block_idx);
+                } else {
+                    flags.set_compare(zero, zero);
+                    flags.set_carry(zero);
+                }
             }
 
             // Arithmetic
-            X86Instruction::Add { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Add {
-                    dest: res_var,
-                    left: dst_var,
-                    right: src_var,
+            X86Instruction::Add { dst, src } | X86Instruction::Xadd { dst, src } => {
+                let left = self.read_operand(dst, reg_state, out, block_idx)?;
+                let right = self.read_operand(src, reg_state, out, block_idx)?;
+                let sum = self.emit(out, block_idx, |dest| SsaOp::Add {
+                    dest,
+                    left,
+                    right,
                     flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::Add);
-                // CF = (result < left) unsigned — unsigned overflow detection
-                let cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf,
-                    left: res_var,
-                    right: dst_var,
-                    unsigned: true,
-                }));
-                flags.set_carry(cf);
+                });
+                if matches!(decoded.instruction, X86Instruction::Xadd { .. }) {
+                    // XADD hands the destination's old value to the source first, so
+                    // the sum is what a register serving as both ends up holding
+                    self.write_operand(src, left, reg_state, out, block_idx)?;
+                }
+                self.write_operand(dst, sum, reg_state, out, block_idx)?;
+                if narrow_bits(dst).is_some() {
+                    flags.clear();
+                } else {
+                    flags.set_result(sum, left, right, ResultKind::Add);
+                    // CF: the sum wrapped below the left operand
+                    let carry = self.compare(CmpKind::Lt, sum, left, true, out, block_idx);
+                    flags.set_carry(carry);
+                }
             }
 
             X86Instruction::Sub { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Sub {
-                    dest: res_var,
-                    left: dst_var,
-                    right: src_var,
+                let left = self.read_operand(dst, reg_state, out, block_idx)?;
+                let right = self.read_operand(src, reg_state, out, block_idx)?;
+                let difference = self.emit(out, block_idx, |dest| SsaOp::Sub {
+                    dest,
+                    left,
+                    right,
                     flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::Sub);
-                // CF = (left < right) unsigned — borrow detection
-                let cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf,
-                    left: dst_var,
-                    right: src_var,
-                    unsigned: true,
-                }));
-                flags.set_carry(cf);
+                });
+                self.write_operand(dst, difference, reg_state, out, block_idx)?;
+                if narrow_bits(dst).is_some() {
+                    flags.clear();
+                } else {
+                    // The flags of SUB are those of CMP on the same operands
+                    flags.set_compare(left, right);
+                    let borrow = self.compare(CmpKind::Lt, left, right, true, out, block_idx);
+                    flags.set_carry(borrow);
+                }
+            }
+
+            X86Instruction::Cmp { left, right } => {
+                let left_value = self.read_operand(left, reg_state, out, block_idx)?;
+                let right_value = self.read_operand(right, reg_state, out, block_idx)?;
+                if narrow_bits(left).is_some() {
+                    flags.clear();
+                } else {
+                    flags.set_compare(left_value, right_value);
+                    let borrow =
+                        self.compare(CmpKind::Lt, left_value, right_value, true, out, block_idx);
+                    flags.set_carry(borrow);
+                }
             }
 
             X86Instruction::Imul { dst, src, src2 } => {
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let multiplier = if let Some(s2) = src2 {
-                    self.get_operand_value(s2, reg_state, &mut result, block_idx)?
-                } else {
-                    // Two-operand form: dst = dst * src
-                    Self::get_register_value(*dst, reg_state)?
+                // The two- and three-operand forms keep the low half of the
+                // product, which is the same for a signed and an unsigned
+                // multiply. CF and OF report whether the product fits, which is
+                // not modelled, and ZF, SF and PF are undefined.
+                let (left, right) = match src2 {
+                    Some(immediate) => (
+                        self.read_operand(src, reg_state, out, block_idx)?,
+                        self.read_operand(immediate, reg_state, out, block_idx)?,
+                    ),
+                    None => (
+                        self.read_register(*dst, reg_state, out, block_idx)?,
+                        self.read_operand(src, reg_state, out, block_idx)?,
+                    ),
                 };
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Mul {
-                    dest: res_var,
-                    left: src_var,
-                    right: multiplier,
+                let product = self.emit(out, block_idx, |dest| SsaOp::Mul {
+                    dest,
+                    left,
+                    right,
                     flags: None,
-                }));
-                reg_state.set(*dst, res_var);
-                flags.set_arithmetic(res_var, src_var, multiplier, ArithmeticKind::Other);
+                });
+                self.write_register(*dst, product, reg_state, out, block_idx)?;
+                flags.clear();
             }
 
             X86Instruction::Mul { src } => {
-                // MUL: EDX:EAX = EAX * src (unsigned)
-                // For simplicity, we only track EAX result
-                let eax = Self::get_register_value(X86Register::Eax, reg_state)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Mul {
-                    dest: res_var,
-                    left: eax,
-                    right: src_var,
+                // EDX:EAX = EAX * src, unsigned, computed as a 64-bit product
+                if narrow_bits(src).is_some() {
+                    return Err(self.unmodelled(decoded, "an 8- or 16-bit MUL"));
+                }
+                let eax = self.read_register(X86Register::Eax, reg_state, out, block_idx)?;
+                let factor = self.read_operand(src, reg_state, out, block_idx)?;
+                let wide_eax = self.convert(eax, SsaType::U64, true, out, block_idx);
+                let wide_factor = self.convert(factor, SsaType::U64, true, out, block_idx);
+                let product = self.emit_typed(SsaType::U64, out, block_idx, |dest| SsaOp::Mul {
+                    dest,
+                    left: wide_eax,
+                    right: wide_factor,
                     flags: None,
-                }));
-                reg_state.set(X86Register::Eax, res_var);
-                flags.set_arithmetic(res_var, eax, src_var, ArithmeticKind::Other);
+                });
+                let (low, high) = self.split_wide(product, out, block_idx);
+                self.write_register(X86Register::Eax, low, reg_state, out, block_idx)?;
+                self.write_register(X86Register::Edx, high, reg_state, out, block_idx)?;
+                // CF and OF report a non-zero high half, which is not modelled;
+                // ZF, SF and PF are undefined
+                flags.clear();
+            }
+
+            X86Instruction::Div { src } | X86Instruction::Idiv { src } => {
+                // EAX, EDX = EDX:EAX / src, EDX:EAX % src, as 64-bit division. A
+                // quotient that does not fit in 32 bits faults natively (#DE); the
+                // division here then keeps its low 32 bits.
+                if narrow_bits(src).is_some() {
+                    return Err(self.unmodelled(decoded, "an 8- or 16-bit DIV or IDIV"));
+                }
+                let unsigned = matches!(decoded.instruction, X86Instruction::Div { .. });
+                let wide = if unsigned { SsaType::U64 } else { SsaType::I64 };
+                let eax = self.read_register(X86Register::Eax, reg_state, out, block_idx)?;
+                let edx = self.read_register(X86Register::Edx, reg_state, out, block_idx)?;
+                let divisor = self.read_operand(src, reg_state, out, block_idx)?;
+                let dividend = self.join_wide(edx, eax, &wide, out, block_idx);
+                let wide_divisor = self.convert(divisor, wide.clone(), unsigned, out, block_idx);
+                let quotient = self.emit_typed(wide.clone(), out, block_idx, |dest| SsaOp::Div {
+                    dest,
+                    left: dividend,
+                    right: wide_divisor,
+                    unsigned,
+                    flags: None,
+                });
+                let remainder = self.emit_typed(wide, out, block_idx, |dest| SsaOp::Rem {
+                    dest,
+                    left: dividend,
+                    right: wide_divisor,
+                    unsigned,
+                    flags: None,
+                });
+                let quotient = self.convert(quotient, SsaType::I32, unsigned, out, block_idx);
+                let remainder = self.convert(remainder, SsaType::I32, unsigned, out, block_idx);
+                self.write_register(X86Register::Eax, quotient, reg_state, out, block_idx)?;
+                self.write_register(X86Register::Edx, remainder, reg_state, out, block_idx)?;
+                // Every flag is undefined after a division
+                flags.clear();
             }
 
             X86Instruction::Neg { dst } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Neg {
-                    dest: res_var,
-                    operand: dst_var,
+                let operand = self.read_operand(dst, reg_state, out, block_idx)?;
+                let negated = self.emit(out, block_idx, |dest| SsaOp::Neg {
+                    dest,
+                    operand,
                     flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic_unary(res_var);
-                // NEG sets CF = (operand != 0)
-                let zero = self.get_constant(0, &mut result, block_idx);
-                let cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Ceq {
-                    dest: cf,
-                    left: dst_var,
-                    right: zero,
-                }));
-                // Ceq gives 1 if equal, but CF = (operand != 0), so we need NOT of Ceq
-                // CF = 1 - Ceq(operand, 0)  or equivalently CF = Cgt(operand, 0, unsigned)
-                // Actually simpler: Ceq gives us (operand == 0), we need (operand != 0)
-                // We can XOR with 1 to flip it
-                let one = self.get_constant(1, &mut result, block_idx);
-                let neg_cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: neg_cf,
-                    left: cf,
-                    right: one,
-                    flags: None,
-                }));
-                flags.set_carry(neg_cf);
+                });
+                self.write_operand(dst, negated, reg_state, out, block_idx)?;
+                if narrow_bits(dst).is_some() {
+                    flags.clear();
+                } else {
+                    flags.set_result(negated, operand, operand, ResultKind::Neg);
+                    // CF = (operand != 0)
+                    let zero = self.get_zero_constant(out, block_idx);
+                    let carry = self.compare(CmpKind::Ne, operand, zero, false, out, block_idx);
+                    flags.set_carry(carry);
+                }
             }
 
-            X86Instruction::Inc { dst } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let one = self.get_constant(1, &mut result, block_idx);
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Add {
-                    dest: res_var,
-                    left: dst_var,
-                    right: one,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                // INC sets ZF/SF/OF but does NOT modify CF
-                flags.set_arithmetic(res_var, dst_var, one, ArithmeticKind::Add);
+            X86Instruction::Inc { dst } | X86Instruction::Dec { dst } => {
+                let operand = self.read_operand(dst, reg_state, out, block_idx)?;
+                let one = self.get_constant(1, out, block_idx);
+                let increment = matches!(decoded.instruction, X86Instruction::Inc { .. });
+                let value = self.emit(out, block_idx, |dest| {
+                    if increment {
+                        SsaOp::Add {
+                            dest,
+                            left: operand,
+                            right: one,
+                            flags: None,
+                        }
+                    } else {
+                        SsaOp::Sub {
+                            dest,
+                            left: operand,
+                            right: one,
+                            flags: None,
+                        }
+                    }
+                });
+                self.write_operand(dst, value, reg_state, out, block_idx)?;
+                // ZF, SF, OF and PF as the addition or subtraction of one sets
+                // them; CF is left as it was
+                if narrow_bits(dst).is_some() {
+                    let carry = flags.carry();
+                    flags.clear();
+                    if let Some(carry) = carry {
+                        flags.set_carry_only(carry);
+                    }
+                } else {
+                    let kind = if increment {
+                        ResultKind::Add
+                    } else {
+                        ResultKind::Sub
+                    };
+                    flags.set_result(value, operand, one, kind);
+                }
             }
 
-            X86Instruction::Dec { dst } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let one = self.get_constant(1, &mut result, block_idx);
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Sub {
-                    dest: res_var,
-                    left: dst_var,
-                    right: one,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                // DEC sets ZF/SF/OF but does NOT modify CF
-                flags.set_arithmetic(res_var, dst_var, one, ArithmeticKind::Sub);
+            X86Instruction::Adc { dst, src } | X86Instruction::Sbb { dst, src } => {
+                // dst + src + CF, or dst - src - CF: the carry the previous
+                // instruction left, which must be known
+                let carry_in = flags.carry().ok_or_else(|| {
+                    self.unmodelled(decoded, "an ADC or SBB whose carry flag is not known")
+                })?;
+                let left = self.read_operand(dst, reg_state, out, block_idx)?;
+                let right = self.read_operand(src, reg_state, out, block_idx)?;
+                let add = matches!(decoded.instruction, X86Instruction::Adc { .. });
+                let partial = self.emit(out, block_idx, |dest| {
+                    if add {
+                        SsaOp::Add {
+                            dest,
+                            left,
+                            right,
+                            flags: None,
+                        }
+                    } else {
+                        SsaOp::Sub {
+                            dest,
+                            left,
+                            right,
+                            flags: None,
+                        }
+                    }
+                });
+                let value = self.emit(out, block_idx, |dest| {
+                    if add {
+                        SsaOp::Add {
+                            dest,
+                            left: partial,
+                            right: carry_in,
+                            flags: None,
+                        }
+                    } else {
+                        SsaOp::Sub {
+                            dest,
+                            left: partial,
+                            right: carry_in,
+                            flags: None,
+                        }
+                    }
+                });
+                self.write_operand(dst, value, reg_state, out, block_idx)?;
+                if narrow_bits(dst).is_some() {
+                    flags.clear();
+                } else {
+                    // ADC carries out of either addition; SBB borrows in either
+                    // subtraction
+                    let (first, second) = if add {
+                        (
+                            self.compare(CmpKind::Lt, partial, left, true, out, block_idx),
+                            self.compare(CmpKind::Lt, value, partial, true, out, block_idx),
+                        )
+                    } else {
+                        (
+                            self.compare(CmpKind::Lt, left, right, true, out, block_idx),
+                            self.compare(CmpKind::Lt, partial, carry_in, true, out, block_idx),
+                        )
+                    };
+                    let carry_out = self.emit(out, block_idx, |dest| SsaOp::Or {
+                        dest,
+                        left: first,
+                        right: second,
+                        flags: None,
+                    });
+                    let kind = if add {
+                        ResultKind::Add
+                    } else {
+                        ResultKind::Sub
+                    };
+                    flags.set_result(value, left, right, kind);
+                    flags.set_carry(carry_out);
+                }
             }
 
-            // Add with carry: dest = dst + src + CF
-            X86Instruction::Adc { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                // Get current carry flag (default to 0 if unknown)
-                let cf_var = flags
-                    .carry()
-                    .unwrap_or_else(|| self.get_constant(0, &mut result, block_idx));
-                // temp = dst + src
-                let temp_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Add {
-                    dest: temp_var,
-                    left: dst_var,
-                    right: src_var,
-                    flags: None,
-                }));
-                // result = temp + CF
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Add {
-                    dest: res_var,
-                    left: temp_var,
-                    right: cf_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::Add);
-                // CF = (temp < dst) | (result < temp) — carry from either addition
-                let cf1 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf1,
-                    left: temp_var,
-                    right: dst_var,
-                    unsigned: true,
-                }));
-                let cf2 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf2,
-                    left: res_var,
-                    right: temp_var,
-                    unsigned: true,
-                }));
-                let new_cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Or {
-                    dest: new_cf,
-                    left: cf1,
-                    right: cf2,
-                    flags: None,
-                }));
-                flags.set_carry(new_cf);
+            // Bitwise
+            X86Instruction::And { dst, src }
+            | X86Instruction::Or { dst, src }
+            | X86Instruction::Xor { dst, src } => {
+                let left = self.read_operand(dst, reg_state, out, block_idx)?;
+                let right = self.read_operand(src, reg_state, out, block_idx)?;
+                let value = self.emit(out, block_idx, |dest| match &decoded.instruction {
+                    X86Instruction::And { .. } => SsaOp::And {
+                        dest,
+                        left,
+                        right,
+                        flags: None,
+                    },
+                    X86Instruction::Or { .. } => SsaOp::Or {
+                        dest,
+                        left,
+                        right,
+                        flags: None,
+                    },
+                    _ => SsaOp::Xor {
+                        dest,
+                        left,
+                        right,
+                        flags: None,
+                    },
+                });
+                self.write_operand(dst, value, reg_state, out, block_idx)?;
+                self.set_logic_flags(flags, value, left, right, narrow_bits(dst), out, block_idx);
             }
 
-            // Subtract with borrow: dest = dst - src - CF
-            X86Instruction::Sbb { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                // Get current carry flag (default to 0 if unknown)
-                let cf_var = flags
-                    .carry()
-                    .unwrap_or_else(|| self.get_constant(0, &mut result, block_idx));
-                // temp = dst - src
-                let temp_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Sub {
-                    dest: temp_var,
-                    left: dst_var,
-                    right: src_var,
+            X86Instruction::Test { left, right } => {
+                let left_value = self.read_operand(left, reg_state, out, block_idx)?;
+                let right_value = self.read_operand(right, reg_state, out, block_idx)?;
+                let value = self.emit(out, block_idx, |dest| SsaOp::And {
+                    dest,
+                    left: left_value,
+                    right: right_value,
                     flags: None,
-                }));
-                // result = temp - CF
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
+                });
+                self.set_logic_flags(
+                    flags,
+                    value,
+                    left_value,
+                    right_value,
+                    narrow_bits(left),
+                    out,
+                    block_idx,
                 );
-                result.push(SsaInstruction::synthetic(SsaOp::Sub {
-                    dest: res_var,
-                    left: temp_var,
-                    right: cf_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::Sub);
-                // CF = (dst < src) | (temp < CF) — borrow from either subtraction
-                let cf1 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf1,
-                    left: dst_var,
-                    right: src_var,
-                    unsigned: true,
-                }));
-                let cf2 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf2,
-                    left: temp_var,
-                    right: cf_var,
-                    unsigned: true,
-                }));
-                let new_cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Or {
-                    dest: new_cf,
-                    left: cf1,
-                    right: cf2,
-                    flags: None,
-                }));
-                flags.set_carry(new_cf);
             }
 
-            // Unsigned division: EDX:EAX / src
-            X86Instruction::Div { src } => {
-                let eax = Self::get_register_value(X86Register::Eax, reg_state)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                // Quotient → EAX
-                let quot_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Div {
-                    dest: quot_var,
-                    left: eax,
-                    right: src_var,
-                    unsigned: true,
+            X86Instruction::Not { dst } => {
+                // NOT does not touch the flags
+                let operand = self.read_operand(dst, reg_state, out, block_idx)?;
+                let value = self.emit(out, block_idx, |dest| SsaOp::Not {
+                    dest,
+                    operand,
                     flags: None,
-                }));
-                reg_state.set(X86Register::Eax, quot_var);
-                // Remainder → EDX
-                let rem_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Rem {
-                    dest: rem_var,
-                    left: eax,
-                    right: src_var,
-                    unsigned: true,
-                    flags: None,
-                }));
-                reg_state.set(X86Register::Edx, rem_var);
-                flags.set_arithmetic(quot_var, eax, src_var, ArithmeticKind::Other);
+                });
+                self.write_operand(dst, value, reg_state, out, block_idx)?;
             }
 
-            // Signed division: EDX:EAX / src
-            X86Instruction::Idiv { src } => {
-                let eax = Self::get_register_value(X86Register::Eax, reg_state)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                // Quotient → EAX
-                let quot_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Div {
-                    dest: quot_var,
-                    left: eax,
-                    right: src_var,
-                    unsigned: false,
-                    flags: None,
-                }));
-                reg_state.set(X86Register::Eax, quot_var);
-                // Remainder → EDX
-                let rem_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Rem {
-                    dest: rem_var,
-                    left: eax,
-                    right: src_var,
-                    unsigned: false,
-                    flags: None,
-                }));
-                reg_state.set(X86Register::Edx, rem_var);
-                flags.set_arithmetic(quot_var, eax, src_var, ArithmeticKind::Other);
+            X86Instruction::Shl { dst, count }
+            | X86Instruction::Shr { dst, count }
+            | X86Instruction::Sar { dst, count } => {
+                let kind = match decoded.instruction {
+                    X86Instruction::Shl { .. } => Shift::Left,
+                    X86Instruction::Shr { .. } => Shift::Right,
+                    _ => Shift::Arithmetic,
+                };
+                self.translate_shift(kind, dst, count, reg_state, flags, out, block_idx)?;
             }
 
-            // Byte swap: reverse byte order using shifts and masks
+            X86Instruction::Rol { dst, count } | X86Instruction::Ror { dst, count } => {
+                // A narrow rotate turns within its own width, which a 32-bit
+                // rotate does not
+                if narrow_bits(dst).is_some() {
+                    return Err(self.unmodelled(decoded, "an 8- or 16-bit rotate"));
+                }
+                let left = matches!(decoded.instruction, X86Instruction::Rol { .. });
+                let value = self.read_operand(dst, reg_state, out, block_idx)?;
+                let amount = self.shift_amount(count, reg_state, out, block_idx)?;
+                let rotated = self.emit(out, block_idx, |dest| {
+                    if left {
+                        SsaOp::Rol {
+                            dest,
+                            value,
+                            amount,
+                        }
+                    } else {
+                        SsaOp::Ror {
+                            dest,
+                            value,
+                            amount,
+                        }
+                    }
+                });
+                self.write_operand(dst, rotated, reg_state, out, block_idx)?;
+                // A rotate by zero leaves the flags alone; any other count sets
+                // CF (and OF for a count of one) and leaves the rest, which the
+                // flag state cannot express
+                if immediate_count(count) != Some(0) {
+                    flags.clear();
+                }
+            }
+
             X86Instruction::Bswap { dst } => {
-                let val = Self::get_register_value(*dst, reg_state)?;
-                // bswap(x) = ((x >> 24) & 0xFF) | ((x >> 8) & 0xFF00)
-                //          | ((x << 8) & 0xFF0000) | ((x << 24) & 0xFF000000)
-                // For simplicity, emit as a chain of shift/mask/or operations
-                let c8 = self.get_constant(8, &mut result, block_idx);
-                let c24 = self.get_constant(24, &mut result, block_idx);
-                let mask_ff = self.get_constant(0xFF, &mut result, block_idx);
-                let mask_ff00 = self.get_constant(0xFF00, &mut result, block_idx);
-                let mask_ff0000 = self.get_constant(0x00FF_0000, &mut result, block_idx);
-                let mask_ff000000 =
-                    self.get_constant(i64::from(0xFF00_0000_u32 as i32), &mut result, block_idx);
-
-                // byte0 = (val >> 24) & 0xFF
-                let shr24 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Shr {
-                    dest: shr24,
-                    value: val,
-                    amount: c24,
-                    unsigned: true,
-                    flags: None,
-                }));
-                let byte0 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: byte0,
-                    left: shr24,
-                    right: mask_ff,
-                    flags: None,
-                }));
-
-                // byte1 = (val >> 8) & 0xFF00
-                let shr8 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Shr {
-                    dest: shr8,
-                    value: val,
-                    amount: c8,
-                    unsigned: true,
-                    flags: None,
-                }));
-                let byte1 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: byte1,
-                    left: shr8,
-                    right: mask_ff00,
-                    flags: None,
-                }));
-
-                // byte2 = (val << 8) & 0xFF0000
-                let shl8 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Shl {
-                    dest: shl8,
-                    value: val,
-                    amount: c8,
-                    flags: None,
-                }));
-                let byte2 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: byte2,
-                    left: shl8,
-                    right: mask_ff0000,
-                    flags: None,
-                }));
-
-                // byte3 = (val << 24) & 0xFF000000
-                let shl24 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Shl {
-                    dest: shl24,
-                    value: val,
-                    amount: c24,
-                    flags: None,
-                }));
-                let byte3 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: byte3,
-                    left: shl24,
-                    right: mask_ff000000,
-                    flags: None,
-                }));
-
-                // Combine: result = byte0 | byte1 | byte2 | byte3
-                let or01 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Or {
-                    dest: or01,
-                    left: byte0,
-                    right: byte1,
-                    flags: None,
-                }));
-                let or012 = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Or {
-                    dest: or012,
-                    left: or01,
-                    right: byte2,
-                    flags: None,
-                }));
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Or {
-                    dest: res_var,
-                    left: or012,
-                    right: byte3,
-                    flags: None,
-                }));
-
-                reg_state.set(*dst, res_var);
-                flags.clear();
+                // BSWAP does not touch the flags
+                if narrow_bits(&X86Operand::Register(*dst)).is_some() {
+                    return Err(self.unmodelled(decoded, "a 16-bit BSWAP"));
+                }
+                let value = self.read_register(*dst, reg_state, out, block_idx)?;
+                let swapped = self.emit(out, block_idx, |dest| SsaOp::BSwap { dest, src: value });
+                self.write_register(*dst, swapped, reg_state, out, block_idx)?;
             }
 
             // Conditional move: dst = condition ? src : dst
@@ -1193,349 +974,110 @@ impl<'a> X86ToSsaTranslator<'a> {
                 dst,
                 src,
             } => {
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let dst_var = Self::get_register_value(*dst, reg_state)?;
+                let src_value = self.read_operand(src, reg_state, out, block_idx)?;
+                let dst_value = self.read_register(*dst, reg_state, out, block_idx)?;
 
                 // Evaluate condition to get a 0/1 value
-                let cond_var =
-                    self.evaluate_condition(*condition, flags, &mut result, block_idx)?;
+                let chosen = self.evaluate_condition(*condition, flags, out, block_idx)?;
 
-                // Implement conditional move as: result = dst ^ (cond_mask & (src ^ dst))
-                // where cond_mask = 0 - cond (produces 0 or 0xFFFFFFFF)
-                let neg_cond = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Neg {
-                    dest: neg_cond,
-                    operand: cond_var,
+                // result = dst ^ (-cond & (src ^ dst)): src when the condition
+                // holds, dst when it does not
+                let mask = self.emit(out, block_idx, |dest| SsaOp::Neg {
+                    dest,
+                    operand: chosen,
                     flags: None,
-                }));
-                let xor_diff = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: xor_diff,
-                    left: src_var,
-                    right: dst_var,
+                });
+                let difference = self.emit(out, block_idx, |dest| SsaOp::Xor {
+                    dest,
+                    left: src_value,
+                    right: dst_value,
                     flags: None,
-                }));
-                let masked = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: masked,
-                    left: xor_diff,
-                    right: neg_cond,
+                });
+                let masked = self.emit(out, block_idx, |dest| SsaOp::And {
+                    dest,
+                    left: difference,
+                    right: mask,
                     flags: None,
-                }));
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: res_var,
-                    left: dst_var,
+                });
+                let value = self.emit(out, block_idx, |dest| SsaOp::Xor {
+                    dest,
+                    left: dst_value,
                     right: masked,
                     flags: None,
-                }));
-                reg_state.set(*dst, res_var);
+                });
+                self.write_register(*dst, value, reg_state, out, block_idx)?;
                 // Cmovcc doesn't modify flags
             }
 
             // Set byte on condition: dst = condition ? 1 : 0
             X86Instruction::Setcc { condition, dst } => {
-                let cond_var =
-                    self.evaluate_condition(*condition, flags, &mut result, block_idx)?;
-                self.set_operand_value(dst, cond_var, reg_state, &mut result, block_idx)?;
+                let value = self.evaluate_condition(*condition, flags, out, block_idx)?;
+                self.write_operand(dst, value, reg_state, out, block_idx)?;
                 // Setcc doesn't modify flags
             }
 
-            // Bit scan forward/reverse
-            X86Instruction::Bsf { dst, src } | X86Instruction::Bsr { dst, src } => {
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                // Approximate: result is the source value (placeholder)
-                reg_state.set(*dst, src_var);
-                flags.clear();
+            X86Instruction::Bsf { .. } | X86Instruction::Bsr { .. } => {
+                // A zero source leaves the destination as it was, which a bit scan
+                // operation does not state
+                return Err(self.unmodelled(decoded, "a bit scan"));
             }
 
-            // Bit test: sets CF based on the tested bit
+            // Bit test: CF is the tested bit; ZF is kept and the rest undefined
             X86Instruction::Bt { src, bit } => {
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let bit_var = self.get_operand_value(bit, reg_state, &mut result, block_idx)?;
-                // BT only sets flags (specifically CF), doesn't modify operands
-                flags.set_test(src_var, bit_var);
-            }
-
-            // Exchange and add: temp = dst; dst = dst + src; src = temp
-            X86Instruction::Xadd { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Add {
-                    dest: res_var,
-                    left: dst_var,
-                    right: src_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                self.set_operand_value(src, dst_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::Add);
-                // XADD sets CF like ADD: CF = (result < left) unsigned
-                let cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf,
-                    left: res_var,
-                    right: dst_var,
-                    unsigned: true,
-                }));
-                flags.set_carry(cf);
-            }
-
-            // Bitwise
-            X86Instruction::And { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: res_var,
-                    left: dst_var,
-                    right: src_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::LogicalOp);
-                // AND always clears CF
-                let zero_cf = self.get_constant(0, &mut result, block_idx);
-                flags.clear_carry(zero_cf);
-            }
-
-            X86Instruction::Or { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Or {
-                    dest: res_var,
-                    left: dst_var,
-                    right: src_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::LogicalOp);
-                // OR always clears CF
-                let zero_cf = self.get_constant(0, &mut result, block_idx);
-                flags.clear_carry(zero_cf);
-            }
-
-            X86Instruction::Xor { dst, src } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let src_var = self.get_operand_value(src, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: res_var,
-                    left: dst_var,
-                    right: src_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, src_var, ArithmeticKind::LogicalOp);
-                // XOR always clears CF
-                let zero_cf = self.get_constant(0, &mut result, block_idx);
-                flags.clear_carry(zero_cf);
-            }
-
-            X86Instruction::Not { dst } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Not {
-                    dest: res_var,
-                    operand: dst_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                // NOT doesn't affect flags (except in some specific cases)
-            }
-
-            X86Instruction::Shl { dst, count } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let count_var = self.get_operand_value(count, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Shl {
-                    dest: res_var,
-                    value: dst_var,
-                    amount: count_var,
-                    flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, count_var, ArithmeticKind::Other);
-            }
-
-            X86Instruction::Shr { dst, count } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let count_var = self.get_operand_value(count, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Shr {
-                    dest: res_var,
-                    value: dst_var,
-                    amount: count_var,
+                if narrow_bits(src).is_some() {
+                    return Err(self.unmodelled(decoded, "a 16-bit BT"));
+                }
+                if src.is_memory() && !matches!(bit, X86Operand::Immediate(_)) {
+                    // A register bit offset addresses a bit string past the operand
+                    return Err(self.unmodelled(decoded, "a BT of memory by a register offset"));
+                }
+                let value = self.read_operand(src, reg_state, out, block_idx)?;
+                let position = self.shift_amount(bit, reg_state, out, block_idx)?;
+                let shifted = self.emit(out, block_idx, |dest| SsaOp::Shr {
+                    dest,
+                    value,
+                    amount: position,
                     unsigned: true,
                     flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, count_var, ArithmeticKind::Other);
-            }
-
-            X86Instruction::Sar { dst, count } => {
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let count_var = self.get_operand_value(count, reg_state, &mut result, block_idx)?;
-                let res_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Shr {
-                    dest: res_var,
-                    value: dst_var,
-                    amount: count_var,
-                    unsigned: false, // SAR is signed shift right
+                });
+                let one = self.get_constant(1, out, block_idx);
+                let carry = self.emit(out, block_idx, |dest| SsaOp::And {
+                    dest,
+                    left: shifted,
+                    right: one,
                     flags: None,
-                }));
-                self.set_operand_value(dst, res_var, reg_state, &mut result, block_idx)?;
-                flags.set_arithmetic(res_var, dst_var, count_var, ArithmeticKind::Other);
-            }
-
-            X86Instruction::Rol { dst, count } | X86Instruction::Ror { dst, count } => {
-                // Rotates are complex to express in SSA
-                // For now, treat as unsupported or approximate
-                let dst_var = self.get_operand_value(dst, reg_state, &mut result, block_idx)?;
-                let _count_var =
-                    self.get_operand_value(count, reg_state, &mut result, block_idx)?;
-                // Keep the value unchanged (this is an approximation)
-                self.set_operand_value(dst, dst_var, reg_state, &mut result, block_idx)?;
-                flags.clear();
-            }
-
-            // Comparison
-            X86Instruction::Cmp { left, right } => {
-                let left_var = self.get_operand_value(left, reg_state, &mut result, block_idx)?;
-                let right_var = self.get_operand_value(right, reg_state, &mut result, block_idx)?;
-                flags.set_compare(left_var, right_var);
-                // CMP sets CF = (left < right) unsigned (same as SUB)
-                let cf = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                result.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: cf,
-                    left: left_var,
-                    right: right_var,
-                    unsigned: true,
-                }));
-                flags.set_carry(cf);
-            }
-
-            X86Instruction::Test { left, right } => {
-                let left_var = self.get_operand_value(left, reg_state, &mut result, block_idx)?;
-                let right_var = self.get_operand_value(right, reg_state, &mut result, block_idx)?;
-                flags.set_test(left_var, right_var);
-                // TEST always clears CF
-                let zero_cf = self.get_constant(0, &mut result, block_idx);
-                flags.clear_carry(zero_cf);
+                });
+                flags.set_carry_only(carry);
             }
 
             // Control flow
             X86Instruction::Jmp { target } => {
                 let target_block = self.find_block_for_address(*target)?;
-                result.push(SsaInstruction::synthetic(SsaOp::Jump {
+                out.push(SsaInstruction::synthetic(SsaOp::Jump {
                     target: target_block,
                 }));
             }
 
             X86Instruction::Jcc { condition, target } => {
                 let target_block = self.find_block_for_address(*target)?;
-                let fallthrough_block = block_idx.saturating_add(1); // Assumes sequential layout
+                // Not taken, control goes on with the instruction after the jump,
+                // which starts a block of its own
+                let fallthrough_block = self.block_at_offset(decoded.end_offset())?;
 
-                // Get comparison operands from flags
-                if let Some((cmp, left, right, unsigned)) = flags.get_branch_operands(*condition) {
-                    // Handle TEST special case
-                    if matches!(flags.producer(), Some(FlagProducer::Test { .. })) {
-                        // For TEST + JE/JNE, we need to compare (left & right) with 0
-                        let and_result = self.create_variable(
-                            VariableOrigin::Phi,
-                            DefSite::instruction(block_idx, result.len()),
-                            self.func.bitness,
-                        );
-                        result.push(SsaInstruction::synthetic(SsaOp::And {
-                            dest: and_result,
-                            left,
-                            right,
-                            flags: None,
-                        }));
-                        let zero = self.get_zero_constant(&mut result, block_idx);
-                        result.push(SsaInstruction::synthetic(SsaOp::BranchCmp {
-                            left: and_result,
-                            right: zero,
-                            cmp,
-                            unsigned: false,
-                            true_target: target_block,
-                            false_target: fallthrough_block,
-                        }));
-                    } else {
-                        result.push(SsaInstruction::synthetic(SsaOp::BranchCmp {
-                            left,
-                            right,
-                            cmp,
-                            unsigned,
-                            true_target: target_block,
-                            false_target: fallthrough_block,
-                        }));
-                    }
+                if let Some((cmp, left, right, unsigned)) = flags.comparison(*condition) {
+                    out.push(SsaInstruction::synthetic(SsaOp::BranchCmp {
+                        left,
+                        right,
+                        cmp,
+                        unsigned,
+                        true_target: target_block,
+                        false_target: fallthrough_block,
+                    }));
                 } else {
-                    // Fall back to evaluate_condition for S/NS/O/NO/P/NP conditions
-                    let cond_var =
-                        self.evaluate_condition(*condition, flags, &mut result, block_idx)?;
-                    let zero = self.get_zero_constant(&mut result, block_idx);
-                    result.push(SsaInstruction::synthetic(SsaOp::BranchCmp {
-                        left: cond_var,
+                    let holds = self.evaluate_condition(*condition, flags, out, block_idx)?;
+                    let zero = self.get_zero_constant(out, block_idx);
+                    out.push(SsaInstruction::synthetic(SsaOp::BranchCmp {
+                        left: holds,
                         right: zero,
                         cmp: CmpKind::Ne,
                         unsigned: false,
@@ -1546,14 +1088,8 @@ impl<'a> X86ToSsaTranslator<'a> {
             }
 
             X86Instruction::Ret => {
-                // Return the value in EAX/RAX
-                let ret_reg = if self.func.bitness == 64 {
-                    X86Register::Rax
-                } else {
-                    X86Register::Eax
-                };
-                let ret_val = reg_state.get(ret_reg);
-                result.push(SsaInstruction::synthetic(SsaOp::Return { value: ret_val }));
+                let ret_val = reg_state.get(X86Register::Eax);
+                out.push(SsaInstruction::synthetic(SsaOp::returns(ret_val)));
             }
 
             X86Instruction::Call { target: _ } => {
@@ -1570,32 +1106,24 @@ impl<'a> X86ToSsaTranslator<'a> {
             }
 
             X86Instruction::Cdq => {
-                // Sign-extend EAX into EDX:EAX
-                // In SSA, we just track that EDX becomes a function of EAX
-                let eax = Self::get_register_value(X86Register::Eax, reg_state)?;
-                // EDX gets sign bits of EAX (all 0s or all 1s)
-                // For simplicity, create a new variable
-                let edx_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, result.len()),
-                    self.func.bitness,
-                );
-                // EDX = EAX >> 31 (arithmetic)
-                let thirty_one = self.get_constant(31, &mut result, block_idx);
-                result.push(SsaInstruction::synthetic(SsaOp::Shr {
-                    dest: edx_var,
+                // EDX = the sign of EAX, in every bit
+                let eax = self.read_register(X86Register::Eax, reg_state, out, block_idx)?;
+                let thirty_one = self.get_constant(31, out, block_idx);
+                let sign = self.emit(out, block_idx, |dest| SsaOp::Shr {
+                    dest,
                     value: eax,
                     amount: thirty_one,
                     unsigned: false,
                     flags: None,
-                }));
-                reg_state.set(X86Register::Edx, edx_var);
+                });
+                self.write_register(X86Register::Edx, sign, reg_state, out, block_idx)?;
             }
 
             X86Instruction::Cwde => {
-                // Sign-extend AX into EAX
-                // In SSA, this is effectively a no-op since we track 32-bit values
-                flags.clear();
+                // EAX = AX sign-extended; the flags are untouched
+                let ax = self.read_register(X86Register::Ax, reg_state, out, block_idx)?;
+                let extended = self.sign_extend(ax, 16, out, block_idx);
+                self.write_register(X86Register::Eax, extended, reg_state, out, block_idx)?;
             }
 
             X86Instruction::Unsupported { offset, mnemonic } => {
@@ -1608,8 +1136,442 @@ impl<'a> X86ToSsaTranslator<'a> {
         Ok(result)
     }
 
-    /// Gets the SSA variable for an operand value.
-    fn get_operand_value(
+    /// The error refusing `decoded`, an instruction in a form this translation does
+    /// not model exactly: `what` names the form.
+    fn unmodelled(&self, decoded: &X86DecodedInstruction, what: &str) -> Error {
+        Error::X86Error(format!(
+            "{what} at 0x{:x} is not modelled exactly",
+            self.func.base_address.saturating_add(decoded.offset)
+        ))
+    }
+
+    /// Records the flags of a logical operation that computed `value`: ZF, SF and
+    /// PF from it, OF and CF cleared. An operation narrower than 32 bits leaves the
+    /// flags unknown, since its ZF, SF and PF are those of its own width.
+    #[allow(clippy::too_many_arguments)]
+    fn set_logic_flags(
+        &mut self,
+        flags: &mut FlagState,
+        value: SsaVarId,
+        left: SsaVarId,
+        right: SsaVarId,
+        narrow: Option<u32>,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) {
+        if narrow.is_some() {
+            flags.clear();
+            return;
+        }
+        flags.set_result(value, left, right, ResultKind::Logic);
+        let zero = self.get_zero_constant(instrs, block_idx);
+        flags.set_carry(zero);
+    }
+
+    /// Translates `SHL`, `SHR` or `SAR` of `dst` by `count`.
+    ///
+    /// The count is masked to five bits, as the processor masks it. A narrow
+    /// operand shifts as its zero-extended (or, for `SAR`, sign-extended) value,
+    /// whose low bits are the narrow result. The flags follow an immediate count at
+    /// the full width: unchanged for a count of zero, else ZF, SF and PF from the
+    /// result and CF the last bit shifted out. A count in a register may be zero,
+    /// so the flags after it are unknown.
+    #[allow(clippy::too_many_arguments)]
+    fn translate_shift(
+        &mut self,
+        kind: Shift,
+        dst: &X86Operand,
+        count: &X86Operand,
+        reg_state: &mut RegisterState,
+        flags: &mut FlagState,
+        out: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> Result<()> {
+        let narrow = narrow_bits(dst);
+        let read = self.read_operand(dst, reg_state, out, block_idx)?;
+        let value = match (kind, narrow) {
+            (Shift::Arithmetic, Some(bits)) => self.sign_extend(read, bits, out, block_idx),
+            _ => read,
+        };
+        let amount = self.shift_amount(count, reg_state, out, block_idx)?;
+        let shifted = self.emit(out, block_idx, |dest| match kind {
+            Shift::Left => SsaOp::Shl {
+                dest,
+                value,
+                amount,
+                flags: None,
+            },
+            Shift::Right | Shift::Arithmetic => SsaOp::Shr {
+                dest,
+                value,
+                amount,
+                unsigned: kind == Shift::Right,
+                flags: None,
+            },
+        });
+        self.write_operand(dst, shifted, reg_state, out, block_idx)?;
+
+        match immediate_count(count) {
+            Some(0) => {}
+            Some(n) if narrow.is_none() => {
+                // CF: SHL shifts bit 32 - n out, SHR and SAR bit n - 1 (n is 1 to 31)
+                let (from, unsigned) = match kind {
+                    Shift::Left => (32_i64.saturating_sub(n), true),
+                    Shift::Right => (n.saturating_sub(1), true),
+                    Shift::Arithmetic => (n.saturating_sub(1), false),
+                };
+                let at = self.get_constant(from, out, block_idx);
+                let moved = self.emit(out, block_idx, |dest| SsaOp::Shr {
+                    dest,
+                    value,
+                    amount: at,
+                    unsigned,
+                    flags: None,
+                });
+                let one = self.get_constant(1, out, block_idx);
+                let carry = self.emit(out, block_idx, |dest| SsaOp::And {
+                    dest,
+                    left: moved,
+                    right: one,
+                    flags: None,
+                });
+                flags.set_result(shifted, value, amount, ResultKind::Shift);
+                flags.set_carry(carry);
+            }
+            _ => flags.clear(),
+        }
+        Ok(())
+    }
+
+    /// The amount of a shift, rotate or bit test: an immediate masked to five
+    /// bits, or a register's value masked as the processor masks it.
+    fn shift_amount(
+        &mut self,
+        count: &X86Operand,
+        reg_state: &RegisterState,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> Result<SsaVarId> {
+        if let Some(amount) = immediate_count(count) {
+            return Ok(self.get_constant(amount, instrs, block_idx));
+        }
+        let value = self.read_operand(count, reg_state, instrs, block_idx)?;
+        let mask = self.get_constant(31, instrs, block_idx);
+        Ok(self.emit(instrs, block_idx, |dest| SsaOp::And {
+            dest,
+            left: value,
+            right: mask,
+            flags: None,
+        }))
+    }
+
+    /// Evaluates an x86 condition code into a 0/1 SSA variable.
+    ///
+    /// After a `CMP` or `SUB`, a comparison condition is the comparison of the
+    /// operands. Otherwise the condition is the formula of the flags it tests
+    /// ([`condition_formula`]), each flag computed from the producer that set it.
+    ///
+    /// # Errors
+    ///
+    /// When the condition reads a flag that is not known.
+    fn evaluate_condition(
+        &mut self,
+        condition: X86Condition,
+        flags: &FlagState,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> Result<SsaVarId> {
+        if let Some((cmp, left, right, unsigned)) = flags.comparison(condition) {
+            return Ok(self.compare(cmp, left, right, unsigned, instrs, block_idx));
+        }
+
+        let unknown = |flag: &str| {
+            Error::X86Error(format!(
+                "Cannot evaluate condition {condition:?}: {flag} is not known"
+            ))
+        };
+        let (formula, negated) = condition_formula(condition);
+        let carry = || flags.carry().ok_or_else(|| unknown("the carry flag"));
+        let producer = || flags.producer().ok_or_else(|| unknown("the flags"));
+        let holds = match formula {
+            FlagFormula::Zero => self.zero_flag(producer()?, instrs, block_idx),
+            FlagFormula::Sign => self.sign_flag(producer()?, instrs, block_idx),
+            FlagFormula::Overflow => self
+                .overflow_flag(producer()?, instrs, block_idx)
+                .ok_or_else(|| unknown("the overflow flag"))?,
+            FlagFormula::Parity => self.parity_flag(producer()?, instrs, block_idx),
+            FlagFormula::Carry => carry()?,
+            FlagFormula::CarryOrZero => {
+                let carry = carry()?;
+                let zero = self.zero_flag(producer()?, instrs, block_idx);
+                self.emit(instrs, block_idx, |dest| SsaOp::Or {
+                    dest,
+                    left: carry,
+                    right: zero,
+                    flags: None,
+                })
+            }
+            FlagFormula::Less | FlagFormula::LessOrEqual => {
+                let producer = producer()?;
+                let sign = self.sign_flag(producer, instrs, block_idx);
+                let overflow = self
+                    .overflow_flag(producer, instrs, block_idx)
+                    .ok_or_else(|| unknown("the overflow flag"))?;
+                let less = self.emit(instrs, block_idx, |dest| SsaOp::Xor {
+                    dest,
+                    left: sign,
+                    right: overflow,
+                    flags: None,
+                });
+                if formula == FlagFormula::Less {
+                    less
+                } else {
+                    let zero = self.zero_flag(producer, instrs, block_idx);
+                    self.emit(instrs, block_idx, |dest| SsaOp::Or {
+                        dest,
+                        left: zero,
+                        right: less,
+                        flags: None,
+                    })
+                }
+            }
+        };
+        if !negated {
+            return Ok(holds);
+        }
+        let one = self.get_constant(1, instrs, block_idx);
+        Ok(self.emit(instrs, block_idx, |dest| SsaOp::Xor {
+            dest,
+            left: holds,
+            right: one,
+            flags: None,
+        }))
+    }
+
+    /// The value the flags of `producer` describe: the result, or for a `CMP` the
+    /// difference of its operands.
+    fn flag_value(
+        &mut self,
+        producer: FlagProducer,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        match producer {
+            FlagProducer::Compare { left, right } => {
+                self.emit(instrs, block_idx, |dest| SsaOp::Sub {
+                    dest,
+                    left,
+                    right,
+                    flags: None,
+                })
+            }
+            FlagProducer::Result { result, .. } => result,
+        }
+    }
+
+    /// ZF as a 0/1 value: the flagged value is zero.
+    fn zero_flag(
+        &mut self,
+        producer: FlagProducer,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        match producer {
+            FlagProducer::Compare { left, right } => {
+                self.compare(CmpKind::Eq, left, right, false, instrs, block_idx)
+            }
+            FlagProducer::Result { result, .. } => {
+                let zero = self.get_zero_constant(instrs, block_idx);
+                self.compare(CmpKind::Eq, result, zero, false, instrs, block_idx)
+            }
+        }
+    }
+
+    /// SF as a 0/1 value: bit 31 of the flagged value.
+    fn sign_flag(
+        &mut self,
+        producer: FlagProducer,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        let value = self.flag_value(producer, instrs, block_idx);
+        self.top_bit(value, instrs, block_idx)
+    }
+
+    /// Bit 31 of `value`, as a 0/1 value.
+    fn top_bit(
+        &mut self,
+        value: SsaVarId,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        let thirty_one = self.get_constant(31, instrs, block_idx);
+        self.emit(instrs, block_idx, |dest| SsaOp::Shr {
+            dest,
+            value,
+            amount: thirty_one,
+            unsigned: true,
+            flags: None,
+        })
+    }
+
+    /// OF as a 0/1 value, or `None` when the producer leaves it undefined.
+    ///
+    /// - `CMP` and SBB/DEC: `((left ^ right) & (left ^ result))` at bit 31
+    /// - ADD/ADC/INC/XADD: `((left ^ result) & (right ^ result))` at bit 31
+    /// - logical operations: 0
+    /// - NEG: the result is the most negative value
+    fn overflow_flag(
+        &mut self,
+        producer: FlagProducer,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> Option<SsaVarId> {
+        let (result, left, right, kind) = match producer {
+            FlagProducer::Compare { left, right } => {
+                let difference = self.flag_value(producer, instrs, block_idx);
+                (difference, left, right, ResultKind::Sub)
+            }
+            FlagProducer::Result {
+                result,
+                left,
+                right,
+                kind,
+            } => (result, left, right, kind),
+        };
+        let (first, second) = match kind {
+            ResultKind::Shift => return None,
+            ResultKind::Logic => return Some(self.get_zero_constant(instrs, block_idx)),
+            ResultKind::Neg => {
+                let minimum = self.get_constant(i64::from(i32::MIN), instrs, block_idx);
+                return Some(self.compare(CmpKind::Eq, result, minimum, false, instrs, block_idx));
+            }
+            ResultKind::Sub => ((left, right), (left, result)),
+            ResultKind::Add => ((left, result), (right, result)),
+        };
+        let a = self.emit(instrs, block_idx, |dest| SsaOp::Xor {
+            dest,
+            left: first.0,
+            right: first.1,
+            flags: None,
+        });
+        let b = self.emit(instrs, block_idx, |dest| SsaOp::Xor {
+            dest,
+            left: second.0,
+            right: second.1,
+            flags: None,
+        });
+        let both = self.emit(instrs, block_idx, |dest| SsaOp::And {
+            dest,
+            left: a,
+            right: b,
+            flags: None,
+        });
+        Some(self.top_bit(both, instrs, block_idx))
+    }
+
+    /// PF as a 0/1 value: the low byte of the flagged value has an even number of
+    /// set bits. Computed by folding the byte's bits together with XOR.
+    fn parity_flag(
+        &mut self,
+        producer: FlagProducer,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        let value = self.flag_value(producer, instrs, block_idx);
+        let mut folded = value;
+        for shift in [4, 2, 1] {
+            let amount = self.get_constant(shift, instrs, block_idx);
+            let moved = self.emit(instrs, block_idx, |dest| SsaOp::Shr {
+                dest,
+                value: folded,
+                amount,
+                unsigned: true,
+                flags: None,
+            });
+            folded = self.emit(instrs, block_idx, |dest| SsaOp::Xor {
+                dest,
+                left: folded,
+                right: moved,
+                flags: None,
+            });
+        }
+        // Bit 0 now holds the low byte's odd parity; PF is its complement
+        let one = self.get_constant(1, instrs, block_idx);
+        let odd = self.emit(instrs, block_idx, |dest| SsaOp::And {
+            dest,
+            left: folded,
+            right: one,
+            flags: None,
+        });
+        self.emit(instrs, block_idx, |dest| SsaOp::Xor {
+            dest,
+            left: odd,
+            right: one,
+            flags: None,
+        })
+    }
+
+    /// Emits the comparison `left cmp right` as the integer 0 or 1.
+    ///
+    /// The comparison itself is a boolean; the flags and the values SETcc, CMOVcc and
+    /// ADC compute with are integers, so it is converted to one.
+    fn compare(
+        &mut self,
+        cmp: CmpKind,
+        left: SsaVarId,
+        right: SsaVarId,
+        unsigned: bool,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        // Ne, Le and Ge are the complements of Eq, Gt and Lt
+        let (base, negate) = match cmp {
+            CmpKind::Eq => (CmpKind::Eq, false),
+            CmpKind::Ne => (CmpKind::Eq, true),
+            CmpKind::Lt => (CmpKind::Lt, false),
+            CmpKind::Ge => (CmpKind::Lt, true),
+            CmpKind::Gt => (CmpKind::Gt, false),
+            CmpKind::Le => (CmpKind::Gt, true),
+        };
+        let compared = self.emit_typed(SsaType::Bool, instrs, block_idx, |dest| match base {
+            CmpKind::Eq => SsaOp::Ceq {
+                dest,
+                left,
+                right,
+                signaling: false,
+            },
+            CmpKind::Lt => SsaOp::Clt {
+                dest,
+                left,
+                right,
+                unsigned,
+                signaling: false,
+            },
+            _ => SsaOp::Cgt {
+                dest,
+                left,
+                right,
+                unsigned,
+                signaling: false,
+            },
+        });
+        let holds = self.convert(compared, SsaType::I32, true, instrs, block_idx);
+        if !negate {
+            return holds;
+        }
+        let one = self.get_constant(1, instrs, block_idx);
+        self.emit(instrs, block_idx, |dest| SsaOp::Xor {
+            dest,
+            left: holds,
+            right: one,
+            flags: None,
+        })
+    }
+
+    /// Reads an operand as a 32-bit value: a narrow register or memory operand
+    /// zero-extended.
+    fn read_operand(
         &mut self,
         operand: &X86Operand,
         reg_state: &RegisterState,
@@ -1617,21 +1579,14 @@ impl<'a> X86ToSsaTranslator<'a> {
         block_idx: usize,
     ) -> Result<SsaVarId> {
         match operand {
-            X86Operand::Register(reg) => Self::get_register_value(*reg, reg_state),
+            X86Operand::Register(reg) => self.read_register(*reg, reg_state, instrs, block_idx),
             X86Operand::Immediate(val) => Ok(self.get_constant(*val, instrs, block_idx)),
             X86Operand::Memory(mem) => self.load_from_memory(mem, reg_state, instrs, block_idx),
         }
     }
 
-    /// Gets the SSA variable for a register.
-    fn get_register_value(reg: X86Register, reg_state: &RegisterState) -> Result<SsaVarId> {
-        reg_state
-            .get(reg)
-            .ok_or_else(|| Error::X86Error(format!("Register {reg:?} not defined")))
-    }
-
-    /// Sets the value of an operand.
-    fn set_operand_value(
+    /// Writes a 32-bit value to an operand: the low bits of it to a narrow one.
+    fn write_operand(
         &mut self,
         operand: &X86Operand,
         value: SsaVarId,
@@ -1641,8 +1596,7 @@ impl<'a> X86ToSsaTranslator<'a> {
     ) -> Result<()> {
         match operand {
             X86Operand::Register(reg) => {
-                reg_state.set(*reg, value);
-                Ok(())
+                self.write_register(*reg, value, reg_state, instrs, block_idx)
             }
             X86Operand::Memory(mem) => {
                 self.store_to_memory(mem, value, reg_state, instrs, block_idx)
@@ -1653,7 +1607,190 @@ impl<'a> X86ToSsaTranslator<'a> {
         }
     }
 
-    /// Loads a value from memory.
+    /// Gets the SSA variable for a register's full slot.
+    fn get_register_value(reg: X86Register, reg_state: &RegisterState) -> Result<SsaVarId> {
+        reg_state
+            .get(reg)
+            .ok_or_else(|| Error::X86Error(format!("Register {reg:?} not defined")))
+    }
+
+    /// Reads `reg`: a 32-bit register's value, or the bits an 8- or 16-bit
+    /// register names in its full register, zero-extended.
+    fn read_register(
+        &mut self,
+        reg: X86Register,
+        reg_state: &RegisterState,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> Result<SsaVarId> {
+        let full = Self::get_register_value(reg, reg_state)?;
+        let Some((shift, mask)) = sub_register(reg) else {
+            return Ok(full);
+        };
+        let lowered = if shift == 0 {
+            full
+        } else {
+            let amount = self.get_constant(shift, instrs, block_idx);
+            self.emit(instrs, block_idx, |dest| SsaOp::Shr {
+                dest,
+                value: full,
+                amount,
+                unsigned: true,
+                flags: None,
+            })
+        };
+        let mask = self.get_constant(mask, instrs, block_idx);
+        Ok(self.emit(instrs, block_idx, |dest| SsaOp::And {
+            dest,
+            left: lowered,
+            right: mask,
+            flags: None,
+        }))
+    }
+
+    /// Writes `value` to `reg`: a 32-bit register takes it whole, an 8- or 16-bit
+    /// register its low bits, inserted into the full register's other bits.
+    fn write_register(
+        &mut self,
+        reg: X86Register,
+        value: SsaVarId,
+        reg_state: &mut RegisterState,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> Result<()> {
+        let Some((shift, mask)) = sub_register(reg) else {
+            reg_state.set(reg, value);
+            return Ok(());
+        };
+        let full = Self::get_register_value(reg, reg_state)?;
+        let keep = self.get_constant(!(mask << shift), instrs, block_idx);
+        let kept = self.emit(instrs, block_idx, |dest| SsaOp::And {
+            dest,
+            left: full,
+            right: keep,
+            flags: None,
+        });
+        let low_mask = self.get_constant(mask, instrs, block_idx);
+        let low = self.emit(instrs, block_idx, |dest| SsaOp::And {
+            dest,
+            left: value,
+            right: low_mask,
+            flags: None,
+        });
+        let placed = if shift == 0 {
+            low
+        } else {
+            let amount = self.get_constant(shift, instrs, block_idx);
+            self.emit(instrs, block_idx, |dest| SsaOp::Shl {
+                dest,
+                value: low,
+                amount,
+                flags: None,
+            })
+        };
+        let merged = self.emit(instrs, block_idx, |dest| SsaOp::Or {
+            dest,
+            left: kept,
+            right: placed,
+            flags: None,
+        });
+        reg_state.set(reg, merged);
+        Ok(())
+    }
+
+    /// `value`'s low `bits` bits sign-extended to 32 bits.
+    fn sign_extend(
+        &mut self,
+        value: SsaVarId,
+        bits: u32,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        if bits >= 32 {
+            return value;
+        }
+        let amount = self.get_constant(i64::from(32_u32.saturating_sub(bits)), instrs, block_idx);
+        let raised = self.emit(instrs, block_idx, |dest| SsaOp::Shl {
+            dest,
+            value,
+            amount,
+            flags: None,
+        });
+        self.emit(instrs, block_idx, |dest| SsaOp::Shr {
+            dest,
+            value: raised,
+            amount,
+            unsigned: false,
+            flags: None,
+        })
+    }
+
+    /// `value` converted to the integer type `target`, read as unsigned or signed.
+    fn convert(
+        &mut self,
+        value: SsaVarId,
+        target: SsaType,
+        unsigned: bool,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        let ty = target.clone();
+        self.emit_typed(ty, instrs, block_idx, |dest| SsaOp::IntConv {
+            dest,
+            operand: value,
+            target,
+            overflow_check: false,
+            unsigned,
+        })
+    }
+
+    /// The 64-bit value `high:low` of the type `wide`, from two 32-bit halves.
+    fn join_wide(
+        &mut self,
+        high: SsaVarId,
+        low: SsaVarId,
+        wide: &SsaType,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> SsaVarId {
+        let high = self.convert(high, wide.clone(), true, instrs, block_idx);
+        let low = self.convert(low, wide.clone(), true, instrs, block_idx);
+        let thirty_two = self.get_constant(32, instrs, block_idx);
+        let raised = self.emit_typed(wide.clone(), instrs, block_idx, |dest| SsaOp::Shl {
+            dest,
+            value: high,
+            amount: thirty_two,
+            flags: None,
+        });
+        self.emit_typed(wide.clone(), instrs, block_idx, |dest| SsaOp::Or {
+            dest,
+            left: raised,
+            right: low,
+            flags: None,
+        })
+    }
+
+    /// The low and high 32-bit halves of the unsigned 64-bit `value`.
+    fn split_wide(
+        &mut self,
+        value: SsaVarId,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+    ) -> (SsaVarId, SsaVarId) {
+        let low = self.convert(value, SsaType::I32, true, instrs, block_idx);
+        let thirty_two = self.get_constant(32, instrs, block_idx);
+        let shifted = self.emit_typed(SsaType::U64, instrs, block_idx, |dest| SsaOp::Shr {
+            dest,
+            value,
+            amount: thirty_two,
+            unsigned: true,
+            flags: None,
+        });
+        let high = self.convert(shifted, SsaType::I32, true, instrs, block_idx);
+        (low, high)
+    }
+
+    /// Loads a memory operand: a narrow one zero-extended to 32 bits.
     fn load_from_memory(
         &mut self,
         mem: &X86Memory,
@@ -1662,30 +1799,29 @@ impl<'a> X86ToSsaTranslator<'a> {
         block_idx: usize,
     ) -> Result<SsaVarId> {
         let addr = self.compute_memory_address(mem, reg_state, instrs, block_idx)?;
-        let result = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-
         let value_type = match mem.size {
-            1 => SsaType::I8,
-            2 => SsaType::I16,
-            8 => SsaType::I64,
-            _ => SsaType::I32,
+            1 => SsaType::U8,
+            2 => SsaType::U16,
+            4 => SsaType::I32,
+            size => {
+                return Err(Error::X86Error(format!(
+                    "a {size}-byte memory operand is not modelled"
+                )))
+            }
         };
-
-        instrs.push(SsaInstruction::synthetic(SsaOp::LoadIndirect {
-            dest: result,
+        let access = AccessQualifiers {
+            address_space: address_space_for(mem),
+            ..AccessQualifiers::FLAT
+        };
+        Ok(self.emit(instrs, block_idx, |dest| SsaOp::LoadIndirect {
+            dest,
             addr,
             value_type,
-            address_space: address_space_for(mem),
-        }));
-
-        Ok(result)
+            access,
+        }))
     }
 
-    /// Stores a value to memory.
+    /// Stores to a memory operand: a narrow one takes the value's low bits.
     fn store_to_memory(
         &mut self,
         mem: &X86Memory,
@@ -1695,656 +1831,30 @@ impl<'a> X86ToSsaTranslator<'a> {
         block_idx: usize,
     ) -> Result<()> {
         let addr = self.compute_memory_address(mem, reg_state, instrs, block_idx)?;
-
         let value_type = match mem.size {
             1 => SsaType::I8,
             2 => SsaType::I16,
-            8 => SsaType::I64,
-            _ => SsaType::I32,
+            4 => SsaType::I32,
+            size => {
+                return Err(Error::X86Error(format!(
+                    "a {size}-byte memory operand is not modelled"
+                )))
+            }
         };
-
         instrs.push(SsaInstruction::synthetic(SsaOp::StoreIndirect {
             addr,
             value,
             value_type,
-            address_space: address_space_for(mem),
+            access: AccessQualifiers {
+                address_space: address_space_for(mem),
+                ..AccessQualifiers::FLAT
+            },
         }));
-
         Ok(())
     }
 
-    /// Evaluates an x86 condition code into a 0/1 SSA variable.
-    ///
-    /// This is used by Cmovcc and Setcc to produce a value based on the
-    /// current flag state. It emits the necessary comparison instructions
-    /// and returns an SSA variable holding 0 (false) or 1 (true).
-    fn evaluate_condition(
-        &mut self,
-        condition: X86Condition,
-        flags: &FlagState,
-        instrs: &mut Vec<SsaInstruction>,
-        block_idx: usize,
-    ) -> Result<SsaVarId> {
-        let eval = flags.get_condition_operands(condition).ok_or_else(|| {
-            Error::X86Error(format!(
-                "Cannot evaluate condition {condition:?}: flags unknown or unsupported"
-            ))
-        })?;
-
-        match eval {
-            ConditionEval::Compare {
-                cmp,
-                left,
-                right,
-                unsigned,
-            } => self.emit_comparison(cmp, left, right, unsigned, instrs, block_idx),
-            ConditionEval::Test { cmp, left, right } => {
-                // Compute AND first, then compare to zero
-                let and_result = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: and_result,
-                    left,
-                    right,
-                    flags: None,
-                }));
-                let zero = self.get_zero_constant(instrs, block_idx);
-                self.emit_comparison(cmp, and_result, zero, false, instrs, block_idx)
-            }
-            ConditionEval::ZeroTest { cmp, result } => {
-                let zero = self.get_zero_constant(instrs, block_idx);
-                self.emit_comparison(cmp, result, zero, false, instrs, block_idx)
-            }
-            ConditionEval::SignFlag { source, negated } => {
-                self.emit_sign_flag(source, negated, instrs, block_idx)
-            }
-            ConditionEval::OverflowFlag {
-                left,
-                right,
-                result,
-                kind,
-                negated,
-            } => self.emit_overflow_flag(left, right, result, kind, negated, instrs, block_idx),
-            ConditionEval::ParityFlag { source, negated } => {
-                self.emit_parity_flag(source, negated, instrs, block_idx)
-            }
-        }
-    }
-
-    /// Emits a comparison SSA operation (Ceq/Clt/Cgt) and returns the result variable.
-    fn emit_comparison(
-        &mut self,
-        cmp: CmpKind,
-        left: SsaVarId,
-        right: SsaVarId,
-        unsigned: bool,
-        instrs: &mut Vec<SsaInstruction>,
-        block_idx: usize,
-    ) -> Result<SsaVarId> {
-        let result = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-
-        match cmp {
-            CmpKind::Eq => {
-                instrs.push(SsaInstruction::synthetic(SsaOp::Ceq {
-                    dest: result,
-                    left,
-                    right,
-                }));
-            }
-            CmpKind::Ne => {
-                // Ne = !Eq: compute Ceq then XOR with 1
-                let eq_result = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Ceq {
-                    dest: eq_result,
-                    left,
-                    right,
-                }));
-                let one = self.get_constant(1, instrs, block_idx);
-                instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: result,
-                    left: eq_result,
-                    right: one,
-                    flags: None,
-                }));
-            }
-            CmpKind::Lt => {
-                instrs.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: result,
-                    left,
-                    right,
-                    unsigned,
-                }));
-            }
-            CmpKind::Gt => {
-                instrs.push(SsaInstruction::synthetic(SsaOp::Cgt {
-                    dest: result,
-                    left,
-                    right,
-                    unsigned,
-                }));
-            }
-            CmpKind::Le => {
-                // Le = !Gt: compute Cgt then XOR with 1
-                let gt_result = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Cgt {
-                    dest: gt_result,
-                    left,
-                    right,
-                    unsigned,
-                }));
-                let one = self.get_constant(1, instrs, block_idx);
-                instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: result,
-                    left: gt_result,
-                    right: one,
-                    flags: None,
-                }));
-            }
-            CmpKind::Ge => {
-                // Ge = !Lt: compute Clt then XOR with 1
-                let lt_result = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Clt {
-                    dest: lt_result,
-                    left,
-                    right,
-                    unsigned,
-                }));
-                let one = self.get_constant(1, instrs, block_idx);
-                instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: result,
-                    left: lt_result,
-                    right: one,
-                    flags: None,
-                }));
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Resolves a `FlagTestSource` to an SSA variable, emitting Sub or And if needed.
-    fn resolve_flag_test_source(
-        &mut self,
-        source: FlagTestSource,
-        instrs: &mut Vec<SsaInstruction>,
-        block_idx: usize,
-    ) -> SsaVarId {
-        match source {
-            FlagTestSource::Direct(var) => var,
-            FlagTestSource::Subtract { left, right } => {
-                let result = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Sub {
-                    dest: result,
-                    left,
-                    right,
-                    flags: None,
-                }));
-                result
-            }
-            FlagTestSource::BitwiseAnd { left, right } => {
-                let result = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: result,
-                    left,
-                    right,
-                    flags: None,
-                }));
-                result
-            }
-        }
-    }
-
-    /// Emits SSA instructions to compute the sign flag (SF) as a 0/1 value.
-    ///
-    /// SF = MSB of the value. Extracts it via `(value >> (bitwidth-1)) & 1`.
-    fn emit_sign_flag(
-        &mut self,
-        source: FlagTestSource,
-        negated: bool,
-        instrs: &mut Vec<SsaInstruction>,
-        block_idx: usize,
-    ) -> Result<SsaVarId> {
-        let value = self.resolve_flag_test_source(source, instrs, block_idx);
-        let shift_amount = if self.func.bitness == 64 { 63 } else { 31 };
-        let shift_const = self.get_constant(shift_amount, instrs, block_idx);
-
-        // sign_shifted = value >> (bitwidth-1), unsigned shift
-        let sign_shifted = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::Shr {
-            dest: sign_shifted,
-            value,
-            amount: shift_const,
-            unsigned: true,
-            flags: None,
-        }));
-
-        // sign_bit = sign_shifted & 1
-        let one = self.get_constant(1, instrs, block_idx);
-        let sign_bit = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::And {
-            dest: sign_bit,
-            left: sign_shifted,
-            right: one,
-            flags: None,
-        }));
-
-        if negated {
-            // NS: return !SF = sign_bit ^ 1
-            let result = self.create_variable(
-                VariableOrigin::Phi,
-                DefSite::instruction(block_idx, instrs.len()),
-                self.func.bitness,
-            );
-            let one2 = self.get_constant(1, instrs, block_idx);
-            instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                dest: result,
-                left: sign_bit,
-                right: one2,
-                flags: None,
-            }));
-            Ok(result)
-        } else {
-            Ok(sign_bit)
-        }
-    }
-
-    /// Emits SSA instructions to compute the overflow flag (OF) as a 0/1 value.
-    ///
-    /// The computation depends on the arithmetic operation that set the flags:
-    /// - `LogicalOp`: OF is always 0 (TEST, AND, OR, XOR clear OF)
-    /// - `Sub`/CMP: OF = ((left ^ right) & (left ^ result)) >> MSB
-    /// - `Add`: OF = ((left ^ result) & (right ^ result)) >> MSB
-    /// - `Neg`: OF = (result == INT_MIN)
-    /// - `Other`: OF approximated as 0
-    #[allow(clippy::too_many_arguments)]
-    fn emit_overflow_flag(
-        &mut self,
-        left: SsaVarId,
-        right: SsaVarId,
-        result: Option<SsaVarId>,
-        kind: ArithmeticKind,
-        negated: bool,
-        instrs: &mut Vec<SsaInstruction>,
-        block_idx: usize,
-    ) -> Result<SsaVarId> {
-        let of = match kind {
-            ArithmeticKind::LogicalOp | ArithmeticKind::Other => {
-                // OF = 0 for logical operations and undefined/complex operations
-                self.get_constant(0, instrs, block_idx)
-            }
-            ArithmeticKind::Sub => {
-                // For CMP (result=None): compute sub_result = left - right
-                // For SUB (result=Some): use existing result
-                let sub_result = if let Some(r) = result {
-                    r
-                } else {
-                    let r = self.create_variable(
-                        VariableOrigin::Phi,
-                        DefSite::instruction(block_idx, instrs.len()),
-                        self.func.bitness,
-                    );
-                    instrs.push(SsaInstruction::synthetic(SsaOp::Sub {
-                        dest: r,
-                        left,
-                        right,
-                        flags: None,
-                    }));
-                    r
-                };
-
-                // OF = ((left ^ right) & (left ^ result)) >> (bitwidth-1)
-                let xor_lr = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: xor_lr,
-                    left,
-                    right,
-                    flags: None,
-                }));
-
-                let xor_ls = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: xor_ls,
-                    left,
-                    right: sub_result,
-                    flags: None,
-                }));
-
-                let and_both = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: and_both,
-                    left: xor_lr,
-                    right: xor_ls,
-                    flags: None,
-                }));
-
-                let shift_amount = if self.func.bitness == 64 { 63 } else { 31 };
-                let shift_const = self.get_constant(shift_amount, instrs, block_idx);
-                let shifted = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Shr {
-                    dest: shifted,
-                    value: and_both,
-                    amount: shift_const,
-                    unsigned: true,
-                    flags: None,
-                }));
-
-                let one = self.get_constant(1, instrs, block_idx);
-                let of_bit = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: of_bit,
-                    left: shifted,
-                    right: one,
-                    flags: None,
-                }));
-                of_bit
-            }
-            ArithmeticKind::Add => {
-                // OF = ((left ^ result) & (right ^ result)) >> (bitwidth-1)
-                let add_result = result.unwrap_or(left); // Should always have result for Add
-
-                let xor_lr = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: xor_lr,
-                    left,
-                    right: add_result,
-                    flags: None,
-                }));
-
-                let xor_rr = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                    dest: xor_rr,
-                    left: right,
-                    right: add_result,
-                    flags: None,
-                }));
-
-                let and_both = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: and_both,
-                    left: xor_lr,
-                    right: xor_rr,
-                    flags: None,
-                }));
-
-                let shift_amount = if self.func.bitness == 64 { 63 } else { 31 };
-                let shift_const = self.get_constant(shift_amount, instrs, block_idx);
-                let shifted = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Shr {
-                    dest: shifted,
-                    value: and_both,
-                    amount: shift_const,
-                    unsigned: true,
-                    flags: None,
-                }));
-
-                let one = self.get_constant(1, instrs, block_idx);
-                let of_bit = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::And {
-                    dest: of_bit,
-                    left: shifted,
-                    right: one,
-                    flags: None,
-                }));
-                of_bit
-            }
-            ArithmeticKind::Neg => {
-                // OF = (result == INT_MIN)
-                let neg_result = result.unwrap_or(left);
-                let int_min = if self.func.bitness == 64 {
-                    self.get_constant(i64::MIN, instrs, block_idx)
-                } else {
-                    self.get_constant(i64::from(i32::MIN), instrs, block_idx)
-                };
-                let of_bit = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Ceq {
-                    dest: of_bit,
-                    left: neg_result,
-                    right: int_min,
-                }));
-                of_bit
-            }
-        };
-
-        if negated {
-            // NO: return !OF = of ^ 1
-            let result_var = self.create_variable(
-                VariableOrigin::Phi,
-                DefSite::instruction(block_idx, instrs.len()),
-                self.func.bitness,
-            );
-            let one = self.get_constant(1, instrs, block_idx);
-            instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                dest: result_var,
-                left: of,
-                right: one,
-                flags: None,
-            }));
-            Ok(result_var)
-        } else {
-            Ok(of)
-        }
-    }
-
-    /// Emits SSA instructions to compute the parity flag (PF) as a 0/1 value.
-    ///
-    /// PF = 1 when the low byte of the value has even parity (even number of 1-bits).
-    /// Computed by XOR-folding the low byte down to a single bit.
-    fn emit_parity_flag(
-        &mut self,
-        source: FlagTestSource,
-        negated: bool,
-        instrs: &mut Vec<SsaInstruction>,
-        block_idx: usize,
-    ) -> Result<SsaVarId> {
-        let value = self.resolve_flag_test_source(source, instrs, block_idx);
-
-        // b = value & 0xFF (isolate low byte)
-        let mask_ff = self.get_constant(0xFF, instrs, block_idx);
-        let b = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::And {
-            dest: b,
-            left: value,
-            right: mask_ff,
-            flags: None,
-        }));
-
-        // b ^= b >> 4
-        let c4 = self.get_constant(4, instrs, block_idx);
-        let shr4 = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::Shr {
-            dest: shr4,
-            value: b,
-            amount: c4,
-            unsigned: true,
-            flags: None,
-        }));
-        let b1 = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-            dest: b1,
-            left: b,
-            right: shr4,
-            flags: None,
-        }));
-
-        // b ^= b >> 2
-        let c2 = self.get_constant(2, instrs, block_idx);
-        let shr2 = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::Shr {
-            dest: shr2,
-            value: b1,
-            amount: c2,
-            unsigned: true,
-            flags: None,
-        }));
-        let b2 = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-            dest: b2,
-            left: b1,
-            right: shr2,
-            flags: None,
-        }));
-
-        // b ^= b >> 1
-        let c1 = self.get_constant(1, instrs, block_idx);
-        let shr1 = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::Shr {
-            dest: shr1,
-            value: b2,
-            amount: c1,
-            unsigned: true,
-            flags: None,
-        }));
-        let b3 = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-            dest: b3,
-            left: b2,
-            right: shr1,
-            flags: None,
-        }));
-
-        // odd_parity = b3 & 1
-        let one = self.get_constant(1, instrs, block_idx);
-        let odd_parity = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-        instrs.push(SsaInstruction::synthetic(SsaOp::And {
-            dest: odd_parity,
-            left: b3,
-            right: one,
-            flags: None,
-        }));
-
-        if negated {
-            // NP (PF=0): return odd_parity (1 when odd number of bits)
-            Ok(odd_parity)
-        } else {
-            // P (PF=1): return !odd_parity (1 when even number of bits)
-            let result = self.create_variable(
-                VariableOrigin::Phi,
-                DefSite::instruction(block_idx, instrs.len()),
-                self.func.bitness,
-            );
-            let one2 = self.get_constant(1, instrs, block_idx);
-            instrs.push(SsaInstruction::synthetic(SsaOp::Xor {
-                dest: result,
-                left: odd_parity,
-                right: one2,
-                flags: None,
-            }));
-            Ok(result)
-        }
-    }
-
-    /// Computes the effective address for a memory operand.
+    /// Computes the effective address for a memory operand: base, index times
+    /// scale and displacement, from 32-bit registers.
     fn compute_memory_address(
         &mut self,
         mem: &X86Memory,
@@ -2352,6 +1862,15 @@ impl<'a> X86ToSsaTranslator<'a> {
         instrs: &mut Vec<SsaInstruction>,
         block_idx: usize,
     ) -> Result<SsaVarId> {
+        // 16-bit addressing wraps at 64K, which a 32-bit sum does not
+        for reg in [mem.base, mem.index].into_iter().flatten() {
+            if sub_register(reg).is_some() {
+                return Err(Error::X86Error(format!(
+                    "16-bit addressing through {reg:?} is not modelled"
+                )));
+            }
+        }
+
         // Start with base or 0
         let mut addr = if let Some(base) = mem.base {
             Self::get_register_value(base, reg_state)?
@@ -2362,125 +1881,132 @@ impl<'a> X86ToSsaTranslator<'a> {
         // Add index * scale
         if let Some(index) = mem.index {
             let index_val = Self::get_register_value(index, reg_state)?;
-
-            // Multiply by scale if not 1
             let scaled = if mem.scale == 1 {
                 index_val
             } else {
                 let scale_const = self.get_constant(i64::from(mem.scale), instrs, block_idx);
-                let scaled_var = self.create_variable(
-                    VariableOrigin::Phi,
-                    DefSite::instruction(block_idx, instrs.len()),
-                    self.func.bitness,
-                );
-                instrs.push(SsaInstruction::synthetic(SsaOp::Mul {
-                    dest: scaled_var,
+                self.emit(instrs, block_idx, |dest| SsaOp::Mul {
+                    dest,
                     left: index_val,
                     right: scale_const,
                     flags: None,
-                }));
-                scaled_var
+                })
             };
-
-            // Add to address
-            let new_addr = self.create_variable(
-                VariableOrigin::Phi,
-                DefSite::instruction(block_idx, instrs.len()),
-                self.func.bitness,
-            );
-            instrs.push(SsaInstruction::synthetic(SsaOp::Add {
-                dest: new_addr,
-                left: addr,
+            let base = addr;
+            addr = self.emit(instrs, block_idx, |dest| SsaOp::Add {
+                dest,
+                left: base,
                 right: scaled,
                 flags: None,
-            }));
-            addr = new_addr;
+            });
         }
 
         // Add displacement
         if mem.displacement != 0 {
             let disp_const = self.get_constant(mem.displacement, instrs, block_idx);
-            let new_addr = self.create_variable(
-                VariableOrigin::Phi,
-                DefSite::instruction(block_idx, instrs.len()),
-                self.func.bitness,
-            );
-            instrs.push(SsaInstruction::synthetic(SsaOp::Add {
-                dest: new_addr,
-                left: addr,
+            let base = addr;
+            addr = self.emit(instrs, block_idx, |dest| SsaOp::Add {
+                dest,
+                left: base,
                 right: disp_const,
                 flags: None,
-            }));
-            addr = new_addr;
+            });
         }
 
         Ok(addr)
     }
 
-    /// Gets or creates an SSA variable for a constant value.
+    /// Emits the 32-bit constant `value` (its low 32 bits) and returns its
+    /// variable.
     fn get_constant(
         &mut self,
         value: i64,
         instrs: &mut Vec<SsaInstruction>,
         block_idx: usize,
     ) -> SsaVarId {
-        let var = self.create_variable(
-            VariableOrigin::Phi,
-            DefSite::instruction(block_idx, instrs.len()),
-            self.func.bitness,
-        );
-
-        let const_value = if self.func.bitness == 64 {
-            ConstValue::I64(value)
-        } else {
-            // Safe: x86 32-bit constant intentionally truncated to i32
-            #[allow(clippy::cast_possible_truncation)]
-            let truncated = value as i32;
-            ConstValue::I32(truncated)
-        };
-
-        instrs.push(SsaInstruction::synthetic(SsaOp::Const {
-            dest: var,
-            value: const_value,
-        }));
-
-        var
+        // Safe: an x86 32-bit constant is its low 32 bits
+        #[allow(clippy::cast_possible_truncation)]
+        let truncated = value as i32;
+        self.emit(instrs, block_idx, |dest| SsaOp::Const {
+            dest,
+            value: ConstValue::I32(truncated),
+        })
     }
 
-    /// Gets or creates a zero constant.
+    /// The zero constant of block `block_idx`, emitted the first time the block
+    /// needs it.
     fn get_zero_constant(
         &mut self,
         instrs: &mut Vec<SsaInstruction>,
         block_idx: usize,
     ) -> SsaVarId {
-        if let Some(zero) = self.zero_const {
-            return zero;
+        if let Some((block, zero)) = self.zero_const {
+            if block == block_idx {
+                return zero;
+            }
         }
-
         let zero = self.get_constant(0, instrs, block_idx);
-        self.zero_const = Some(zero);
+        self.zero_const = Some((block_idx, zero));
         zero
     }
 
-    /// Creates a new SSA variable using the local allocator.
-    fn create_variable(
+    /// Emits the operation `op` builds for a new 32-bit variable, and returns the
+    /// variable.
+    fn emit(
+        &mut self,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+        op: impl FnOnce(SsaVarId) -> SsaOp,
+    ) -> SsaVarId {
+        self.emit_typed(SsaType::I32, instrs, block_idx, op)
+    }
+
+    /// Emits the operation `op` builds for a new variable of type `ty`, and
+    /// returns the variable.
+    fn emit_typed(
+        &mut self,
+        ty: SsaType,
+        instrs: &mut Vec<SsaInstruction>,
+        block_idx: usize,
+        op: impl FnOnce(SsaVarId) -> SsaOp,
+    ) -> SsaVarId {
+        let dest = self.create_typed_variable(
+            VariableOrigin::Phi,
+            DefSite::instruction(block_idx, instrs.len()),
+            ty,
+        );
+        instrs.push(SsaInstruction::synthetic(op(dest)));
+        dest
+    }
+
+    /// Creates a new 32-bit SSA variable using the local allocator.
+    fn create_variable(&mut self, origin: VariableOrigin, def_site: DefSite) -> SsaVarId {
+        self.create_typed_variable(origin, def_site, SsaType::I32)
+    }
+
+    /// Creates a new SSA variable of type `ty` using the local allocator.
+    fn create_typed_variable(
         &mut self,
         origin: VariableOrigin,
         def_site: DefSite,
-        bitness: u32,
+        ty: SsaType,
     ) -> SsaVarId {
-        let var_type = if bitness == 64 {
-            SsaType::I64
-        } else {
-            SsaType::I32
-        };
         let id = SsaVarId::from_index(self.variables.len());
-        let var = SsaVariable::new(id, origin, 0, def_site, var_type);
+        let var = SsaVariable::new(id, origin, 0, def_site, ty);
         self.variables.push(var);
         id
     }
 
-    /// Finds the block index for a given address.
+    /// The block starting at `offset`.
+    fn block_at_offset(&self, offset: u64) -> Result<usize> {
+        self.block_by_offset.get(&offset).copied().ok_or_else(|| {
+            Error::X86Error(format!(
+                "No block starts at offset 0x{offset:x}: control falls off the decoded code"
+            ))
+        })
+    }
+
+    /// Finds the block index for a given absolute address.
     fn find_block_for_address(&self, addr: u64) -> Result<usize> {
         let offset = addr.checked_sub(self.func.base_address).ok_or_else(|| {
             Error::X86Error(format!(
@@ -2488,132 +2014,438 @@ impl<'a> X86ToSsaTranslator<'a> {
                 self.func.base_address
             ))
         })?;
-
-        for node_id in self.func.node_ids() {
-            let idx = node_id.index();
-            if let Some(block) = self.func.block(idx) {
-                if block.start_offset == offset {
-                    return Ok(idx);
-                }
-            }
-        }
-
-        Err(Error::X86Error(format!(
-            "No block found for address 0x{addr:x}"
-        )))
+        self.block_at_offset(offset)
     }
 }
 
-/// Returns the register index defined by an instruction, if any.
-fn get_defined_register(instr: &X86Instruction) -> Option<usize> {
-    match instr {
-        X86Instruction::Mov { dst, .. }
-        | X86Instruction::Movzx { dst, .. }
-        | X86Instruction::Movsx { dst, .. }
-        | X86Instruction::Add { dst, .. }
-        | X86Instruction::Sub { dst, .. }
-        | X86Instruction::And { dst, .. }
-        | X86Instruction::Or { dst, .. }
-        | X86Instruction::Xor { dst, .. }
-        | X86Instruction::Not { dst }
-        | X86Instruction::Neg { dst }
-        | X86Instruction::Inc { dst }
-        | X86Instruction::Dec { dst }
-        | X86Instruction::Shl { dst, .. }
-        | X86Instruction::Shr { dst, .. }
-        | X86Instruction::Sar { dst, .. }
-        | X86Instruction::Rol { dst, .. }
-        | X86Instruction::Ror { dst, .. }
-        | X86Instruction::Adc { dst, .. }
-        | X86Instruction::Sbb { dst, .. }
-        | X86Instruction::Setcc { dst, .. }
-        | X86Instruction::Xadd { dst, .. } => {
-            if let X86Operand::Register(reg) = dst {
-                Some(reg.base_index() as usize)
-            } else {
-                None
-            }
-        }
-        X86Instruction::Lea { dst, .. }
-        | X86Instruction::Imul { dst, .. }
-        | X86Instruction::Bswap { dst }
-        | X86Instruction::Cmovcc { dst, .. }
-        | X86Instruction::Bsf { dst, .. }
-        | X86Instruction::Bsr { dst, .. } => Some(dst.base_index() as usize),
-        X86Instruction::Pop { dst } => Some(dst.base_index() as usize),
-        X86Instruction::Mul { .. }
-        | X86Instruction::Div { .. }
-        | X86Instruction::Idiv { .. }
-        | X86Instruction::Cdq => {
-            // These define EAX/EDX
-            Some(0) // EAX
-        }
-        X86Instruction::Xchg { dst, src } => {
-            // Both operands are modified
-            if let X86Operand::Register(reg) = dst {
-                Some(reg.base_index() as usize)
-            } else if let X86Operand::Register(reg) = src {
-                Some(reg.base_index() as usize)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Converts a register index back to a register.
-fn index_to_register(index: usize, bitness: u32) -> Option<X86Register> {
-    // Segment registers are the same regardless of bitness
-    match index {
-        16 => return Some(X86Register::Es),
-        17 => return Some(X86Register::Cs),
-        18 => return Some(X86Register::Ss),
-        19 => return Some(X86Register::Ds),
-        20 => return Some(X86Register::Fs),
-        21 => return Some(X86Register::Gs),
-        _ => {}
-    }
-
-    if bitness == 64 {
-        match index {
-            0 => Some(X86Register::Rax),
-            1 => Some(X86Register::Rcx),
-            2 => Some(X86Register::Rdx),
-            3 => Some(X86Register::Rbx),
-            4 => Some(X86Register::Rsp),
-            5 => Some(X86Register::Rbp),
-            6 => Some(X86Register::Rsi),
-            7 => Some(X86Register::Rdi),
-            8 => Some(X86Register::R8),
-            9 => Some(X86Register::R9),
-            10 => Some(X86Register::R10),
-            11 => Some(X86Register::R11),
-            12 => Some(X86Register::R12),
-            13 => Some(X86Register::R13),
-            14 => Some(X86Register::R14),
-            15 => Some(X86Register::R15),
-            _ => None,
-        }
-    } else {
-        match index {
-            0 => Some(X86Register::Eax),
-            1 => Some(X86Register::Ecx),
-            2 => Some(X86Register::Edx),
-            3 => Some(X86Register::Ebx),
-            4 => Some(X86Register::Esp),
-            5 => Some(X86Register::Ebp),
-            6 => Some(X86Register::Esi),
-            7 => Some(X86Register::Edi),
-            _ => None,
-        }
-    }
+/// The direction and fill of a shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shift {
+    /// `SHL`: toward the top bit, filling with zeros.
+    Left,
+    /// `SHR`: toward bit 0, filling with zeros.
+    Right,
+    /// `SAR`: toward bit 0, filling with the sign bit.
+    Arithmetic,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{analysis::x86::decoder::x86_decode_all, compiler::SsaCodeGenerator};
+    use crate::{
+        analysis::{
+            x86::decoder::{x86_decode_all, x86_decode_traversal},
+            CilTarget, SsaEvaluator,
+        },
+        compiler::SsaCodeGenerator,
+    };
+
+    /// What the 32-bit function `bytes` returns for the argument `input`, run by the SSA
+    /// evaluator through every block it takes, or the error translating it.
+    fn run(bytes: &[u8], input: i32) -> std::result::Result<i32, String> {
+        let instructions = x86_decode_all(bytes, 32, 0).map_err(|e| e.to_string())?;
+        run_function(&X86Function::new(&instructions, 32, 0), input)
+    }
+
+    /// What the function `cfg` returns for the argument `input`, run by the SSA evaluator,
+    /// or the error translating it.
+    fn run_function(cfg: &X86Function, input: i32) -> std::result::Result<i32, String> {
+        let ssa = X86ToSsaTranslator::new(cfg)
+            .translate()
+            .map_err(|e| e.to_string())?;
+        let arg = ssa.argument_variables().next().expect("the argument").id();
+        let mut eval = SsaEvaluator::new(&ssa, CilTarget::x86().machine());
+        eval.set_concrete(arg, ConstValue::I32(input));
+        let trace = eval.execute(0, None, 1000);
+        assert!(trace.is_complete(), "evaluation did not complete");
+        let last = *trace.blocks().last().expect("a block ran");
+        let returned = ssa
+            .block(last)
+            .and_then(|block| {
+                block
+                    .instructions()
+                    .iter()
+                    .find_map(|instr| match instr.op() {
+                        SsaOp::Return {
+                            value: Some(value), ..
+                        } => Some(*value),
+                        _ => None,
+                    })
+            })
+            .expect("the last block returns a value");
+        let value = eval.get_concrete(returned);
+        value
+            .and_then(|value| value.as_i32())
+            .ok_or_else(|| format!("the function returns {value:?}, not a concrete int32"))
+    }
+
+    /// `pop eax` then `body` then `ret`.
+    fn function(body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x58];
+        bytes.extend_from_slice(body);
+        bytes.push(0xC3);
+        bytes
+    }
+
+    /// `mov reg32, imm32`, the register numbered `reg` (0 = EAX, 1 = ECX, ...).
+    fn mov_imm(reg: u8, value: i32) -> Vec<u8> {
+        let mut bytes = vec![0xB8 + reg];
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    /// The arithmetic flags of an x86 instruction, as the Intel manual defines them.
+    #[derive(Debug, Clone, Copy)]
+    struct Flags {
+        cf: bool,
+        zf: bool,
+        sf: bool,
+        of: bool,
+        pf: bool,
+    }
+
+    impl Flags {
+        /// ZF, SF and PF of `result`, with `cf` and `of`.
+        fn of_result(result: i32, cf: bool, of: bool) -> Self {
+            Self {
+                cf,
+                zf: result == 0,
+                sf: result < 0,
+                of,
+                pf: (result as u8).count_ones().is_multiple_of(2),
+            }
+        }
+
+        /// Whether condition code `cc` (0 = O ... 15 = G) holds.
+        fn holds(self, cc: u8) -> bool {
+            let less = self.sf != self.of;
+            let base = match cc >> 1 {
+                0 => self.of,
+                1 => self.cf,
+                2 => self.zf,
+                3 => self.cf || self.zf,
+                4 => self.sf,
+                5 => self.pf,
+                6 => less,
+                _ => self.zf || less,
+            };
+            base ^ (cc & 1 == 1)
+        }
+    }
+
+    /// The edge values the condition tests run every producer over.
+    const EDGES: [i32; 9] = [0, 1, -1, 2, 0x7F, 0x80, i32::MAX, i32::MIN, 0x1234_5678];
+
+    /// Every condition after every flag-setting producer the translation models, run by the
+    /// SSA evaluator, gives what the processor gives: `pop eax; xor edx, edx; mov ecx, b;
+    /// <op>; setcc dl; mov eax, edx; ret`. The producers before covered a few conditions each
+    /// and lowered the rest wrongly: JE after ADD compared the sum with itself, and L, B
+    /// and their kin after ADD, AND or a shift compared the operands, which is CMP's
+    /// meaning alone.
+    #[test]
+    fn every_condition_after_every_producer_is_the_processors() {
+        // (name, encoding, reference result flags)
+        type Reference = fn(i32, i32) -> Flags;
+        let producers: [(&str, &[u8], Reference); 10] = [
+            ("add", &[0x01, 0xC8], |a, b| {
+                let (r, of) = a.overflowing_add(b);
+                Flags::of_result(r, (a as u32).overflowing_add(b as u32).1, of)
+            }),
+            ("sub", &[0x29, 0xC8], |a, b| {
+                let (r, of) = a.overflowing_sub(b);
+                Flags::of_result(r, (a as u32) < (b as u32), of)
+            }),
+            ("cmp", &[0x39, 0xC8], |a, b| {
+                let (r, of) = a.overflowing_sub(b);
+                Flags::of_result(r, (a as u32) < (b as u32), of)
+            }),
+            ("and", &[0x21, 0xC8], |a, b| {
+                Flags::of_result(a & b, false, false)
+            }),
+            ("or", &[0x09, 0xC8], |a, b| {
+                Flags::of_result(a | b, false, false)
+            }),
+            ("xor", &[0x31, 0xC8], |a, b| {
+                Flags::of_result(a ^ b, false, false)
+            }),
+            ("test", &[0x85, 0xC8], |a, b| {
+                Flags::of_result(a & b, false, false)
+            }),
+            // INC and DEC keep CF, which `xor edx, edx` cleared
+            ("inc", &[0x40], |a, _| {
+                let (r, of) = a.overflowing_add(1);
+                Flags::of_result(r, false, of)
+            }),
+            ("dec", &[0x48], |a, _| {
+                let (r, of) = a.overflowing_sub(1);
+                Flags::of_result(r, false, of)
+            }),
+            ("neg", &[0xF7, 0xD8], |a, _| {
+                let (r, of) = a.overflowing_neg();
+                Flags::of_result(r, a != 0, of)
+            }),
+        ];
+        for (name, op, reference) in producers {
+            for cc in 0u8..16 {
+                for b in EDGES {
+                    let mut body = vec![0x31, 0xD2];
+                    body.extend(mov_imm(1, b));
+                    body.extend_from_slice(op);
+                    body.extend_from_slice(&[0x0F, 0x90 + cc, 0xC2, 0x89, 0xD0]);
+                    let bytes = function(&body);
+                    for a in EDGES {
+                        let expected = i32::from(reference(a, b).holds(cc));
+                        assert_eq!(
+                            run(&bytes, a),
+                            Ok(expected),
+                            "{name} {a:#x}, {b:#x} then condition {cc:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A conditional jump after an addition branches on the sum: `add eax, 1; je` is
+    /// taken for -1 alone. It compared the sum with itself, so it was always taken, and
+    /// its not-taken edge went to whichever block came next in index order.
+    #[test]
+    fn a_jump_after_an_addition_tests_the_sum() {
+        // add eax, 1; je +6; mov eax, 7; ret; mov eax, 9
+        let mut body = vec![0x83, 0xC0, 0x01, 0x74, 0x06];
+        body.extend(mov_imm(0, 7));
+        body.push(0xC3);
+        body.extend(mov_imm(0, 9));
+        let bytes = function(&body);
+        assert_eq!(run(&bytes, -1), Ok(9));
+        assert_eq!(run(&bytes, 5), Ok(7));
+    }
+
+    /// Instructions that do not touch the flags leave them for the jump after: `cmp`,
+    /// then a `mov`, `lea`, `push` and `pop`, then `jl`. Each of them cleared the flags,
+    /// and the jump was refused.
+    #[test]
+    fn flags_survive_the_instructions_that_do_not_touch_them() {
+        // cmp eax, 10; mov ecx, 5; lea edx, [ecx+1]; push ecx; pop ecx; jl +6;
+        // mov eax, 1; ret; mov eax, 2
+        let mut body = vec![0x83, 0xF8, 0x0A];
+        body.extend(mov_imm(1, 5));
+        body.extend_from_slice(&[0x8D, 0x51, 0x01, 0x51, 0x59, 0x7C, 0x06]);
+        body.extend(mov_imm(0, 1));
+        body.push(0xC3);
+        body.extend(mov_imm(0, 2));
+        let bytes = function(&body);
+        for a in EDGES {
+            assert_eq!(run(&bytes, a), Ok(if a < 10 { 2 } else { 1 }), "{a:#x}");
+        }
+    }
+
+    /// A block that ends without a jump falls through to the block after it, and is
+    /// given that jump: `jl` skips the `mov` it would otherwise run into.
+    #[test]
+    fn a_block_without_a_jump_falls_through() {
+        // cmp eax, 5; jl +5; mov eax, 1; add eax, 2
+        let mut body = vec![0x83, 0xF8, 0x05, 0x7C, 0x05];
+        body.extend(mov_imm(0, 1));
+        body.extend_from_slice(&[0x83, 0xC0, 0x02]);
+        let bytes = function(&body);
+        assert_eq!(run(&bytes, 3), Ok(5));
+        assert_eq!(run(&bytes, 7), Ok(3));
+    }
+
+    /// The zero a block needs is its own. One constant shared by the function was
+    /// defined in the first block that asked (here the AND's, for its cleared carry),
+    /// and read in blocks that block does not dominate (the SETE's, comparing the TEST's
+    /// result with zero): on the path through the other block it held nothing.
+    #[test]
+    fn each_block_has_its_own_zero() {
+        // cmp eax, 5; je +5; and eax, 1; jmp +5; test eax, eax; sete al
+        let body = [
+            0x83, 0xF8, 0x05, 0x74, 0x05, 0x83, 0xE0, 0x01, 0xEB, 0x05, 0x85, 0xC0, 0x0F, 0x94,
+            0xC0,
+        ];
+        let bytes = function(&body);
+        // 5 is not zero, so SETE writes 0 into AL
+        assert_eq!(run(&bytes, 5), Ok(0));
+        assert_eq!(run(&bytes, 7), Ok(1));
+    }
+
+    /// An 8- or 16-bit register is its bits of the full register: `mov cl, al` changes
+    /// the low byte of ECX alone, `mov ch, al` the byte above it, `movsx` and `movzx`
+    /// extend what they read, and CWDE and CDQ extend the sign. Every one of these
+    /// read or replaced the whole register.
+    #[test]
+    fn sub_registers_are_their_bits_of_the_full_register() {
+        let base = 0x1234_5678;
+        // mov ecx, base; mov cl, al; mov eax, ecx
+        let mut low = mov_imm(1, base);
+        low.extend_from_slice(&[0x88, 0xC1, 0x89, 0xC8]);
+        // mov ecx, base; mov ch, al; mov eax, ecx
+        let mut high = mov_imm(1, base);
+        high.extend_from_slice(&[0x88, 0xC5, 0x89, 0xC8]);
+        for a in EDGES {
+            let byte = a & 0xFF;
+            assert_eq!(run(&function(&low), a), Ok((base & !0xFF) | byte), "{a:#x}");
+            assert_eq!(
+                run(&function(&high), a),
+                Ok((base & !0xFF00) | (byte << 8)),
+                "{a:#x}"
+            );
+            // movsx eax, al
+            assert_eq!(
+                run(&function(&[0x0F, 0xBE, 0xC0]), a),
+                Ok(i32::from(a as i8))
+            );
+            // movzx eax, ax
+            assert_eq!(run(&function(&[0x0F, 0xB7, 0xC0]), a), Ok(a & 0xFFFF));
+            // cwde
+            assert_eq!(run(&function(&[0x98]), a), Ok(i32::from(a as i16)));
+            // cdq; mov eax, edx
+            assert_eq!(run(&function(&[0x99, 0x89, 0xD0]), a), Ok(a >> 31));
+            // add al, 1: a carry out of the byte stays out of the rest
+            assert_eq!(
+                run(&function(&[0x04, 0x01]), a),
+                Ok((a & !0xFF) | (a.wrapping_add(1) & 0xFF)),
+                "{a:#x}"
+            );
+        }
+    }
+
+    /// MUL leaves the high half of the product in EDX, and DIV and IDIV divide EDX:EAX:
+    /// both were computed from EAX alone.
+    #[test]
+    fn multiplication_and_division_use_both_halves() {
+        // mov ecx, 0x10000; mul ecx; mov eax, edx
+        let mut mul = mov_imm(1, 0x10000);
+        mul.extend_from_slice(&[0xF7, 0xE1, 0x89, 0xD0]);
+        // mov edx, 1; mov ecx, 16; div ecx
+        let mut div = mov_imm(2, 1);
+        div.extend(mov_imm(1, 16));
+        div.extend_from_slice(&[0xF7, 0xF1]);
+        // cdq; mov ecx, -3; idiv ecx; mov eax, edx
+        let mut idiv = vec![0x99];
+        idiv.extend(mov_imm(1, -3));
+        idiv.extend_from_slice(&[0xF7, 0xF9, 0x89, 0xD0]);
+        for a in EDGES {
+            let ua = u64::from(a as u32);
+            assert_eq!(run(&function(&mul), a), Ok((ua >> 16) as i32), "{a:#x}");
+            assert_eq!(
+                run(&function(&div), a),
+                Ok((((1u64 << 32) | ua) / 16) as i32),
+                "{a:#x}"
+            );
+            if a != i32::MIN {
+                assert_eq!(run(&function(&idiv), a), Ok(a % -3), "{a:#x}");
+            }
+        }
+    }
+
+    /// Shifts mask their count to five bits, set CF to the last bit shifted out, and
+    /// rotate as rotates: a count of 33 shifts by one, `shr` then `setb` reads bit 0, and
+    /// `rol` moves the top bits around. A rotate kept its value unchanged, and a shift's
+    /// CF stayed what the instruction before left.
+    #[test]
+    fn shifts_and_rotates_are_the_processors() {
+        for a in EDGES {
+            let ua = a as u32;
+            // mov ecx, 33; shl eax, cl
+            let mut shl = mov_imm(1, 33);
+            shl.extend_from_slice(&[0xD3, 0xE0]);
+            assert_eq!(run(&function(&shl), a), Ok(a.wrapping_shl(1)), "{a:#x}");
+            // xor edx, edx; shr eax, 1; setb dl; mov eax, edx
+            let shr = [0x31, 0xD2, 0xD1, 0xE8, 0x0F, 0x92, 0xC2, 0x89, 0xD0];
+            assert_eq!(run(&function(&shr), a), Ok(a & 1), "{a:#x}");
+            // sar eax, 4
+            assert_eq!(run(&function(&[0xC1, 0xF8, 0x04]), a), Ok(a >> 4));
+            // rol eax, 8
+            assert_eq!(
+                run(&function(&[0xC1, 0xC0, 0x08]), a),
+                Ok(ua.rotate_left(8) as i32)
+            );
+            // ror eax, 3
+            assert_eq!(
+                run(&function(&[0xC1, 0xC8, 0x03]), a),
+                Ok(ua.rotate_right(3) as i32)
+            );
+            // xor edx, edx; bt eax, 3; setb dl; mov eax, edx
+            let bt = [
+                0x31, 0xD2, 0x0F, 0xBA, 0xE0, 0x03, 0x0F, 0x92, 0xC2, 0x89, 0xD0,
+            ];
+            assert_eq!(run(&function(&bt), a), Ok((a >> 3) & 1), "{a:#x}");
+            // xadd eax, eax: the sum, written after the old value
+            assert_eq!(
+                run(&function(&[0x0F, 0xC1, 0xC0]), a),
+                Ok(a.wrapping_add(a)),
+                "{a:#x}"
+            );
+        }
+    }
+
+    /// What the translation does not model exactly it refuses, so the caller keeps the
+    /// native stub: a bit scan (whose result was its source), an ADC whose carry is not
+    /// known (which read it as 0), a pop with nothing pushed (which read a value no
+    /// instruction wrote), the one-operand IMUL (which wrote EAX alone) and 64-bit code.
+    #[test]
+    fn what_is_not_modelled_is_refused() {
+        // bsf eax, eax
+        assert!(run(&function(&[0x0F, 0xBC, 0xC0]), 1).is_err());
+        // adc eax, 1
+        assert!(run(&function(&[0x83, 0xD0, 0x01]), 1).is_err());
+        // pop ecx; mov eax, ecx: what the caller's frame held is read. Popped and not
+        // read, as an epilogue restores a saved register, it is no reason to refuse
+        assert!(run(&function(&[0x59, 0x89, 0xC8]), 1).is_err());
+        assert_eq!(run(&function(&[0x59]), 1), Ok(1));
+        // mov ecx, 3; imul ecx
+        let mut imul = mov_imm(1, 3);
+        imul.extend_from_slice(&[0xF7, 0xE9]);
+        assert!(run(&function(&imul), 1).is_err());
+
+        let instructions = x86_decode_all(&[0x58, 0xC3], 64, 0).unwrap();
+        let cfg = X86Function::new(&instructions, 64, 0);
+        assert!(X86ToSsaTranslator::new(&cfg).translate().is_err());
+    }
+
+    /// A function is entered where its entry is, not at its lowest address: a traversal
+    /// decode entered at `pop eax; jmp 0` returns the code at 0 first, by address, and
+    /// built from the first instruction the function began with `add eax, 5` reading an
+    /// EAX nothing wrote.
+    #[test]
+    fn a_function_is_entered_at_its_entry() {
+        // 0: add eax, 5; 3: ret; 4: pop eax; 5: jmp 0
+        let bytes = [0x83, 0xC0, 0x05, 0xC3, 0x58, 0xEB, 0xF9];
+        let decoded = x86_decode_traversal(&bytes, 32, 0, 4).unwrap();
+        let cfg = X86Function::with_entry(&decoded.instructions, 32, 0, 4);
+        assert_eq!(cfg.block(0).map(|block| block.start_offset), Some(4));
+        for a in EDGES {
+            assert_eq!(run_function(&cfg, a), Ok(a.wrapping_add(5)), "{a:#x}");
+        }
+    }
+
+    /// Instructions the decoder approximated by others decode as unsupported, and their
+    /// functions are refused: BTS, BTR and BTC (as BT, which leaves the bit), CBW (as
+    /// CWDE, which extends AX instead of AL) and CWD (as CDQ, which fills EDX instead of
+    /// DX). The linear decode keeps them as unsupported instead of failing as a whole.
+    #[test]
+    fn approximated_instructions_are_refused() {
+        // bts eax, 3; btr eax, 3; btc eax, 3; cbw; cwd
+        for body in [
+            &[0x0F, 0xBA, 0xE8, 0x03][..],
+            &[0x0F, 0xBA, 0xF0, 0x03],
+            &[0x0F, 0xBA, 0xF8, 0x03],
+            &[0x66, 0x98],
+            &[0x66, 0x99],
+        ] {
+            let bytes = function(body);
+            let decoded = x86_decode_all(&bytes, 32, 0).expect("the decode stays whole");
+            assert!(
+                decoded
+                    .iter()
+                    .any(|instr| matches!(instr.instruction, X86Instruction::Unsupported { .. })),
+                "{body:02x?}"
+            );
+            assert!(run(&bytes, 1).is_err(), "{body:02x?}");
+        }
+    }
 
     /// `fs:`/`gs:` become distinct address spaces; every other segment stays in
     /// the flat default. Marking `ss:`/`ds:` would let alias analysis prove two
@@ -2655,10 +2487,10 @@ mod tests {
         let cfg = X86Function::new(&instructions, 32, 0x1000);
         let ssa = X86ToSsaTranslator::new(&cfg).translate().unwrap();
 
-        let spaces: Vec<Option<u16>> = ssa
+        let spaces: Vec<Option<NonZeroU16>> = ssa
             .iter_instructions()
             .filter_map(|(_, _, instr)| match instr.op() {
-                SsaOp::LoadIndirect { address_space, .. } => Some(*address_space),
+                SsaOp::LoadIndirect { access: space, .. } => Some(space.address_space),
                 _ => None,
             })
             .collect();
@@ -2886,9 +2718,62 @@ mod tests {
         assert!(has_branch);
     }
 
+    /// A register defined before a diamond and read after it, with neither
+    /// arm writing it, reads the value from before the diamond: no phi is
+    /// placed for it, and the join is not entered with nothing.
+    #[test]
+    fn a_register_written_before_a_diamond_is_read_after_it() {
+        let bytes = [
+            0x58, // pop eax
+            0x8b, 0xc8, // mov ecx, eax
+            0x83, 0xf8, 0x0a, // cmp eax, 10
+            0x7c, 0x05, // jl +5 (to the second arm)
+            0x83, 0xc0, 0x01, // add eax, 1
+            0xeb, 0x03, // jmp +3 (to the join)
+            0x83, 0xc0, 0x02, // add eax, 2
+            0x01, 0xc8, // add eax, ecx
+            0xc3, // ret
+        ];
+        let instructions = x86_decode_all(&bytes, 32, 0x1000).unwrap();
+        let cfg = X86Function::new(&instructions, 32, 0x1000);
+        let ssa = X86ToSsaTranslator::new(&cfg)
+            .translate()
+            .expect("the diamond translates");
+        assert_eq!(ssa.block_count(), 4);
+    }
+
+    /// A register read before anything writes it is refused, whether no path
+    /// writes it or only some do: these stubs are entered with nothing in
+    /// their registers.
+    #[test]
+    fn a_register_read_before_any_write_is_refused() {
+        let translate = |bytes: &[u8]| {
+            let instructions = x86_decode_all(bytes, 32, 0x1000).unwrap();
+            let cfg = X86Function::new(&instructions, 32, 0x1000);
+            X86ToSsaTranslator::new(&cfg).translate()
+        };
+        // add eax, 5; ret
+        assert!(
+            translate(&[0x83, 0xc0, 0x05, 0xc3]).is_err(),
+            "on every path"
+        );
+        let one_path = [
+            0x59, // pop ecx
+            0x85, 0xc9, // test ecx, ecx
+            0x74, 0x05, // jz +5 (to the join)
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x83, 0xc0, 0x02, // add eax, 2
+            0xc3, // ret
+        ];
+        assert!(
+            translate(&one_path).is_err(),
+            "on the path that skips the write"
+        );
+    }
+
     #[test]
     fn test_register_state() {
-        let mut state = RegisterState::new(32);
+        let mut state = RegisterState::new();
 
         let v1 = SsaVarId::from_index(0);
         state.set(X86Register::Eax, v1);
@@ -3110,11 +2995,11 @@ mod tests {
 
     #[test]
     fn test_translate_cmovs_after_cmp() {
-        // pop eax; pop ecx; cmp eax, 0; cmovs eax, ecx; ret
+        // pop eax; mov ecx, 5; cmp eax, 0; cmovs eax, ecx; ret
         // CMOVS: conditional move if sign flag is set
         let bytes = [
             0x58, // pop eax
-            0x59, // pop ecx
+            0xb9, 0x05, 0x00, 0x00, 0x00, // mov ecx, 5
             0x83, 0xf8, 0x00, // cmp eax, 0
             0x0f, 0x48, 0xc1, // cmovs eax, ecx
             0xc3, // ret
@@ -3129,6 +3014,10 @@ mod tests {
         let block = ssa.block(0).unwrap();
         let last = block.instructions().last().unwrap();
         assert!(matches!(last.op(), SsaOp::Return { .. }));
+
+        // A negative argument moves ECX in; any other stays
+        assert_eq!(run(&bytes, -3), Ok(5));
+        assert_eq!(run(&bytes, 3), Ok(3));
     }
 
     #[test]

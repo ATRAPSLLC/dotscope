@@ -127,7 +127,7 @@ impl OwnedCircularityValidator {
     /// recording it, so that no consumer can ever observe the trivial inheritance cycle. An
     /// edge that was never recorded is structurally invisible to
     /// [`validate_inheritance_cycles`](Self::validate_inheritance_cycles), which walks the
-    /// resolved graph — so without this check the most easily forged inheritance cycle in the
+    /// resolved graph - so without this check the most easily forged inheritance cycle in the
     /// format would load silently and be reported by nothing.
     ///
     /// Longer cycles (`A -> B -> A`) are *not* elided and are caught by the graph walk. Only
@@ -520,12 +520,11 @@ impl Default for OwnedCircularityValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::circularity::{
                 create_assembly_with_self_referential_type,
                 owned_circularity_validator_file_factory,
@@ -536,7 +535,6 @@ mod tests {
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_circularity_validator() -> Result<()> {
         let validator = OwnedCircularityValidator::new();
         let config = ValidationConfig {
@@ -547,7 +545,6 @@ mod tests {
         owned_validator_test(
             owned_circularity_validator_file_factory,
             "OwnedCircularityValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )
@@ -556,7 +553,7 @@ mod tests {
     /// The self-edge really is absent from the resolved graph.
     ///
     /// This is the half of the contract that `test_owned_circularity_validator` cannot see.
-    /// That test only asserts the validator *rejects* the assembly — which it would also do if
+    /// That test only asserts the validator *rejects* the assembly - which it would also do if
     /// the edge were present and the ordinary graph walk caught it. Pinning `base() == None`
     /// here is what makes the raw-column check in
     /// [`validate_self_referential_bases`](OwnedCircularityValidator::validate_self_referential_bases)
@@ -567,7 +564,6 @@ mod tests {
     /// Without this, deleting the elision and deleting the raw check would cancel out and no
     /// test would notice.
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn self_referential_base_is_elided_from_the_resolved_graph() -> Result<()> {
         let assembly = create_assembly_with_self_referential_type()?;
         let TestAssemblySource::Memory(data) = &assembly.source else {
@@ -596,7 +592,7 @@ mod tests {
             self_ref.base().map(|b| b.token)
         );
 
-        // Claim 3: and because it is elided, walking the graph finds nothing — which is
+        // Claim 3: and because it is elided, walking the graph finds nothing - which is
         // exactly why the raw-column check has to exist.
         let validator = OwnedCircularityValidator::new();
         let mut visited = FxHashSet::default();

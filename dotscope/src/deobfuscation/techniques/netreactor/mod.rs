@@ -17,6 +17,7 @@
 
 mod antitamp;
 mod antitrial;
+mod emptyresource;
 mod helpers;
 mod hooks;
 mod licensecheck;
@@ -24,13 +25,14 @@ mod necrobit;
 mod privateimpl;
 mod resources;
 
-pub(crate) use antitamp::NetReactorAntiTamp;
-pub(crate) use antitrial::NetReactorAntiTrial;
-pub(crate) use helpers::find_resources_referenced_by_methods;
-pub(crate) use licensecheck::NetReactorLicenseCheck;
-pub(crate) use necrobit::NetReactorNecroBit;
-pub(crate) use privateimpl::NetReactorPrivateImpl;
-pub(crate) use resources::NetReactorResources;
+pub use antitamp::NetReactorAntiTamp;
+pub use antitrial::NetReactorAntiTrial;
+pub use emptyresource::NetReactorEmptyResource;
+pub use helpers::find_resources_referenced_by_methods;
+pub use licensecheck::NetReactorLicenseCheck;
+pub use necrobit::NetReactorNecroBit;
+pub use privateimpl::NetReactorPrivateImpl;
+pub use resources::NetReactorResources;
 
 #[cfg(test)]
 mod tests {
@@ -38,20 +40,15 @@ mod tests {
 
     use crate::{
         assembly::Operand,
-        deobfuscation::{engine::DeobfuscationEngine, EngineConfig},
         metadata::validation::ValidationConfig,
+        testkit::{engine, fixture},
         CilObject,
     };
 
     fn load_nr_sample(name: &str) -> CilObject {
-        let path = format!("tests/samples/packers/netreactor/7.5.0/{name}");
+        let path = fixture(&format!("packers/netreactor/7.5.0/{name}"));
         CilObject::from_path_with_validation(&path, ValidationConfig::analysis())
             .unwrap_or_else(|e| panic!("Failed to load {name}: {e}"))
-    }
-
-    fn sample_exists(name: &str) -> bool {
-        let path = format!("tests/samples/packers/netreactor/7.5.0/{name}");
-        std::path::Path::new(&path).exists()
     }
 
     // Collects all ldstr string literals from an assembly by walking method IL.
@@ -82,13 +79,7 @@ mod tests {
     // Runs the full deobfuscation pipeline on the NR string-encrypted sample.
     // Validates: detection fires, strings are decrypted, decrypted strings match original.
     #[test]
-    #[ignore]
     fn test_nr_string_decryption() {
-        if !sample_exists("reactor_strings.exe") {
-            eprintln!("Skipping: reactor_strings.exe not found");
-            return;
-        }
-
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
             .is_test(true)
@@ -107,7 +98,7 @@ mod tests {
 
         // Run deobfuscation on the protected sample
         let assembly = load_nr_sample("reactor_strings.exe");
-        let engine = DeobfuscationEngine::new(EngineConfig::default());
+        let engine = engine();
         let (output, result) = engine
             .process_assembly(assembly)
             .expect("Deobfuscation should succeed");
@@ -183,20 +174,14 @@ mod tests {
 
     // Same test but for the combined necrobit + strings sample.
     #[test]
-    #[ignore]
     fn test_nr_necrobit_strings_decryption() {
-        if !sample_exists("reactor_necrobit_strings.exe") {
-            eprintln!("Skipping: reactor_necrobit_strings.exe not found");
-            return;
-        }
-
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
             .is_test(true)
             .try_init();
 
         let assembly = load_nr_sample("reactor_necrobit_strings.exe");
-        let engine = DeobfuscationEngine::new(EngineConfig::default());
+        let engine = engine();
         let (_output, result) = engine
             .process_assembly(assembly)
             .expect("Deobfuscation should succeed");

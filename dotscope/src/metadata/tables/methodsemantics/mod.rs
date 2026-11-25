@@ -21,7 +21,7 @@
 //!
 //! - [`MethodSemanticsRaw`] - Raw table data with unresolved indexes for initial parsing
 //! - [`MethodSemantics`] - Processed data with resolved references and owned data for runtime use
-//! - [`MethodSemanticsLoader`] - Handles conversion between raw and processed representations
+//! - [`MethodSemanticsLoader`](crate::metadata::loader::tables::MethodSemanticsLoader) - Handles conversion between raw and processed representations
 //! - [`MethodSemanticsMap`] - Thread-safe storage mapping tokens to processed entries
 //! - [`MethodSemanticsAttributes`] - Constants defining semantic relationship types
 //!
@@ -57,14 +57,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

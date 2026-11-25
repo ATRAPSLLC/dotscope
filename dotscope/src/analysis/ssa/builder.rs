@@ -12,7 +12,8 @@
 //! The builder uses a closure-based API where all blocks are defined within
 //! a single expression, making the CFG structure visually clear:
 //!
-//! ```rust,ignore
+//! ```
+//! # use dotscope::analysis::{SsaFunctionBuilder, SsaType};
 //! let ssa = SsaFunctionBuilder::new(1, 0).build_with(|f| {
 //!     let cond = f.arg(0, SsaType::I32);
 //!
@@ -33,46 +34,10 @@
 use std::collections::HashMap;
 
 use crate::analysis::ssa::{
-    ConstValue, ConstValueCilExt, DefSite, FunctionVarAllocator, MethodRef, PhiNode, PhiOperand,
-    SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId, VariableOrigin,
+    CallData, Callee, ConstValue, ConstValueCilExt, DefSite, FunctionVarAllocator, MethodRef,
+    PhiNode, PhiOperand, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId,
+    VariableOrigin,
 };
-
-/// Builds the conversion op that produces `target` from `operand`.
-///
-/// A CIL conversion opcode fixes the destination type but not the source (the
-/// evaluation-stack value is untyped at decompose time), so the source domain
-/// defaults to integer: a float target is an integer→float conversion, a
-/// pointer target an integer→pointer conversion, and every other target an
-/// integer→integer conversion. `unsigned` carries the opcode's signedness
-/// (`conv.u*` vs `conv.i*`); `overflow_check` the checked `conv.ovf.*` form.
-pub(crate) fn conv_op_for_target(
-    dest: SsaVarId,
-    operand: SsaVarId,
-    target: SsaType,
-    unsigned: bool,
-    overflow_check: bool,
-) -> SsaOp {
-    match target {
-        SsaType::F32 | SsaType::F64 => SsaOp::IntToFloat {
-            dest,
-            operand,
-            target,
-            unsigned,
-        },
-        SsaType::Pointer(_) | SsaType::ByRef(_) => SsaOp::IntToPtr {
-            dest,
-            operand,
-            target,
-        },
-        _ => SsaOp::IntConv {
-            dest,
-            operand,
-            target,
-            overflow_check,
-            unsigned,
-        },
-    }
-}
 
 /// Builder for constructing SSA functions programmatically.
 ///
@@ -82,8 +47,8 @@ pub(crate) fn conv_op_for_target(
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::analysis::SsaFunctionBuilder;
+/// ```
+/// use dotscope::analysis::{SsaFunctionBuilder, SsaType};
 ///
 /// // Simple function: return arg0 + arg1
 /// let ssa = SsaFunctionBuilder::new(2, 0).build_with(|f| {
@@ -176,6 +141,13 @@ impl SsaFunctionBuilder {
         self.alloc_var_with_origin(VariableOrigin::Phi)
     }
 
+    /// The type `var` was allocated with, `Unknown` for a placeholder not yet typed.
+    fn type_of(&self, var: SsaVarId) -> SsaType {
+        self.variables
+            .get(var.index())
+            .map_or(SsaType::Unknown, |entry| entry.3.clone())
+    }
+
     /// Allocates a fresh variable ID for a stack temporary with a known type.
     fn alloc_stack_var_typed(&mut self, var_type: SsaType) -> SsaVarId {
         let id = self.alloc_stack_var();
@@ -230,6 +202,95 @@ impl SsaFunctionBuilder {
             }
         }
 
+        // A placeholder allocated before its definition (`var`, `phi`), or computed from one,
+        // has no type of its own: it takes the type its definition states (`op_typed`), a copy
+        // or arithmetic its first operand's (ECMA-335 III.1.5), another op the type the op
+        // itself gives its result, a phi its operands' (valid SSA gives them one). Repeated,
+        // since each can read another placeholder.
+        loop {
+            let unknown = |func: &SsaFunction, var: SsaVarId| {
+                func.variable(var)
+                    .is_some_and(|variable| !variable.has_known_type())
+            };
+            let known = |func: &SsaFunction, var: SsaVarId| {
+                func.variable(var)
+                    .filter(|variable| variable.has_known_type())
+                    .map(|variable| variable.var_type().clone())
+            };
+            let mut inferred = Vec::new();
+            for block in func.blocks() {
+                for phi in block.phi_nodes() {
+                    if unknown(&func, phi.result()) {
+                        if let Some(ty) = phi
+                            .operands()
+                            .iter()
+                            .find_map(|operand| known(&func, operand.value()))
+                        {
+                            inferred.push((phi.result(), ty));
+                        }
+                    }
+                }
+                for instruction in block.instructions() {
+                    let Some(dest) = instruction.op().dest() else {
+                        continue;
+                    };
+                    if !unknown(&func, dest) {
+                        continue;
+                    }
+                    let op = instruction.op();
+                    let operand = match op {
+                        SsaOp::Copy { src, .. }
+                        | SsaOp::Neg { operand: src, .. }
+                        | SsaOp::Not { operand: src, .. }
+                        | SsaOp::Add { left: src, .. }
+                        | SsaOp::Sub { left: src, .. }
+                        | SsaOp::Mul { left: src, .. }
+                        | SsaOp::Div { left: src, .. }
+                        | SsaOp::Rem { left: src, .. }
+                        | SsaOp::And { left: src, .. }
+                        | SsaOp::Or { left: src, .. }
+                        | SsaOp::Xor { left: src, .. }
+                        | SsaOp::Shl { value: src, .. }
+                        | SsaOp::Shr { value: src, .. }
+                        | SsaOp::AddOvf { left: src, .. }
+                        | SsaOp::SubOvf { left: src, .. }
+                        | SsaOp::MulOvf { left: src, .. }
+                        | SsaOp::Rol { value: src, .. }
+                        | SsaOp::Ror { value: src, .. }
+                        | SsaOp::BSwap { src, .. }
+                        | SsaOp::BRev { src, .. }
+                        | SsaOp::Ckfinite { operand: src, .. } => Some(*src),
+                        _ => None,
+                    };
+                    // An op typed by its operand waits for the operand: the generic
+                    // arithmetic type would fix an `int64` sum as `int32`
+                    let ty = match operand {
+                        _ if instruction.result_type().is_some() => {
+                            instruction.result_type().cloned()
+                        }
+                        Some(src) => known(&func, src),
+                        None => op.infer_result_type(),
+                    };
+                    if let Some(ty) = ty {
+                        inferred.push((dest, ty));
+                    }
+                }
+            }
+            if inferred.is_empty() {
+                break;
+            }
+            for (var, ty) in inferred {
+                if let Some(variable) = func.variable_mut(var) {
+                    variable.set_type(ty);
+                }
+            }
+        }
+
+        // Each variable's uses, as the rest of the crate expects them recorded: a function
+        // whose use lists are empty while its code reads its values is one the verifier
+        // rejects, and passes that consult the lists see values nothing reads
+        func.recompute_uses();
+
         // Validate no Unknown types remain on used variables
         func.validate_types()?;
 
@@ -250,7 +311,7 @@ impl SsaFunctionContext<'_> {
     ///
     /// If `index >= num_args`, allocates a fresh stack variable instead. This
     /// keeps construction non-panicking; misuse will surface during type
-    /// validation in [`SsaFunctionBuilder::build`].
+    /// validation in [`SsaFunctionBuilder::build_with`].
     #[must_use]
     pub fn arg(&mut self, index: usize, ty: SsaType) -> SsaVarId {
         let Some(&id) = self.builder.arg_vars.get(index) else {
@@ -266,7 +327,7 @@ impl SsaFunctionContext<'_> {
     ///
     /// If `index >= num_locals`, allocates a fresh stack variable instead. This
     /// keeps construction non-panicking; misuse will surface during type
-    /// validation in [`SsaFunctionBuilder::build`].
+    /// validation in [`SsaFunctionBuilder::build_with`].
     #[must_use]
     pub fn local(&mut self, index: usize, ty: SsaType) -> SsaVarId {
         let Some(&id) = self.builder.local_vars.get(index) else {
@@ -370,7 +431,7 @@ impl SsaBlockBuilder<'_> {
         let dest = self.builder.alloc_stack_var_typed(SsaType::F32);
         let op = SsaOp::Const {
             dest,
-            value: ConstValue::F32(value),
+            value: ConstValue::from(value),
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -382,7 +443,7 @@ impl SsaBlockBuilder<'_> {
         let dest = self.builder.alloc_stack_var_typed(SsaType::F64);
         let op = SsaOp::Const {
             dest,
-            value: ConstValue::F64(value),
+            value: ConstValue::from(value),
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -437,7 +498,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left + right
     #[must_use]
     pub fn add(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Add {
             dest,
             left,
@@ -448,10 +511,29 @@ impl SsaBlockBuilder<'_> {
         dest
     }
 
+    /// Adds: dest = add.ovf(left, right) - trapping on signed overflow
+    #[must_use]
+    pub fn add_ovf(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
+        let op = SsaOp::AddOvf {
+            dest,
+            left,
+            right,
+            unsigned: false,
+            flags: None,
+        };
+        self.block.add_instruction(SsaInstruction::synthetic(op));
+        dest
+    }
+
     /// Adds: dest = left - right
     #[must_use]
     pub fn sub(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Sub {
             dest,
             left,
@@ -465,7 +547,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left * right
     #[must_use]
     pub fn mul(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Mul {
             dest,
             left,
@@ -479,7 +563,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left / right (signed)
     #[must_use]
     pub fn div(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Div {
             dest,
             left,
@@ -494,7 +580,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left / right (unsigned)
     #[must_use]
     pub fn div_un(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Div {
             dest,
             left,
@@ -509,7 +597,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left % right (signed)
     #[must_use]
     pub fn rem(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Rem {
             dest,
             left,
@@ -524,7 +614,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left % right (unsigned)
     #[must_use]
     pub fn rem_un(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Rem {
             dest,
             left,
@@ -539,7 +631,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left & right
     #[must_use]
     pub fn and(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::And {
             dest,
             left,
@@ -553,7 +647,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left | right
     #[must_use]
     pub fn or(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Or {
             dest,
             left,
@@ -567,7 +663,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = left ^ right
     #[must_use]
     pub fn xor(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(left));
         let op = SsaOp::Xor {
             dest,
             left,
@@ -581,7 +679,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = value << amount
     #[must_use]
     pub fn shl(&mut self, value: SsaVarId, amount: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(value));
         let op = SsaOp::Shl {
             dest,
             value,
@@ -595,7 +695,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = value >> amount (signed)
     #[must_use]
     pub fn shr(&mut self, value: SsaVarId, amount: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(value));
         let op = SsaOp::Shr {
             dest,
             value,
@@ -610,7 +712,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = value >> amount (unsigned)
     #[must_use]
     pub fn shr_un(&mut self, value: SsaVarId, amount: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(value));
         let op = SsaOp::Shr {
             dest,
             value,
@@ -625,7 +729,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = -operand
     #[must_use]
     pub fn neg(&mut self, operand: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(operand));
         let op = SsaOp::Neg {
             dest,
             operand,
@@ -638,7 +744,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = ~operand
     #[must_use]
     pub fn not(&mut self, operand: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(operand));
         let op = SsaOp::Not {
             dest,
             operand,
@@ -651,7 +759,9 @@ impl SsaBlockBuilder<'_> {
     /// Adds: dest = src (copy)
     #[must_use]
     pub fn copy(&mut self, src: SsaVarId) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(SsaType::I32);
+        let dest = self
+            .builder
+            .alloc_stack_var_typed(self.builder.type_of(src));
         let op = SsaOp::Copy { dest, src };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -661,7 +771,12 @@ impl SsaBlockBuilder<'_> {
     #[must_use]
     pub fn ceq(&mut self, left: SsaVarId, right: SsaVarId) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(SsaType::Bool);
-        let op = SsaOp::Ceq { dest, left, right };
+        let op = SsaOp::Ceq {
+            dest,
+            left,
+            right,
+            signaling: false,
+        };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
     }
@@ -675,6 +790,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: false,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -689,6 +805,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: true,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -703,6 +820,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: false,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -717,6 +835,7 @@ impl SsaBlockBuilder<'_> {
             left,
             right,
             unsigned: true,
+            signaling: false,
         };
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
@@ -726,7 +845,7 @@ impl SsaBlockBuilder<'_> {
     #[must_use]
     pub fn conv(&mut self, operand: SsaVarId, target: SsaType) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(target.clone());
-        let op = conv_op_for_target(dest, operand, target, false, false);
+        let op = SsaOp::conversion_between(dest, operand, target, None, false, false);
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
     }
@@ -735,7 +854,7 @@ impl SsaBlockBuilder<'_> {
     #[must_use]
     pub fn conv_un(&mut self, operand: SsaVarId, target: SsaType) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(target.clone());
-        let op = conv_op_for_target(dest, operand, target, true, false);
+        let op = SsaOp::conversion_between(dest, operand, target, None, true, false);
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
     }
@@ -744,7 +863,7 @@ impl SsaBlockBuilder<'_> {
     #[must_use]
     pub fn conv_ovf(&mut self, operand: SsaVarId, target: SsaType) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(target.clone());
-        let op = conv_op_for_target(dest, operand, target, false, true);
+        let op = SsaOp::conversion_between(dest, operand, target, None, false, true);
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
     }
@@ -753,7 +872,7 @@ impl SsaBlockBuilder<'_> {
     #[must_use]
     pub fn conv_ovf_un(&mut self, operand: SsaVarId, target: SsaType) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(target.clone());
-        let op = conv_op_for_target(dest, operand, target, true, true);
+        let op = SsaOp::conversion_between(dest, operand, target, None, true, true);
         self.block.add_instruction(SsaInstruction::synthetic(op));
         dest
     }
@@ -786,13 +905,13 @@ impl SsaBlockBuilder<'_> {
 
     /// Adds: return (void)
     pub fn ret(&mut self) {
-        let op = SsaOp::Return { value: None };
+        let op = SsaOp::returns(None);
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
     /// Adds: return value
     pub fn ret_val(&mut self, value: SsaVarId) {
-        let op = SsaOp::Return { value: Some(value) };
+        let op = SsaOp::returns(Some(value));
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
@@ -808,60 +927,21 @@ impl SsaBlockBuilder<'_> {
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
-    /// Adds: call method with return value and explicit result type.
+    /// Adds: a call of `callee` with a return value of `result_type`.
     ///
     /// Returns the variable holding the call result.
     #[must_use]
-    pub fn call(&mut self, method: MethodRef, args: &[SsaVarId], result_type: SsaType) -> SsaVarId {
+    pub fn call(&mut self, callee: Callee, args: &[SsaVarId], result_type: SsaType) -> SsaVarId {
         let dest = self.builder.alloc_stack_var_typed(result_type.clone());
-        let op = SsaOp::Call {
-            dest: Some(dest),
-            method,
-            args: args.to_vec(),
-        };
+        let op = CallData::new(Some(dest), callee, args.to_vec()).into();
         self.block
             .add_instruction(SsaInstruction::synthetic(op).with_result_type(result_type));
         dest
     }
 
-    /// Adds: call method without return value (void)
-    pub fn call_void(&mut self, method: MethodRef, args: &[SsaVarId]) {
-        let op = SsaOp::Call {
-            dest: None,
-            method,
-            args: args.to_vec(),
-        };
-        self.block.add_instruction(SsaInstruction::synthetic(op));
-    }
-
-    /// Adds: callvirt method with return value and explicit result type.
-    ///
-    /// Returns the variable holding the call result.
-    #[must_use]
-    pub fn callvirt(
-        &mut self,
-        method: MethodRef,
-        args: &[SsaVarId],
-        result_type: SsaType,
-    ) -> SsaVarId {
-        let dest = self.builder.alloc_stack_var_typed(result_type.clone());
-        let op = SsaOp::CallVirt {
-            dest: Some(dest),
-            method,
-            args: args.to_vec(),
-        };
-        self.block
-            .add_instruction(SsaInstruction::synthetic(op).with_result_type(result_type));
-        dest
-    }
-
-    /// Adds: callvirt method without return value (void)
-    pub fn callvirt_void(&mut self, method: MethodRef, args: &[SsaVarId]) {
-        let op = SsaOp::CallVirt {
-            dest: None,
-            method,
-            args: args.to_vec(),
-        };
+    /// Adds: a call of `callee` without a return value.
+    pub fn call_void(&mut self, callee: Callee, args: &[SsaVarId]) {
+        let op = CallData::new(None, callee, args.to_vec()).into();
         self.block.add_instruction(SsaInstruction::synthetic(op));
     }
 
@@ -933,6 +1013,7 @@ impl SsaBlockBuilder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::{SsaVerifier, VerifyLevel};
 
     #[test]
     fn test_simple_function() {
@@ -1134,5 +1215,72 @@ mod tests {
             .unwrap();
 
         assert_eq!(ssa.num_locals(), 2);
+    }
+
+    /// A built function records each variable's uses, so it is one the verifier accepts:
+    /// with empty use lists every test that built one handed its passes invalid SSA.
+    #[test]
+    fn a_built_function_verifies() {
+        let ssa = SsaFunctionBuilder::new(2, 0)
+            .build_with(|f| {
+                let (a, b) = (f.arg(0, SsaType::I32), f.arg(1, SsaType::I32));
+                f.block(0, |blk| {
+                    let sum = blk.add(a, b);
+                    blk.ret_val(sum);
+                });
+            })
+            .unwrap();
+        let findings = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// Arithmetic has its operands' type (ECMA-335 III.1.5): an `int64` sum is an `int64`,
+    /// where every result used to be an `int32`.
+    #[test]
+    fn arithmetic_takes_its_operands_type() {
+        let mut sum = None;
+        let ssa = SsaFunctionBuilder::new(2, 0)
+            .build_with(|f| {
+                let (a, b) = (f.arg(0, SsaType::I64), f.arg(1, SsaType::I64));
+                f.block(0, |blk| {
+                    let r = blk.add(a, b);
+                    sum = Some(r);
+                    blk.ret_val(r);
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            ssa.variable(sum.unwrap()).unwrap().var_type(),
+            &SsaType::I64
+        );
+    }
+
+    /// A placeholder defined by a copy, and the phi that merges it, take the type of what
+    /// they hold.
+    #[test]
+    fn a_placeholder_and_its_phi_take_their_values_type() {
+        let mut merged = None;
+        let mut next = None;
+        let ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let n = f.arg(0, SsaType::I64);
+                let placeholder = f.var();
+                next = Some(placeholder);
+                f.block(0, |b| b.jump(1));
+                f.block(1, |b| {
+                    let phi = b.phi(&[(0, n), (1, placeholder)]);
+                    merged = Some(phi);
+                    b.op(SsaOp::Copy {
+                        dest: placeholder,
+                        src: phi,
+                    });
+                    b.branch(n, 1, 2);
+                });
+                f.block(2, |b| b.ret_val(merged.unwrap()));
+            })
+            .unwrap();
+        for var in [merged.unwrap(), next.unwrap()] {
+            assert_eq!(ssa.variable(var).unwrap().var_type(), &SsaType::I64);
+        }
     }
 }

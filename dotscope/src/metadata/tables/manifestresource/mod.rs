@@ -7,7 +7,7 @@
 //! # Module Components
 //! - [`ManifestResourceRaw`] - Raw table structure with unresolved coded indexes
 //! - [`ManifestResource`] - Owned variant with resolved references and resource data access
-//! - [`ManifestResourceLoader`] - Internal loader for processing table entries (crate-private)
+//! - [`ManifestResourceLoader`](crate::metadata::loader::tables::ManifestResourceLoader) - Internal loader for processing table entries (crate-private)
 //! - [`ManifestResourceAttributes`] - Resource visibility and access control flags
 //! - Type aliases for collections: [`ManifestResourceMap`], [`ManifestResourceList`], [`ManifestResourceRc`]
 //!
@@ -44,14 +44,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

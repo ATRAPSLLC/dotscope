@@ -41,16 +41,17 @@ use crate::{
         CilAssembly,
     },
     metadata::{
-        method::MethodBody,
+        method::{ExceptionHandlerFlags, MethodBody},
         signatures::{
             parse_field_signature, parse_local_var_signature, parse_method_signature,
-            parse_property_signature, parse_type_spec_signature, CustomModifier,
-            SignatureLocalVariable, SignatureParameter, TypeSignature,
+            parse_method_spec_signature, parse_property_signature, parse_type_spec_signature,
+            SIGNATURE_HEADER,
         },
         streams::Blob,
         tables::{
-            skip_unreadable, CustomAttributeRaw, FieldRaw, GenericParamConstraintRaw,
-            InterfaceImplRaw, MemberRefRaw, MethodDefRaw, MethodSpecRaw, PropertyRaw,
+            skip_unreadable, CustomAttributeRaw, EventRaw, ExportedTypeRaw, FieldRaw,
+            GenericParamConstraintRaw, ImplMapRaw, InterfaceImplRaw, ManifestResourceRaw,
+            MemberRefRaw, MethodDefRaw, MethodImplRaw, MethodSpecRaw, PropertyRaw,
             StandAloneSigRaw, TableDataOwned, TableId, TypeDefRaw, TypeRefRaw, TypeSpecRaw,
         },
         token::Token,
@@ -67,13 +68,13 @@ use crate::{
 /// This approach is fundamentally safer than garbage-collection-style orphan
 /// removal because it never removes pre-existing orphans (which may be used
 /// via reflection or dynamic code generation).
-pub(super) struct PreDeletionRefs {
+pub struct PreDeletionRefs {
     /// Token operands found in method bodies of entities being deleted.
-    pub(super) il_tokens: HashSet<Token>,
+    pub il_tokens: HashSet<Token>,
     /// TypeRef RIDs referenced by signatures and extends clauses of entities being deleted.
-    pub(super) typeref_rids: HashSet<u32>,
+    pub typeref_rids: HashSet<u32>,
     /// StandAloneSig RIDs referenced by method bodies of methods being deleted.
-    pub(super) standalonesig_rids: BTreeSet<u32>,
+    pub standalonesig_rids: BTreeSet<u32>,
 }
 
 /// Collects all token references from entities that are about to be deleted.
@@ -91,7 +92,7 @@ pub(super) struct PreDeletionRefs {
 /// # Returns
 ///
 /// A [`PreDeletionRefs`] containing all tokens referenced by the entities.
-pub(super) fn collect_pre_deletion_references(
+pub fn collect_pre_deletion_references(
     assembly: &CilAssembly,
     methods: &BTreeSet<Token>,
     fields: &BTreeSet<Token>,
@@ -145,7 +146,11 @@ pub(super) fn collect_pre_deletion_references(
 
                 // Scan method signature for TypeRef references
                 if let Some(blob) = &blob_heap {
-                    scan_method_signature_blob(blob, methoddef.signature, &mut typeref_rids);
+                    scan_method_signature_blob(
+                        blob,
+                        methoddef.signature,
+                        &mut TypeRefRows(&mut typeref_rids),
+                    );
                 }
             }
         }
@@ -165,7 +170,11 @@ pub(super) fn collect_pre_deletion_references(
                     if !fields.contains(&field_token) {
                         continue;
                     }
-                    scan_field_signature_blob(blob, field.signature, &mut typeref_rids);
+                    scan_field_signature_blob(
+                        blob,
+                        field.signature,
+                        &mut TypeRefRows(&mut typeref_rids),
+                    );
                 }
             }
         }
@@ -308,18 +317,24 @@ fn scan_method_body_bytes(data: &[u8], base_rva: usize, referenced: &mut HashSet
         collect(&blocks, referenced);
     }
 
-    // Decode exception handler regions — these are not reachable via normal
+    // Decode exception handler and filter regions: these are not reachable via normal
     // control flow so decode_blocks(offset=0) never visits them. Use unbounded
     // recursive disassembly (None) so branch targets outside the handler's
     // declared region are followed (e.g., finally blocks that branch to
     // outlier code like Monitor.Exit or IDisposable.Dispose stubs).
     for handler in &body.exception_handlers {
-        let h_offset = handler.handler_offset as usize;
-        if h_offset < code_data.len() {
-            let Some(h_rva) = code_rva.checked_add(h_offset) else {
+        let mut entries = vec![handler.handler_offset as usize];
+        if handler.flags == ExceptionHandlerFlags::FILTER {
+            entries.push(handler.filter_offset as usize);
+        }
+        for entry in entries {
+            if entry >= code_data.len() {
+                continue;
+            }
+            let Some(entry_rva) = code_rva.checked_add(entry) else {
                 continue;
             };
-            if let Ok(blocks) = decode_blocks(code_data, h_offset, h_rva, None) {
+            if let Ok(blocks) = decode_blocks(code_data, entry, entry_rva, None) {
                 collect(&blocks, referenced);
             }
         }
@@ -331,55 +346,6 @@ fn scan_method_body_bytes(data: &[u8], base_rva: usize, referenced: &mut HashSet
     }
 }
 
-/// Parses a local variable signature blob and collects all embedded TypeDef
-/// and TypeRef tokens. These tokens appear in `Class`/`ValueType` type
-/// signatures within the local variable declarations.
-///
-/// This is used to protect types referenced by local variable signatures
-/// from being inadvertently removed during cleanup.
-fn collect_type_tokens_from_local_sig(blob_data: &[u8], referenced: &mut HashSet<Token>) {
-    let Ok(sig) = parse_local_var_signature(blob_data) else {
-        return;
-    };
-
-    for local in &sig.locals {
-        collect_all_type_tokens(&local.base, referenced);
-    }
-}
-
-/// Recursively collects TypeDef, TypeRef, and TypeSpec tokens from a type
-/// signature.
-///
-/// `ELEMENT_TYPE_CLASS` and `ELEMENT_TYPE_VALUETYPE` are followed by a
-/// `TypeDefOrRefOrSpecEncoded` token (ECMA-335 §II.23.2.8), so the token's
-/// table can be `TypeDef` (0x02), `TypeRef` (0x01), **or** `TypeSpec`
-/// (0x1B). All three must flow into the live-set so that the cascade
-/// cleanup doesn't drop a TypeSpec that's referenced only via a local
-/// variable signature (no IL operand picks it up).
-fn collect_all_type_tokens(sig: &TypeSignature, out: &mut HashSet<Token>) {
-    match sig {
-        TypeSignature::Class(token) | TypeSignature::ValueType(token) => {
-            let table = token.table();
-            if table == 0x01 || table == 0x02 || table == 0x1B {
-                out.insert(*token);
-            }
-        }
-        TypeSignature::GenericInst(base, args) => {
-            collect_all_type_tokens(base, out);
-            for arg in args {
-                collect_all_type_tokens(arg, out);
-            }
-        }
-        TypeSignature::SzArray(arr) => collect_all_type_tokens(&arr.base, out),
-        TypeSignature::Array(arr) => collect_all_type_tokens(&arr.base, out),
-        TypeSignature::Ptr(ptr) => collect_all_type_tokens(&ptr.base, out),
-        TypeSignature::ByRef(inner) | TypeSignature::Pinned(inner) => {
-            collect_all_type_tokens(inner, out);
-        }
-        _ => {}
-    }
-}
-
 /// Collects TypeDef tokens referenced by surviving field signatures.
 ///
 /// Scans the #Blob heap entries referenced by non-deleted Field rows,
@@ -387,7 +353,7 @@ fn collect_all_type_tokens(sig: &TypeSignature, out: &mut HashSet<Token>) {
 /// This protects types like `__StaticArrayInitTypeSize=N` (which have no
 /// methods, no fields, and are referenced only via field signature blobs)
 /// from being incorrectly removed as "empty types".
-pub(super) fn collect_typedefs_from_field_signatures(assembly: &CilAssembly) -> HashSet<Token> {
+pub fn collect_typedefs_from_field_signatures(assembly: &CilAssembly) -> HashSet<Token> {
     let mut referenced = HashSet::new();
 
     let view = assembly.view();
@@ -414,7 +380,7 @@ pub(super) fn collect_typedefs_from_field_signatures(assembly: &CilAssembly) -> 
         }
         if let Ok(blob_data) = blob_heap.get(field.signature as usize) {
             if let Ok(sig) = parse_field_signature(blob_data) {
-                collect_all_type_tokens(&sig.base, &mut referenced);
+                sig.type_tokens(&mut referenced);
             }
         }
     }
@@ -422,12 +388,66 @@ pub(super) fn collect_typedefs_from_field_signatures(assembly: &CilAssembly) -> 
     referenced
 }
 
-/// Collects StandAloneSig RIDs referenced by method body headers.
+/// Collects TypeDef tokens referenced by surviving TypeSpec signatures.
 ///
-/// Scans all method bodies (original and regenerated) and extracts the
-/// LocalVarSigTok from fat headers. Returns the set of StandAloneSig RIDs
-/// that are actually used by method bodies.
-pub(super) fn collect_referenced_standalonesig_rids(assembly: &CilAssembly) -> HashSet<u32> {
+/// A TypeSpec's signature names the types it is built from: the generic type
+/// and its arguments for an instantiation, the element type for an array or
+/// pointer, and so on. Those names can be TypeDefs of this assembly, and a
+/// TypeSpec row is the only place they appear - no IL operand and no field
+/// signature picks them up.
+///
+/// Without this, a TypeDef reachable only as, say, the argument of a
+/// `List<T>` instantiation looks unused and is removed as an empty type,
+/// leaving the surviving TypeSpec pointing at a row that is no longer there.
+/// Loading the result then fails outright on the dangling spec.
+///
+/// This is the same protection [`collect_typedefs_from_field_signatures`]
+/// gives to types named only by a field signature.
+pub fn collect_typedefs_from_typespec_signatures(assembly: &CilAssembly) -> HashSet<Token> {
+    let mut referenced = HashSet::new();
+
+    let view = assembly.view();
+    let Some(tables) = view.tables() else {
+        return referenced;
+    };
+    let Some(typespec_table) = tables.table::<TypeSpecRaw>() else {
+        return referenced;
+    };
+    let Some(blob_heap) = view.blobs() else {
+        return referenced;
+    };
+
+    for typespec in typespec_table.iter() {
+        let typespec = match typespec {
+            Ok(row) => row,
+            Err(e) => {
+                log::warn!("skipping unreadable metadata row: {e}");
+                continue;
+            }
+        };
+        if assembly
+            .changes()
+            .is_row_deleted(TableId::TypeSpec, typespec.rid)
+        {
+            continue;
+        }
+        if let Ok(blob_data) = blob_heap.get(typespec.signature as usize) {
+            if let Ok(sig) = parse_type_spec_signature(blob_data) {
+                sig.type_tokens(&mut referenced);
+            }
+        }
+    }
+
+    referenced
+}
+
+/// Collects the StandAloneSig RIDs surviving method bodies use: the LocalVarSigTok of each
+/// fat header (original and regenerated bodies), and the `calli` operands among
+/// `body_tokens`, whose StandAloneSig is a method signature.
+pub fn collect_referenced_standalonesig_rids(
+    assembly: &CilAssembly,
+    body_tokens: &HashSet<Token>,
+) -> HashSet<u32> {
     let mut referenced = HashSet::new();
 
     // Collect (rid, rva) pairs while holding view borrow
@@ -457,6 +477,7 @@ pub(super) fn collect_referenced_standalonesig_rids(assembly: &CilAssembly) -> H
             }
         });
     }
+    referenced.extend(rows_of(body_tokens, TableId::StandAloneSig));
 
     referenced
 }
@@ -470,7 +491,13 @@ pub(super) fn collect_referenced_standalonesig_rids(assembly: &CilAssembly) -> H
 ///
 /// Returns a set of all referenced tokens (TypeRef, TypeDef, MemberRef, MethodDef,
 /// MethodSpec, TypeSpec, Field, etc.)
-pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> {
+///
+/// # Arguments
+///
+/// * `assembly` - The assembly whose method bodies are scanned
+/// * `gone` - MethodDefs to treat as deleted besides the rows already deleted: the methods a
+///   cleanup is deciding to delete, whose bodies keep nothing alive
+pub fn scan_method_body_tokens(assembly: &CilAssembly, gone: &HashSet<Token>) -> HashSet<Token> {
     let mut referenced = HashSet::new();
 
     // Collect (rid, effective_rva) pairs while holding view borrow
@@ -488,6 +515,7 @@ pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> 
             .into_iter()
             .filter_map(skip_unreadable)
             .filter(|m| !assembly.changes().is_row_deleted(TableId::MethodDef, m.rid))
+            .filter(|m| !gone.contains(&Token::from_parts(TableId::MethodDef, m.rid)))
             .map(|m| get_effective_method_rva(assembly, m.rid, m.rva))
             .filter(|&rva| rva != 0)
             .collect()
@@ -500,18 +528,20 @@ pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> 
             scan_method_body_bytes(data, base_rva, &mut referenced);
             // Also collect StandAloneSig RIDs from method body headers so we can
             // scan their blobs for embedded TypeDef/TypeRef tokens below.
-            if let Ok(body) = MethodBody::from(data) {
-                if body.local_var_sig_token != 0 {
-                    local_sig_rids.insert(body.local_var_sig_token & 0x00FF_FFFF);
-                }
+            if let Some(sig_rid) = MethodBody::from(data)
+                .ok()
+                .and_then(|body| body.local_var_sig_rid())
+            {
+                local_sig_rids.insert(sig_rid);
             }
         });
     }
 
-    // Second pass: scan StandAloneSig blobs referenced by surviving methods
-    // for TypeDef/TypeRef tokens embedded in local variable type signatures.
-    // Without this, types referenced only through local variable signatures
-    // (not via IL operands) would be unprotected from cleanup removal.
+    // Second pass: scan the StandAloneSig blobs surviving methods use (local variable lists
+    // and `calli` signatures) for the type tokens they embed. Without this, types referenced
+    // only through those signatures (not via IL operands) would be unprotected from cleanup
+    // removal.
+    local_sig_rids.extend(rows_of(&referenced, TableId::StandAloneSig));
     {
         let view = assembly.view();
         if let (Some(tables), Some(blob_heap)) = (view.tables(), view.blobs()) {
@@ -519,7 +549,7 @@ pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> 
                 for &rid in &local_sig_rids {
                     if let Some(sig_row) = sig_table.get(rid).ok().flatten() {
                         if let Ok(blob_data) = blob_heap.get(sig_row.signature as usize) {
-                            collect_type_tokens_from_local_sig(blob_data, &mut referenced);
+                            standalone_signature_type_tokens(blob_data, &mut referenced);
                         }
                     }
                 }
@@ -537,7 +567,7 @@ pub(super) fn scan_method_body_tokens(assembly: &CilAssembly) -> HashSet<Token> 
 /// types, return types) are not captured by the `.class` cascade. This function
 /// fills that gap by scanning the signatures of deleted MemberRefs and returning
 /// any TypeRef RIDs found within.
-pub(super) fn collect_typerefs_from_deleted_memberref_sigs(
+pub fn collect_typerefs_from_deleted_memberref_sigs(
     assembly: &CilAssembly,
     memberref_rids: &HashSet<u32>,
 ) -> HashSet<u32> {
@@ -560,8 +590,9 @@ pub(super) fn collect_typerefs_from_deleted_memberref_sigs(
 
     for &rid in memberref_rids {
         if let Some(memberref) = memberref_table.get(rid).ok().flatten() {
-            if !scan_method_signature_blob(blob_heap, memberref.signature, &mut result) {
-                scan_field_signature_blob(blob_heap, memberref.signature, &mut result);
+            let mut rows = TypeRefRows(&mut result);
+            if !scan_method_signature_blob(blob_heap, memberref.signature, &mut rows) {
+                scan_field_signature_blob(blob_heap, memberref.signature, &mut rows);
             }
         }
     }
@@ -569,154 +600,136 @@ pub(super) fn collect_typerefs_from_deleted_memberref_sigs(
     result
 }
 
-/// Scans metadata tables to collect TypeRef RIDs that are referenced.
+/// The rows surviving metadata rows reference through a column that keeps its target alive.
 ///
-/// Collects references from:
-/// - TypeDef.extends (base class)
-/// - InterfaceImpl.interface
-/// - MemberRef.class (when pointing to TypeRef)
-/// - GenericParamConstraint.constraint
-/// - CustomAttribute.constructor (indirectly via MemberRef)
-pub(super) fn scan_typeref_metadata_refs(assembly: &CilAssembly) -> HashSet<u32> {
-    let mut referenced_rids = HashSet::new();
-
+/// These are every column of ECMA-335 II.22 that can name a TypeRef, TypeSpec, MemberRef,
+/// ModuleRef, AssemblyRef or File:
+///
+/// | Column | Names |
+/// |---|---|
+/// | `TypeDef.Extends`, `InterfaceImpl.Interface`, `GenericParamConstraint.Constraint`, `Event.EventType` | TypeRef, TypeSpec |
+/// | `MemberRef.Class` | TypeRef, TypeSpec, ModuleRef |
+/// | `CustomAttribute.Type`, `MethodSpec.Method`, `MethodImpl.MethodBody`, `MethodImpl.MethodDeclaration` | MemberRef |
+/// | `TypeRef.ResolutionScope` | ModuleRef, AssemblyRef |
+/// | `ImplMap.ImportScope` | ModuleRef |
+/// | `ExportedType.Implementation`, `ManifestResource.Implementation` | AssemblyRef, File |
+///
+/// The other columns that name these tables (`CustomAttribute.Parent`) belong to rows their
+/// target owns, which go with it. A TypeRef's `ResolutionScope` naming another TypeRef is
+/// nesting: [`close_over_typeref_nesting`] applies it once the live set is complete, so a
+/// nested TypeRef on its way out does not keep its parent.
+pub fn scan_metadata_keepers(assembly: &CilAssembly) -> HashSet<Token> {
+    let mut keepers = HashSet::new();
     let view = assembly.view();
     let Some(tables) = view.tables() else {
-        return referenced_rids;
+        return keepers;
     };
+    let live = |table: TableId, rid: u32| !assembly.changes().is_row_deleted(table, rid);
 
-    // TypeDef.extends - base class references (skip deleted types)
-    if let Some(typedef_table) = tables.table::<TypeDefRaw>() {
-        for typedef in typedef_table {
-            let typedef = match typedef {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::TypeDef, typedef.rid)
+    if let Some(table) = tables.table::<TypeDefRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::TypeDef, row.rid) {
+                keepers.insert(row.extends.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<InterfaceImplRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::InterfaceImpl, row.rid) {
+                keepers.insert(row.interface.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<GenericParamConstraintRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::GenericParamConstraint, row.rid) {
+                keepers.insert(row.constraint.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<EventRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::Event, row.rid) {
+                keepers.insert(row.event_type.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<MemberRefRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::MemberRef, row.rid) {
+                keepers.insert(row.class.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<CustomAttributeRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::CustomAttribute, row.rid) {
+                keepers.insert(row.constructor.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<MethodSpecRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::MethodSpec, row.rid) {
+                keepers.insert(row.method.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<MethodImplRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::MethodImpl, row.rid) {
+                keepers.insert(row.method_body.token);
+                keepers.insert(row.method_declaration.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<TypeRefRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::TypeRef, row.rid)
+                && !row.resolution_scope.token.is_table(TableId::TypeRef)
             {
-                continue;
+                keepers.insert(row.resolution_scope.token);
             }
-            if typedef.extends.token.is_table(TableId::TypeRef) {
-                referenced_rids.insert(typedef.extends.token.row());
+        }
+    }
+    if let Some(table) = tables.table::<ImplMapRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::ImplMap, row.rid) && row.import_scope != 0 {
+                keepers.insert(Token::from_parts(TableId::ModuleRef, row.import_scope));
+            }
+        }
+    }
+    if let Some(table) = tables.table::<ExportedTypeRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::ExportedType, row.rid) {
+                keepers.insert(row.implementation.token);
+            }
+        }
+    }
+    if let Some(table) = tables.table::<ManifestResourceRaw>() {
+        for row in table.iter().filter_map(skip_unreadable) {
+            if live(TableId::ManifestResource, row.rid) {
+                keepers.insert(row.implementation.token);
             }
         }
     }
 
-    // InterfaceImpl.interface (skip deleted rows)
-    if let Some(interfaceimpl_table) = tables.table::<InterfaceImplRaw>() {
-        for impl_ in interfaceimpl_table {
-            let impl_ = match impl_ {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::InterfaceImpl, impl_.rid)
-            {
-                continue;
-            }
-            if impl_.interface.token.is_table(TableId::TypeRef) {
-                referenced_rids.insert(impl_.interface.token.row());
-            }
-        }
-    }
+    keepers
+}
 
-    // MemberRef.class - declaring type of member references (skip deleted rows)
-    if let Some(memberref_table) = tables.table::<MemberRefRaw>() {
-        for memberref in memberref_table {
-            let memberref = match memberref {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::MemberRef, memberref.rid)
-            {
-                continue;
-            }
-            if memberref.class.token.is_table(TableId::TypeRef) {
-                referenced_rids.insert(memberref.class.token.row());
-            }
-        }
-    }
-
-    // GenericParamConstraint - type constraints (skip deleted rows)
-    if let Some(constraint_table) = tables.table::<GenericParamConstraintRaw>() {
-        for constraint in constraint_table {
-            let constraint = match constraint {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::GenericParamConstraint, constraint.rid)
-            {
-                continue;
-            }
-            if constraint.constraint.token.is_table(TableId::TypeRef) {
-                referenced_rids.insert(constraint.constraint.token.row());
-            }
-        }
-    }
-
-    // CustomAttribute.constructor - when it's a MemberRef on a TypeRef (skip deleted rows)
-    if let Some(attr_table) = tables.table::<CustomAttributeRaw>() {
-        if let Some(memberref_table) = tables.table::<MemberRefRaw>() {
-            for attr in attr_table {
-                let attr = match attr {
-                    Ok(row) => row,
-                    Err(e) => {
-                        log::warn!("skipping unreadable metadata row: {e}");
-                        continue;
-                    }
-                };
-                if assembly
-                    .changes()
-                    .is_row_deleted(TableId::CustomAttribute, attr.rid)
-                {
-                    continue;
-                }
-                if attr.constructor.token.is_table(TableId::MemberRef) {
-                    let memberref_rid = attr.constructor.token.row();
-                    if assembly
-                        .changes()
-                        .is_row_deleted(TableId::MemberRef, memberref_rid)
-                    {
-                        continue;
-                    }
-                    if let Some(memberref) = memberref_table.get(memberref_rid).ok().flatten() {
-                        if memberref.class.token.is_table(TableId::TypeRef) {
-                            referenced_rids.insert(memberref.class.token.row());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    referenced_rids
+/// The rows of `table` among `tokens`.
+pub fn rows_of(tokens: &HashSet<Token>, table: TableId) -> impl Iterator<Item = u32> + '_ {
+    tokens
+        .iter()
+        .filter(move |token| token.is_table(table))
+        .map(Token::row)
 }
 
 /// The `nested TypeRef -> enclosing TypeRef` edges, as `(rid, enclosing_rid)` pairs.
 ///
 /// A nested type is encoded as a TypeRef whose `ResolutionScope` points at the *enclosing*
-/// TypeRef, and nothing in the ordinary reference scans reads that column — so an enclosing
-/// TypeRef referenced only from a surviving nested one looks orphaned, is deleted, and leaves
-/// the survivor's scope dangling.
+/// TypeRef. [`scan_metadata_keepers`] leaves that edge out: an enclosing TypeRef is kept only
+/// through a nested TypeRef that is itself live, which only the complete live set tells.
 ///
 /// Collected separately from [`close_over_typeref_nesting`] because the closure has to run
 /// against the *complete* live set. Rows already marked deleted are excluded: a nested TypeRef
@@ -767,297 +780,37 @@ fn close_over_typeref_nesting(referenced_rids: &mut HashSet<u32>, nesting: &[(u3
     }
 }
 
-/// Scans metadata tables to collect MemberRef RIDs that are referenced.
-///
-/// Collects references from:
-/// - CustomAttribute.constructor
-/// - MethodSpec.method
-pub(super) fn scan_memberref_metadata_refs(assembly: &CilAssembly) -> HashSet<u32> {
-    let mut referenced_rids = HashSet::new();
+/// The TypeRef rows among the tokens extended into it: a signature's
+/// [`type_tokens`](crate::metadata::signatures::TypeSignature::type_tokens) collected as
+/// TypeRef rows.
+struct TypeRefRows<'a>(&'a mut HashSet<u32>);
 
-    let view = assembly.view();
-    let Some(tables) = view.tables() else {
-        return referenced_rids;
-    };
-
-    // CustomAttribute.constructor (skip deleted rows)
-    if let Some(attr_table) = tables.table::<CustomAttributeRaw>() {
-        for attr in attr_table {
-            let attr = match attr {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::CustomAttribute, attr.rid)
-            {
-                continue;
-            }
-            if attr.constructor.token.is_table(TableId::MemberRef) {
-                referenced_rids.insert(attr.constructor.token.row());
-            }
-        }
-    }
-
-    // MethodSpec.method (skip deleted rows)
-    if let Some(methodspec_table) = tables.table::<MethodSpecRaw>() {
-        for spec in methodspec_table {
-            let spec = match spec {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::MethodSpec, spec.rid)
-            {
-                continue;
-            }
-            if spec.method.token.is_table(TableId::MemberRef) {
-                referenced_rids.insert(spec.method.token.row());
-            }
-        }
-    }
-
-    referenced_rids
-}
-
-/// Scans metadata tables to collect TypeSpec RIDs that are referenced.
-///
-/// Collects references from:
-/// - MemberRef.class
-/// - InterfaceImpl.interface
-/// - GenericParamConstraint.constraint
-/// - TypeDef.extends
-pub(super) fn scan_typespec_metadata_refs(assembly: &CilAssembly) -> HashSet<u32> {
-    let mut referenced_rids = HashSet::new();
-
-    let view = assembly.view();
-    let Some(tables) = view.tables() else {
-        return referenced_rids;
-    };
-
-    // MemberRef.class (skip deleted rows)
-    if let Some(memberref_table) = tables.table::<MemberRefRaw>() {
-        for memberref in memberref_table {
-            let memberref = match memberref {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::MemberRef, memberref.rid)
-            {
-                continue;
-            }
-            if memberref.class.token.is_table(TableId::TypeSpec) {
-                referenced_rids.insert(memberref.class.token.row());
-            }
-        }
-    }
-
-    // InterfaceImpl.interface (skip deleted rows)
-    if let Some(interfaceimpl_table) = tables.table::<InterfaceImplRaw>() {
-        for impl_ in interfaceimpl_table {
-            let impl_ = match impl_ {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::InterfaceImpl, impl_.rid)
-            {
-                continue;
-            }
-            if impl_.interface.token.is_table(TableId::TypeSpec) {
-                referenced_rids.insert(impl_.interface.token.row());
-            }
-        }
-    }
-
-    // GenericParamConstraint.constraint (skip deleted rows)
-    if let Some(constraint_table) = tables.table::<GenericParamConstraintRaw>() {
-        for constraint in constraint_table {
-            let constraint = match constraint {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::GenericParamConstraint, constraint.rid)
-            {
-                continue;
-            }
-            if constraint.constraint.token.is_table(TableId::TypeSpec) {
-                referenced_rids.insert(constraint.constraint.token.row());
-            }
-        }
-    }
-
-    // TypeDef.extends (skip deleted rows)
-    if let Some(typedef_table) = tables.table::<TypeDefRaw>() {
-        for typedef in typedef_table {
-            let typedef = match typedef {
-                Ok(row) => row,
-                Err(e) => {
-                    log::warn!("skipping unreadable metadata row: {e}");
-                    continue;
-                }
-            };
-            if assembly
-                .changes()
-                .is_row_deleted(TableId::TypeDef, typedef.rid)
-            {
-                continue;
-            }
-            if typedef.extends.token.is_table(TableId::TypeSpec) {
-                referenced_rids.insert(typedef.extends.token.row());
-            }
-        }
-    }
-
-    referenced_rids
-}
-
-/// Extracts TypeRef RIDs from a TypeSignature recursively.
-///
-/// TypeRef tokens can appear in Class/ValueType type signatures and in
-/// custom modifiers. This function walks the type signature tree and
-/// collects all embedded TypeRef RIDs.
-fn collect_typerefs_from_type(sig: &TypeSignature, referenced: &mut HashSet<u32>) {
-    match sig {
-        // Direct type references
-        TypeSignature::Class(token) | TypeSignature::ValueType(token) => {
-            if token.is_table(TableId::TypeRef) {
-                referenced.insert(token.row());
-            }
-        }
-
-        // Recursive types
-        TypeSignature::SzArray(arr) => {
-            for modifier in &arr.modifiers {
-                collect_typerefs_from_modifier(modifier, referenced);
-            }
-            collect_typerefs_from_type(&arr.base, referenced);
-        }
-        TypeSignature::Array(arr) => {
-            collect_typerefs_from_type(&arr.base, referenced);
-        }
-        TypeSignature::Ptr(ptr) => {
-            for modifier in &ptr.modifiers {
-                collect_typerefs_from_modifier(modifier, referenced);
-            }
-            collect_typerefs_from_type(&ptr.base, referenced);
-        }
-        TypeSignature::ByRef(inner) | TypeSignature::Pinned(inner) => {
-            collect_typerefs_from_type(inner, referenced);
-        }
-
-        // Generic instantiation - base type + type arguments
-        TypeSignature::GenericInst(base, args) => {
-            collect_typerefs_from_type(base, referenced);
-            for arg in args {
-                collect_typerefs_from_type(arg, referenced);
-            }
-        }
-
-        // Custom modifiers
-        TypeSignature::ModifiedRequired(modifiers) | TypeSignature::ModifiedOptional(modifiers) => {
-            for modifier in modifiers {
-                collect_typerefs_from_modifier(modifier, referenced);
-            }
-        }
-
-        // Function pointer - method signature embedded
-        TypeSignature::FnPtr(method_sig) => {
-            collect_typerefs_from_parameter(&method_sig.return_type, referenced);
-            for param in &method_sig.params {
-                collect_typerefs_from_parameter(param, referenced);
-            }
-        }
-
-        // Primitive and simple types - no tokens
-        TypeSignature::Void
-        | TypeSignature::Boolean
-        | TypeSignature::Char
-        | TypeSignature::I1
-        | TypeSignature::U1
-        | TypeSignature::I2
-        | TypeSignature::U2
-        | TypeSignature::I4
-        | TypeSignature::U4
-        | TypeSignature::I8
-        | TypeSignature::U8
-        | TypeSignature::R4
-        | TypeSignature::R8
-        | TypeSignature::I
-        | TypeSignature::U
-        | TypeSignature::String
-        | TypeSignature::Object
-        | TypeSignature::TypedByRef
-        | TypeSignature::GenericParamType(_)
-        | TypeSignature::GenericParamMethod(_)
-        | TypeSignature::Sentinel
-        | TypeSignature::Internal
-        | TypeSignature::Unknown
-        | TypeSignature::Type
-        | TypeSignature::Boxed
-        | TypeSignature::Field
-        | TypeSignature::Modifier
-        | TypeSignature::Reserved => {}
+impl Extend<Token> for TypeRefRows<'_> {
+    fn extend<I: IntoIterator<Item = Token>>(&mut self, tokens: I) {
+        self.0.extend(
+            tokens
+                .into_iter()
+                .filter(|token| token.is_table(TableId::TypeRef))
+                .map(|token| token.row()),
+        );
     }
 }
 
-/// Extracts TypeRef RIDs from a custom modifier.
-fn collect_typerefs_from_modifier(modifier: &CustomModifier, referenced: &mut HashSet<u32>) {
-    if modifier.modifier_type.is_table(TableId::TypeRef) {
-        referenced.insert(modifier.modifier_type.row());
-    }
-}
-
-/// Extracts TypeRef RIDs from a parameter (method return type or parameter).
-fn collect_typerefs_from_parameter(param: &SignatureParameter, referenced: &mut HashSet<u32>) {
-    for modifier in &param.modifiers {
-        collect_typerefs_from_modifier(modifier, referenced);
-    }
-    collect_typerefs_from_type(&param.base, referenced);
-}
-
-/// Extracts TypeRef RIDs from a local variable.
-fn collect_typerefs_from_local(local: &SignatureLocalVariable, referenced: &mut HashSet<u32>) {
-    for modifier in &local.modifiers {
-        collect_typerefs_from_modifier(modifier, referenced);
-    }
-    collect_typerefs_from_type(&local.base, referenced);
-}
-
-/// Scans all signature blobs in metadata tables to collect TypeRef RIDs.
+/// The TypeDef, TypeRef and TypeSpec tokens the signature blobs of surviving rows name.
 ///
 /// This function scans signatures from:
 /// - MethodDef.signature (method signatures)
 /// - Field.signature (field signatures)
 /// - MemberRef.signature (member reference signatures)
-/// - StandAloneSig.signature (local variable signatures)
+/// - StandAloneSig.signature, for the signatures surviving method bodies use: local variable
+///   lists and `calli` method signatures
 /// - TypeSpec.signature (type specification signatures)
 /// - Property.type (property signatures)
-///
-/// Note: MethodSpec.instantiation contains only type arguments, which are
-/// handled separately through the TypeSpec signature parser.
-pub(super) fn scan_signature_typeref_refs(assembly: &CilAssembly) -> HashSet<u32> {
+/// - MethodSpec.instantiation (the type arguments of a generic method instantiation)
+pub fn scan_signature_type_refs(
+    assembly: &CilAssembly,
+    body_tokens: &HashSet<Token>,
+) -> HashSet<Token> {
     let mut referenced_rids = HashSet::new();
 
     let view = assembly.view();
@@ -1130,9 +883,9 @@ pub(super) fn scan_signature_typeref_refs(assembly: &CilAssembly) -> HashSet<u32
         }
     }
 
-    // StandAloneSig signatures (local variables) - only scan those actually referenced
-    // by method bodies. Regenerated methods may not use their original signatures.
-    let referenced_sigs = collect_referenced_standalonesig_rids(assembly);
+    // StandAloneSig signatures - only scan those actually referenced by method bodies.
+    // Regenerated methods may not use their original signatures.
+    let referenced_sigs = collect_referenced_standalonesig_rids(assembly, body_tokens);
     if let Some(standalonesig_table) = tables.table::<StandAloneSigRaw>() {
         for sig in standalonesig_table {
             let sig = match sig {
@@ -1144,7 +897,9 @@ pub(super) fn scan_signature_typeref_refs(assembly: &CilAssembly) -> HashSet<u32
             };
             // Only scan StandAloneSigs that are referenced by current method bodies
             if referenced_sigs.contains(&sig.rid) {
-                scan_local_var_signature_blob(blob_heap, sig.signature, &mut referenced_rids);
+                if let Ok(blob_data) = blob_heap.get(sig.signature as usize) {
+                    standalone_signature_type_tokens(blob_data, &mut referenced_rids);
+                }
             }
         }
     }
@@ -1189,6 +944,24 @@ pub(super) fn scan_signature_typeref_refs(assembly: &CilAssembly) -> HashSet<u32
         }
     }
 
+    // MethodSpec instantiations (skip deleted rows)
+    if let Some(methodspec_table) = tables.table::<MethodSpecRaw>() {
+        for spec in methodspec_table.iter().filter_map(skip_unreadable) {
+            if assembly
+                .changes()
+                .is_row_deleted(TableId::MethodSpec, spec.rid)
+            {
+                continue;
+            }
+            let Ok(blob_data) = blob_heap.get(spec.instantiation as usize) else {
+                continue;
+            };
+            if let Ok(instantiation) = parse_method_spec_signature(blob_data) {
+                instantiation.type_tokens(&mut referenced_rids);
+            }
+        }
+    }
+
     referenced_rids
 }
 
@@ -1197,7 +970,7 @@ pub(super) fn scan_signature_typeref_refs(assembly: &CilAssembly) -> HashSet<u32
 fn scan_method_signature_blob(
     blob_heap: &Blob<'_>,
     blob_index: u32,
-    referenced: &mut HashSet<u32>,
+    referenced: &mut impl Extend<Token>,
 ) -> bool {
     let Ok(blob_data) = blob_heap.get(blob_index as usize) else {
         return false;
@@ -1207,10 +980,7 @@ fn scan_method_signature_blob(
         return false;
     };
 
-    collect_typerefs_from_parameter(&sig.return_type, referenced);
-    for param in &sig.params {
-        collect_typerefs_from_parameter(param, referenced);
-    }
+    sig.type_tokens(referenced);
 
     true
 }
@@ -1220,7 +990,7 @@ fn scan_method_signature_blob(
 fn scan_field_signature_blob(
     blob_heap: &Blob<'_>,
     blob_index: u32,
-    referenced: &mut HashSet<u32>,
+    referenced: &mut impl Extend<Token>,
 ) -> bool {
     let Ok(blob_data) = blob_heap.get(blob_index as usize) else {
         return false;
@@ -1230,30 +1000,20 @@ fn scan_field_signature_blob(
         return false;
     };
 
-    for modifier in &sig.modifiers {
-        collect_typerefs_from_modifier(modifier, referenced);
-    }
-    collect_typerefs_from_type(&sig.base, referenced);
+    sig.type_tokens(referenced);
 
     true
 }
 
-/// Scans a local variable signature blob for TypeRef references.
-fn scan_local_var_signature_blob(
-    blob_heap: &Blob<'_>,
-    blob_index: u32,
-    referenced: &mut HashSet<u32>,
-) {
-    let Ok(blob_data) = blob_heap.get(blob_index as usize) else {
-        return;
-    };
-
-    let Ok(sig) = parse_local_var_signature(blob_data) else {
-        return;
-    };
-
-    for local in &sig.locals {
-        collect_typerefs_from_local(local, referenced);
+/// The type tokens a StandAloneSig blob names: a local variable list (`LOCAL_SIG`) or, for a
+/// `calli`, a method signature.
+fn standalone_signature_type_tokens(blob_data: &[u8], referenced: &mut impl Extend<Token>) {
+    if blob_data.first() == Some(&SIGNATURE_HEADER::LOCAL_SIG) {
+        if let Ok(sig) = parse_local_var_signature(blob_data) {
+            sig.type_tokens(referenced);
+        }
+    } else if let Ok(sig) = parse_method_signature(blob_data) {
+        sig.type_tokens(referenced);
     }
 }
 
@@ -1261,7 +1021,7 @@ fn scan_local_var_signature_blob(
 fn scan_typespec_signature_blob(
     blob_heap: &Blob<'_>,
     blob_index: u32,
-    referenced: &mut HashSet<u32>,
+    referenced: &mut impl Extend<Token>,
 ) {
     let Ok(blob_data) = blob_heap.get(blob_index as usize) else {
         return;
@@ -1271,14 +1031,14 @@ fn scan_typespec_signature_blob(
         return;
     };
 
-    collect_typerefs_from_type(&sig.base, referenced);
+    sig.type_tokens(referenced);
 }
 
 /// Scans a property signature blob for TypeRef references.
 fn scan_property_signature_blob(
     blob_heap: &Blob<'_>,
     blob_index: u32,
-    referenced: &mut HashSet<u32>,
+    referenced: &mut impl Extend<Token>,
 ) {
     let Ok(blob_data) = blob_heap.get(blob_index as usize) else {
         return;
@@ -1288,13 +1048,7 @@ fn scan_property_signature_blob(
         return;
     };
 
-    for modifier in &sig.modifiers {
-        collect_typerefs_from_modifier(modifier, referenced);
-    }
-    collect_typerefs_from_type(&sig.base, referenced);
-    for param in &sig.params {
-        collect_typerefs_from_parameter(param, referenced);
-    }
+    sig.type_tokens(referenced);
 }
 
 /// Removes TypeRef entries that are cascade candidates and no longer referenced.
@@ -1306,7 +1060,7 @@ fn scan_property_signature_blob(
 /// # Returns
 ///
 /// A tuple of (count_removed, set_of_deleted_rids).
-pub(super) fn remove_unreferenced_typerefs(
+pub fn remove_unreferenced_typerefs(
     assembly: &mut CilAssembly,
     candidates: &BTreeSet<u32>,
     body_tokens: &HashSet<Token>,
@@ -1325,53 +1079,18 @@ pub(super) fn remove_unreferenced_typerefs(
         }
     }
 
-    // From metadata tables (computed at this point, after prior cascade removals)
-    referenced_rids.extend(scan_typeref_metadata_refs(assembly));
-
-    // From signature blobs (method sigs, field sigs, local var sigs, etc.)
-    let signature_refs = scan_signature_typeref_refs(assembly);
-    referenced_rids.extend(signature_refs);
-
-    // Also include TypeRefs referenced indirectly through MemberRefs used in code
-    let memberref_body_rids: HashSet<u32> = body_tokens
-        .iter()
-        .filter(|t| t.is_table(TableId::MemberRef))
-        .map(Token::row)
-        .collect();
-
-    {
-        let view = assembly.view();
-        if let Some(tables) = view.tables() {
-            if let Some(memberref_table) = tables.table::<MemberRefRaw>() {
-                for memberref in memberref_table {
-                    let memberref = match memberref {
-                        Ok(row) => row,
-                        Err(e) => {
-                            log::warn!("skipping unreadable metadata row: {e}");
-                            continue;
-                        }
-                    };
-                    if assembly
-                        .changes()
-                        .is_row_deleted(TableId::MemberRef, memberref.rid)
-                    {
-                        continue;
-                    }
-                    if memberref_body_rids.contains(&memberref.rid)
-                        && memberref.class.token.is_table(TableId::TypeRef)
-                    {
-                        referenced_rids.insert(memberref.class.token.row());
-                    }
-                }
-            }
-        }
-    }
+    // From the metadata columns and signature blobs of surviving rows, at this point, after
+    // prior cascade removals. A surviving MemberRef's class is among the columns, so the
+    // TypeRefs of the MemberRefs code and attributes still use are kept.
+    referenced_rids.extend(rows_of(&scan_metadata_keepers(assembly), TableId::TypeRef));
+    referenced_rids.extend(rows_of(
+        &scan_signature_type_refs(assembly, body_tokens),
+        TableId::TypeRef,
+    ));
 
     // Last, once every source above has contributed: a nested TypeRef that survives keeps its
-    // enclosing TypeRef alive. This has to see the *whole* live set — running it inside
-    // `scan_typeref_metadata_refs` meant it saw only that function's own five metadata sources,
-    // so a nested TypeRef kept alive by an IL body token, a signature blob, or a MemberRef
-    // never marked its parent, and the parent was deleted out from under it.
+    // enclosing TypeRef alive. This has to see the whole live set, so that a nested TypeRef
+    // kept alive by an IL body token, a signature blob or a MemberRef marks its parent too.
     let nesting = typeref_nesting_edges(assembly);
     close_over_typeref_nesting(&mut referenced_rids, &nesting);
 
@@ -1386,7 +1105,7 @@ pub(super) fn remove_unreferenced_typerefs(
 /// # Returns
 ///
 /// A tuple of (count_removed, set_of_deleted_rids).
-pub(super) fn remove_unreferenced_memberrefs(
+pub fn remove_unreferenced_memberrefs(
     assembly: &mut CilAssembly,
     candidates: &BTreeSet<u32>,
     body_tokens: &HashSet<Token>,
@@ -1405,43 +1124,12 @@ pub(super) fn remove_unreferenced_memberrefs(
         }
     }
 
-    // From metadata tables (computed at this point, reflecting current deletion state)
-    referenced_rids.extend(scan_memberref_metadata_refs(assembly));
-
-    // Also include MemberRefs referenced through MethodSpecs in method bodies
-    let methodspec_body_rids: HashSet<u32> = body_tokens
-        .iter()
-        .filter(|t| t.is_table(TableId::MethodSpec))
-        .map(Token::row)
-        .collect();
-
-    {
-        let view = assembly.view();
-        if let Some(tables) = view.tables() {
-            if let Some(methodspec_table) = tables.table::<MethodSpecRaw>() {
-                for spec in methodspec_table {
-                    let spec = match spec {
-                        Ok(row) => row,
-                        Err(e) => {
-                            log::warn!("skipping unreadable metadata row: {e}");
-                            continue;
-                        }
-                    };
-                    if assembly
-                        .changes()
-                        .is_row_deleted(TableId::MethodSpec, spec.rid)
-                    {
-                        continue;
-                    }
-                    if methodspec_body_rids.contains(&spec.rid)
-                        && spec.method.token.is_table(TableId::MemberRef)
-                    {
-                        referenced_rids.insert(spec.method.token.row());
-                    }
-                }
-            }
-        }
-    }
+    // From the metadata columns of surviving rows, reflecting the current deletion state:
+    // custom attribute constructors, MethodSpecs and MethodImpls.
+    referenced_rids.extend(rows_of(
+        &scan_metadata_keepers(assembly),
+        TableId::MemberRef,
+    ));
 
     remove_candidates_not_alive(assembly, TableId::MemberRef, candidates, &referenced_rids)
 }
@@ -1454,7 +1142,7 @@ pub(super) fn remove_unreferenced_memberrefs(
 /// # Returns
 ///
 /// A tuple of (count_removed, set_of_deleted_rids).
-pub(super) fn remove_unreferenced_typespecs(
+pub fn remove_unreferenced_typespecs(
     assembly: &mut CilAssembly,
     candidates: &BTreeSet<u32>,
     body_tokens: &HashSet<Token>,
@@ -1473,8 +1161,13 @@ pub(super) fn remove_unreferenced_typespecs(
         }
     }
 
-    // From metadata tables (computed at this point, after prior cascade removals)
-    referenced_rids.extend(scan_typespec_metadata_refs(assembly));
+    // From the metadata columns and signature blobs of surviving rows, at this point, after
+    // prior cascade removals.
+    referenced_rids.extend(rows_of(&scan_metadata_keepers(assembly), TableId::TypeSpec));
+    referenced_rids.extend(rows_of(
+        &scan_signature_type_refs(assembly, body_tokens),
+        TableId::TypeSpec,
+    ));
 
     remove_candidates_not_alive(assembly, TableId::TypeSpec, candidates, &referenced_rids)
 }
@@ -1483,19 +1176,19 @@ pub(super) fn remove_unreferenced_typespecs(
 mod tests {
     use super::*;
     use crate::{
-        cilassembly::cleanup::utils::PLACEHOLDER_RVA_THRESHOLD,
+        cilassembly::changes::METHOD_BODY_PLACEHOLDER_BASE,
         metadata::{tables::TableId, token::Token},
     };
 
     #[test]
     fn test_placeholder_rva_detection() {
         // Placeholder RVAs start at 0xF000_0000
-        const { assert!(0xF000_0000 >= PLACEHOLDER_RVA_THRESHOLD) };
-        const { assert!(0xF000_0001 >= PLACEHOLDER_RVA_THRESHOLD) };
+        const { assert!(0xF000_0000 >= METHOD_BODY_PLACEHOLDER_BASE) };
+        const { assert!(0xF000_0001 >= METHOD_BODY_PLACEHOLDER_BASE) };
 
         // Normal RVAs are below the threshold
-        const { assert!(0x2000 < PLACEHOLDER_RVA_THRESHOLD) };
-        const { assert!(0x0000_FFFF < PLACEHOLDER_RVA_THRESHOLD) };
+        const { assert!(0x2000 < METHOD_BODY_PLACEHOLDER_BASE) };
+        const { assert!(0x0000_FFFF < METHOD_BODY_PLACEHOLDER_BASE) };
     }
 
     #[test]
@@ -1511,12 +1204,9 @@ mod tests {
 
     /// A nested TypeRef kept alive by *any* source must keep its enclosing TypeRef alive too.
     ///
-    /// The closure used to run inside `scan_typeref_metadata_refs`, where it could see only
-    /// that function's own metadata sources — not the IL body tokens, signature blobs or
-    /// MemberRef-derived RIDs unioned in afterwards. Seeding here with a RID that only those
-    /// later sources would have supplied is what distinguishes the fixed version: under the
-    /// old ordering the enclosing RIDs stayed absent and the rows were deleted, leaving the
-    /// survivor's `ResolutionScope` pointing at whatever shifted into their place.
+    /// The live set is seeded with a RID only an IL body token supplied: the closure runs over
+    /// the complete live set, so the enclosing RIDs are marked, and the survivor's
+    /// `ResolutionScope` never points at a deleted row.
     #[test]
     fn nesting_closure_marks_enclosing_typerefs_of_a_live_nested_typeref() {
         // 3 nested in 2, 2 nested in 1 — the transitive `A+B+C` shape.

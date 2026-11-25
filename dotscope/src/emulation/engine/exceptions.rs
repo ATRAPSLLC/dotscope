@@ -3,7 +3,7 @@
 //! The CIL emulator uses synthetic tokens (in the `0x7F01_00xx` range, using
 //! table `0x7F` which does not exist in ECMA-335) to represent BCL exception
 //! types that don't exist in the loaded assembly's metadata. All token constants
-//! are defined in [`synthetic_exception`](super::error::synthetic_exception).
+//! are defined in [`synthetic_exception`].
 //! This module defines the parent-child
 //! hierarchy so that `catch` clauses correctly discriminate between exception
 //! types per ECMA-335 §III.4.27: "an exception is caught if the thrown type is
@@ -119,6 +119,8 @@ pub fn parent(token: Token) -> Option<Token> {
         t if t == synthetic_exception::ACCESS_VIOLATION => {
             Some(synthetic_exception::SYSTEM_EXCEPTION)
         }
+        t if t == synthetic_exception::CRYPTOGRAPHIC => Some(synthetic_exception::SYSTEM_EXCEPTION),
+        t if t == synthetic_exception::INVALID_DATA => Some(synthetic_exception::SYSTEM_EXCEPTION),
 
         // SystemException → Exception
         t if t == synthetic_exception::SYSTEM_EXCEPTION => {
@@ -221,6 +223,10 @@ pub fn token_from_fullname(fullname: &str) -> Option<Token> {
         "System.MissingFieldException" => Some(synthetic_exception::MISSING_FIELD),
         "System.NotImplementedException" => Some(synthetic_exception::NOT_IMPLEMENTED),
         "System.AccessViolationException" => Some(synthetic_exception::ACCESS_VIOLATION),
+        "System.Security.Cryptography.CryptographicException" => {
+            Some(synthetic_exception::CRYPTOGRAPHIC)
+        }
+        "System.IO.InvalidDataException" => Some(synthetic_exception::INVALID_DATA),
         _ => None,
     }
 }
@@ -369,6 +375,8 @@ mod tests {
             synthetic_exception::MISSING_FIELD,
             synthetic_exception::NOT_IMPLEMENTED,
             synthetic_exception::ACCESS_VIOLATION,
+            synthetic_exception::CRYPTOGRAPHIC,
+            synthetic_exception::INVALID_DATA,
         ];
 
         for exc in &all_exceptions {

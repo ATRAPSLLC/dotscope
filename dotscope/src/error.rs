@@ -97,13 +97,16 @@ use std::{io, sync::Arc};
 
 use thiserror::Error;
 
+// Re-exported at the crate root in every feature set: the real error with `emulation`, the
+// stub below without it, so the root path survives enabling the feature.
 #[cfg(feature = "emulation")]
-use crate::emulation::EmulationError;
+pub use crate::emulation::EmulationError;
 use crate::metadata::{tables::TableId, token::Token};
 
-// Stub type for EmulationError when emulation feature is disabled.
-// This allows the Error enum to remain stable across feature configurations.
-// The type is public to match the visibility of the Error::Emulation variant.
+/// Stands in for the emulator's error when the `emulation` feature is disabled.
+///
+/// It keeps [`Error::Emulation`] the same across feature configurations. Nothing builds one
+/// without the feature, so the variant never occurs in such a build.
 #[cfg(not(feature = "emulation"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmulationError(String);
@@ -146,7 +149,15 @@ impl std::fmt::Display for EmulationError {
 /// ```
 #[macro_export]
 macro_rules! malformed_error {
-    // Single string version
+    // A format string literal: its inline arguments (`{name}`) are formatted
+    ($msg:literal) => {
+        $crate::Error::Parse($crate::ParseFailure::Other {
+            stage: $crate::ParseStage::Generic,
+            message: format!("{} ({}:{})", format!($msg), file!(), line!()),
+        })
+    };
+
+    // A message built elsewhere
     ($msg:expr) => {
         $crate::Error::Parse($crate::ParseFailure::Other {
             stage: $crate::ParseStage::Generic,
@@ -179,11 +190,15 @@ macro_rules! malformed_error {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```
 /// # use dotscope::out_of_bounds_error;
-/// if index >= data.len() {
-///     return Err(out_of_bounds_error!());
+/// fn byte_at(data: &[u8], index: usize) -> dotscope::Result<u8> {
+///     if index >= data.len() {
+///         return Err(out_of_bounds_error!());
+///     }
+///     Ok(data[index])
 /// }
+/// assert!(byte_at(&[1, 2], 2).is_err());
 /// ```
 #[macro_export]
 macro_rules! out_of_bounds_error {
@@ -388,6 +403,22 @@ pub enum Error {
     #[error("Codegen error: {0}")]
     CodegenFailed(String),
 
+    /// An exception region the generated layout does not keep in one piece.
+    ///
+    /// A clause names one contiguous span of bytes for each of its regions, so
+    /// a layout that places code outside a region between the region's blocks
+    /// cannot be described. Code generation refuses the method rather than
+    /// dropping the clause, which would leave the code it guards unprotected.
+    #[error("Codegen error: exception region of blocks {start}..{end} is not contiguous in the layout: {intruder} falls inside it")]
+    EhRegionNotContiguous {
+        /// The region's first block.
+        start: usize,
+        /// The block after its last.
+        end: usize,
+        /// The layout entry that falls inside the region.
+        intruder: String,
+    },
+
     /// Cannot modify replaced table.
     ///
     /// This error occurs when attempting to apply sparse modifications
@@ -509,6 +540,19 @@ pub enum Error {
     /// configured size limits.
     #[error("Layout failed: {0}")]
     LayoutFailed(String),
+
+    /// A row the write deletes is still named by something the write keeps.
+    ///
+    /// The writer never retargets such a reference to a neighbouring row. Under
+    /// [`DanglingPolicy::Null`](crate::cilassembly::DanglingPolicy::Null) it writes a null
+    /// reference instead of failing.
+    #[error("{referrer} names {target}, which the write deletes")]
+    DanglingReference {
+        /// What names the deleted row; its tokens are the ones the input assembly has.
+        referrer: Referrer,
+        /// The deleted row, as the input assembly numbers it.
+        target: Token,
+    },
 
     /// Memory mapping failed during binary reading or writing.
     ///
@@ -689,6 +733,8 @@ pub enum ParseStage {
     StreamHeader,
     /// Tilde (`#~`) stream containing metadata table rows.
     TildeStream,
+    /// A Portable PDB's `#Pdb` stream.
+    PdbStream,
     /// Per-table row layout/decoding within the tilde stream.
     TableRow,
     /// One of the heap streams (`#Strings`, `#US`, `#Blob`, `#GUID`).
@@ -741,6 +787,7 @@ impl std::fmt::Display for ParseStage {
             ParseStage::MetadataRoot => "metadata root",
             ParseStage::StreamHeader => "stream header",
             ParseStage::TildeStream => "tilde (#~) stream",
+            ParseStage::PdbStream => "#Pdb stream",
             ParseStage::TableRow => "metadata table row",
             ParseStage::Heap => "heap",
             ParseStage::DataDirectory => "data directory",
@@ -827,6 +874,35 @@ impl std::fmt::Display for StreamKind {
             StreamKind::Guid => "#GUID",
             StreamKind::Pdb => "#Pdb",
         })
+    }
+}
+
+/// What names a row in a write: a column of another row, a method body, or the CLI header.
+///
+/// Carried by [`Error::DanglingReference`]. Its tokens are the ones the input assembly has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Referrer {
+    /// A column of a metadata row.
+    Column {
+        /// The row.
+        row: Token,
+        /// The column, by its ECMA-335 name.
+        column: &'static str,
+    },
+    /// A method body: an instruction operand, its local variable signature or a catch type.
+    Body(Token),
+    /// The entry point in the CLI header.
+    EntryPoint,
+}
+
+impl std::fmt::Display for Referrer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Referrer::Column { row, column } => write!(f, "{column} of {row}"),
+            Referrer::Body(method) => write!(f, "the body of {method}"),
+            Referrer::EntryPoint => f.write_str("the entry point"),
+        }
     }
 }
 
@@ -971,8 +1047,8 @@ impl From<EmulationError> for Error {
     }
 }
 
-impl From<analyssa::GraphError> for Error {
-    fn from(err: analyssa::GraphError) -> Self {
+impl From<analyssa::Error> for Error {
+    fn from(err: analyssa::Error) -> Self {
         Error::GraphError(err.0)
     }
 }
@@ -986,6 +1062,24 @@ impl From<Error> for analyssa::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message's inline arguments are formatted: the single-literal form printed `{name}`
+    /// as it is written.
+    #[test]
+    fn malformed_error_formats_inline_arguments() {
+        let value = 0x1234;
+        let name = "column";
+        let error = malformed_error!("{value:#x} does not fit the {name}");
+        assert!(
+            error.to_string().contains("0x1234 does not fit the column"),
+            "{error}"
+        );
+        let built = format!("built {}", 7);
+        assert!(malformed_error!(built).to_string().contains("built 7"));
+        assert!(malformed_error!("{} and {}", 1, 2)
+            .to_string()
+            .contains("1 and 2"));
+    }
 
     /// `Clone` must preserve the variant.
     ///

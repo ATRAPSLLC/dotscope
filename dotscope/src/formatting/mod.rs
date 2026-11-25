@@ -200,7 +200,7 @@ impl IlFormatter {
             }
 
             if self.opts.show_security {
-                if let Some(sec) = cil_type.security.get() {
+                for (_, sec) in cil_type.security.iter() {
                     security::format_security(w, sec, "  ")?;
                 }
             }
@@ -265,7 +265,7 @@ impl IlFormatter {
             attributes::format_custom_attributes(w, &method.custom_attributes, "    ", asm)?;
         }
         if self.opts.show_security {
-            if let Some(sec) = method.security.get() {
+            for (_, sec) in method.security.iter() {
                 security::format_security(w, sec, "    ")?;
             }
         }
@@ -352,7 +352,7 @@ impl IlFormatter {
 ///
 /// Produces either:
 /// - Simple form: `.override TypeName::MethodName` (when declaration parent is NOT a TypeSpec)
-/// - Full method-ref form: `.override method instance void class IFoo`1<int32>::Bar(params)`
+/// - Full method-ref form: `` .override method instance void class IFoo`1<int32>::Bar(params) ``
 ///   (when declaration parent IS a TypeSpec, e.g. generic type instantiation)
 fn format_override_directive(
     w: &mut dyn Write,
@@ -400,16 +400,16 @@ fn format_override_directive(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use crate::{
         formatting::{FormatterOptions, IlFormatter},
         metadata::token::Token,
+        testkit::fixture,
         CilObject,
     };
 
     fn load_crafted_2() -> CilObject {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/crafted_2.exe");
+        let path = fixture("crafted_2.exe");
         CilObject::from_path(&path).expect("Failed to load crafted_2.exe")
     }
 
@@ -418,7 +418,7 @@ mod tests {
         let cil_type = asm
             .query_types()
             .defined()
-            .filter(|t| &*t.fullname() == type_name)
+            .filter(|t| t.fullname() == type_name)
             .find_all()
             .into_iter()
             .next()
@@ -454,6 +454,22 @@ mod tests {
         assert!(
             output.contains(".class"),
             "Missing .class directive: {output}"
+        );
+    }
+
+    /// A constraint that is a type specification is written from its signature, with its
+    /// arguments: `IEquatable<TKey>` was written `IEquatable`1`, another type.
+    #[test]
+    fn a_type_specification_constraint_keeps_its_arguments() {
+        let asm = load_crafted_2();
+        let output = format_type_by_name(&asm, "ComplexGeneric`3");
+        let header = output
+            .lines()
+            .find(|line| line.starts_with(".class"))
+            .unwrap();
+        assert!(
+            header.contains("(class [mscorlib]'System.IEquatable`1'<!0>) TKey"),
+            "{header}"
         );
     }
 
@@ -751,9 +767,7 @@ mod tests {
     }
 
     fn load_dotnet_10(name: &str) -> CilObject {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/samples/dotnet_10.0")
-            .join(name);
+        let path = fixture("dotnet_10.0").join(name);
         CilObject::from_path(&path).unwrap_or_else(|e| panic!("Failed to load {name}: {e}"))
     }
 
@@ -803,6 +817,23 @@ mod tests {
         assert!(
             output.contains(".custom"),
             "Missing .custom under .interfaceimpl for {type_name}: {output}"
+        );
+    }
+
+    /// A pinned by-reference local is `T& pinned`: the `&` belongs to the type and `pinned`
+    /// follows it. It was written `T pinned&`, which ILAsm does not read.
+    #[test]
+    fn a_pinned_byref_local_is_written_as_ilasm_reads_it() {
+        let asm = CilObject::from_path(fixture("WindowsBase.dll")).unwrap();
+        let formatter = IlFormatter::new(FormatterOptions::default());
+        let mut buf = Vec::new();
+        formatter.format_assembly(&mut buf, &asm).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+
+        assert!(!text.contains("pinned&"));
+        assert!(
+            text.contains("& pinned"),
+            "WindowsBase has pinned by-reference locals"
         );
     }
 }

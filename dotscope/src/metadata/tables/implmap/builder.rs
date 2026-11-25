@@ -189,8 +189,8 @@ impl ImplMapBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// # use dotscope::metadata::tables::{CodedIndex, TableId, ImplMapBuilder};
+    /// ```
+    /// # use dotscope::metadata::tables::{CodedIndex, CodedIndexType, ImplMapBuilder, TableId};
     /// let builder = ImplMapBuilder::new()
     ///     .member_forwarded(CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MemberForwarded));
     /// ```
@@ -333,7 +333,7 @@ mod tests {
     use super::*;
     use crate::{
         cilassembly::ChangeRefKind, metadata::tables::implmap::PInvokeAttributes, prelude::*,
-        test::factories::table::assemblyref::get_test_assembly,
+        testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

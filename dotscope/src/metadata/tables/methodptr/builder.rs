@@ -184,7 +184,7 @@ impl Default for MethodPtrBuilder {
 mod tests {
     use super::*;
     use crate::{
-        cilassembly::ChangeRefKind, test::factories::table::assemblyref::get_test_assembly,
+        cilassembly::ChangeRefKind, testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

@@ -7,7 +7,7 @@
 use crate::{
     cilassembly::{builders::method_body::MethodBodyBuilder, ChangeRefRc, CilAssembly},
     metadata::{
-        method::{MethodAccessFlags, MethodImplCodeType, MethodModifiers},
+        method::{MethodAccessFlags, MethodImplCodeType, MethodImplOptions, MethodModifiers},
         signatures::{encode_method_signature, SignatureMethod, SignatureParameter, TypeSignature},
         tables::{MethodDefBuilder, ParamAttributes, ParamBuilder, TableId},
         token::Token,
@@ -129,7 +129,7 @@ use crate::{
 ///     .static_method()
 ///     .calling_convention_stdcall() // Windows API calling convention
 ///     .returns(TypeSignature::I4)
-///     .extern_method() // No IL implementation - native code
+///     .pinvoke_impl() // No IL implementation - native code
 ///     .build(&mut assembly)?;
 /// # Ok(())
 /// # }
@@ -151,7 +151,7 @@ use crate::{
 ///     .calling_convention_vararg() // Supports variable arguments
 ///     .parameter("format", TypeSignature::String)
 ///     .returns(TypeSignature::I4)
-///     .extern_method()
+///     .pinvoke_impl()
 ///     .build(&mut assembly)?;
 /// # Ok(())
 /// # }
@@ -168,6 +168,10 @@ pub struct MethodBuilder {
 
     /// Implementation flags (IL, native, etc.)
     impl_flags: MethodImplCodeType,
+
+    /// Implementation options (internal call and the like), combined with the code type into
+    /// the ImplFlags column
+    impl_options: MethodImplOptions,
 
     /// Return type
     return_type: TypeSignature,
@@ -224,6 +228,7 @@ impl MethodBuilder {
             access_flags: MethodAccessFlags::PRIVATE, // Default to private
             modifiers: MethodModifiers::ZERO,
             impl_flags: MethodImplCodeType::IL,
+            impl_options: MethodImplOptions::ZERO,
             return_type: TypeSignature::Void,
             parameters: Vec::new(),
             body_builder: None,
@@ -751,7 +756,12 @@ impl MethodBuilder {
     /// Mark this method as extern (no implementation).
     ///
     /// Extern methods are implemented outside of IL (e.g., native code,
-    /// runtime-provided, etc.).
+    /// runtime-provided, etc.). This drops the IL body only: ECMA-335 §II.22.26 lets a
+    /// method have no body (RVA 0) only when it is abstract, a P/Invoke
+    /// ([`pinvoke_impl`](Self::pinvoke_impl)), an internal call
+    /// ([`internal_call`](Self::internal_call)) or implemented by the runtime
+    /// ([`runtime_implemented`](Self::runtime_implemented)), and
+    /// [`build`](Self::build) refuses a bodyless method that is none of these.
     ///
     /// # Examples
     ///
@@ -763,6 +773,62 @@ impl MethodBuilder {
     #[must_use]
     pub fn extern_method(mut self) -> Self {
         self.body_builder = None; // No IL implementation
+        self
+    }
+
+    /// Mark this method as a P/Invoke: implemented by a native function, without an IL body.
+    ///
+    /// Sets `PinvokeImpl` (0x2000) and drops any body. The native function it calls is named
+    /// by an ImplMap row ([`crate::metadata::tables::ImplMapBuilder`]) forwarding to this
+    /// method, which ECMA-335 §II.22.22 requires of every P/Invoke.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::MethodBuilder;
+    ///
+    /// let builder = MethodBuilder::new("MessageBoxW").public().static_method().pinvoke_impl();
+    /// ```
+    #[must_use]
+    pub fn pinvoke_impl(mut self) -> Self {
+        self.modifiers |= MethodModifiers::PINVOKE_IMPL;
+        self.body_builder = None;
+        self
+    }
+
+    /// Mark this method as an internal call: implemented inside the runtime itself, without an
+    /// IL body.
+    ///
+    /// Sets the `InternalCall` implementation flag (0x1000) and drops any body.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::MethodBuilder;
+    ///
+    /// let builder = MethodBuilder::new("GetHashCode").public().internal_call();
+    /// ```
+    #[must_use]
+    pub fn internal_call(mut self) -> Self {
+        self.impl_options |= MethodImplOptions::INTERNAL_CALL;
+        self.body_builder = None;
+        self
+    }
+
+    /// Mark this method as implemented by the runtime, without an IL body: the code type is
+    /// `Runtime` (0x0003), as for a delegate's `Invoke`, `BeginInvoke` and `EndInvoke`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::MethodBuilder;
+    ///
+    /// let builder = MethodBuilder::new("Invoke").public().virtual_method().runtime_implemented();
+    /// ```
+    #[must_use]
+    pub fn runtime_implemented(mut self) -> Self {
+        self.impl_flags = MethodImplCodeType::RUNTIME;
+        self.body_builder = None;
         self
     }
 
@@ -786,6 +852,30 @@ impl MethodBuilder {
     ///
     /// Returns an error if method creation fails at any step.
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {
+        // ECMA-335 §II.22.26: a method has a body (RVA non-zero) exactly when it is neither
+        // abstract, nor a P/Invoke, nor an internal call, nor implemented by the runtime.
+        let bodyless = self.modifiers.contains(MethodModifiers::ABSTRACT)
+            || self.modifiers.contains(MethodModifiers::PINVOKE_IMPL)
+            || self.impl_options.contains(MethodImplOptions::INTERNAL_CALL)
+            || self.impl_flags == MethodImplCodeType::RUNTIME;
+        match (&self.body_builder, bodyless) {
+            (None, false) => {
+                return Err(malformed_error!(
+                    "Method '{}' has no body but is not abstract, a P/Invoke, an internal call \
+                     or runtime-implemented (ECMA-335 II.22.26)",
+                    self.name
+                ));
+            }
+            (Some(_), true) => {
+                return Err(malformed_error!(
+                    "Method '{}' has a body but is abstract, a P/Invoke, an internal call or \
+                     runtime-implemented, which have none (ECMA-335 II.22.26)",
+                    self.name
+                ));
+            }
+            _ => {}
+        }
+
         // Extract values needed for both signature and parameter creation
         let return_type = self.return_type.clone();
         let parameters = self.parameters.clone();
@@ -801,6 +891,7 @@ impl MethodBuilder {
             stdcall: self.stdcall,
             thiscall: self.thiscall,
             fastcall: self.fastcall,
+            unmanaged: false,
             param_count_generic: 0,
             param_count: u32::try_from(parameters.len())
                 .map_err(|_| malformed_error!("Method parameter count exceeds u32 range"))?,
@@ -861,7 +952,7 @@ impl MethodBuilder {
         let method_token = MethodDefBuilder::new()
             .name(&self.name)
             .flags(combined_flags)
-            .impl_flags(self.impl_flags.bits())
+            .impl_flags(self.impl_flags.bits() | self.impl_options.bits())
             .signature(&signature_bytes)
             .rva(rva)
             .param_list(param_start_index) // Point to our parameter table entries
@@ -891,16 +982,16 @@ impl Default for MethodBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::{cilassemblyview::CilAssemblyView, signatures::TypeSignature, tables::TableId},
+        testkit::fixture,
     };
 
     fn get_test_assembly() -> Result<CilAssembly> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path)?;
         Ok(CilAssembly::new(view))
     }
@@ -1032,7 +1123,6 @@ mod tests {
             .abstract_method()
             .virtual_method()
             .returns(TypeSignature::I4)
-            .extern_method() // No implementation
             .build(&mut assembly)?;
 
         assert_eq!(
@@ -1112,7 +1202,7 @@ mod tests {
             .calling_convention_cdecl()
             .parameter("x", TypeSignature::I4)
             .returns(TypeSignature::I4)
-            .extern_method() // No implementation for P/Invoke
+            .pinvoke_impl()
             .build(&mut assembly)?;
 
         assert_eq!(
@@ -1127,7 +1217,7 @@ mod tests {
             .calling_convention_stdcall()
             .parameter("x", TypeSignature::I4)
             .returns(TypeSignature::I4)
-            .extern_method()
+            .pinvoke_impl()
             .build(&mut assembly)?;
 
         assert_eq!(
@@ -1168,7 +1258,7 @@ mod tests {
             .calling_convention_vararg()
             .parameter("format", TypeSignature::String)
             .returns(TypeSignature::Void)
-            .extern_method() // Vararg methods are typically extern
+            .pinvoke_impl() // Vararg methods are typically P/Invokes
             .build(&mut assembly)?;
 
         assert_eq!(
@@ -1219,7 +1309,7 @@ mod tests {
             .calling_convention_stdcall() // Switch to stdcall (should clear cdecl)
             .parameter("x", TypeSignature::I4)
             .returns(TypeSignature::I4)
-            .extern_method()
+            .pinvoke_impl()
             .build(&mut assembly)?;
 
         assert_eq!(method.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
@@ -1276,6 +1366,55 @@ mod tests {
             ChangeRefKind::TableRow(TableId::MethodDef)
         ); // MethodDef table
 
+        Ok(())
+    }
+
+    /// ECMA-335 §II.22.26: a method without a body must be abstract, a P/Invoke, an internal
+    /// call or runtime-implemented, and one of those must not have a body. The builder made a
+    /// bodyless method of any other kind, which the loader's validation refuses.
+    #[test]
+    fn a_method_has_a_body_exactly_when_its_kind_needs_one() -> Result<()> {
+        let mut assembly = get_test_assembly()?;
+
+        assert!(MethodBuilder::new("NoBody")
+            .public()
+            .static_method()
+            .build(&mut assembly)
+            .is_err());
+        assert!(MethodBuilder::new("NoBodyExtern")
+            .public()
+            .static_method()
+            .extern_method()
+            .build(&mut assembly)
+            .is_err());
+        assert!(MethodBuilder::new("AbstractWithBody")
+            .public()
+            .virtual_method()
+            .abstract_method()
+            .implementation(|body| {
+                body.implementation(|asm| {
+                    asm.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut assembly)
+            .is_err());
+
+        MethodBuilder::new("Native")
+            .public()
+            .static_method()
+            .pinvoke_impl()
+            .build(&mut assembly)?;
+        MethodBuilder::new("Intrinsic")
+            .public()
+            .static_method()
+            .internal_call()
+            .build(&mut assembly)?;
+        MethodBuilder::new("Invoke")
+            .public()
+            .virtual_method()
+            .runtime_implemented()
+            .build(&mut assembly)?;
         Ok(())
     }
 }

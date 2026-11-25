@@ -20,8 +20,8 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! # use dotscope::metadata::tables::customattribute::CustomAttribute;
+//! ```no_run
+//! # use dotscope::metadata::tables::CustomAttribute;
 //! # fn example(attribute: &CustomAttribute) -> dotscope::Result<()> {
 //! // Apply the custom attribute to its parent element
 //! attribute.apply()?;
@@ -32,6 +32,7 @@
 //! println!("Named arguments: {:?}", attribute.value.named_args);
 //! # Ok(())
 //! # }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Thread Safety
@@ -158,7 +159,9 @@ impl CustomAttribute {
             | CilTypeReference::TypeSpec(entry)
             | CilTypeReference::TypeRef(entry) => {
                 if let Some(type_ref) = entry.upgrade() {
-                    type_ref.custom_attributes.push(attribute_value);
+                    type_ref
+                        .custom_attributes
+                        .push_row(self.token, attribute_value);
                     Ok(())
                 } else {
                     Err(malformed_error!("Type reference is no longer valid"))
@@ -166,78 +169,114 @@ impl CustomAttribute {
             }
             CilTypeReference::MethodDef(entry) => {
                 if let Some(method) = entry.upgrade() {
-                    method.custom_attributes.push(attribute_value);
+                    method
+                        .custom_attributes
+                        .push_row(self.token, attribute_value);
                     Ok(())
                 } else {
                     Err(malformed_error!("Method reference is no longer valid"))
                 }
             }
             CilTypeReference::Field(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::Param(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::Property(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::Event(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::Assembly(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::Module(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::InterfaceImpl(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::MemberRef(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::DeclSecurity(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::StandAloneSig(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::ModuleRef(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::AssemblyRef(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::File(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::ExportedType(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::GenericParam(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::GenericParamConstraint(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             CilTypeReference::MethodSpec(entry) => {
-                entry.custom_attributes.push(attribute_value);
+                entry
+                    .custom_attributes
+                    .push_row(self.token, attribute_value);
                 Ok(())
             }
             //CilTypeReference::ManifestResource(entry) => {},

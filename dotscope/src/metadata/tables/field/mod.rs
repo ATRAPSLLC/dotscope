@@ -16,13 +16,13 @@
 //!
 //! - **Raw Representation**: [`crate::metadata::tables::field::raw::FieldRaw`] - Direct binary table format with unresolved indexes
 //! - **Owned Data**: [`crate::metadata::tables::field::owned::Field`] - Resolved entries with owned data and parsed signatures
-//! - **Loading Infrastructure**: [`crate::metadata::tables::field::loader::FieldLoader`] - Processes raw entries during metadata loading
+//! - **Loading Infrastructure**: [`crate::metadata::loader::tables::FieldLoader`] - Processes raw entries during metadata loading
 //! - **Type Aliases**: Collection types for managing Field entries efficiently
 //! - **Attributes**: [`crate::metadata::tables::field::FieldAttributes`] module with field characteristic constants
 //!
 //! # Integration
 //!
-//! - Raw entries are processed by [`crate::metadata::tables::field::loader::FieldLoader`] during metadata loading
+//! - Raw entries are processed by [`crate::metadata::loader::tables::FieldLoader`] during metadata loading
 //! - Integrates with [`crate::metadata::streams::Strings`] for name resolution and [`crate::metadata::streams::Blob`] for signature parsing
 //! - References type definitions through field ownership relationships
 //!
@@ -52,17 +52,15 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::metadata::token::Token;
+use crate::{metadata::token::Token, utils::LazyList};
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 
@@ -77,8 +75,9 @@ pub type FieldMap = SkipMap<Token, FieldRc>;
 ///
 /// Provides a growable collection of Field entries with thread-safe append
 /// operations. Used for collecting entries during parallel processing phases
-/// of metadata loading.
-pub type FieldList = Arc<boxcar::Vec<FieldRc>>;
+/// of metadata loading. A list allocates its storage on its first push: a type reference
+/// or a constructed type holds none.
+pub type FieldList = LazyList<FieldRc>;
 
 /// Reference-counted pointer to a Field entry
 ///

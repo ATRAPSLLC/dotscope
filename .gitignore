@@ -6,3 +6,4 @@ dotscope/fuzz/coverage/*
 fuzz-*.log
 .DS_Store
 lcov.info
+*.gguf

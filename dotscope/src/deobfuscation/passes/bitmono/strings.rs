@@ -24,6 +24,7 @@
 //! 3. Derive AES key material per `(salt_token, key_token)` pair via PBKDF2
 //! 4. Decrypt the encrypted field's FieldRVA data using AES-256-CBC
 //! 5. Replace `Call` with `Const(DecryptedString(...))` and NOP the `LoadStaticField`s
+//!    nothing else reads
 //!
 //! # Example
 //!
@@ -47,7 +48,7 @@ use std::{
 };
 
 use crate::{
-    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     deobfuscation::{
         techniques::BitMonoStringFindings,
@@ -89,6 +90,8 @@ pub struct StringDecryptionPass {
     string_cache: Mutex<HashMap<Token, String>>,
     /// Crypto parameters extracted from the decryptor method's SSA.
     crypto_params: CryptoParameters,
+    /// The most PRF invocations one key derivation may take, 0 for no bound.
+    max_work: u64,
 }
 
 impl StringDecryptionPass {
@@ -98,10 +101,13 @@ impl StringDecryptionPass {
     ///
     /// * `findings` - Detection findings containing decryptor method tokens.
     /// * `crypto_params` - PBKDF2/AES parameters extracted from the decryptor SSA.
+    /// * `max_work` - The most PRF invocations one key derivation may take, 0 for no bound
+    ///   (the parameters are constants of an attacker-supplied method body).
     #[must_use]
     pub fn from_findings(
         findings: &BitMonoStringFindings,
         crypto_params: CryptoParameters,
+        max_work: u64,
     ) -> Self {
         let decryptor_tokens = findings.decryptor_tokens.iter().copied().collect();
         Self {
@@ -110,6 +116,7 @@ impl StringDecryptionPass {
             key_cache: Mutex::new(HashMap::new()),
             string_cache: Mutex::new(HashMap::new()),
             crypto_params,
+            max_work,
         }
     }
 
@@ -135,7 +142,7 @@ impl StringDecryptionPass {
 
         let salt_bytes = get_field_rva_data(assembly, salt_token.row(), field_rva_map)?;
         let key_bytes = get_field_rva_data(assembly, key_token.row(), field_rva_map)?;
-        let derived = derive_key_iv(&key_bytes, &salt_bytes, &self.crypto_params)?;
+        let derived = derive_key_iv(&key_bytes, &salt_bytes, &self.crypto_params, self.max_work)?;
 
         self.key_cache
             .lock()
@@ -211,6 +218,7 @@ impl SsaPass<CilTarget, CompilerContext> for StringDecryptionPass {
         let ctx = host;
         let method_token = method.0;
         let mut changed = false;
+        let mut field_loads: Vec<(usize, usize)> = Vec::new();
 
         // Build LoadStaticField index once for the entire method
         let ldsfld_index = build_ldsfld_index(ssa);
@@ -260,14 +268,9 @@ impl SsaPass<CilTarget, CompilerContext> for StringDecryptionPass {
                     }
                 }
 
-                // NOP the LoadStaticField instructions (may be in different blocks)
-                for &(ldsfld_block, ldsfld_idx) in ldsfld_locations {
-                    if let Some(block) = ssa.block_mut(ldsfld_block) {
-                        if let Some(instr) = block.instruction_mut(ldsfld_idx) {
-                            instr.set_op(SsaOp::Nop);
-                        }
-                    }
-                }
+                // The LoadStaticField instructions (may be in different
+                // blocks) go once nothing reads them.
+                field_loads.extend(ldsfld_locations.iter().copied());
                 changed = true;
             }
 
@@ -280,6 +283,11 @@ impl SsaPass<CilTarget, CompilerContext> for StringDecryptionPass {
                     block_idx,
                 ));
         }
+
+        // A field load another call still reads stays: a site whose decryption
+        // failed, or one sharing the salt or key load with a site that
+        // succeeded.
+        ssa.remove_unread_instructions(field_loads);
 
         Ok(changed)
     }
@@ -318,7 +326,7 @@ fn build_ldsfld_index(ssa: &SsaFunction) -> LdsfldIndex {
     let mut index = HashMap::new();
     for (block_idx, block) in ssa.blocks().iter().enumerate() {
         for (instr_idx, instr) in block.instructions().iter().enumerate() {
-            if let SsaOp::LoadStaticField { dest, field } = instr.op() {
+            if let SsaOp::LoadStaticField { dest, field, .. } = instr.op() {
                 index.insert(*dest, (block_idx, instr_idx, field.token()));
             }
         }
@@ -345,12 +353,11 @@ fn find_decryption_sites(
 
     for (i, instr) in block.instructions().iter().enumerate() {
         // Look for Call to a decryptor method
-        let (call_dest, call_token, args) = match instr.op() {
-            SsaOp::Call { dest, method, args } => {
-                let Some(d) = dest else { continue };
-                (*d, method.token(), args.clone())
-            }
-            _ => continue,
+        let Some((call_token, call)) = instr.op().method_call() else {
+            continue;
+        };
+        let (Some(call_dest), args) = (call.dest, call.args.clone()) else {
+            continue;
         };
 
         if !decryptor_tokens.contains(&call_token) {
@@ -458,10 +465,10 @@ fn get_field_rva_data(
         Error::Deobfuscation(format!("No FieldRVA entry for field RID 0x{:X}", field_rid))
     })?;
 
-    let file = assembly.file();
-    let offset = file.rva_to_offset(*rva as usize)?;
-    let data = file.data_slice(offset, *size)?;
-    Ok(data.to_vec())
+    Ok(assembly
+        .file()
+        .rva_slice(*rva as usize, *size)?
+        .into_owned())
 }
 
 /// Decrypts a single encrypted string using AES-256-CBC with PKCS7 padding.
@@ -471,9 +478,9 @@ fn decrypt_string(encrypted: &[u8], key: &[u8], iv: &[u8]) -> Result<String> {
     }
 
     let decrypted =
-        apply_crypto_transform("AES", key, iv, false, encrypted, 1, 2).ok_or_else(|| {
+        apply_crypto_transform("AES", key, iv, false, encrypted, 1, 2).map_err(|failure| {
             Error::Deobfuscation(format!(
-                "AES-256-CBC decryption failed for {} bytes",
+                "AES-256-CBC decryption failed for {} bytes: {failure}",
                 encrypted.len()
             ))
         })?;
@@ -501,8 +508,127 @@ fn decrypt_string(encrypted: &[u8], key: &[u8], iv: &[u8]) -> Result<String> {
 
 #[cfg(all(test, feature = "legacy-crypto"))]
 mod tests {
-    use super::decrypt_string;
-    use crate::utils::{apply_crypto_transform, derive_key_iv, CryptoParameters};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        analysis::{
+            AccessQualifiers, CallGraph, Callee, FieldRef, SsaFunctionBuilder, SsaInstruction,
+            SsaType,
+        },
+        testkit::{helpers::test_assembly_arc, passes::run_verified},
+    };
+
+    /// A site whose decryption fails keeps the salt and key loads it shares
+    /// with a site that succeeded; the successful site's own load goes.
+    #[test]
+    fn test_shared_field_loads_stay_while_read() {
+        let decryptor = Token::new(0x0600_0002);
+        let field = |row: u32| FieldRef::new(Token::new(0x0400_7000 | row));
+        let mut ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                let loads: Vec<SsaVarId> = (0..4).map(|_| f.var()).collect();
+                f.block(0, |b| {
+                    for (row, &dest) in (1..).zip(&loads[..3]) {
+                        b.op_typed(
+                            SsaOp::LoadStaticField {
+                                dest,
+                                field: field(row),
+                                access: AccessQualifiers::FLAT,
+                            },
+                            SsaType::Object,
+                        );
+                    }
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(decryptor)),
+                        &loads[..3],
+                        SsaType::String,
+                    );
+                    b.op_typed(
+                        SsaOp::LoadStaticField {
+                            dest: loads[3],
+                            field: field(4),
+                            access: AccessQualifiers::FLAT,
+                        },
+                        SsaType::Object,
+                    );
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(decryptor)),
+                        &[loads[3], loads[1], loads[2]],
+                        SsaType::String,
+                    );
+                    b.ret();
+                });
+            })
+            .unwrap();
+        let pass = StringDecryptionPass {
+            decryptor_tokens: HashSet::from([decryptor]),
+            field_rva_map: OnceLock::new(),
+            key_cache: Mutex::new(HashMap::new()),
+            // Only the first site's field decrypts; the second has no data.
+            string_cache: Mutex::new(HashMap::from([(
+                Token::new(0x0400_7001),
+                "Hello".to_string(),
+            )])),
+            crypto_params: CryptoParameters::default(),
+            max_work: 0,
+        };
+        let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
+        ctx.set_assembly(test_assembly_arc());
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::new(Token::new(0x0600_0001)),
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(changed, "the first site decrypts");
+        let ops: Vec<&SsaOp> = ssa
+            .block(0)
+            .unwrap()
+            .instructions()
+            .iter()
+            .map(SsaInstruction::op)
+            .collect();
+        let loaded: Vec<FieldRef> = ops
+            .iter()
+            .filter_map(|op| match op {
+                SsaOp::LoadStaticField { field, .. } => Some(*field),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loaded,
+            [field(2), field(3), field(4)],
+            "the first site's own load goes; the salt and key loads the failed site reads stay"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                SsaOp::Const {
+                    value: ConstValue::DecryptedString(_),
+                    ..
+                }
+            )),
+            "the first site's call is its string"
+        );
+        assert_eq!(
+            ops.iter().filter(|op| matches!(op, SsaOp::Call(_))).count(),
+            1,
+            "the failed site is untouched"
+        );
+    }
+
+    /// A derivation past the budget is refused before any of it is done: its parameters are
+    /// constants of an attacker-supplied body.
+    #[test]
+    fn a_key_derivation_past_the_budget_is_refused() {
+        // SHA-1, 48 bytes: three blocks of 1000 iterations
+        let params = CryptoParameters::default();
+        assert!(derive_key_iv(&[0; 8], &[0; 8], &params, 3000).is_ok());
+        assert!(derive_key_iv(&[0; 8], &[0; 8], &params, 2999).is_err());
+    }
 
     #[test]
     fn test_derive_key_iv_zeros() {
@@ -511,13 +637,13 @@ mod tests {
         let key = [0u8; 8];
 
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         assert_eq!(aes_key.len(), 32, "AES-256 key should be 32 bytes");
         assert_eq!(aes_iv.len(), 16, "AES IV should be 16 bytes");
 
         // Verify deterministic output with all-zero inputs
-        let (aes_key2, aes_iv2) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key2, aes_iv2) = derive_key_iv(&key, &salt, &params, 0).unwrap();
         assert_eq!(aes_key, aes_key2, "Key derivation should be deterministic");
         assert_eq!(aes_iv, aes_iv2, "IV derivation should be deterministic");
     }
@@ -527,7 +653,7 @@ mod tests {
         let salt = [0u8; 8];
         let key = [0u8; 8];
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         // Encrypt a test string using the shared crypto utility
         let original = "Hello, BitMono!";
@@ -545,7 +671,7 @@ mod tests {
         let salt = [0u8; 8];
         let key = [0u8; 8];
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         let result = decrypt_string(&[], &aes_key, &aes_iv).unwrap();
         assert_eq!(result, "");
@@ -556,7 +682,7 @@ mod tests {
         let salt = [0u8; 8];
         let key = [0u8; 8];
         let params = CryptoParameters::default();
-        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params).unwrap();
+        let (aes_key, aes_iv) = derive_key_iv(&key, &salt, &params, 0).unwrap();
 
         // Non-multiple-of-16 data should fail
         let result = decrypt_string(&[1, 2, 3], &aes_key, &aes_iv);

@@ -15,7 +15,7 @@
 //! # Components
 //! - [`crate::metadata::tables::fieldptr::raw::FieldPtrRaw`]: Raw field pointer data read directly from metadata tables
 //! - [`crate::metadata::tables::fieldptr::owned::FieldPtr`]: Owned field pointer data with resolved references
-//! - [`crate::metadata::tables::fieldptr::loader::FieldPtrLoader`]: Processes and loads field pointer metadata
+//! - [`crate::metadata::loader::tables::FieldPtrLoader`]: Processes and loads field pointer metadata
 //! - [`crate::metadata::tables::fieldptr::FieldPtrMap`]: Thread-safe collection of field pointers indexed by token
 //! - [`crate::metadata::tables::fieldptr::FieldPtrList`]: Vector-based collection of field pointers
 //! - [`crate::metadata::tables::fieldptr::FieldPtrRc`]: Reference-counted field pointer for shared ownership
@@ -49,14 +49,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

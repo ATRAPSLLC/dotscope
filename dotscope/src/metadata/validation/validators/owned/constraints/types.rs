@@ -76,7 +76,7 @@ use std::collections::HashSet;
 
 use crate::{
     metadata::{
-        tables::GenericParamAttributes,
+        tables::{GenericParamAttributes, TableId},
         typesystem::{CilFlavor, CilType},
         validation::{
             context::{OwnedValidationContext, ValidationContext},
@@ -176,12 +176,10 @@ impl OwnedTypeConstraintValidator {
             for (_, constraint_ref) in generic_param.constraints.iter() {
                 if let Some(constraint_type) = constraint_ref.upgrade() {
                     // Check for circular constraint references
-                    let constraint_name = constraint_type.fullname();
-                    if visited_constraints.contains(&constraint_name) {
+                    if !visited_constraints.insert(constraint_type.fullname().text_hash()) {
                         // Allow multiple identical constraints (common pattern)
                         continue;
                     }
-                    visited_constraints.insert(constraint_name.clone());
 
                     // Validate constraint type accessibility
                     if constraint_type.name.is_empty() {
@@ -257,19 +255,9 @@ impl OwnedTypeConstraintValidator {
                 Ok(())
             }
             CilFlavor::ValueType => {
-                // Value types can be constraints in some cases
-                // Allow System value types and enums
-                let type_name = constraint_type.fullname();
-                if type_name.starts_with("System.")
-                    || &*type_name == "System.ValueType"
-                    || &*type_name == "System.Enum"
-                {
-                    Ok(())
-                } else {
-                    // Custom value types as constraints might be questionable
-                    // But allow them for now as they can be used in some scenarios
-                    Ok(())
-                }
+                // A value type is a valid constraint (ECMA-335 II.10.1.7 places no limit on
+                // the constraint's kind beyond its being a type)
+                Ok(())
             }
             CilFlavor::Object => {
                 // System.Object is a valid constraint
@@ -363,11 +351,6 @@ impl OwnedTypeConstraintValidator {
     ) -> Result<()> {
         // For each type, check if it properly satisfies constraints when used as a generic argument
         for type_entry in context.all_types() {
-            // Check base type constraint satisfaction
-            if let Some(base_type) = type_entry.base() {
-                Self::validate_inheritance_constraints(type_entry, &base_type);
-            }
-
             // Check interface implementation constraint satisfaction
             for (_, entry) in type_entry.interfaces.iter() {
                 if let Some(interface_type) = entry.interface.upgrade() {
@@ -377,33 +360,6 @@ impl OwnedTypeConstraintValidator {
         }
 
         Ok(())
-    }
-
-    /// Validates inheritance constraints between a derived type and its base type.
-    ///
-    /// # Arguments
-    ///
-    /// * `derived_type` - The type inheriting from the base
-    /// * `base_type` - The base type being inherited from
-    ///
-    /// # Returns
-    ///
-    /// Validates inheritance constraints.
-    fn validate_inheritance_constraints(derived_type: &CilType, base_type: &CilType) {
-        // Skip validation for System types and special relationships
-        let derived_fullname = derived_type.fullname();
-        let base_fullname = base_type.fullname();
-
-        if derived_fullname.starts_with("System.") || base_fullname.starts_with("System.") {
-            return;
-        }
-
-        // For generic types, verify that constraint satisfaction is maintained
-        if derived_type.generic_params.count() > 0 || base_type.generic_params.count() > 0 {
-            // Simplified constraint validation - in a full implementation,
-            // this would check that all generic constraints are properly satisfied
-            // through the inheritance relationship
-        }
     }
 
     /// Validates interface implementation constraint satisfaction.
@@ -421,26 +377,18 @@ impl OwnedTypeConstraintValidator {
         implementing_type: &CilType,
         interface_type: &CilType,
     ) -> Result<()> {
-        // Skip validation for System interfaces
-        let interface_fullname = interface_type.fullname();
-        if interface_fullname.starts_with("System.") {
-            return Ok(());
-        }
-
-        // Validate that the interface is actually an interface
-        if !interface_type.flags.is_interface() {
-            // Allow for external interfaces that might not have correct flags
-            let is_likely_interface =
-                interface_fullname.contains(".I") || interface_fullname.starts_with('I');
-            if !is_likely_interface {
-                return Err(Error::ValidationOwnedFailed {
-                    validator: self.name().to_string(),
-                    message: format!(
-                        "Type '{}' implements non-interface type '{}'",
-                        implementing_type.name, interface_type.name
-                    ),
-                });
-            }
+        // ECMA-335 II.22.23: an InterfaceImpl's Interface is an interface, and the runtime
+        // refuses a class implementing anything else. Only a definition's flags say what it
+        // is: a TypeRef that resolved to no definition, or a constructed TypeSpec, carries
+        // none, so only a TypeDef is judged.
+        if interface_type.token.is_table(TableId::TypeDef) && !interface_type.flags.is_interface() {
+            return Err(Error::ValidationOwnedFailed {
+                validator: self.name().to_string(),
+                message: format!(
+                    "Type '{}' implements non-interface type '{}'",
+                    implementing_type.name, interface_type.name
+                ),
+            });
         }
 
         Ok(())
@@ -475,12 +423,11 @@ impl Default for OwnedTypeConstraintValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::constraints_types::owned_type_constraint_validator_file_factory,
             owned_validator_test,
         },
@@ -492,14 +439,12 @@ mod tests {
     /// and assemblies with constraint violations (when available) using the centralized
     /// owned validator test harness.
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_type_constraint_validator_comprehensive() -> Result<()> {
         let validator = OwnedTypeConstraintValidator::new();
 
         owned_validator_test(
             owned_type_constraint_validator_file_factory,
             "OwnedTypeConstraintValidator",
-            "", // Accept any error type since metadata resolution errors vary
             ValidationConfig {
                 enable_semantic_validation: true,
                 ..Default::default()

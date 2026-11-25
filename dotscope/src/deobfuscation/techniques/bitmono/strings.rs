@@ -54,7 +54,7 @@ use std::{
 #[cfg(feature = "legacy-crypto")]
 use crate::deobfuscation::passes::bitmono::StringDecryptionPass;
 use crate::{
-    analysis::{CilTarget, ConstValue, SsaFunction, SsaOp, SsaVarId},
+    analysis::{Callee, CilTarget, ConstValue, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     cilassembly::CleanupRequest,
     compiler::{CompilerContext, PassPhase, SsaPass},
     deobfuscation::{
@@ -67,7 +67,7 @@ use crate::{
         tables::{MemberRefRaw, MetadataTable, RowReadable, TableId, TypeDefRaw, TypeRefRaw},
         token::Token,
     },
-    utils::{CryptoParameters, MAX_DERIVED_KEY_LEN, MAX_PBKDF2_ITERATIONS},
+    utils::CryptoParameters,
     CilObject,
 };
 
@@ -185,10 +185,10 @@ impl Technique for BitMonoStrings {
             let ssa = entry.value();
             for block in ssa.blocks() {
                 for instr in block.instructions() {
-                    let (call_token, args) = match instr.op() {
-                        SsaOp::Call { method, args, .. } => (method.token(), args),
-                        _ => continue,
+                    let Some((call_token, call)) = instr.op().method_call() else {
+                        continue;
                     };
+                    let args = &call.args;
                     if !decryptor_set.contains(&call_token) {
                         continue;
                     }
@@ -243,16 +243,18 @@ impl Technique for BitMonoStrings {
     #[cfg(feature = "legacy-crypto")]
     fn create_pass(
         &self,
-        _ctx: &AnalysisContext,
+        ctx: &AnalysisContext,
         detection: &Detection,
         _assembly: &Arc<CilObject>,
     ) -> Vec<Box<dyn SsaPass<CilTarget, CompilerContext>>> {
         let Some(findings) = detection.findings::<StringFindings>() else {
             return Vec::new();
         };
+        // The key derivation is held to what emulating the decryptor's own call could spend
         vec![Box::new(StringDecryptionPass::from_findings(
             findings,
             findings.crypto_params.clone(),
+            ctx.config.emulation.limits.max_instructions,
         ))]
     }
 
@@ -387,8 +389,10 @@ fn has_crypto_ops(ssa: &SsaFunction, assembly: &CilObject) -> bool {
         for instr in block.instructions() {
             let token = match instr.op() {
                 SsaOp::NewObj { ctor, .. } => ctor.token(),
-                SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => method.token(),
-                _ => continue,
+                op => match op.method_call() {
+                    Some((token, _)) => token,
+                    None => continue,
+                },
             };
 
             if let Some(name) = resolve_type_name(assembly, token) {
@@ -414,7 +418,7 @@ fn has_crypto_ops(ssa: &SsaFunction, assembly: &CilObject) -> bool {
 /// Scans the SSA for:
 /// 1. `NewObj { ctor: Rfc2898DeriveBytes::.ctor, args: [..., iterations] }` to get
 ///    the PBKDF2 iteration count
-/// 2. `CallVirt { method: GetBytes, args: [_, size] }` to get key and IV sizes
+/// 2. a virtual call of `GetBytes` with `args: [_, size]` to get key and IV sizes
 ///
 /// Falls back to [`CryptoParameters::default()`] for any parameter that cannot
 /// be resolved from the SSA.
@@ -448,9 +452,14 @@ fn extract_crypto_parameters(ssa: &SsaFunction, assembly: &CilObject) -> CryptoP
                         }
                     }
                 }
-                // CallVirt GetBytes(int32) — extract key and IV sizes
-                SsaOp::CallVirt { method, args, .. } => {
-                    if let Some(name) = assembly.resolve_method_name(method.token()) {
+                // callvirt GetBytes(int32) — extract key and IV sizes
+                SsaOp::Call(call) if matches!(call.callee, Callee::Virtual(_)) => {
+                    let args = &call.args;
+                    let name = call
+                        .callee
+                        .method()
+                        .and_then(|method| assembly.resolve_method_name(method.token()));
+                    if let Some(name) = name {
                         if name == "GetBytes" && args.len() == 2 {
                             // args[0] = this (Rfc2898DeriveBytes instance), args[1] = size
                             if let Some(ConstValue::I32(size)) =
@@ -474,17 +483,6 @@ fn extract_crypto_parameters(ssa: &SsaFunction, assembly: &CilObject) -> CryptoP
     }
     if let Some(&iv_size) = get_bytes_sizes.get(1) {
         params.iv_size = iv_size as usize;
-    }
-
-    // Defence in depth. `derive_pbkdf2_key` enforces these ceilings too and is the guard that
-    // matters, but everything above is lifted verbatim from constants in an attacker-supplied
-    // method body, so an implausible value here means the detection misfired rather than that a
-    // real decryptor wants a 2 GB key. Falling back to the .NET defaults keeps the pass working
-    // on the samples it was written for instead of failing the whole assembly.
-    if params.iterations > MAX_PBKDF2_ITERATIONS
-        || params.key_size.saturating_add(params.iv_size) > MAX_DERIVED_KEY_LEN
-    {
-        return CryptoParameters::default();
     }
 
     params
@@ -522,7 +520,7 @@ fn build_const_map(ssa: &SsaFunction) -> HashMap<SsaVarId, ConstValue> {
 fn resolve_ldsfld_field(ssa: &SsaFunction, var_id: SsaVarId) -> Option<Token> {
     for block in ssa.blocks() {
         for instr in block.instructions() {
-            if let SsaOp::LoadStaticField { dest, field } = instr.op() {
+            if let SsaOp::LoadStaticField { dest, field, .. } = instr.op() {
                 if *dest == var_id {
                     return Some(field.token());
                 }
@@ -588,16 +586,16 @@ fn resolve_type_name(assembly: &CilObject, token: Token) -> Option<String> {
 mod tests {
     use crate::{
         deobfuscation::techniques::{bitmono::BitMonoStrings, Technique},
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     /// Verify that IL-level detect() is a no-op (detection is SSA-based).
     ///
     /// Positive detection is tested through the full pipeline in
-    /// `dotscope/tests/bitmono.rs::test_all_bitmono_samples`.
+    /// `full::bitmono::test_all_bitmono_samples` (`dotscope/tests/it/full/bitmono.rs`).
     #[test]
     fn test_detect_is_noop() {
-        let assembly = load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_strings.exe");
+        let assembly = load_sample("packers/bitmono/0.39.0/bitmono_strings.exe");
         let technique = BitMonoStrings;
         let detection = technique.detect(&assembly);
         assert!(
@@ -608,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
         let technique = BitMonoStrings;
         let detection = technique.detect(&assembly);
         assert!(

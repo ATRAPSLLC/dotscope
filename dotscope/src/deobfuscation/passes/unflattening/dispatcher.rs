@@ -14,7 +14,7 @@
 //! This module provides representations for all these patterns and analysis
 //! functions to classify them.
 
-use crate::analysis::{SsaFunction, SsaOp, SsaVarId};
+use crate::analysis::{InstrId, SsaFunction, SsaOp, SsaVarId};
 
 /// A detected CFF dispatcher with all its metadata.
 ///
@@ -40,6 +40,15 @@ pub struct Dispatcher {
     /// Optimization passes may remove the `ldc.i4; stloc` that set this value,
     /// so it's captured during detection when the SSA is still complete.
     pub initial_state: Option<i64>,
+    /// Identity of the switch instruction this dispatcher was detected on.
+    ///
+    /// Detection runs in an earlier phase than the pass that uses the result,
+    /// and everything in between - pruning, block merging, reconstruction -
+    /// renumbers blocks. [`Self::block`] is therefore a position that expires,
+    /// while an [`InstrId`] names the same instruction wherever it ends up.
+    /// `None` for a dispatcher built before ids were assigned, which falls
+    /// back to the recorded index.
+    pub switch_instr: Option<InstrId>,
 }
 
 impl Dispatcher {
@@ -55,7 +64,19 @@ impl Dispatcher {
             transform: StateTransform::Identity,
             confidence: 0.0,
             initial_state: None,
+            switch_instr: None,
         }
+    }
+
+    /// Records which instruction the dispatcher switch is.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Identity of the switch instruction.
+    #[must_use]
+    pub fn with_switch_instr(mut self, id: InstrId) -> Self {
+        self.switch_instr = Some(id);
+        self
     }
 
     /// Sets the state phi variable
@@ -127,54 +148,49 @@ impl Dispatcher {
         self.cases.get(index).copied().unwrap_or(self.default)
     }
 
-    /// Refreshes variable IDs against the current SSA.
+    /// Re-reads the dispatcher out of the current SSA.
     ///
-    /// Earlier passes (opaque field predicates, etc.) trigger `rebuild_ssa()` which
-    /// reindexes variables, making the original `SsaVarId` values stale. This method
-    /// keeps the stable structural data (block indices, transform, confidence) and
-    /// re-derives `switch_var` and `state_phi` from the current SSA block.
+    /// Detection runs in its own phase, and by the time the pass consumes the
+    /// result the function has been through pruning, block merging and one or
+    /// more reconstructions. Everything recorded as an index - the dispatcher
+    /// block, its cases, its default - names a position that may now hold a
+    /// different block, and every `SsaVarId` has been re-minted.
     ///
-    /// Returns `None` if the dispatcher block no longer contains a valid switch.
+    /// So only the switch's identity is carried across, and everything else is
+    /// read back off the instruction it names: the block it now sits in, the
+    /// targets it now has, and the variable it now switches on. Filtering stale
+    /// indices for being out of range, as this did before, keeps whichever ones
+    /// happen to still be in range while silently dropping the rest - it cannot
+    /// tell a case that moved from a case that went away.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The current state of the function.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the switch is gone, which is what an earlier pass having
+    /// already resolved the dispatch looks like.
     #[must_use]
     pub fn refresh(&self, ssa: &SsaFunction) -> Option<Self> {
-        let block_count = ssa.block_count();
-        if self.block >= block_count {
+        let (block_idx, instr_idx) = self.locate(ssa)?;
+        let SsaOp::Switch {
+            value,
+            targets,
+            default,
+        } = ssa.block(block_idx)?.instructions().get(instr_idx)?.op()
+        else {
             return None;
+        };
+
+        let mut refreshed = Self::new(block_idx, *value, targets.clone(), *default);
+        if let Some(id) = self.switch_instr {
+            refreshed = refreshed.with_switch_instr(id);
         }
-        let block = ssa.block(self.block)?;
-
-        // Find the Switch instruction to get the current switch_var
-        let switch_var = block
-            .instructions()
-            .iter()
-            .find_map(|instr| match instr.op() {
-                SsaOp::Switch { value, .. } => Some(*value),
-                _ => None,
-            })?;
-
-        // Find the state phi: the phi whose result feeds into the switch value
-        // through the dispatcher's state-transform chain. Reuse the IR's
-        // backward tracer (which follows arithmetic/bitwise/unary state
-        // transforms) rather than an ad-hoc, fixed-depth, first-operand walk —
-        // the latter capped at 5 steps and ignored `neg`/`not`, missing the
-        // state phi behind ConfuserEx "expression" wrappers like `-(!!state)`.
-        let state_phi = ssa.trace_to_phi(switch_var, Some(self.block));
-
-        let mut refreshed = Self::new(
-            self.block,
-            switch_var,
-            self.cases
-                .iter()
-                .copied()
-                .filter(|&c| c < block_count)
-                .collect(),
-            if self.default < block_count {
-                self.default
-            } else {
-                self.block
-            },
-        );
-        if let Some(phi) = state_phi {
+        // The phi feeding the switch, found through the IR's backward tracer so
+        // that an encoded dispatcher - `(state ^ key) % n` - resolves to the
+        // same phi a plain one does.
+        if let Some(phi) = ssa.trace_to_phi(*value) {
             refreshed = refreshed.with_state_phi(phi);
         }
         refreshed = refreshed
@@ -185,6 +201,27 @@ impl Dispatcher {
         }
 
         Some(refreshed)
+    }
+
+    /// Where the dispatcher switch is now.
+    ///
+    /// By identity when one was recorded. Without it there is nothing to look
+    /// for but the recorded position, and the first switch in that block is the
+    /// best guess available - which is what every dispatcher used to rely on.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The current state of the function.
+    fn locate(&self, ssa: &SsaFunction) -> Option<(usize, usize)> {
+        if let Some(id) = self.switch_instr {
+            return ssa.locate_instruction(id);
+        }
+        let block = ssa.block(self.block)?;
+        let instr_idx = block
+            .instructions()
+            .iter()
+            .position(|instr| matches!(instr.op(), SsaOp::Switch { .. }))?;
+        Some((self.block, instr_idx))
     }
 
     /// Converts to DispatcherInfo for compatibility.

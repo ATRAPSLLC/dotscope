@@ -15,7 +15,7 @@
 //! # Components
 //! - [`crate::metadata::tables::fieldmarshal::raw::FieldMarshalRaw`]: Raw field marshal data read directly from metadata tables
 //! - [`crate::metadata::tables::fieldmarshal::owned::FieldMarshal`]: Owned field marshal data with resolved references
-//! - [`crate::metadata::tables::fieldmarshal::loader::FieldMarshalLoader`]: Processes and loads field marshal metadata
+//! - [`crate::metadata::loader::tables::FieldMarshalLoader`]: Processes and loads field marshal metadata
 //! - [`crate::metadata::tables::fieldmarshal::FieldMarshalMap`]: Thread-safe collection of field marshals indexed by token
 //! - [`crate::metadata::tables::fieldmarshal::FieldMarshalList`]: Vector-based collection of field marshals
 //! - [`crate::metadata::tables::fieldmarshal::FieldMarshalRc`]: Reference-counted field marshal for shared ownership
@@ -52,14 +52,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

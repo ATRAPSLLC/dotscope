@@ -44,11 +44,9 @@
 //! ```
 
 use std::{
-    collections::HashSet,
-    sync::atomic::{AtomicBool, Ordering},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::{Arc, OnceLock},
 };
-
-use dashmap::{mapref::entry::Entry, DashMap};
 
 use crate::{
     metadata::{
@@ -56,6 +54,8 @@ use crate::{
             native::NativeImports, Import, ImportRc, ImportSourceId, ImportType,
             Imports as CilImports,
         },
+        streams::SharedStr,
+        tables::ModuleRefRc,
         token::Token,
     },
     Result,
@@ -73,7 +73,8 @@ use crate::{
 /// All operations are thread-safe using interior mutability:
 /// - CIL imports use existing concurrent data structures
 /// - Native imports are thread-safe by design
-/// - Unified caches use atomic coordination
+/// - The unified views are built once, by the first reader, and rebuilt after a change
+///   to the native imports
 ///
 /// # Performance
 ///
@@ -88,14 +89,82 @@ pub struct UnifiedImportContainer {
     /// Native PE imports (new implementation)
     native: NativeImports,
 
-    /// Cached unified view by name (lazy-populated)
-    unified_name_cache: DashMap<String, Vec<ImportEntry>>,
+    /// The unified views, built on first use
+    unified: OnceLock<Unified>,
+}
 
-    /// Cached unified DLL dependencies (lazy-populated)
-    unified_dll_cache: DashMap<String, DllSource>,
+/// The unified views of both import sources.
+#[derive(Default)]
+struct Unified {
+    /// Imports by name
+    by_name: HashMap<SharedStr, Vec<ImportEntry>>,
+    /// The DLLs imported from, by their name lower-cased: the Windows loader compares DLL
+    /// names ignoring case, so `KERNEL32.dll` and `kernel32.dll` are one DLL. Ordered, so the
+    /// DLLs are listed in the same order on every run.
+    by_dll: BTreeMap<Caseless, DllEntry>,
+}
 
-    /// Flag indicating unified caches need rebuilding
-    cache_dirty: AtomicBool,
+/// A name compared, hashed and ordered ignoring ASCII case, as the Windows loader compares
+/// DLL names and import names, without a lower-cased copy of it.
+#[derive(Clone)]
+struct Caseless(SharedStr);
+
+impl Caseless {
+    /// The name's bytes, lower-cased.
+    fn lowered(&self) -> impl Iterator<Item = u8> + '_ {
+        self.0.bytes().map(|byte| byte.to_ascii_lowercase())
+    }
+}
+
+impl PartialEq for Caseless {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl Eq for Caseless {}
+
+impl std::hash::Hash for Caseless {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for byte in self.lowered() {
+            state.write_u8(byte);
+        }
+        state.write_u8(0xFF);
+    }
+}
+
+impl PartialOrd for Caseless {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Caseless {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.lowered().cmp(other.lowered())
+    }
+}
+
+/// One DLL of the unified view.
+struct DllEntry {
+    /// The DLL's name as the first import naming it spells it
+    name: SharedStr,
+    /// Which import sources use the DLL
+    source: DllSource,
+    /// The functions imported from it by either source, each spelling once; a native
+    /// function imported by ordinal is `#ordinal`
+    functions: BTreeSet<SharedStr>,
+}
+
+impl DllEntry {
+    /// An entry for a DLL first seen spelled `name`, used by `source`.
+    fn new(name: SharedStr, source: DllSource) -> Self {
+        Self {
+            name,
+            source,
+            functions: BTreeSet::new(),
+        }
+    }
 }
 
 /// Unified import entry that can represent either CIL or native imports.
@@ -110,8 +179,8 @@ pub enum ImportEntry {
 /// Reference to a native import function.
 #[derive(Clone, Debug)]
 pub struct NativeImportRef {
-    /// DLL name containing the function
-    pub dll_name: String,
+    /// DLL name containing the function, the string its descriptor's imports share
+    pub dll_name: Arc<str>,
     /// Function name (if imported by name)
     pub function_name: Option<String>,
     /// Function ordinal (if imported by ordinal)
@@ -135,11 +204,11 @@ pub enum DllSource {
 #[derive(Clone, Debug)]
 pub struct DllDependency {
     /// DLL name
-    pub name: String,
+    pub name: SharedStr,
     /// Source of the dependency
     pub source: DllSource,
     /// All functions imported from this DLL
-    pub functions: Vec<String>,
+    pub functions: Vec<SharedStr>,
 }
 
 impl Clone for UnifiedImportContainer {
@@ -147,9 +216,7 @@ impl Clone for UnifiedImportContainer {
         Self {
             cil: self.cil.clone(),
             native: self.native.clone(),
-            unified_name_cache: DashMap::new(), // Reset cache on clone
-            unified_dll_cache: DashMap::new(),  // Reset cache on clone
-            cache_dirty: AtomicBool::new(true), // Mark cache as dirty
+            unified: OnceLock::new(),
         }
     }
 }
@@ -164,9 +231,7 @@ impl UnifiedImportContainer {
         Self {
             cil: CilImports::new(),
             native: NativeImports::new(),
-            unified_name_cache: DashMap::new(),
-            unified_dll_cache: DashMap::new(),
-            cache_dirty: AtomicBool::new(true),
+            unified: OnceLock::new(),
         }
     }
 
@@ -261,13 +326,11 @@ impl UnifiedImportContainer {
     /// }
     /// ```
     pub fn find_by_name(&self, name: &str) -> Vec<ImportEntry> {
-        self.ensure_cache_fresh();
-
-        if let Some(entries) = self.unified_name_cache.get(name) {
-            entries.value().clone()
-        } else {
-            Vec::new()
-        }
+        self.unified()
+            .by_name
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get all DLL dependencies from both CIL P/Invoke and native imports.
@@ -293,17 +356,13 @@ impl UnifiedImportContainer {
     /// }
     /// ```
     pub fn get_all_dll_dependencies(&self) -> Vec<DllDependency> {
-        self.ensure_cache_fresh();
-
-        self.unified_dll_cache
-            .iter()
-            .map(|entry| {
-                let dll_name = entry.key();
-                DllDependency {
-                    name: dll_name.clone(),
-                    source: entry.value().clone(),
-                    functions: self.get_functions_for_dll(dll_name),
-                }
+        self.unified()
+            .by_dll
+            .values()
+            .map(|dll| DllDependency {
+                name: dll.name.clone(),
+                source: dll.source.clone(),
+                functions: dll.functions.iter().cloned().collect(),
             })
             .collect()
     }
@@ -321,11 +380,11 @@ impl UnifiedImportContainer {
     /// let dll_names = container.get_all_dll_names();
     /// println!("All DLL dependencies: {:?}", dll_names);
     /// ```
-    pub fn get_all_dll_names(&self) -> Vec<String> {
-        self.ensure_cache_fresh();
-        self.unified_dll_cache
-            .iter()
-            .map(|entry| entry.key().clone())
+    pub fn get_all_dll_names(&self) -> Vec<SharedStr> {
+        self.unified()
+            .by_dll
+            .values()
+            .map(|dll| dll.name.clone())
             .collect()
     }
 
@@ -446,181 +505,134 @@ impl UnifiedImportContainer {
         Ok(())
     }
 
-    /// Ensure unified caches are up to date.
-    fn ensure_cache_fresh(&self) {
-        if self.cache_dirty.load(Ordering::Relaxed) {
-            self.rebuild_unified_caches();
-            self.cache_dirty.store(false, Ordering::Relaxed);
-        }
+    /// The unified views, built by the first reader since the last change.
+    fn unified(&self) -> &Unified {
+        self.unified.get_or_init(|| self.build_unified())
     }
 
-    /// Mark unified caches as dirty (need rebuilding).
-    fn invalidate_cache(&self) {
-        self.cache_dirty.store(true, Ordering::Relaxed);
+    /// Drops the unified views after a change to the native imports.
+    fn invalidate_cache(&mut self) {
+        self.unified = OnceLock::new();
     }
 
-    /// Rebuild all unified cache structures.
-    ///
-    /// This method handles deduplication of imports when the same function
-    /// is imported via both CIL P/Invoke and native PE imports. In such cases,
-    /// we prefer the native import entry since it has concrete IAT information.
-    fn rebuild_unified_caches(&self) {
-        self.unified_name_cache.clear();
-        self.unified_dll_cache.clear();
+    /// Builds the unified views of both sources: every native import, and every CIL import
+    /// but a P/Invoke import that a native import of the same DLL and function (ignoring
+    /// case) duplicates. Each module's and each descriptor's DLL name is copied once, not
+    /// once per import from it.
+    fn build_unified(&self) -> Unified {
+        let mut unified = Unified::default();
 
-        // First pass: Build a set of native imports for deduplication
-        // Key: (dll_name_lowercase, function_name_lowercase)
-        let mut native_import_set: HashSet<(String, String)> = HashSet::new();
+        // The native imports' function names by DLL, ignoring case, for the duplicates
+        let mut native_names: HashMap<Caseless, HashSet<Caseless>> = HashMap::new();
         for descriptor in self.native.descriptors() {
-            let dll_lower = descriptor.dll_name.to_ascii_lowercase();
+            let names = native_names
+                .entry(Caseless(SharedStr::from(Arc::clone(&descriptor.dll_name))))
+                .or_default();
             for function in &descriptor.functions {
-                if let Some(ref func_name) = function.name {
-                    native_import_set.insert((dll_lower.clone(), func_name.to_ascii_lowercase()));
+                if let Some(name) = &function.name {
+                    names.insert(Caseless(SharedStr::from(name.as_str())));
                 }
             }
         }
 
-        // Populate from CIL imports, skipping those that exist as native imports
         for import_entry in &self.cil {
             let import = import_entry.value();
             let token = *import_entry.key();
-
-            // Check if this is a P/Invoke method that duplicates a native import
-            let is_duplicate = if matches!(import.import, ImportType::Method(_)) {
-                if let Some(dll_name) = Self::extract_dll_from_pinvoke_import(import, &self.cil) {
-                    let key = (
-                        dll_name.to_ascii_lowercase(),
-                        import.name.to_ascii_lowercase(),
-                    );
-                    native_import_set.contains(&key)
-                } else {
-                    false
-                }
-            } else {
-                false
+            let Some(module) = Self::pinvoke_module(import, &self.cil) else {
+                unified
+                    .by_name
+                    .entry(import.name.clone())
+                    .or_default()
+                    .push(ImportEntry::Cil(import.clone()));
+                continue;
             };
+            let dll_key = Caseless(module.name.clone());
 
-            // Add to name cache only if not a duplicate
+            let is_duplicate = native_names
+                .get(&dll_key)
+                .is_some_and(|names| names.contains(&Caseless(import.name.clone())));
             if !is_duplicate {
-                self.unified_name_cache
+                unified
+                    .by_name
                     .entry(import.name.clone())
                     .or_default()
                     .push(ImportEntry::Cil(import.clone()));
             }
 
-            // Add to DLL cache if it's a P/Invoke method import
-            if matches!(import.import, ImportType::Method(_)) {
-                if let Some(dll_name) = Self::extract_dll_from_pinvoke_import(import, &self.cil) {
-                    match self.unified_dll_cache.entry(dll_name) {
-                        Entry::Occupied(mut entry) => match entry.get_mut() {
-                            DllSource::Cil(tokens) | DllSource::Both(tokens) => tokens.push(token),
-                            DllSource::Native => {
-                                let tokens = vec![token];
-                                *entry.get_mut() = DllSource::Both(tokens);
-                            }
-                        },
-                        Entry::Vacant(entry) => {
-                            entry.insert(DllSource::Cil(vec![token]));
-                        }
+            let dll = match unified.by_dll.get_mut(&dll_key) {
+                Some(dll) => {
+                    match &mut dll.source {
+                        DllSource::Cil(tokens) | DllSource::Both(tokens) => tokens.push(token),
+                        source @ DllSource::Native => *source = DllSource::Both(vec![token]),
                     }
+                    dll
                 }
-            }
+                None => unified.by_dll.entry(dll_key).or_insert_with(|| {
+                    DllEntry::new(module.name.clone(), DllSource::Cil(vec![token]))
+                }),
+            };
+            dll.functions.insert(import.name.clone());
         }
 
-        // Populate from native imports
         for descriptor in self.native.descriptors() {
-            let dll_name = &descriptor.dll_name;
-
+            if descriptor.functions.is_empty() {
+                continue;
+            }
+            let dll_name = SharedStr::from(Arc::clone(&descriptor.dll_name));
+            let dll = unified
+                .by_dll
+                .entry(Caseless(dll_name.clone()))
+                .or_insert_with(|| DllEntry::new(dll_name, DllSource::Native));
+            if let DllSource::Cil(tokens) = &mut dll.source {
+                dll.source = DllSource::Both(std::mem::take(tokens));
+            }
             for function in &descriptor.functions {
-                if let Some(ref func_name) = function.name {
-                    self.unified_name_cache
-                        .entry(func_name.clone())
+                if let Some(name) = &function.name {
+                    let name = SharedStr::from(name.as_str());
+                    dll.functions.insert(name.clone());
+                    unified
+                        .by_name
+                        .entry(name)
                         .or_default()
                         .push(ImportEntry::Native(NativeImportRef {
-                            dll_name: dll_name.clone(),
-                            function_name: Some(func_name.clone()),
+                            dll_name: Arc::clone(&descriptor.dll_name),
+                            function_name: function.name.clone(),
                             ordinal: function.ordinal,
                             iat_rva: function.rva,
                         }));
-                }
-
-                match self.unified_dll_cache.entry(dll_name.clone()) {
-                    Entry::Occupied(mut entry) => {
-                        match entry.get() {
-                            DllSource::Cil(tokens) => {
-                                let tokens = tokens.clone();
-                                *entry.get_mut() = DllSource::Both(tokens);
-                            }
-                            DllSource::Native | DllSource::Both(_) => {
-                                // Already has native usage, no change needed
-                            }
-                        }
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert(DllSource::Native);
-                    }
+                } else if let Some(ordinal) = function.ordinal {
+                    dll.functions.insert(SharedStr::from(format!("#{ordinal}")));
                 }
             }
         }
+
+        unified
     }
 
-    /// Extract DLL name from a CIL P/Invoke import.
+    /// The module a CIL P/Invoke method import calls into, from the [`ModuleRef`] it names.
     ///
-    /// This examines the import's source information to determine if it's
-    /// a P/Invoke method import and extracts the target DLL name from the
-    /// associated [`ModuleRef`].
-    ///
-    /// # Arguments
-    /// * `import` - The CIL import to examine
-    /// * `cil_imports` - The CIL imports container for looking up module references
-    ///
-    /// # Returns
-    /// - `Some(String)` containing the DLL name if this is a P/Invoke method import
-    /// - `None` if this is not a P/Invoke import or the module reference cannot be found
-    fn extract_dll_from_pinvoke_import(
-        import: &Import,
-        cil_imports: &CilImports,
-    ) -> Option<String> {
+    /// [`ModuleRef`]: crate::metadata::tables::ModuleRef
+    fn pinvoke_module(import: &Import, cil_imports: &CilImports) -> Option<ModuleRefRc> {
         if !matches!(import.import, ImportType::Method(_)) {
             return None;
         }
-
-        if let ImportSourceId::ModuleRef(token) = import.source_id {
-            if let Some(module_ref) = cil_imports.get_module_ref(token) {
-                return Some(module_ref.name.clone());
-            }
+        match import.source_id {
+            ImportSourceId::ModuleRef(token) => cil_imports.get_module_ref(token),
+            _ => None,
         }
-
-        None
     }
 
-    /// Get all function names imported from a specific DLL.
+    /// Get all function names imported from a specific DLL, its name compared ignoring case.
     ///
-    /// Collects function names from both native PE imports and CIL P/Invoke
-    /// method imports that target the specified DLL.
+    /// Collects function names from both native PE imports and CIL P/Invoke method imports
+    /// that target the DLL, under every spelling of its name.
+    #[cfg(test)]
     fn get_functions_for_dll(&self, dll_name: &str) -> Vec<String> {
-        let mut functions = HashSet::new();
-
-        if let Some(descriptor) = self.native.get_descriptor(dll_name) {
-            for function in &descriptor.functions {
-                if let Some(ref name) = function.name {
-                    functions.insert(name.clone());
-                } else if let Some(ordinal) = function.ordinal {
-                    functions.insert(format!("#{ordinal}"));
-                }
-            }
-        }
-
-        for import_entry in &self.cil {
-            let import = import_entry.value();
-            if let Some(import_dll) = Self::extract_dll_from_pinvoke_import(import, &self.cil) {
-                if import_dll.eq_ignore_ascii_case(dll_name) {
-                    functions.insert(import.name.clone());
-                }
-            }
-        }
-
-        functions.into_iter().collect()
+        self.unified()
+            .by_dll
+            .get(&Caseless(SharedStr::from(dll_name)))
+            .map(|dll| dll.functions.iter().map(ToString::to_string).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -637,7 +649,7 @@ impl std::fmt::Debug for UnifiedImportContainer {
             .field("cil_count", &self.cil.len())
             .field("native_dll_count", &self.native.dll_count())
             .field("native_function_count", &self.native.total_function_count())
-            .field("is_cache_dirty", &self.cache_dirty.load(Ordering::Relaxed))
+            .field("is_cache_built", &self.unified.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -645,7 +657,7 @@ impl std::fmt::Debug for UnifiedImportContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::{create_method, create_module_ref};
+    use crate::testkit::{create_method, create_module_ref};
 
     #[test]
     fn test_unified_import_container_new() {
@@ -731,7 +743,7 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         if let ImportEntry::Native(native_ref) = &results[0] {
-            assert_eq!(native_ref.dll_name, "kernel32.dll");
+            assert_eq!(&*native_ref.dll_name, "kernel32.dll");
             assert_eq!(native_ref.function_name, Some("TestImport".to_string()));
         } else {
             panic!("Expected Native import entry");
@@ -760,9 +772,9 @@ mod tests {
 
         let dll_names = container.get_all_dll_names();
         assert_eq!(dll_names.len(), 3);
-        assert!(dll_names.contains(&"kernel32.dll".to_string()));
-        assert!(dll_names.contains(&"user32.dll".to_string()));
-        assert!(dll_names.contains(&"advapi32.dll".to_string()));
+        assert!(dll_names.iter().any(|name| name == "kernel32.dll"));
+        assert!(dll_names.iter().any(|name| name == "user32.dll"));
+        assert!(dll_names.iter().any(|name| name == "advapi32.dll"));
     }
 
     #[test]
@@ -783,8 +795,11 @@ mod tests {
 
         let dep = kernel32_dep.unwrap();
         assert!(dep.functions.len() >= 2);
-        assert!(dep.functions.contains(&"GetCurrentProcessId".to_string()));
-        assert!(dep.functions.contains(&"GetLastError".to_string()));
+        assert!(dep
+            .functions
+            .iter()
+            .any(|name| name == "GetCurrentProcessId"));
+        assert!(dep.functions.iter().any(|name| name == "GetLastError"));
     }
 
     #[test]
@@ -814,8 +829,8 @@ mod tests {
         // Mutating native should invalidate cache
         let _ = container.native_mut();
 
-        // Cache should be dirty now
-        assert!(container.cache_dirty.load(Ordering::Relaxed));
+        // The views are rebuilt on the next read
+        assert!(container.unified.get().is_none());
     }
 
     #[test]
@@ -828,9 +843,9 @@ mod tests {
         // Force cache to be built
         let _ = container.find_by_name("TestFunc");
 
-        // Clone should reset cache to dirty
+        // A clone builds its own views
         let cloned = container.clone();
-        assert!(cloned.cache_dirty.load(Ordering::Relaxed));
+        assert!(cloned.unified.get().is_none());
 
         // But data should be preserved
         assert!(!cloned.is_empty());
@@ -852,13 +867,13 @@ mod tests {
     #[test]
     fn test_native_import_ref_structure() {
         let import_ref = NativeImportRef {
-            dll_name: "kernel32.dll".to_string(),
+            dll_name: "kernel32.dll".into(),
             function_name: Some("GetCurrentProcessId".to_string()),
             ordinal: None,
             iat_rva: 0x1000,
         };
 
-        assert_eq!(import_ref.dll_name, "kernel32.dll");
+        assert_eq!(&*import_ref.dll_name, "kernel32.dll");
         assert_eq!(
             import_ref.function_name,
             Some("GetCurrentProcessId".to_string())
@@ -870,7 +885,7 @@ mod tests {
     #[test]
     fn test_native_import_ref_ordinal() {
         let import_ref = NativeImportRef {
-            dll_name: "user32.dll".to_string(),
+            dll_name: "user32.dll".into(),
             function_name: None,
             ordinal: Some(120),
             iat_rva: 0x2000,
@@ -883,14 +898,14 @@ mod tests {
     #[test]
     fn test_native_import_ref_clone() {
         let import_ref = NativeImportRef {
-            dll_name: "test.dll".to_string(),
+            dll_name: "test.dll".into(),
             function_name: Some("TestFunc".to_string()),
             ordinal: None,
             iat_rva: 0x3000,
         };
 
         let cloned = import_ref.clone();
-        assert_eq!(cloned.dll_name, "test.dll");
+        assert_eq!(&*cloned.dll_name, "test.dll");
         assert_eq!(cloned.function_name, Some("TestFunc".to_string()));
     }
 
@@ -928,12 +943,9 @@ mod tests {
     #[test]
     fn test_dll_dependency_structure() {
         let dep = DllDependency {
-            name: "kernel32.dll".to_string(),
+            name: "kernel32.dll".into(),
             source: DllSource::Native,
-            functions: vec![
-                "GetCurrentProcessId".to_string(),
-                "GetLastError".to_string(),
-            ],
+            functions: vec!["GetCurrentProcessId".into(), "GetLastError".into()],
         };
 
         assert_eq!(dep.name, "kernel32.dll");
@@ -975,7 +987,7 @@ mod tests {
         // Add a P/Invoke method import to the CIL imports
         container
             .cil
-            .add_method("GetProcessId".to_string(), &token, method, &module_ref)
+            .add_method("GetProcessId".into(), &token, method, &module_ref)
             .expect("Failed to add method import");
 
         // Verify the DLL appears in the unified DLL list
@@ -1000,7 +1012,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "GetProcessId".to_string(),
+                "GetProcessId".into(),
                 &Token::new(0x0A000001),
                 method1,
                 &module_ref,
@@ -1010,7 +1022,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "GetCurrentProcess".to_string(),
+                "GetCurrentProcess".into(),
                 &Token::new(0x0A000002),
                 method2,
                 &module_ref,
@@ -1020,7 +1032,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "ExitProcess".to_string(),
+                "ExitProcess".into(),
                 &Token::new(0x0A000003),
                 method3,
                 &module_ref,
@@ -1035,18 +1047,25 @@ mod tests {
             .expect("kernel32.dll should be in dependencies");
 
         assert!(
-            kernel32_dep.functions.contains(&"GetProcessId".to_string()),
+            kernel32_dep
+                .functions
+                .iter()
+                .any(|name| name == "GetProcessId"),
             "GetProcessId should be in functions. Found: {:?}",
             kernel32_dep.functions
         );
         assert!(
             kernel32_dep
                 .functions
-                .contains(&"GetCurrentProcess".to_string()),
+                .iter()
+                .any(|name| name == "GetCurrentProcess"),
             "GetCurrentProcess should be in functions"
         );
         assert!(
-            kernel32_dep.functions.contains(&"ExitProcess".to_string()),
+            kernel32_dep
+                .functions
+                .iter()
+                .any(|name| name == "ExitProcess"),
             "ExitProcess should be in functions"
         );
     }
@@ -1060,7 +1079,7 @@ mod tests {
 
         container
             .cil
-            .add_method("TestPInvokeMethod".to_string(), &token, method, &module_ref)
+            .add_method("TestPInvokeMethod".into(), &token, method, &module_ref)
             .expect("Failed to add method import");
 
         // Find the import by name in the unified container
@@ -1090,7 +1109,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "GetProcessId".to_string(),
+                "GetProcessId".into(),
                 &Token::new(0x0A000001),
                 method,
                 &module_ref,
@@ -1105,11 +1124,17 @@ mod tests {
             .expect("kernel32.dll should be in dependencies");
 
         assert!(
-            kernel32_dep.functions.contains(&"GetLastError".to_string()),
+            kernel32_dep
+                .functions
+                .iter()
+                .any(|name| name == "GetLastError"),
             "GetLastError should be in functions (native)"
         );
         assert!(
-            kernel32_dep.functions.contains(&"GetProcessId".to_string()),
+            kernel32_dep
+                .functions
+                .iter()
+                .any(|name| name == "GetProcessId"),
             "GetProcessId should be in functions (CIL P/Invoke)"
         );
 
@@ -1119,6 +1144,56 @@ mod tests {
             "Source should be Both since both CIL and native use kernel32.dll. Got: {:?}",
             kernel32_dep.source
         );
+    }
+
+    /// DLL names that differ only in case are one DLL, as the Windows loader resolves them:
+    /// listed once under the spelling first seen, with the functions of every spelling,
+    /// each once, and a CIL spelling and a native one make it used by both.
+    #[test]
+    fn case_variants_of_a_dll_name_are_one_dll() {
+        let mut container = UnifiedImportContainer::new();
+        container
+            .add_native_function("kernel32.dll", "GetLastError")
+            .unwrap();
+        for (rid, (dll, function)) in [
+            ("KERNEL32.DLL", "Sleep"),
+            ("Kernel32.dll", "Beep"),
+            ("KERNEL32.DLL", "Sleep"),
+            ("user32.dll", "MessageBoxW"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rid = u32::try_from(rid).unwrap() + 1;
+            container
+                .cil
+                .add_method(
+                    function.into(),
+                    &Token::new(0x0600_0000 | rid),
+                    create_method(function),
+                    &create_module_ref(rid, dll),
+                )
+                .unwrap();
+        }
+
+        let names = container.get_all_dll_names();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("kernel32.dll")));
+        assert_eq!(
+            container.get_all_dll_names(),
+            names,
+            "the same order every time"
+        );
+
+        let dependencies = container.get_all_dll_dependencies();
+        let kernel32 = dependencies
+            .iter()
+            .find(|dependency| dependency.name.eq_ignore_ascii_case("kernel32.dll"))
+            .unwrap();
+        assert_eq!(kernel32.functions, ["Beep", "GetLastError", "Sleep"]);
+        assert!(matches!(&kernel32.source, DllSource::Both(tokens) if tokens.len() == 3));
     }
 
     #[test]
@@ -1131,7 +1206,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "TestFunc".to_string(),
+                "TestFunc".into(),
                 &Token::new(0x0A000001),
                 method,
                 &module_ref,
@@ -1161,7 +1236,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "GetLastError".to_string(),
+                "GetLastError".into(),
                 &Token::new(0x0A000001),
                 method,
                 &module_ref,
@@ -1199,7 +1274,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "GETLASTERROR".to_string(),
+                "GETLASTERROR".into(),
                 &Token::new(0x0A000001),
                 method,
                 &module_ref,
@@ -1234,7 +1309,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "GetProcessId".to_string(),
+                "GetProcessId".into(),
                 &Token::new(0x0A000001),
                 method,
                 &module_ref,
@@ -1273,7 +1348,7 @@ mod tests {
         container
             .cil
             .add_method(
-                "GetLastError".to_string(),
+                "GetLastError".into(),
                 &Token::new(0x0A000001),
                 method,
                 &module_ref,

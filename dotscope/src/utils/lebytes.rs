@@ -16,20 +16,7 @@
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::LeBytes;
-///
-/// let b = LeBytes::from_4(42i32.to_le_bytes());
-/// assert_eq!(b.len(), 4);
-/// assert_eq!(&*b, &42i32.to_le_bytes());
-///
-/// // Works with flat_map for byte streams
-/// let values = [1i32, 2, 3];
-/// let bytes: Vec<u8> = values.iter()
-///     .flat_map(|v| LeBytes::from_4(v.to_le_bytes()))
-///     .collect();
-/// assert_eq!(bytes.len(), 12);
-/// ```
+/// The `examples::le_bytes_example` test in this module runs this example.
 #[derive(Debug, Clone, Copy)]
 pub struct LeBytes {
     buf: [u8; 8],
@@ -253,5 +240,27 @@ mod tests {
         assert_eq!(iter.len(), 4);
         iter.next();
         assert_eq!(iter.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn le_bytes_example() -> Result<()> {
+        let b = LeBytes::from_4(42i32.to_le_bytes());
+        assert_eq!(b.len(), 4);
+        assert_eq!(&*b, &42i32.to_le_bytes());
+
+        // Works with flat_map for byte streams
+        let values = [1i32, 2, 3];
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|v| LeBytes::from_4(v.to_le_bytes()))
+            .collect();
+        assert_eq!(bytes.len(), 12);
+        Ok(())
     }
 }

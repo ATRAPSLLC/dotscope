@@ -51,18 +51,25 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// # use dotscope::prelude::*;
-/// # use dotscope::metadata::tables::FieldLayoutBuilder;
+/// # use dotscope::metadata::tables::{FieldBuilder, FieldLayoutBuilder};
 /// # use std::path::Path;
 /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 /// let mut assembly = CilAssembly::new(view);
 ///
 /// // Create explicit layout for a P/Invoke structure
 /// // struct Point { int x; int y; }
-/// // Assuming we created fields and got their ChangeRefs
-/// let x_field_ref = /* ... */; // ChangeRef to field
-/// let y_field_ref = /* ... */; // ChangeRef to field
+/// // `int32` fields (signature `FIELD`, `ELEMENT_TYPE_I4`)
+/// let int32_field = |name: &str, assembly: &mut CilAssembly| {
+///     FieldBuilder::new()
+///         .name(name)
+///         .flags(FieldAttributes::PUBLIC)
+///         .signature(&[0x06, 0x08])
+///         .build(assembly)
+/// };
+/// let x_field_ref = int32_field("x", &mut assembly)?;
+/// let y_field_ref = int32_field("y", &mut assembly)?;
 ///
 /// // X field at offset 0 (start of struct)
 /// let x_layout = FieldLayoutBuilder::new()
@@ -78,8 +85,8 @@ use crate::{
 ///
 /// // Create a union-like structure with overlapping fields
 /// // union Value { int intValue; float floatValue; }
-/// let int_field_ref = /* ... */;   // ChangeRef to field
-/// let float_field_ref = /* ... */; // ChangeRef to field
+/// let int_field_ref = int32_field("intValue", &mut assembly)?;
+/// let float_field_ref = int32_field("floatValue", &mut assembly)?;
 ///
 /// // Both fields start at offset 0 (overlapping)
 /// let int_layout = FieldLayoutBuilder::new()
@@ -93,8 +100,8 @@ use crate::{
 ///     .build(&mut assembly)?;
 ///
 /// // Create cache-line aligned fields for performance
-/// let cache_field1_ref = /* ... */; // ChangeRef to field
-/// let cache_field2_ref = /* ... */; // ChangeRef to field
+/// let cache_field1_ref = int32_field("hot", &mut assembly)?;
+/// let cache_field2_ref = int32_field("cold", &mut assembly)?;
 ///
 /// // First field at start
 /// let aligned_layout1 = FieldLayoutBuilder::new()
@@ -267,397 +274,386 @@ impl FieldLayoutBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
+        testkit::fixture,
     };
 
     #[test]
     fn test_field_layout_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a basic field layout
-            let field_row = 1u32; // Field RID 1
+        // Create a basic field layout
+        let field_row = 1u32; // Field RID 1
 
-            let layout_ref = FieldLayoutBuilder::new()
-                .field(field_row)
-                .field_offset(0)
-                .build(&mut assembly)
-                .unwrap();
+        let layout_ref = FieldLayoutBuilder::new()
+            .field(field_row)
+            .field_offset(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference has correct kind
-            assert_eq!(
-                layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-        }
+        // Verify reference has correct kind
+        assert_eq!(
+            layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
     }
 
     #[test]
     fn test_field_layout_builder_different_offsets() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Test various common offset values
-            let field1 = 1u32; // Field RID 1
-            let field2 = 2u32; // Field RID 2
-            let field3 = 3u32; // Field RID 3
-            let field4 = 4u32; // Field RID 4
+        // Test various common offset values
+        let field1 = 1u32; // Field RID 1
+        let field2 = 2u32; // Field RID 2
+        let field3 = 3u32; // Field RID 3
+        let field4 = 4u32; // Field RID 4
 
-            // Offset 0 (start of structure)
-            let layout1 = FieldLayoutBuilder::new()
-                .field(field1)
-                .field_offset(0)
-                .build(&mut assembly)
-                .unwrap();
+        // Offset 0 (start of structure)
+        let layout1 = FieldLayoutBuilder::new()
+            .field(field1)
+            .field_offset(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Offset 4 (typical int alignment)
-            let layout2 = FieldLayoutBuilder::new()
-                .field(field2)
-                .field_offset(4)
-                .build(&mut assembly)
-                .unwrap();
+        // Offset 4 (typical int alignment)
+        let layout2 = FieldLayoutBuilder::new()
+            .field(field2)
+            .field_offset(4)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Offset 8 (typical double alignment)
-            let layout3 = FieldLayoutBuilder::new()
-                .field(field3)
-                .field_offset(8)
-                .build(&mut assembly)
-                .unwrap();
+        // Offset 8 (typical double alignment)
+        let layout3 = FieldLayoutBuilder::new()
+            .field(field3)
+            .field_offset(8)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Offset 64 (cache line alignment)
-            let layout4 = FieldLayoutBuilder::new()
-                .field(field4)
-                .field_offset(64)
-                .build(&mut assembly)
-                .unwrap();
+        // Offset 64 (cache line alignment)
+        let layout4 = FieldLayoutBuilder::new()
+            .field(field4)
+            .field_offset(64)
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed with FieldLayout kind
-            assert_eq!(
-                layout1.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                layout2.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                layout3.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                layout4.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
+        // All should succeed with FieldLayout kind
+        assert_eq!(
+            layout1.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            layout2.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            layout3.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            layout4.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
 
-            // All should be different references
-            assert!(!std::sync::Arc::ptr_eq(&layout1, &layout2));
-            assert!(!std::sync::Arc::ptr_eq(&layout1, &layout3));
-            assert!(!std::sync::Arc::ptr_eq(&layout1, &layout4));
-        }
+        // All should be different references
+        assert!(!std::sync::Arc::ptr_eq(&layout1, &layout2));
+        assert!(!std::sync::Arc::ptr_eq(&layout1, &layout3));
+        assert!(!std::sync::Arc::ptr_eq(&layout1, &layout4));
     }
 
     #[test]
     fn test_field_layout_builder_union_layout() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create overlapping fields (union behavior)
-            let int_field = 1u32; // Field RID 1
-            let float_field = 2u32; // Field RID 2
+        // Create overlapping fields (union behavior)
+        let int_field = 1u32; // Field RID 1
+        let float_field = 2u32; // Field RID 2
 
-            // Both fields at offset 0 (overlapping)
-            let int_layout = FieldLayoutBuilder::new()
-                .field(int_field)
-                .field_offset(0)
-                .build(&mut assembly)
-                .unwrap();
+        // Both fields at offset 0 (overlapping)
+        let int_layout = FieldLayoutBuilder::new()
+            .field(int_field)
+            .field_offset(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            let float_layout = FieldLayoutBuilder::new()
-                .field(float_field)
-                .field_offset(0) // Same offset = union
-                .build(&mut assembly)
-                .unwrap();
+        let float_layout = FieldLayoutBuilder::new()
+            .field(float_field)
+            .field_offset(0) // Same offset = union
+            .build(&mut assembly)
+            .unwrap();
 
-            // Both should succeed with different references
-            assert!(!std::sync::Arc::ptr_eq(&int_layout, &float_layout));
-            assert_eq!(
-                int_layout.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                float_layout.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-        }
+        // Both should succeed with different references
+        assert!(!std::sync::Arc::ptr_eq(&int_layout, &float_layout));
+        assert_eq!(
+            int_layout.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            float_layout.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
     }
 
     #[test]
     fn test_field_layout_builder_large_offsets() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let field_row = 1u32; // Field RID 1
+        let field_row = 1u32; // Field RID 1
 
-            // Test large but valid offset
-            let large_offset = 1024 * 1024; // 1MB offset
-            let layout_ref = FieldLayoutBuilder::new()
-                .field(field_row)
-                .field_offset(large_offset)
-                .build(&mut assembly)
-                .unwrap();
+        // Test large but valid offset
+        let large_offset = 1024 * 1024; // 1MB offset
+        let layout_ref = FieldLayoutBuilder::new()
+            .field(field_row)
+            .field_offset(large_offset)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
     }
 
     #[test]
     fn test_field_layout_builder_missing_field_offset() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let field_row = 1u32; // Field RID 1
+        let field_row = 1u32; // Field RID 1
 
-            let result = FieldLayoutBuilder::new()
-                .field(field_row)
-                // Missing field_offset
-                .build(&mut assembly);
+        let result = FieldLayoutBuilder::new()
+            .field(field_row)
+            // Missing field_offset
+            .build(&mut assembly);
 
-            // Should fail because field offset is required
-            assert!(result.is_err());
-        }
+        // Should fail because field offset is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_layout_builder_missing_field() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = FieldLayoutBuilder::new()
-                .field_offset(4)
-                // Missing field
-                .build(&mut assembly);
+        let result = FieldLayoutBuilder::new()
+            .field_offset(4)
+            // Missing field
+            .build(&mut assembly);
 
-            // Should fail because field is required
-            assert!(result.is_err());
-        }
+        // Should fail because field is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_layout_builder_zero_field_rid() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Use row index 0 (invalid)
-            let invalid_field = 0u32;
+        // Use row index 0 (invalid)
+        let invalid_field = 0u32;
 
-            let result = FieldLayoutBuilder::new()
-                .field(invalid_field)
-                .field_offset(0)
-                .build(&mut assembly);
+        let result = FieldLayoutBuilder::new()
+            .field(invalid_field)
+            .field_offset(0)
+            .build(&mut assembly);
 
-            // Should fail because field row index cannot be 0
-            assert!(result.is_err());
-        }
+        // Should fail because field row index cannot be 0
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_layout_builder_reserved_offset() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let field_row = 1u32; // Field RID 1
+        let field_row = 1u32; // Field RID 1
 
-            let result = FieldLayoutBuilder::new()
-                .field(field_row)
-                .field_offset(u32::MAX) // Reserved value
-                .build(&mut assembly);
+        let result = FieldLayoutBuilder::new()
+            .field(field_row)
+            .field_offset(u32::MAX) // Reserved value
+            .build(&mut assembly);
 
-            // Should fail because 0xFFFFFFFF is reserved
-            assert!(result.is_err());
-        }
+        // Should fail because 0xFFFFFFFF is reserved
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_layout_builder_multiple_layouts() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create layouts for multiple fields simulating a struct
-            let field1 = 1u32; // int field
-            let field2 = 2u32; // float field
-            let field3 = 3u32; // double field
-            let field4 = 4u32; // byte field
+        // Create layouts for multiple fields simulating a struct
+        let field1 = 1u32; // int field
+        let field2 = 2u32; // float field
+        let field3 = 3u32; // double field
+        let field4 = 4u32; // byte field
 
-            let layout1 = FieldLayoutBuilder::new()
-                .field(field1)
-                .field_offset(0) // int at offset 0
-                .build(&mut assembly)
-                .unwrap();
+        let layout1 = FieldLayoutBuilder::new()
+            .field(field1)
+            .field_offset(0) // int at offset 0
+            .build(&mut assembly)
+            .unwrap();
 
-            let layout2 = FieldLayoutBuilder::new()
-                .field(field2)
-                .field_offset(4) // float at offset 4
-                .build(&mut assembly)
-                .unwrap();
+        let layout2 = FieldLayoutBuilder::new()
+            .field(field2)
+            .field_offset(4) // float at offset 4
+            .build(&mut assembly)
+            .unwrap();
 
-            let layout3 = FieldLayoutBuilder::new()
-                .field(field3)
-                .field_offset(8) // double at offset 8 (aligned)
-                .build(&mut assembly)
-                .unwrap();
+        let layout3 = FieldLayoutBuilder::new()
+            .field(field3)
+            .field_offset(8) // double at offset 8 (aligned)
+            .build(&mut assembly)
+            .unwrap();
 
-            let layout4 = FieldLayoutBuilder::new()
-                .field(field4)
-                .field_offset(16) // byte at offset 16
-                .build(&mut assembly)
-                .unwrap();
+        let layout4 = FieldLayoutBuilder::new()
+            .field(field4)
+            .field_offset(16) // byte at offset 16
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed and be different references
-            assert!(!std::sync::Arc::ptr_eq(&layout1, &layout2));
-            assert!(!std::sync::Arc::ptr_eq(&layout1, &layout3));
-            assert!(!std::sync::Arc::ptr_eq(&layout1, &layout4));
-            assert!(!std::sync::Arc::ptr_eq(&layout2, &layout3));
-            assert!(!std::sync::Arc::ptr_eq(&layout2, &layout4));
-            assert!(!std::sync::Arc::ptr_eq(&layout3, &layout4));
+        // All should succeed and be different references
+        assert!(!std::sync::Arc::ptr_eq(&layout1, &layout2));
+        assert!(!std::sync::Arc::ptr_eq(&layout1, &layout3));
+        assert!(!std::sync::Arc::ptr_eq(&layout1, &layout4));
+        assert!(!std::sync::Arc::ptr_eq(&layout2, &layout3));
+        assert!(!std::sync::Arc::ptr_eq(&layout2, &layout4));
+        assert!(!std::sync::Arc::ptr_eq(&layout3, &layout4));
 
-            // All should have FieldLayout kind
-            assert_eq!(
-                layout1.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                layout2.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                layout3.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                layout4.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-        }
+        // All should have FieldLayout kind
+        assert_eq!(
+            layout1.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            layout2.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            layout3.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            layout4.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
     }
 
     #[test]
     fn test_field_layout_builder_realistic_struct() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Realistic scenario: Point3D struct with explicit layout
-            // struct Point3D { float x, y, z; int flags; }
-            let x_field = 1u32; // x coordinate
-            let y_field = 2u32; // y coordinate
-            let z_field = 3u32; // z coordinate
-            let flags_field = 4u32; // flags
+        // Realistic scenario: Point3D struct with explicit layout
+        // struct Point3D { float x, y, z; int flags; }
+        let x_field = 1u32; // x coordinate
+        let y_field = 2u32; // y coordinate
+        let z_field = 3u32; // z coordinate
+        let flags_field = 4u32; // flags
 
-            // Create layouts with proper float alignment
-            let x_layout_ref = FieldLayoutBuilder::new()
-                .field(x_field)
-                .field_offset(0) // x at start
-                .build(&mut assembly)
-                .unwrap();
+        // Create layouts with proper float alignment
+        let x_layout_ref = FieldLayoutBuilder::new()
+            .field(x_field)
+            .field_offset(0) // x at start
+            .build(&mut assembly)
+            .unwrap();
 
-            let y_layout_ref = FieldLayoutBuilder::new()
-                .field(y_field)
-                .field_offset(4) // y after x (4-byte float)
-                .build(&mut assembly)
-                .unwrap();
+        let y_layout_ref = FieldLayoutBuilder::new()
+            .field(y_field)
+            .field_offset(4) // y after x (4-byte float)
+            .build(&mut assembly)
+            .unwrap();
 
-            let z_layout_ref = FieldLayoutBuilder::new()
-                .field(z_field)
-                .field_offset(8) // z after y (4-byte float)
-                .build(&mut assembly)
-                .unwrap();
+        let z_layout_ref = FieldLayoutBuilder::new()
+            .field(z_field)
+            .field_offset(8) // z after y (4-byte float)
+            .build(&mut assembly)
+            .unwrap();
 
-            let flags_layout_ref = FieldLayoutBuilder::new()
-                .field(flags_field)
-                .field_offset(12) // flags after z (4-byte float)
-                .build(&mut assembly)
-                .unwrap();
+        let flags_layout_ref = FieldLayoutBuilder::new()
+            .field(flags_field)
+            .field_offset(12) // flags after z (4-byte float)
+            .build(&mut assembly)
+            .unwrap();
 
-            // All layouts should be created successfully
-            assert_eq!(
-                x_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                y_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                z_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                flags_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
+        // All layouts should be created successfully
+        assert_eq!(
+            x_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            y_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            z_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            flags_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
 
-            // All should be different references
-            assert!(!std::sync::Arc::ptr_eq(&x_layout_ref, &y_layout_ref));
-            assert!(!std::sync::Arc::ptr_eq(&x_layout_ref, &z_layout_ref));
-            assert!(!std::sync::Arc::ptr_eq(&x_layout_ref, &flags_layout_ref));
-            assert!(!std::sync::Arc::ptr_eq(&y_layout_ref, &z_layout_ref));
-            assert!(!std::sync::Arc::ptr_eq(&y_layout_ref, &flags_layout_ref));
-            assert!(!std::sync::Arc::ptr_eq(&z_layout_ref, &flags_layout_ref));
-        }
+        // All should be different references
+        assert!(!std::sync::Arc::ptr_eq(&x_layout_ref, &y_layout_ref));
+        assert!(!std::sync::Arc::ptr_eq(&x_layout_ref, &z_layout_ref));
+        assert!(!std::sync::Arc::ptr_eq(&x_layout_ref, &flags_layout_ref));
+        assert!(!std::sync::Arc::ptr_eq(&y_layout_ref, &z_layout_ref));
+        assert!(!std::sync::Arc::ptr_eq(&y_layout_ref, &flags_layout_ref));
+        assert!(!std::sync::Arc::ptr_eq(&z_layout_ref, &flags_layout_ref));
     }
 
     #[test]
     fn test_field_layout_builder_performance_alignment() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Performance-oriented layout with cache line alignment
-            let hot_field = 1u32; // Frequently accessed
-            let cold_field = 2u32; // Rarely accessed
+        // Performance-oriented layout with cache line alignment
+        let hot_field = 1u32; // Frequently accessed
+        let cold_field = 2u32; // Rarely accessed
 
-            // Hot field at start (cache line 0)
-            let hot_layout_ref = FieldLayoutBuilder::new()
-                .field(hot_field)
-                .field_offset(0)
-                .build(&mut assembly)
-                .unwrap();
+        // Hot field at start (cache line 0)
+        let hot_layout_ref = FieldLayoutBuilder::new()
+            .field(hot_field)
+            .field_offset(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Cold field at next cache line boundary (64 bytes)
-            let cold_layout_ref = FieldLayoutBuilder::new()
-                .field(cold_field)
-                .field_offset(64)
-                .build(&mut assembly)
-                .unwrap();
+        // Cold field at next cache line boundary (64 bytes)
+        let cold_layout_ref = FieldLayoutBuilder::new()
+            .field(cold_field)
+            .field_offset(64)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Both should succeed
-            assert_eq!(
-                hot_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert_eq!(
-                cold_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldLayout)
-            );
-            assert!(!std::sync::Arc::ptr_eq(&hot_layout_ref, &cold_layout_ref));
-        }
+        // Both should succeed
+        assert_eq!(
+            hot_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert_eq!(
+            cold_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldLayout)
+        );
+        assert!(!std::sync::Arc::ptr_eq(&hot_layout_ref, &cold_layout_ref));
     }
 }

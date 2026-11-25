@@ -16,7 +16,7 @@
 //! - [`crate::metadata::tables::assemblyref::raw::AssemblyRefRaw`] - Raw table structure with unresolved heap indexes
 //! - [`crate::metadata::tables::assemblyref::owned::AssemblyRef`] - Owned variant with resolved strings/blobs
 //! - [`crate::metadata::tables::assemblyref::assemblyrefhash::AssemblyRefHash`] - Hash information for verification
-//! - [`crate::metadata::tables::assemblyref::loader::AssemblyRefLoader`] - Internal loader for processing table data
+//! - [`crate::metadata::loader::tables::AssemblyRefLoader`] - Internal loader for processing table data
 //! - [`crate::metadata::tables::assemblyref::AssemblyRefMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::assemblyref::AssemblyRefList`] - Collection type for assembly references
 //! - [`crate::metadata::tables::assemblyref::AssemblyRefRc`] - Reference-counted pointer
@@ -59,7 +59,6 @@ use crate::metadata::{
 
 mod assemblyrefhash;
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
@@ -67,7 +66,6 @@ mod writer;
 
 pub use assemblyrefhash::*;
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

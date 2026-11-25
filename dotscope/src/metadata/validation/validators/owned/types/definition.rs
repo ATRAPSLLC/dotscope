@@ -45,7 +45,7 @@
 //! # Error Handling
 //!
 //! This validator returns [`crate::Error::ValidationOwnedFailed`] for:
-//! - Type definition structure violations (empty names, invalid tokens, null characters)
+//! - Type definition structure violations (empty names, invalid tokens)
 //! - Type attribute consistency failures (invalid visibility, layout, or semantics attributes)
 //! - Type flavor inconsistencies (interface flavor without interface flag, invalid base types)
 //! - Special constraint violations (RTSpecialName without SpecialName, sealed interfaces)
@@ -85,6 +85,7 @@ use crate::{
             traits::OwnedValidator,
         },
     },
+    utils::TryForEachInOrder,
     Error, Result,
 };
 
@@ -134,7 +135,7 @@ impl OwnedTypeDefinitionValidator {
         context
             .target_assembly_types()
             .par_iter()
-            .try_for_each(|type_entry| -> Result<()> {
+            .try_for_each_in_order(|type_entry| -> Result<()> {
                 // Validate type name is not empty (except for special cases)
                 if type_entry.name.is_empty() && type_entry.namespace != "<Module>" {
                     return Err(Error::ValidationOwnedFailed {
@@ -152,26 +153,6 @@ impl OwnedTypeDefinitionValidator {
                     return Err(Error::ValidationOwnedFailed {
                         validator: self.name().to_string(),
                         message: format!("Type '{type_name}' has invalid token (0)"),
-                    });
-                }
-
-                // Validate type name doesn't contain invalid characters
-                if type_entry.name.contains('\0') {
-                    let type_name = &type_entry.name;
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!("Type '{type_name}' contains null character in name"),
-                    });
-                }
-
-                // Validate namespace doesn't contain invalid characters
-                if type_entry.namespace.contains('\0') {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: {
-                            let type_name = &type_entry.name;
-                            format!("Type '{type_name}' contains null character in namespace")
-                        },
                     });
                 }
 
@@ -337,9 +318,9 @@ impl OwnedTypeDefinitionValidator {
                 // Value types should typically inherit from System.ValueType or System.Enum
                 if let Some(base_type) = type_entry.base() {
                     let base_fullname = base_type.fullname();
-                    if &*base_fullname != "System.ValueType"
-                        && &*base_fullname != "System.Enum"
-                        && &*base_fullname != "System.Object"
+                    if base_fullname != "System.ValueType"
+                        && base_fullname != "System.Enum"
+                        && base_fullname != "System.Object"
                     {
                         // Object is allowed for primitives
                         // Allow some flexibility for special cases
@@ -492,19 +473,17 @@ impl Default for OwnedTypeDefinitionValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::type_definition::owned_type_definition_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_type_definition_validator() -> Result<()> {
         let validator = OwnedTypeDefinitionValidator::new();
         let config = ValidationConfig {
@@ -515,7 +494,6 @@ mod tests {
         owned_validator_test(
             owned_type_definition_validator_file_factory,
             "OwnedTypeDefinitionValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

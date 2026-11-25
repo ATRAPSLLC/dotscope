@@ -14,7 +14,7 @@
 //!
 //! # Cleanup
 //!
-//! Returns the dead nop method tokens via [`cleanup()`](SsaTechnique::cleanup)
+//! Returns the dead nop method tokens via [`cleanup()`](crate::deobfuscation::Technique::cleanup)
 //! for removal during the assembly cleanup phase.
 
 use std::any::Any;
@@ -128,12 +128,12 @@ impl Technique for BitMonoNops {
 mod tests {
     use crate::{
         deobfuscation::techniques::{bitmono::BitMonoNops, Technique},
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly = load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_combined.exe");
+        let assembly = load_sample("packers/bitmono/0.39.0/bitmono_combined.exe");
 
         let technique = BitMonoNops::new(50_000);
         let detection = technique.detect(&assembly);
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = BitMonoNops::new(50_000);
         let detection = technique.detect(&assembly);

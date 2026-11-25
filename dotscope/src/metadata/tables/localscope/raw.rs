@@ -12,7 +12,7 @@ use crate::{
         method::MethodMap,
         tables::{
             ImportScopeMap, LocalConstantMap, LocalScope, LocalScopeRc, LocalVariableMap,
-            MetadataTable, TableId, TableInfoRef, TableRow,
+            MemberRanges, TableId, TableInfoRef, TableRow,
         },
         token::Token,
     },
@@ -95,23 +95,32 @@ impl LocalScopeRaw {
     /// # Parameters
     /// - `methods`: Map of resolved methods for method reference resolution
     /// - `import_scopes`: Map of resolved import scopes for import scope resolution
-    /// - `variables`: Map of resolved local variables for building variable lists
-    /// - `constants`: Map of resolved local constants for building constant lists
-    /// - `scope_table`: The raw `LocalScope` table for looking up next scope indices
+    /// - `variables_map`: Map of resolved local variables for building variable lists
+    /// - `constants_map`: Map of resolved local constants for building constant lists
+    /// - `variable_ranges`: The normalized `VariableList` runs of the whole `LocalScope` table
+    ///   ([`TablesHeader::member_ranges`](crate::metadata::streams::TablesHeader::member_ranges)
+    ///   with [`MemberList::LocalScopeVariables`](crate::metadata::tables::MemberList::LocalScopeVariables)),
+    ///   clamped to the `LocalVariable` table so a hostile column cannot make a scope iterate
+    ///   past it
+    /// - `constant_ranges`: The normalized `ConstantList` runs
+    ///   ([`MemberList::LocalScopeConstants`](crate::metadata::tables::MemberList::LocalScopeConstants))
     ///
     /// # Returns
     /// Returns `Ok(LocalScopeRc)` with the resolved scope data, or an error if
     /// any references are invalid or point to malformed data.
     ///
     /// # Errors
-    /// Returns an error if any references are invalid or point to malformed data.
+    /// Returns an error if the method or import scope reference is invalid. The variable and
+    /// constant runs cannot fail: they are normalized to lie inside their tables, and a row in
+    /// them that is not loaded is left out of the scope.
     pub fn to_owned(
         &self,
         methods: &MethodMap,
         import_scopes: &ImportScopeMap,
-        variables: &LocalVariableMap,
-        constants: &LocalConstantMap,
-        scope_table: &MetadataTable<LocalScopeRaw>,
+        variables_map: &LocalVariableMap,
+        constants_map: &LocalConstantMap,
+        variable_ranges: &MemberRanges,
+        constant_ranges: &MemberRanges,
     ) -> Result<LocalScopeRc> {
         let method_token = Token::new(
             0x0600_0000_u32
@@ -146,86 +155,28 @@ impl LocalScopeRaw {
                 )
             };
 
-        let next_rid = self.rid.checked_add(1).ok_or_else(|| {
-            malformed_error!(
-                "LocalScope rid overflow when computing next rid: {}",
-                self.rid
-            )
-        })?;
+        // A variable or constant that is not loaded is left out rather than failing the
+        // scope: its own row failed (and was reported, or failed a strict load) before this
+        // loader ran, and the scope's other locals are still worth having.
+        let variables = Arc::new(boxcar::Vec::with_capacity(
+            variable_ranges.range(self.rid).len(),
+        ));
+        for variable in variable_ranges
+            .direct_members(self.rid, variables_map)
+            .flatten()
+        {
+            _ = variables.push(variable);
+        }
 
-        let variables = if self.variable_list == 0 {
-            Arc::new(boxcar::Vec::new())
-        } else {
-            let start = self.variable_list;
-
-            let end = if let Some(next_scope) = scope_table.get(next_rid)? {
-                if next_scope.variable_list != 0 {
-                    next_scope.variable_list
-                } else {
-                    let len = u32::try_from(variables.len()).map_err(|_| {
-                        malformed_error!("LocalVariable count exceeds u32: {}", variables.len())
-                    })?;
-                    len.checked_add(1).ok_or_else(|| {
-                        malformed_error!("LocalVariable end index overflow: {}", len)
-                    })?
-                }
-            } else {
-                let len = u32::try_from(variables.len()).map_err(|_| {
-                    malformed_error!("LocalVariable count exceeds u32: {}", variables.len())
-                })?;
-                len.checked_add(1)
-                    .ok_or_else(|| malformed_error!("LocalVariable end index overflow: {}", len))?
-            };
-
-            let list = Arc::new(boxcar::Vec::new());
-            for i in start..end {
-                let var_token_value = 0x3300_0000_u32
-                    .checked_add(i)
-                    .ok_or_else(|| malformed_error!("LocalVariable token overflow: {}", i))?;
-                let var_token = Token::new(var_token_value);
-                if let Some(var_entry) = variables.get(&var_token) {
-                    list.push(var_entry.value().clone());
-                }
-            }
-            list
-        };
-
-        let constants = if self.constant_list == 0 {
-            Arc::new(boxcar::Vec::new())
-        } else {
-            let start = self.constant_list;
-
-            let end = if let Some(next_scope) = scope_table.get(next_rid)? {
-                if next_scope.constant_list != 0 {
-                    next_scope.constant_list
-                } else {
-                    let len = u32::try_from(constants.len()).map_err(|_| {
-                        malformed_error!("LocalConstant count exceeds u32: {}", constants.len())
-                    })?;
-                    len.checked_add(1).ok_or_else(|| {
-                        malformed_error!("LocalConstant end index overflow: {}", len)
-                    })?
-                }
-            } else {
-                let len = u32::try_from(constants.len()).map_err(|_| {
-                    malformed_error!("LocalConstant count exceeds u32: {}", constants.len())
-                })?;
-                len.checked_add(1)
-                    .ok_or_else(|| malformed_error!("LocalConstant end index overflow: {}", len))?
-            };
-
-            let list = Arc::new(boxcar::Vec::new());
-            for i in start..end {
-                let const_token_value = 0x3400_0000_u32
-                    .checked_add(i)
-                    .ok_or_else(|| malformed_error!("LocalConstant token overflow: {}", i))?;
-                let const_token = Token::new(const_token_value);
-                if let Some(const_entry) = constants.get(&const_token) {
-                    list.push(const_entry.value().clone());
-                }
-            }
-            list
-        };
+        let constants = Arc::new(boxcar::Vec::with_capacity(
+            constant_ranges.range(self.rid).len(),
+        ));
+        for constant in constant_ranges
+            .direct_members(self.rid, constants_map)
+            .flatten()
+        {
+            _ = constants.push(constant);
+        }
 
         let local_scope = LocalScope {
             rid: self.rid,

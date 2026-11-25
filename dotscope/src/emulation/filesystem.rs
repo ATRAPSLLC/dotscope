@@ -23,6 +23,10 @@ use cowfile::CowFile;
 pub struct VirtualFs {
     /// Virtual files keyed by normalized path.
     entries: HashMap<String, CowFile>,
+    /// Further names of a mapped file, normalized, each to the normalized path it is mapped
+    /// under: one file reached by several paths, as an assembly is under its file name and
+    /// its module name, without a copy per name.
+    aliases: HashMap<String, String>,
 }
 
 impl VirtualFs {
@@ -31,6 +35,7 @@ impl VirtualFs {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -85,6 +90,22 @@ impl VirtualFs {
             .insert(Self::normalize_path(vfs_path), CowFile::from_vec(data));
     }
 
+    /// Makes `alias_path` a further name of the file mapped under `target_path`: a lookup of
+    /// either finds the same file, and the file is held (and forked) once. An alias of a name
+    /// that is itself mapped, or of itself, is ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `alias_path` - The further name to register
+    /// * `target_path` - The path the file is mapped under
+    pub fn alias(&mut self, alias_path: &str, target_path: &str) {
+        let alias = Self::normalize_path(alias_path);
+        let target = Self::normalize_path(target_path);
+        if alias != target && !self.entries.contains_key(&alias) {
+            self.aliases.insert(alias, target);
+        }
+    }
+
     /// Looks up a virtual file by path (case-insensitive, slash-normalized).
     ///
     /// First tries an exact (normalized) match. If that fails, falls back to
@@ -101,13 +122,21 @@ impl VirtualFs {
     /// A reference to the [`CowFile`] if found, or `None`.
     pub fn get(&self, vfs_path: &str) -> Option<&CowFile> {
         let normalized = Self::normalize_path(vfs_path);
-        self.entries.get(&normalized).or_else(|| {
-            // Also try matching just the filename component
+        let mapped = |path: &String| {
+            self.entries.get(path).or_else(|| {
+                self.aliases
+                    .get(path)
+                    .and_then(|target| self.entries.get(target))
+            })
+        };
+        mapped(&normalized).or_else(|| {
+            // Also try matching just the filename component, of a mapped path or an alias
             let filename = Self::extract_filename(&normalized);
             self.entries
-                .iter()
-                .find(|(k, _)| Self::extract_filename(k) == filename)
-                .map(|(_, v)| v)
+                .keys()
+                .chain(self.aliases.keys())
+                .find(|path| Self::extract_filename(path) == filename)
+                .and_then(mapped)
         })
     }
 
@@ -136,7 +165,7 @@ impl VirtualFs {
 
     /// Forks the virtual filesystem, creating an independent copy.
     ///
-    /// Each entry uses [`CowFile::fork()`]:
+    /// Aliases name the same entries in the fork. Each entry uses [`CowFile::fork()`]:
     /// - Mmap-backed entries re-open the same file (zero-copy OS CoW)
     /// - Vec-backed entries clone the data
     /// - Pending writes are **not** carried over — the fork starts clean
@@ -151,7 +180,10 @@ impl VirtualFs {
             .iter()
             .map(|(path, cow)| Ok((path.clone(), cow.fork()?)))
             .collect::<Result<_, cowfile::Error>>()?;
-        Ok(VirtualFs { entries })
+        Ok(VirtualFs {
+            entries,
+            aliases: self.aliases.clone(),
+        })
     }
 
     /// Normalizes a path for case-insensitive, platform-agnostic lookup.
@@ -226,6 +258,39 @@ mod tests {
         vfs.map_data("test.exe", vec![0x4D, 0x5A]);
         // Should match by filename even with full path
         assert!(vfs.exists(r"C:\Program Files\test.exe"));
+    }
+
+    /// An alias names the mapped file itself, held once: a lookup by the alias, by its file
+    /// name under another directory and in a fork all find that file. The template mapped the
+    /// assembly under its file name and its module name as separate copies, each copied again
+    /// with every fork.
+    #[test]
+    fn an_alias_names_the_mapped_file() {
+        let mut vfs = VirtualFs::new();
+        vfs.map_data("assembly.exe", vec![0x4D, 0x5A, 1]);
+        vfs.alias("Original.exe", "assembly.exe");
+        vfs.alias("Module.dll", "assembly.exe");
+        assert_eq!(vfs.len(), 1);
+
+        let mapped: *const CowFile = vfs.get("assembly.exe").unwrap();
+        assert_eq!(
+            vfs.get("ORIGINAL.EXE").map(|file| file as *const CowFile),
+            Some(mapped)
+        );
+        assert_eq!(
+            vfs.get(r"C:\some\dir\Module.dll")
+                .map(|file| file as *const CowFile),
+            Some(mapped)
+        );
+
+        let forked = vfs.fork().unwrap();
+        assert_eq!(forked.len(), 1);
+        assert_eq!(forked.get("module.dll").unwrap().data(), &[0x4D, 0x5A, 1]);
+
+        // An alias does not shadow a file mapped under the same name
+        vfs.map_data("other.bin", vec![7]);
+        vfs.alias("other.bin", "assembly.exe");
+        assert_eq!(vfs.get("other.bin").unwrap().data(), &[7]);
     }
 
     #[test]

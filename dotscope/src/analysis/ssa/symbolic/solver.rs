@@ -6,7 +6,13 @@
 
 use std::collections::HashMap;
 
-use analyssa::analysis::symbolic::{expr::SymbolicExpr as GenericSymbolicExpr, ops::SymbolicOp};
+use analyssa::{
+    analysis::{
+        consts::scalar::{ScalarKind, ScalarOperation},
+        symbolic::expr::SymbolicExpr as GenericSymbolicExpr,
+    },
+    ir::{evaluation::NumericOp, integer::IntegerType},
+};
 
 use crate::{analysis::ssa::CilTarget, metadata::typesystem::PointerSize};
 
@@ -21,15 +27,15 @@ type SymbolicExpr = GenericSymbolicExpr<CilTarget>;
 /// # Example
 ///
 /// ```rust,no_run
-/// use dotscope::analysis::{SymbolicExpr, SymbolicOp, Z3Solver};
+/// use dotscope::analysis::{SymbolicExpr, NumericOp, Z3Solver};
 ///
 /// let solver = Z3Solver::new();
 ///
 /// // Find all state values where (state XOR 0x12345678) % 13 == 5
 /// let expr = SymbolicExpr::binary(
-///     SymbolicOp::RemU,
+///     NumericOp::RemU,
 ///     SymbolicExpr::binary(
-///         SymbolicOp::Xor,
+///         NumericOp::Xor,
 ///         SymbolicExpr::named("state"),
 ///         SymbolicExpr::constant_i32(0x12345678),
 ///     ),
@@ -385,7 +391,11 @@ impl Z3Solver {
             z3::SatResult::Unsat => {
                 // Expression is constant - find the value
                 // Evaluate with any input (e.g., 0)
-                if let Some(c) = expr.substitute_named(var_name, 0, ptr_size).as_i64() {
+                if let Some(c) = expr
+                    .substitute_named(var_name, &SymbolicExpr::constant_i64(0))
+                    .simplify(ptr_size)
+                    .as_i64()
+                {
                     Some(c)
                 } else {
                     // Try Z3 to find the constant value
@@ -432,15 +442,28 @@ impl Z3Solver {
         var_map: &HashMap<String, z3::ast::BV>,
     ) -> z3::ast::BV {
         match expr {
-            SymbolicExpr::Constant(v) => {
-                // Extract i64 value from ConstValue for Z3
-                let val = v.as_i64().unwrap_or(0);
-                z3::ast::BV::from_i64(val, 32)
-            }
+            // An integer is its low word; a constant without integer bits
+            // (a float, a string) is a value of its own, unconstrained.
+            SymbolicExpr::Constant(v) => match (v.as_i64(), v.as_u64()) {
+                (Some(signed), _) => z3::ast::BV::from_i64(signed, 32),
+                (None, Some(unsigned)) => z3::ast::BV::from_u64(unsigned, 32),
+                (None, None) => z3::ast::BV::fresh_const("constant", 32),
+            },
 
             SymbolicExpr::Variable(var_id) => {
                 // Create a unique name for SSA variables
                 let name = format!("ssa_{}", var_id.index());
+                z3::ast::BV::new_const(name, 32)
+            }
+
+            // One execution of a definition is an unconstrained value of its
+            // own: neither the SSA variable nor another execution of it.
+            SymbolicExpr::Instance(instance) => {
+                let name = format!(
+                    "instance_{}_{}",
+                    instance.source().index(),
+                    instance.generation()
+                );
                 z3::ast::BV::new_const(name, 32)
             }
 
@@ -454,89 +477,358 @@ impl Z3Solver {
             }
 
             SymbolicExpr::Unary { op, operand } => {
-                let operand_z3 = self.translate_to_z3(operand, var_map);
-                match op {
-                    SymbolicOp::Neg => operand_z3.bvneg(),
-                    SymbolicOp::Not => operand_z3.bvnot(),
-                    _ => operand_z3, // Shouldn't happen for valid unary ops
-                }
+                Self::numeric_unary(*op, self.translate_to_z3(operand, var_map))
             }
 
-            SymbolicExpr::Binary { op, left, right } => {
-                let left_z3 = self.translate_to_z3(left, var_map);
-                let right_z3 = self.translate_to_z3(right, var_map);
+            SymbolicExpr::Binary { op, left, right } => Self::numeric_binary(
+                *op,
+                &self.translate_to_z3(left, var_map),
+                &self.translate_to_z3(right, var_map),
+            ),
 
-                match op {
-                    SymbolicOp::Add => left_z3.bvadd(&right_z3),
-                    SymbolicOp::Sub => left_z3.bvsub(&right_z3),
-                    SymbolicOp::Mul => left_z3.bvmul(&right_z3),
-                    SymbolicOp::DivS => left_z3.bvsdiv(&right_z3),
-                    SymbolicOp::DivU => left_z3.bvudiv(&right_z3),
-                    SymbolicOp::RemS => left_z3.bvsrem(&right_z3),
-                    SymbolicOp::RemU => left_z3.bvurem(&right_z3),
-                    SymbolicOp::And => left_z3.bvand(&right_z3),
-                    SymbolicOp::Or => left_z3.bvor(&right_z3),
-                    SymbolicOp::Xor => left_z3.bvxor(&right_z3),
-                    SymbolicOp::Shl => left_z3.bvshl(&right_z3),
-                    SymbolicOp::ShrS => left_z3.bvashr(&right_z3),
-                    SymbolicOp::ShrU => left_z3.bvlshr(&right_z3),
-                    // Comparisons return 1 or 0
-                    SymbolicOp::Eq => left_z3
-                        .eq(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::Ne => left_z3
-                        .eq(&right_z3)
-                        .not()
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::LtS => left_z3
-                        .bvslt(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::LtU => left_z3
-                        .bvult(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::GtS => left_z3
-                        .bvsgt(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::GtU => left_z3
-                        .bvugt(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::LeS => left_z3
-                        .bvsle(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::LeU => left_z3
-                        .bvule(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::GeS => left_z3
-                        .bvsge(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    SymbolicOp::GeU => left_z3
-                        .bvuge(&right_z3)
-                        .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
-                    // Rotate operations.
-                    SymbolicOp::Rol => left_z3.bvrotl(&right_z3),
-                    SymbolicOp::Ror => left_z3.bvrotr(&right_z3),
-                    // Rotate-through-carry have no direct bitvector mapping.
-                    SymbolicOp::Rcl | SymbolicOp::Rcr => left_z3,
-                    // Unary ops shouldn't appear in binary context.
-                    SymbolicOp::Neg
-                    | SymbolicOp::Not
-                    | SymbolicOp::BSwap
-                    | SymbolicOp::BRev
-                    | SymbolicOp::BitScanForward
-                    | SymbolicOp::BitScanReverse
-                    | SymbolicOp::Popcount
-                    | SymbolicOp::Parity => left_z3,
-                }
+            SymbolicExpr::TypedUnary { op, operand } => {
+                Self::scalar_unary(**op, self.translate_to_z3(operand, var_map))
             }
+
+            SymbolicExpr::TypedBinary { op, left, right } => Self::scalar_binary(
+                **op,
+                &self.translate_to_z3(left, var_map),
+                &self.translate_to_z3(right, var_map),
+            ),
+        }
+    }
+
+    /// Translates a unary numeric operation over the 32-bit word `operand`.
+    ///
+    /// A bit scan of zero has no index, so its result there is a value of
+    /// its own, unconstrained. A binary operation has no meaning over one
+    /// operand and is unconstrained as well.
+    fn numeric_unary(op: NumericOp, operand: z3::ast::BV) -> z3::ast::BV {
+        let bit = |index: u32| operand.extract(index, index);
+        let set = |index: u32| bit(index).eq(z3::ast::BV::from_u64(1, 1));
+        match op {
+            NumericOp::Neg => operand.bvneg(),
+            NumericOp::Not => operand.bvnot(),
+            NumericOp::BSwap => (8..32)
+                .step_by(8)
+                .fold(operand.extract(7, 0), |swapped, low| {
+                    swapped.concat(operand.extract(low | 7, low))
+                }),
+            NumericOp::BRev => (1..32).fold(bit(0), |reversed, index| reversed.concat(bit(index))),
+            NumericOp::BitScanForward => (0..32)
+                .rev()
+                .fold(z3::ast::BV::fresh_const("bsf_zero", 32), |higher, index| {
+                    set(index).ite(&z3::ast::BV::from_u64(index.into(), 32), &higher)
+                }),
+            NumericOp::BitScanReverse => (0..32)
+                .fold(z3::ast::BV::fresh_const("bsr_zero", 32), |lower, index| {
+                    set(index).ite(&z3::ast::BV::from_u64(index.into(), 32), &lower)
+                }),
+            NumericOp::Popcount => Self::population(&operand),
+            NumericOp::Parity => Self::population(&operand).bvand(z3::ast::BV::from_u64(1, 32)),
+            NumericOp::Add
+            | NumericOp::Sub
+            | NumericOp::Mul
+            | NumericOp::DivS
+            | NumericOp::DivU
+            | NumericOp::RemS
+            | NumericOp::RemU
+            | NumericOp::Rol
+            | NumericOp::Ror
+            | NumericOp::And
+            | NumericOp::Or
+            | NumericOp::Xor
+            | NumericOp::Shl
+            | NumericOp::ShrS
+            | NumericOp::ShrU
+            | NumericOp::Eq
+            | NumericOp::Ne
+            | NumericOp::LtS
+            | NumericOp::LtU
+            | NumericOp::GtS
+            | NumericOp::GtU
+            | NumericOp::LeS
+            | NumericOp::LeU
+            | NumericOp::GeS
+            | NumericOp::GeU => z3::ast::BV::fresh_const("malformed", 32),
+        }
+    }
+
+    /// The number of set bits of the 32-bit word `operand`.
+    fn population(operand: &z3::ast::BV) -> z3::ast::BV {
+        (0..32).fold(z3::ast::BV::from_u64(0, 32), |count, index| {
+            count.bvadd(operand.extract(index, index).zero_ext(31))
+        })
+    }
+
+    /// Translates a binary numeric operation over `left` and `right`.
+    fn numeric_binary(op: NumericOp, left: &z3::ast::BV, right: &z3::ast::BV) -> z3::ast::BV {
+        match op {
+            NumericOp::Add => left.bvadd(right),
+            NumericOp::Sub => left.bvsub(right),
+            NumericOp::Mul => left.bvmul(right),
+            NumericOp::DivS => left.bvsdiv(right),
+            NumericOp::DivU => left.bvudiv(right),
+            NumericOp::RemS => left.bvsrem(right),
+            NumericOp::RemU => left.bvurem(right),
+            NumericOp::And => left.bvand(right),
+            NumericOp::Or => left.bvor(right),
+            NumericOp::Xor => left.bvxor(right),
+            NumericOp::Shl => Self::shifted(right, left.bvshl(right)),
+            NumericOp::ShrS => Self::shifted(right, left.bvashr(right)),
+            NumericOp::ShrU => Self::shifted(right, left.bvlshr(right)),
+            // Comparisons return 1 or 0
+            NumericOp::Eq => left
+                .eq(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::Ne => left
+                .eq(right)
+                .not()
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::LtS => left
+                .bvslt(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::LtU => left
+                .bvult(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::GtS => left
+                .bvsgt(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::GtU => left
+                .bvugt(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::LeS => left
+                .bvsle(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::LeU => left
+                .bvule(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::GeS => left
+                .bvsge(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            NumericOp::GeU => left
+                .bvuge(right)
+                .ite(&z3::ast::BV::from_i64(1, 32), &z3::ast::BV::from_i64(0, 32)),
+            // Rotate operations.
+            NumericOp::Rol => left.bvrotl(right),
+            NumericOp::Ror => left.bvrotr(right),
+            // A unary operation has no meaning over two operands.
+            NumericOp::Neg
+            | NumericOp::Not
+            | NumericOp::BSwap
+            | NumericOp::BRev
+            | NumericOp::BitScanForward
+            | NumericOp::BitScanReverse
+            | NumericOp::Popcount
+            | NumericOp::Parity => z3::ast::BV::fresh_const("malformed", 32),
+        }
+    }
+
+    /// The word a shift by `amount` yields, `shifted` for a distance inside
+    /// the word: a distance of the word's width or more shifts by each
+    /// target's own convention, so its result is a value of its own,
+    /// unconstrained.
+    fn shifted(amount: &z3::ast::BV, shifted: z3::ast::BV) -> z3::ast::BV {
+        amount
+            .bvult(z3::ast::BV::from_u64(32, 32))
+            .ite(&shifted, &z3::ast::BV::fresh_const("shifted_out", 32))
+    }
+
+    /// Translates a unary operation that keeps its declared scalar semantics.
+    ///
+    /// A checked operation's value, where it returns, is the wrapping one; an
+    /// overflow traps and yields none. A copy is its operand, and a conversion
+    /// the operand as its target holds it ([`Self::converted`]).
+    fn scalar_unary(op: ScalarOperation, operand: z3::ast::BV) -> z3::ast::BV {
+        match op.kind() {
+            ScalarKind::Numeric(numeric) | ScalarKind::Checked { op: numeric, .. } => {
+                Self::numeric_unary(numeric, operand)
+            }
+            ScalarKind::Convert { target, .. } => Self::converted(&operand, target),
+            ScalarKind::Copy => operand,
+        }
+    }
+
+    /// Translates a binary operation that keeps its declared scalar semantics,
+    /// a checked one as the wrapping value it returns with. A conversion and
+    /// a copy take one operand, so over two they are unconstrained.
+    fn scalar_binary(op: ScalarOperation, left: &z3::ast::BV, right: &z3::ast::BV) -> z3::ast::BV {
+        match op.kind() {
+            ScalarKind::Numeric(numeric) | ScalarKind::Checked { op: numeric, .. } => {
+                Self::numeric_binary(numeric, left, right)
+            }
+            ScalarKind::Convert { .. } | ScalarKind::Copy => {
+                z3::ast::BV::fresh_const("malformed", 32)
+            }
+        }
+    }
+
+    /// The 32-bit value `operand` is as `target` holds it: its low bits,
+    /// extended by the target's sign, where the target is narrower than the
+    /// model's word, and the word itself otherwise. A checked conversion
+    /// that returns holds a value in range, which is the same bits.
+    fn converted(operand: &z3::ast::BV, target: IntegerType) -> z3::ast::BV {
+        let bits = target.bits();
+        if bits >= 32 {
+            return operand.clone();
+        }
+        let low = operand.extract(bits.saturating_sub(1), 0);
+        if target.signed() {
+            low.sign_ext(32u32.saturating_sub(bits))
+        } else {
+            low.zero_ext(32u32.saturating_sub(bits))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use analyssa::analysis::symbolic::{expr::SymbolicExpr, ops::SymbolicOp};
+    use analyssa::{
+        analysis::{consts::scalar::ScalarOperation, symbolic::expr::SymbolicExpr},
+        ir::evaluation::NumericOp,
+    };
 
-    use crate::{analysis::ssa::symbolic::Z3Solver, metadata::typesystem::PointerSize};
+    use crate::{
+        analysis::{
+            ssa::symbolic::Z3Solver, CilTarget, ConstValue, SsaEvaluator, SsaFunctionBuilder,
+            SsaType,
+        },
+        metadata::typesystem::PointerSize,
+    };
+
+    /// An operation that keeps its declared scalar semantics solves as that
+    /// operation: `conv.i1` holds a byte's range sign-extended, `conv.u1` the
+    /// same byte zero-extended, and a checked add, where it returns, the sum.
+    /// The control: the word a byte's conversion cannot reach is no solution.
+    #[test]
+    fn test_z3_typed_operation_solves_as_its_declared_semantics() {
+        let mut defined = Vec::new();
+        let ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let input = f.arg(0, SsaType::I32);
+                f.block(0, |b| {
+                    defined.push(b.conv(input, SsaType::I8));
+                    defined.push(b.conv(input, SsaType::U8));
+                    defined.push(b.add_ovf(input, input));
+                    b.ret();
+                });
+            })
+            .unwrap();
+        let machine = CilTarget::x86().machine();
+        let operation = |value| {
+            let op = ssa.get_definition(value).unwrap();
+            ScalarOperation::capture(&ssa, op, machine).unwrap().0
+        };
+        let x = || SymbolicExpr::named("x");
+        let signed = SymbolicExpr::typed_unary(operation(defined[0]), x()).unwrap();
+        let unsigned = SymbolicExpr::typed_unary(operation(defined[1]), x()).unwrap();
+        let sum = SymbolicExpr::typed_binary(operation(defined[2]), x(), x()).unwrap();
+
+        let solver = Z3Solver::new();
+        assert!(solver.is_satisfiable(&signed, "x", -128));
+        assert!(
+            !solver.is_satisfiable(&signed, "x", 0x80),
+            "a signed byte is never 128"
+        );
+        assert!(solver.is_satisfiable(&unsigned, "x", 0x80));
+        assert!(
+            !solver.is_satisfiable(&unsigned, "x", -1),
+            "an unsigned byte is never all ones"
+        );
+        assert!(solver.is_satisfiable(&sum, "x", 10));
+        assert!(!solver.is_satisfiable(&sum, "x", 7), "twice a word is even");
+    }
+
+    /// Every operation solves as the value it computes, and one whose value
+    /// the program leaves to the target solves as no value in particular.
+    /// The bit operations over 0x112 (bits 1, 4 and 8) state their results;
+    /// a bit scan of zero, a shift by the word's width, a constant without
+    /// integer bits and an operation given the wrong number of operands
+    /// prove nothing; an unsigned 64-bit constant is its low word.
+    #[test]
+    fn test_z3_operations_solve_as_the_values_they_compute() {
+        let solver = Z3Solver::new();
+        let always = |expr: SymbolicExpr<CilTarget>, expected: i64| {
+            let predicate =
+                SymbolicExpr::binary(NumericOp::Eq, expr, SymbolicExpr::constant_i64(expected));
+            solver.check_opaque_predicate(&predicate, &[])
+        };
+        let bits = || SymbolicExpr::constant_i32(0x112);
+        for (op, expected) in [
+            (NumericOp::BSwap, 0x1201_0000),
+            (NumericOp::BRev, 0x4880_0000),
+            (NumericOp::Popcount, 3),
+            (NumericOp::Parity, 1),
+            (NumericOp::BitScanForward, 1),
+            (NumericOp::BitScanReverse, 8),
+        ] {
+            assert_eq!(
+                always(SymbolicExpr::unary(op, bits()), expected),
+                Some(true),
+                "{op:?}"
+            );
+        }
+        for op in [NumericOp::BitScanForward, NumericOp::BitScanReverse] {
+            let zero = SymbolicExpr::unary(op, SymbolicExpr::constant_i32(0));
+            assert_eq!(always(zero, 0), None, "{op:?} of zero");
+        }
+        let one = || SymbolicExpr::constant_i32(1);
+        let shifted = |distance| {
+            SymbolicExpr::binary(NumericOp::Shl, one(), SymbolicExpr::constant_i32(distance))
+        };
+        assert_eq!(always(shifted(31), i64::from(i32::MIN)), Some(true));
+        assert_eq!(always(shifted(32), 0), None, "shifted by the width");
+        let string = SymbolicExpr::constant(ConstValue::String(0));
+        assert_eq!(always(string, 0), None, "a string's token");
+        let wide = SymbolicExpr::constant(ConstValue::U64(0xFFFF_FFFF_0000_0005));
+        assert_eq!(always(wide, 5), Some(true), "the low word");
+        let unary_as_binary = SymbolicExpr::binary(NumericOp::Popcount, bits(), bits());
+        assert_eq!(always(unary_as_binary, 0x112), None);
+        let binary_as_unary = SymbolicExpr::unary(NumericOp::Add, bits());
+        assert_eq!(always(binary_as_unary, 0x112), None);
+    }
+
+    /// One execution of an opaque definition is its own unconstrained value:
+    /// equal to itself, but not tied to the SSA variable it came from. A tree
+    /// past the evaluator's size limit is such an execution.
+    #[test]
+    fn test_z3_instance_is_distinct_from_its_variable() {
+        let mut defined = None;
+        let ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let input = f.arg(0, SsaType::I32);
+                f.block(0, |b| {
+                    let mut value = input;
+                    for _ in 0..13 {
+                        value = b.mul(value, value);
+                    }
+                    defined = Some(value);
+                    b.ret();
+                });
+            })
+            .unwrap();
+        let squared = defined.unwrap();
+        let mut eval = SsaEvaluator::new(&ssa, CilTarget::x86().machine());
+        eval.set_symbolic(ssa.argument_variables().next().unwrap().id(), "x");
+        eval.evaluate_block(0);
+        let read = eval.get(squared).cloned().unwrap();
+        let mut found = None;
+        read.for_each_instance(|instance| {
+            found.get_or_insert(instance);
+        });
+        let instance = found.unwrap_or_else(|| panic!("{read:?}"));
+        let opaque = SymbolicExpr::Instance(instance);
+
+        let solver = Z3Solver::new();
+        let itself = SymbolicExpr::binary(NumericOp::Eq, opaque.clone(), opaque.clone());
+        assert_eq!(solver.check_opaque_predicate(&itself, &[]), Some(true));
+        let variable = SymbolicExpr::binary(
+            NumericOp::Eq,
+            opaque,
+            SymbolicExpr::Variable(instance.source()),
+        );
+        assert_eq!(solver.check_opaque_predicate(&variable, &[]), None);
+    }
 
     #[test]
     fn test_z3_simple_solve() {
@@ -544,7 +836,7 @@ mod tests {
 
         // Solve: state + 5 = 10  =>  state = 5
         let expr = SymbolicExpr::binary(
-            SymbolicOp::Add,
+            NumericOp::Add,
             SymbolicExpr::named("state"),
             SymbolicExpr::constant_i32(5),
         );
@@ -560,7 +852,7 @@ mod tests {
 
         // Solve: state XOR 0x1234 = 0x5678
         let expr = SymbolicExpr::binary(
-            SymbolicOp::Xor,
+            NumericOp::Xor,
             SymbolicExpr::named("state"),
             SymbolicExpr::constant_i32(0x1234),
         );
@@ -579,11 +871,11 @@ mod tests {
 
         // Solve: (state XOR 0x12345678) % 13 = 5
         let xored = SymbolicExpr::binary(
-            SymbolicOp::Xor,
+            NumericOp::Xor,
             SymbolicExpr::named("state"),
             SymbolicExpr::constant_i32(0x12345678),
         );
-        let expr = SymbolicExpr::binary(SymbolicOp::RemU, xored, SymbolicExpr::constant_i32(13));
+        let expr = SymbolicExpr::binary(NumericOp::RemU, xored, SymbolicExpr::constant_i32(13));
 
         let solutions = solver.solve_for_value(&expr, "state", 5, 10);
         assert!(!solutions.is_empty());
@@ -601,7 +893,7 @@ mod tests {
 
         // Build mapping for: state % 5
         let expr = SymbolicExpr::binary(
-            SymbolicOp::RemU,
+            NumericOp::RemU,
             SymbolicExpr::named("state"),
             SymbolicExpr::constant_i32(5),
         );
@@ -621,7 +913,7 @@ mod tests {
 
         // state % 5 = 3 should be satisfiable
         let expr = SymbolicExpr::binary(
-            SymbolicOp::RemU,
+            NumericOp::RemU,
             SymbolicExpr::named("state"),
             SymbolicExpr::constant_i32(5),
         );
@@ -639,9 +931,9 @@ mod tests {
         // Actually this is false due to overflow. Let's use a simpler case:
         // (x | ~x) == -1 is always true (all bits set)
         let x = SymbolicExpr::named("x");
-        let not_x = SymbolicExpr::unary(SymbolicOp::Not, x.clone());
-        let or_expr = SymbolicExpr::binary(SymbolicOp::Or, x, not_x);
-        let cmp = SymbolicExpr::binary(SymbolicOp::Eq, or_expr, SymbolicExpr::constant_i32(-1));
+        let not_x = SymbolicExpr::unary(NumericOp::Not, x.clone());
+        let or_expr = SymbolicExpr::binary(NumericOp::Or, x, not_x);
+        let cmp = SymbolicExpr::binary(NumericOp::Eq, or_expr, SymbolicExpr::constant_i32(-1));
 
         let result = solver.check_opaque_predicate(&cmp, &["x"]);
         assert_eq!(result, Some(true), "(x | ~x) == -1 should always be true");
@@ -653,9 +945,9 @@ mod tests {
 
         // (x & ~x) != 0 is always false (x & ~x is always 0)
         let x = SymbolicExpr::named("x");
-        let not_x = SymbolicExpr::unary(SymbolicOp::Not, x.clone());
-        let and_expr = SymbolicExpr::binary(SymbolicOp::And, x, not_x);
-        let cmp = SymbolicExpr::binary(SymbolicOp::Ne, and_expr, SymbolicExpr::constant_i32(0));
+        let not_x = SymbolicExpr::unary(NumericOp::Not, x.clone());
+        let and_expr = SymbolicExpr::binary(NumericOp::And, x, not_x);
+        let cmp = SymbolicExpr::binary(NumericOp::Ne, and_expr, SymbolicExpr::constant_i32(0));
 
         let result = solver.check_opaque_predicate(&cmp, &["x"]);
         assert_eq!(result, Some(false), "(x & ~x) != 0 should always be false");
@@ -667,7 +959,7 @@ mod tests {
 
         // x > 0 is NOT an opaque predicate (can be true or false)
         let expr = SymbolicExpr::binary(
-            SymbolicOp::GtS,
+            NumericOp::GtS,
             SymbolicExpr::named("x"),
             SymbolicExpr::constant_i32(0),
         );
@@ -682,8 +974,8 @@ mod tests {
 
         // (x - x) == 0 is always true
         let x = SymbolicExpr::named("x");
-        let sub = SymbolicExpr::binary(SymbolicOp::Sub, x.clone(), x);
-        let cmp = SymbolicExpr::binary(SymbolicOp::Eq, sub, SymbolicExpr::constant_i32(0));
+        let sub = SymbolicExpr::binary(NumericOp::Sub, x.clone(), x);
+        let cmp = SymbolicExpr::binary(NumericOp::Eq, sub, SymbolicExpr::constant_i32(0));
 
         let result = solver.check_opaque_predicate(&cmp, &["x"]);
         assert_eq!(result, Some(true), "(x - x) == 0 should always be true");
@@ -695,8 +987,8 @@ mod tests {
 
         // (x ^ x) == 0 is always true
         let x = SymbolicExpr::named("x");
-        let xor = SymbolicExpr::binary(SymbolicOp::Xor, x.clone(), x);
-        let cmp = SymbolicExpr::binary(SymbolicOp::Eq, xor, SymbolicExpr::constant_i32(0));
+        let xor = SymbolicExpr::binary(NumericOp::Xor, x.clone(), x);
+        let cmp = SymbolicExpr::binary(NumericOp::Eq, xor, SymbolicExpr::constant_i32(0));
 
         let result = solver.check_opaque_predicate(&cmp, &["x"]);
         assert_eq!(result, Some(true), "(x ^ x) == 0 should always be true");
@@ -709,10 +1001,10 @@ mod tests {
         // (x + y) - (y + x) == 0 is always true (commutativity of addition)
         let x = SymbolicExpr::named("x");
         let y = SymbolicExpr::named("y");
-        let sum1 = SymbolicExpr::binary(SymbolicOp::Add, x.clone(), y.clone());
-        let sum2 = SymbolicExpr::binary(SymbolicOp::Add, y, x);
-        let diff = SymbolicExpr::binary(SymbolicOp::Sub, sum1, sum2);
-        let cmp = SymbolicExpr::binary(SymbolicOp::Eq, diff, SymbolicExpr::constant_i32(0));
+        let sum1 = SymbolicExpr::binary(NumericOp::Add, x.clone(), y.clone());
+        let sum2 = SymbolicExpr::binary(NumericOp::Add, y, x);
+        let diff = SymbolicExpr::binary(NumericOp::Sub, sum1, sum2);
+        let cmp = SymbolicExpr::binary(NumericOp::Eq, diff, SymbolicExpr::constant_i32(0));
 
         let result = solver.check_opaque_predicate(&cmp, &["x", "y"]);
         assert_eq!(
@@ -728,7 +1020,7 @@ mod tests {
 
         // x > 5 can be true (e.g., x = 10)
         let expr = SymbolicExpr::binary(
-            SymbolicOp::GtS,
+            NumericOp::GtS,
             SymbolicExpr::named("x"),
             SymbolicExpr::constant_i32(5),
         );
@@ -742,7 +1034,7 @@ mod tests {
 
         // x > 5 can be false (e.g., x = 0)
         let expr = SymbolicExpr::binary(
-            SymbolicOp::GtS,
+            NumericOp::GtS,
             SymbolicExpr::named("x"),
             SymbolicExpr::constant_i32(5),
         );
@@ -756,7 +1048,7 @@ mod tests {
 
         // 5 + 3 is always 8
         let expr = SymbolicExpr::binary(
-            SymbolicOp::Add,
+            NumericOp::Add,
             SymbolicExpr::constant_i32(5),
             SymbolicExpr::constant_i32(3),
         );
@@ -771,7 +1063,7 @@ mod tests {
 
         // x + 3 varies with x
         let expr = SymbolicExpr::binary(
-            SymbolicOp::Add,
+            NumericOp::Add,
             SymbolicExpr::named("x"),
             SymbolicExpr::constant_i32(3),
         );

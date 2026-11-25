@@ -76,7 +76,7 @@
 //!
 //! ## Array Type Resolution
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::metadata::{
 //!     typesystem::{TypeResolver, ArrayDimensions},
 //!     signatures::{TypeSignature, SignatureArray}
@@ -84,16 +84,17 @@
 //!
 //! # fn example(mut resolver: TypeResolver) -> dotscope::Result<()> {
 //! // Create array signature: int[]
-//! let array_sig = TypeSignature::Array(Box::new(ArraySpecification {
-//!     base: TypeSignature::I4,
+//! let array_sig = TypeSignature::Array(SignatureArray {
+//!     base: Box::new(TypeSignature::I4),
 //!     rank: 1,
-//!     dimensions: ArrayDimensions::default(),
-//! }));
+//!     dimensions: vec![ArrayDimensions::default()],
+//! });
 //!
 //! let array_type = resolver.resolve(&array_sig)?;
 //! assert_eq!(array_type.name, "Int32[]");
 //! # Ok(())
 //! # }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Context-Aware Resolution
@@ -121,7 +122,6 @@
 //! The resolver provides comprehensive error reporting:
 //! - **`TypeNotFound`**: Referenced types don't exist in registry
 //! - **`RecursionLimit`**: Maximum recursion depth exceeded
-//! - **`TypeMissingParent`**: Modifier types without required parent context
 //! - **`TypeError`**: General type system inconsistencies
 //!
 //! # Performance Characteristics
@@ -143,7 +143,8 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        signatures::{SignatureMethod, SignatureMethodSpec, TypeSignature},
+        signatures::{SignatureArray, SignatureMethod, SignatureMethodSpec, TypeSignature},
+        streams::SharedStr,
         tables::MethodSpec,
         token::Token,
         typesystem::{
@@ -151,8 +152,8 @@ use crate::{
             CompleteTypeSpec, TypeRegistry, TypeSource,
         },
     },
-    utils::{truncate_chars, LazyList},
-    Error::{RecursionLimit, TypeError, TypeMissingParent, TypeNotFound},
+    utils::truncate_chars,
+    Error::{RecursionLimit, TypeError, TypeNotFound},
     Result,
 };
 
@@ -408,7 +409,6 @@ impl TypeResolver {
     /// The method can fail with several error types:
     /// - [`TypeNotFound`] - Referenced types don't exist in the registry
     /// - [`RecursionLimit`] - Maximum recursion depth exceeded (circular references)
-    /// - [`TypeMissingParent`] - Modifier types require parent context
     /// - [`TypeError`] - General type system inconsistencies
     ///
     /// # Resolution Strategy
@@ -445,7 +445,7 @@ impl TypeResolver {
     ///
     /// ## Complex Type Resolution
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use dotscope::metadata::{
     ///     signatures::{TypeSignature, SignatureArray},
     ///     typesystem::ArrayDimensions,
@@ -458,14 +458,15 @@ impl TypeResolver {
     /// let class_type = resolver.resolve(&class_sig)?;
     ///
     /// // Resolve array type
-    /// let array_sig = TypeSignature::Array(Box::new(ArraySpecification {
-    ///     base: TypeSignature::I4,
+    /// let array_sig = TypeSignature::Array(SignatureArray {
+    ///     base: Box::new(TypeSignature::I4),
     ///     rank: 1,
-    ///     dimensions: ArrayDimensions::default(),
-    /// }));
+    ///     dimensions: vec![ArrayDimensions::default()],
+    /// });
     /// let array_type = resolver.resolve(&array_sig)?;
     /// # Ok(())
     /// # }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     ///
     /// # Thread Safety
@@ -474,25 +475,6 @@ impl TypeResolver {
     /// resolver instances for concurrent resolution operations.
     pub fn resolve(&mut self, signature: &TypeSignature) -> Result<CilTypeRc> {
         self.resolve_with_depth(signature, 0)
-    }
-
-    /// Formats a type name with generic arity marker.
-    ///
-    /// If the name doesn't already contain a backtick (`), appends the generic arity
-    /// in the format `Name`N` where N is the number of type arguments.
-    ///
-    /// # Arguments
-    /// * `base_name` - The original type name
-    /// * `arg_count` - The number of generic type arguments
-    ///
-    /// # Returns
-    /// The name with generic arity marker, or the original name if already present.
-    fn format_generic_name(base_name: &str, arg_count: usize) -> String {
-        if base_name.contains('`') {
-            base_name.to_string()
-        } else {
-            format!("{base_name}`{arg_count}")
-        }
     }
 
     /// Formats a stable name for function pointer types based on signature characteristics.
@@ -506,8 +488,12 @@ impl TypeResolver {
     ///
     /// # Returns
     /// A deterministic string like `FnPtr_stdcall_2_void` representing the signature.
-    fn format_fnptr_name(signature: &SignatureMethod) -> String {
-        let calling_convention = if signature.stdcall {
+    pub fn format_fnptr_name(signature: &SignatureMethod) -> String {
+        let calling_convention = if signature.vararg {
+            "vararg"
+        } else if signature.unmanaged {
+            "unmanaged"
+        } else if signature.stdcall {
             "stdcall"
         } else if signature.cdecl {
             "cdecl"
@@ -602,27 +588,29 @@ impl TypeResolver {
                     Err(TypeNotFound(*token))
                 }
             }
-            TypeSignature::ModifiedRequired(modifiers)
-            | TypeSignature::ModifiedOptional(modifiers) => {
+            // A modified type is the type it modifies. The modifiers are recorded on the
+            // signature's owner (the parent) when there is one, never on the modified type: that
+            // is a shared type (`int32` itself), which every other use of it would see them on.
+            TypeSignature::ModifiedRequired(modifiers, base)
+            | TypeSignature::ModifiedOptional(modifiers, base) => {
+                let required = matches!(signature, TypeSignature::ModifiedRequired(..));
                 if let Some(parent_token) = self.token_parent {
-                    if let Some(parent_type) = self.registry.get(&parent_token) {
-                        for modifier in modifiers {
-                            if let Some(mod_type) = self.registry.get(&modifier.modifier_type) {
-                                parent_type.modifiers.push(CilModifier {
-                                    required: modifier.is_required,
-                                    modifier: mod_type.into(),
-                                });
-                            } else {
-                                return Err(TypeNotFound(modifier.modifier_type));
-                            }
-                        }
-                        Ok(parent_type)
-                    } else {
-                        Err(TypeNotFound(parent_token))
+                    let parent_type = self
+                        .registry
+                        .get(&parent_token)
+                        .ok_or(TypeNotFound(parent_token))?;
+                    for modifier in modifiers {
+                        let mod_type = self
+                            .registry
+                            .get(&modifier.modifier_type)
+                            .ok_or(TypeNotFound(modifier.modifier_type))?;
+                        parent_type.modifiers.push(CilModifier {
+                            required,
+                            modifier: mod_type.into(),
+                        });
                     }
-                } else {
-                    Err(TypeMissingParent)
                 }
+                self.resolve_with_depth(base, depth.saturating_add(1))
             }
             TypeSignature::Array(array) => {
                 let mut token_init = self.token_init.take();
@@ -635,20 +623,20 @@ impl TypeResolver {
                     dimensions: array.dimensions.clone(),
                 };
 
-                // Create array name: ElementName[,] for multi-dimensional arrays
+                // As the runtime names a general array: `ElementName[*]` at rank 1, which is
+                // not the vector `ElementName[]`, and `ElementName[,]` at rank 2
                 let namespace = element_type.namespace.clone();
-                let name = if array.rank == 1 {
-                    format!("{}[]", element_type.name)
-                } else {
-                    let commas = (array.rank as usize).saturating_sub(1);
-                    format!("{}[{}]", element_type.name, ",".repeat(commas))
-                };
+                let name = format!(
+                    "{}[{}]",
+                    element_type.name,
+                    SignatureArray::rank_bounds(array.rank)
+                );
 
                 let array_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                     token_init: token_init.take(),
                     flavor: array_flavor,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -681,7 +669,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: array_flavor,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -713,7 +701,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: CilFlavor::Pointer,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -745,7 +733,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: CilFlavor::ByRef,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -763,8 +751,8 @@ impl TypeResolver {
                     flavor: CilFlavor::FnPtr {
                         signature: fn_ptr.clone(),
                     },
-                    namespace: String::new(),
-                    name,
+                    namespace: SharedStr::default(),
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -785,7 +773,7 @@ impl TypeResolver {
                     token_init: token_init.take(),
                     flavor: CilFlavor::Pinned,
                     namespace: namespace.clone(),
-                    name,
+                    name: name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -800,8 +788,11 @@ impl TypeResolver {
 
                 let base_type = self.resolve_with_depth(base_sig, depth.saturating_add(1))?;
 
+                // An instance is named as its definition is: the arity suffix is a compiler's
+                // naming convention, and a nested type that only inherits its enclosing type's
+                // parameters has none
                 let namespace = base_type.namespace.clone();
-                let name = Self::format_generic_name(&base_type.name, type_args.len());
+                let name = base_type.name.clone();
 
                 // Use the base type's source instead of the current assembly source
                 // Generic instantiations should inherit the source from their base type
@@ -851,7 +842,7 @@ impl TypeResolver {
                         instantiation: SignatureMethodSpec {
                             generic_args: vec![],
                         },
-                        custom_attributes: LazyList::new(),
+                        custom_attributes: Default::default(),
                         generic_args: {
                             let type_ref_list = Arc::new(boxcar::Vec::with_capacity(1));
                             type_ref_list.push(arg_type.into());
@@ -861,10 +852,10 @@ impl TypeResolver {
                     generic_inst.generic_args.push(method_spec);
                 }
 
-                if let Some(definition_base) = base_type.base() {
-                    generic_inst.set_base(&definition_base.into())?;
-                }
-
+                // The instance's base is its definition's with the arguments substituted, which
+                // is not computed here; the definition's own base is set after the type
+                // specifications load, so a copy of it would depend on load order. Nesting is
+                // known by now (the loaders that resolve signatures run after `NestedClass`).
                 if let Some(enclosing) = base_type.enclosing_type.get() {
                     let _ = generic_inst.set_enclosing_type(enclosing);
                 }
@@ -880,8 +871,8 @@ impl TypeResolver {
                         index: *index,
                         method: false,
                     },
-                    namespace: String::new(),
-                    name: param_name,
+                    namespace: SharedStr::default(),
+                    name: param_name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -899,8 +890,8 @@ impl TypeResolver {
                         index: *index,
                         method: true,
                     },
-                    namespace: String::new(),
-                    name: param_name,
+                    namespace: SharedStr::default(),
+                    name: param_name.into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -913,8 +904,8 @@ impl TypeResolver {
                 let typed_ref_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                     token_init: self.token_init.take(),
                     flavor: CilFlavor::ValueType,
-                    namespace: "System".to_string(),
-                    name: "TypedReference".to_string(),
+                    namespace: "System".into(),
+                    name: "TypedReference".into(),
                     source: self.current_source.clone(),
                     generic_args: None,
                     base_type: None,
@@ -1023,6 +1014,19 @@ mod tests {
 
         assert_ne!(int_array.token, int_2d_array.token);
 
+        // A rank-1 general array (`int32[1...]`) is not the vector, by name or by flavor.
+        let based_sig = TypeSignature::Array(SignatureArray {
+            rank: 1,
+            dimensions: vec![ArrayDimensions {
+                size: None,
+                lower_bound: Some(1),
+            }],
+            base: Box::new(TypeSignature::I4),
+        });
+        let based = resolver.resolve(&based_sig).unwrap();
+        assert_eq!(based.name, "Int32[*]");
+        assert_ne!(*int_array.flavor(), *based.flavor());
+
         let int_3d_array_sig = TypeSignature::Array(SignatureArray {
             rank: 3,
             dimensions: vec![
@@ -1059,8 +1063,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(in_attr_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Runtime.InteropServices".to_string(),
-                name: "InAttribute".to_string(),
+                namespace: "System.Runtime.InteropServices".into(),
+                name: "InAttribute".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1198,8 +1202,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(list_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "List`1".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "List`1".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1212,11 +1216,11 @@ mod tests {
             number: 0,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "T".to_string(),
-            constraints: Arc::new(boxcar::Vec::new()),
+            name: "T".into(),
+            constraints: Default::default(),
             rid: 1,
             offset: 1,
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         });
 
         list_type.generic_params.push(type_param);
@@ -1279,6 +1283,46 @@ mod tests {
         };
     }
 
+    /// An instance is named as its definition is and nested where it is: a nested type that
+    /// only inherits its enclosing type's parameters (`Outer`1/Inner`) has no arity suffix to
+    /// add. Its base is not its definition's, which is unsubstituted and, while loading, set
+    /// or not depending on what loaded first.
+    #[test]
+    fn an_instance_is_named_and_nested_as_its_definition() {
+        let test_identity = AssemblyIdentity::parse("TestAssembly, Version=1.0.0.0").unwrap();
+        let registry = Arc::new(TypeRegistry::new(test_identity).unwrap());
+        let class = |token: u32, name: &str| {
+            registry
+                .get_or_create_type(&CompleteTypeSpec {
+                    token_init: Some(Token::new(token)),
+                    flavor: CilFlavor::Class,
+                    namespace: Default::default(),
+                    name: name.into(),
+                    source: TypeSource::Unknown,
+                    generic_args: None,
+                    base_type: None,
+                    flags: None,
+                })
+                .unwrap()
+        };
+        let outer = class(0x0200_0010, "Outer`1");
+        let inner = class(0x0200_0011, "Inner");
+        let base = class(0x0200_0012, "Base");
+        inner.set_enclosing_type(&outer.clone().into()).unwrap();
+        inner.set_base(&base.into()).unwrap();
+
+        let instance = TypeResolver::new(registry.clone())
+            .resolve(&TypeSignature::GenericInst(
+                Box::new(TypeSignature::Class(inner.token)),
+                vec![TypeSignature::I4],
+            ))
+            .unwrap();
+
+        assert_eq!(instance.name, "Inner");
+        assert_eq!(&*instance.fullname(), "Outer`1/Inner");
+        assert!(instance.base().is_none());
+    }
+
     #[test]
     fn test_resolve_class_and_valuetype() {
         let test_identity = AssemblyIdentity::parse("TestAssembly, Version=1.0.0.0").unwrap();
@@ -1291,8 +1335,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(class_token),
                 flavor: CilFlavor::Class,
-                namespace: "System".to_string(),
-                name: "String".to_string(),
+                namespace: "System".into(),
+                name: "String".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1304,8 +1348,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(value_token),
                 flavor: CilFlavor::ValueType,
-                namespace: "System".to_string(),
-                name: "DateTime".to_string(),
+                namespace: "System".into(),
+                name: "DateTime".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1338,8 +1382,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(modifier_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Runtime.InteropServices".to_string(),
-                name: "InAttribute".to_string(),
+                namespace: "System.Runtime.InteropServices".into(),
+                name: "InAttribute".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1353,8 +1397,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(parent_token),
                 flavor: CilFlavor::Class,
-                namespace: "System".to_string(),
-                name: "Int32".to_string(),
+                namespace: "System".into(),
+                name: "Int32".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1362,34 +1406,46 @@ mod tests {
             })
             .unwrap();
 
-        let mut resolver = TypeResolver::new(registry).with_parent(parent_token);
+        let mut resolver = TypeResolver::new(registry.clone()).with_parent(parent_token);
+        let int32 = resolver.resolve(&TypeSignature::I4).unwrap();
 
-        let req_mod_sig =
-            TypeSignature::ModifiedRequired(vec![crate::metadata::signatures::CustomModifier {
+        // A modified type resolves to the type it modifies; its modifiers go on the parent
+        let req_mod_sig = TypeSignature::ModifiedRequired(
+            vec![crate::metadata::signatures::CustomModifier {
                 is_required: true,
                 modifier_type: modifier_token,
-            }]);
+            }],
+            Box::new(TypeSignature::I4),
+        );
         let req_mod_type = resolver.resolve(&req_mod_sig).unwrap();
-
-        assert_eq!(req_mod_type.token, parent_token);
-        assert_eq!(req_mod_type.modifiers.count(), 1);
-        assert!(req_mod_type.modifiers[0].required);
+        assert_eq!(req_mod_type.token, int32.token);
         assert_eq!(
-            req_mod_type.modifiers[0].modifier.token().unwrap(),
+            int32.modifiers.count(),
+            0,
+            "the shared int32 gets no modifier"
+        );
+
+        let parent = registry.get(&parent_token).unwrap();
+        assert_eq!(parent.modifiers.count(), 1);
+        assert!(parent.modifiers.get(0).unwrap().required);
+        assert_eq!(
+            parent.modifiers.get(0).unwrap().modifier.token().unwrap(),
             modifier_token
         );
 
-        let opt_mod_sig =
-            TypeSignature::ModifiedOptional(vec![crate::metadata::signatures::CustomModifier {
+        // A run of the other kind nested inside resolves through both
+        let nested_sig = TypeSignature::ModifiedOptional(
+            vec![crate::metadata::signatures::CustomModifier {
                 is_required: false,
                 modifier_type: modifier_token,
-            }]);
-        let opt_mod_type = resolver.resolve(&opt_mod_sig).unwrap();
-
-        assert_eq!(opt_mod_type.token, parent_token);
-        assert_eq!(opt_mod_type.modifiers.count(), 2);
-        assert!(opt_mod_type.modifiers[0].required);
-        assert!(!opt_mod_type.modifiers[1].required);
+            }],
+            Box::new(req_mod_sig),
+        );
+        let nested_type = resolver.resolve(&nested_sig).unwrap();
+        assert_eq!(nested_type.token, int32.token);
+        assert_eq!(parent.modifiers.count(), 3);
+        assert!(!parent.modifiers.get(1).unwrap().required);
+        assert!(parent.modifiers.get(2).unwrap().required);
     }
 
     #[test]
@@ -1440,20 +1496,21 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::TypeNotFound(_))));
 
-        // Test TypeMissingParent error
+        // A modified type needs no parent: it is the type it modifies
         let mod_token = Token::new(0x01000001);
-        let mod_sig =
-            TypeSignature::ModifiedRequired(vec![crate::metadata::signatures::CustomModifier {
+        let mod_sig = TypeSignature::ModifiedRequired(
+            vec![crate::metadata::signatures::CustomModifier {
                 is_required: true,
                 modifier_type: mod_token,
-            }]);
-        let result = resolver.resolve(&mod_sig);
-
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::TypeMissingParent)));
+            }],
+            Box::new(TypeSignature::I4),
+        );
+        let resolved = resolver
+            .resolve(&mod_sig)
+            .expect("a modified int32 resolves");
+        assert_eq!(resolved.name, "Int32");
 
         // Test unsupported signature
-        struct UnsupportedSignature;
 
         #[allow(non_local_definitions)]
         impl TypeSignature {

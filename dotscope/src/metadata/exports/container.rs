@@ -50,6 +50,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use crate::{
     metadata::{
         exports::{native::NativeExports, Exports as CilExports},
+        streams::SharedStr,
         tables::ExportedTypeRc,
         token::Token,
     },
@@ -102,10 +103,10 @@ pub struct UnifiedExportContainer {
     native: NativeExports,
 
     /// Cached unified view by name (lazy-populated)
-    unified_name_cache: DashMap<String, Vec<ExportEntry>>,
+    unified_name_cache: DashMap<SharedStr, Vec<ExportEntry>>,
 
     /// Cached all exported function names (lazy-populated)
-    unified_function_cache: DashMap<String, ExportSource>,
+    unified_function_cache: DashMap<SharedStr, ExportSource>,
 
     /// Flag indicating unified caches need rebuilding
     cache_dirty: AtomicBool,
@@ -171,8 +172,8 @@ pub enum ExportSource {
 /// Information about an exported function combining both sources.
 #[derive(Clone, Debug)]
 pub struct ExportedFunction {
-    /// Function name
-    pub name: String,
+    /// Function name, shared with the export it names
+    pub name: SharedStr,
     /// Source of the export
     pub source: ExportSource,
     /// Whether it's a forwarder (native only)
@@ -417,10 +418,8 @@ impl UnifiedExportContainer {
     /// println!("Total exports: {}", container.total_count());
     /// ```
     pub fn total_count(&self) -> usize {
-        self.cil
-            .len()
-            .saturating_add(self.native.function_count())
-            .saturating_add(self.native.forwarder_count())
+        // `function_count` counts the forwarders as well
+        self.cil.len().saturating_add(self.native.function_count())
     }
 
     /// Add a native function export.
@@ -628,9 +627,10 @@ impl UnifiedExportContainer {
         // Populate from native exports
         for function in self.native.functions() {
             if let Some(ref name) = function.name {
+                let key = SharedStr::from(name.as_str());
                 // Add to name cache
                 self.unified_name_cache
-                    .entry(name.clone())
+                    .entry(key.clone())
                     .or_default()
                     .push(ExportEntry::Native(NativeExportRef {
                         ordinal: function.ordinal,
@@ -639,7 +639,7 @@ impl UnifiedExportContainer {
                     }));
 
                 // Add to function cache
-                match self.unified_function_cache.entry(name.clone()) {
+                match self.unified_function_cache.entry(key) {
                     Entry::Occupied(mut entry) => {
                         match entry.get() {
                             ExportSource::Cil(token) => {
@@ -660,9 +660,10 @@ impl UnifiedExportContainer {
         // Populate from native forwarders
         for forwarder in self.native.forwarders() {
             if let Some(ref name) = forwarder.name {
+                let key = SharedStr::from(name.as_str());
                 // Add to name cache
                 self.unified_name_cache
-                    .entry(name.clone())
+                    .entry(key.clone())
                     .or_default()
                     .push(ExportEntry::Native(NativeExportRef {
                         ordinal: forwarder.ordinal,
@@ -672,7 +673,7 @@ impl UnifiedExportContainer {
 
                 // Add to function cache
                 self.unified_function_cache
-                    .entry(name.clone())
+                    .entry(key)
                     .or_insert_with(|| ExportSource::Native(forwarder.ordinal));
             }
         }
@@ -975,7 +976,7 @@ mod tests {
     #[test]
     fn test_exported_function_structure() {
         let func = ExportedFunction {
-            name: "TestFunction".to_string(),
+            name: "TestFunction".into(),
             source: ExportSource::Native(1),
             is_forwarder: false,
             forwarder_target: None,
@@ -989,7 +990,7 @@ mod tests {
     #[test]
     fn test_exported_function_forwarder() {
         let func = ExportedFunction {
-            name: "ForwardedFunc".to_string(),
+            name: "ForwardedFunc".into(),
             source: ExportSource::Native(1),
             is_forwarder: true,
             forwarder_target: Some("target.dll.RealFunc".to_string()),
@@ -1102,6 +1103,7 @@ mod tests {
         // Verify counts
         assert_eq!(container.native().function_count(), 3);
         assert_eq!(container.native().forwarder_count(), 1);
+        assert_eq!(container.total_count(), 3, "a forwarder counts once");
 
         // Verify named function is findable
         let named_results = container.find_by_name("NamedFunc");

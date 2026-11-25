@@ -14,7 +14,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```no_run
 //! # use dotscope::prelude::*;
 //! # use std::path::Path;
 //! # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
@@ -32,7 +32,7 @@
 //!     .name("Resources.resources")
 //!     .contains_no_metadata()
 //!     .hash_value(&[0xAB, 0xCD, 0xEF, 0x01])
-//!     .build(&mut context)?;
+//!     .build(&mut assembly)?;
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -269,7 +269,7 @@ impl FileBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// # use dotscope::prelude::*;
     /// # use std::path::Path;
     /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
@@ -280,7 +280,7 @@ impl FileBuilder {
     ///     .contains_metadata()
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created File with token: {}", file_token);
+    /// println!("Created File with token: {:?}", file_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {
@@ -324,7 +324,7 @@ mod tests {
     use super::*;
     use crate::{
         cilassembly::ChangeRefKind, metadata::tables::FileAttributes,
-        test::factories::table::assemblyref::get_test_assembly,
+        testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

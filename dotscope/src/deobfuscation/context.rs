@@ -46,7 +46,7 @@ pub struct HookFactory {
 /// warmup methods, and state machine providers.
 ///
 /// All `CompilerContext` methods and fields are accessible via `Deref`:
-/// ```rust,ignore
+/// ```text
 /// let ctx: &AnalysisContext = ...;
 /// ctx.events.record(...);           // via Deref to CompilerContext
 /// ctx.add_known_value(...);         // via Deref to CompilerContext
@@ -146,7 +146,7 @@ impl AnalysisContext {
     /// Creates a new analysis context with custom configuration.
     pub fn with_config(call_graph: Arc<CallGraph>, config: EngineConfig) -> Self {
         Self {
-            compiler: CompilerContext::new(call_graph),
+            compiler: CompilerContext::new(call_graph).with_budget(config.budget),
             decryptors: Arc::new(DecryptorContext::new()),
             dispatchers: Arc::new(DashSet::new()),
             unflattened_dispatchers: Arc::new(DashSet::new()),
@@ -207,12 +207,6 @@ impl AnalysisContext {
     #[must_use]
     pub fn has_emulation_hooks(&self) -> bool {
         !self.emulation_hooks.is_empty()
-    }
-
-    /// Returns the emulation max instructions limit from config.
-    #[must_use]
-    pub fn emulation_max_instructions(&self) -> u64 {
-        self.config.emulation.max_instructions
     }
 
     /// Registers a method to be executed during emulation template warmup.
@@ -310,23 +304,47 @@ mod tests {
 
     use super::*;
     use crate::{
-        analysis::{CallGraph, ConstValue, SsaVarId},
+        analysis::{
+            CallGraph, ConstValue, DefSite, SsaFunction, SsaType, SsaVarId, VariableOrigin,
+        },
         compiler::CallSiteInfo,
         metadata::token::Token,
     };
+
+    /// Registers `method` with a function holding `count` values, and returns
+    /// their ids.
+    ///
+    /// A known value is a fact *about a value*, so there has to be one to
+    /// attach it to. This is what a real caller has: constant propagation
+    /// records what it proved about the function it just walked.
+    fn method_with_values(ctx: &AnalysisContext, method: Token, count: usize) -> Vec<SsaVarId> {
+        let mut ssa = SsaFunction::new(0, count);
+        let ids: Vec<SsaVarId> = (0..count)
+            .map(|index| {
+                ssa.create_variable(
+                    VariableOrigin::Local(u16::try_from(index).unwrap_or(u16::MAX)),
+                    0,
+                    DefSite::entry(),
+                    SsaType::I32,
+                )
+            })
+            .collect();
+        ctx.set_ssa(method, ssa);
+        ids
+    }
 
     #[test]
     fn test_call_site_info() {
         let info = CallSiteInfo {
             caller: Token::new(0x06000001),
-            offset: 10,
+            site: None,
             arguments: vec![Some(ConstValue::I32(42)), None],
             is_live: true,
         };
 
         assert_eq!(info.caller, Token::new(0x06000001));
-        assert_eq!(info.offset, 10);
         assert_eq!(info.arguments.len(), 2);
+        assert_eq!(info.argument_constant(0), Some(&ConstValue::I32(42)));
     }
 
     #[test]
@@ -335,9 +353,8 @@ mod tests {
         let ctx = AnalysisContext::new(call_graph);
 
         let method = Token::new(0x06000001);
-        let var1 = SsaVarId::from_index(0);
-        let var2 = SsaVarId::from_index(1);
-        let var3 = SsaVarId::from_index(2);
+        let vars = method_with_values(&ctx, method, 3);
+        let (var1, var2, var3) = (vars[0], vars[1], vars[2]);
 
         // Initially no known values
         assert!(!ctx.has_known_value(method, var1));
@@ -360,9 +377,11 @@ mod tests {
 
         // Different method has different values
         let method2 = Token::new(0x06000002);
-        assert!(!ctx.has_known_value(method2, var1));
-        ctx.add_known_value(method2, var1, ConstValue::I32(1));
-        assert!(ctx.known_value_is(method2, var1, |v| *v == ConstValue::I32(1)));
+        let other_vars = method_with_values(&ctx, method2, 1);
+        let other_var = other_vars[0];
+        assert!(!ctx.has_known_value(method2, other_var));
+        ctx.add_known_value(method2, other_var, ConstValue::I32(1));
+        assert!(ctx.known_value_is(method2, other_var, |v| *v == ConstValue::I32(1)));
         assert!(ctx.known_value_is(method, var1, |v| *v == ConstValue::I32(99)));
 
         // Clear values for one method
@@ -370,7 +389,7 @@ mod tests {
         assert!(!ctx.has_known_value(method, var1));
         assert_eq!(ctx.known_value_count(method), 0);
         // Other method unaffected
-        assert!(ctx.known_value_is(method2, var1, |v| *v == ConstValue::I32(1)));
+        assert!(ctx.known_value_is(method2, other_var, |v| *v == ConstValue::I32(1)));
     }
 
     #[test]
@@ -379,12 +398,10 @@ mod tests {
         let ctx = AnalysisContext::new(call_graph);
 
         let method = Token::new(0x06000001);
-        let v0 = SsaVarId::from_index(0);
-        let v1 = SsaVarId::from_index(1);
-        let v2 = SsaVarId::from_index(2);
-        ctx.add_known_value(method, v0, ConstValue::I32(1));
-        ctx.add_known_value(method, v1, ConstValue::I32(2));
-        ctx.add_known_value(method, v2, ConstValue::I32(3));
+        let vars = method_with_values(&ctx, method, 3);
+        ctx.add_known_value(method, vars[0], ConstValue::I32(1));
+        ctx.add_known_value(method, vars[1], ConstValue::I32(2));
+        ctx.add_known_value(method, vars[2], ConstValue::I32(3));
 
         let mut count = 0;
         ctx.for_each_known_value(method, |_, _| count += 1);
@@ -398,15 +415,20 @@ mod tests {
 
         let method1 = Token::new(0x06000001);
         let method2 = Token::new(0x06000002);
+        let var1 = method_with_values(&ctx, method1, 1)[0];
+        let var2 = method_with_values(&ctx, method2, 1)[0];
 
         // Spawn multiple threads that access different parts of the context
         let handles: Vec<_> = (0..4)
             .map(|i| {
                 let ctx = Arc::clone(&ctx);
-                let method = if i % 2 == 0 { method1 } else { method2 };
+                let (method, var) = if i % 2 == 0 {
+                    (method1, var1)
+                } else {
+                    (method2, var2)
+                };
                 thread::spawn(move || {
                     for j in 0..100 {
-                        let var = SsaVarId::from_index(0);
                         ctx.add_known_value(method, var, ConstValue::I32(j));
                         ctx.mark_dead(Token::new(0x06000000 + i * 1000 + j as u32));
                         ctx.add_entry_point(Token::new(0x06000000 + i * 1000 + j as u32));

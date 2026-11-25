@@ -75,7 +75,7 @@
 //! All `GetString` methods automatically capture decoded strings through
 //! the [`CaptureContext`] for analysis:
 //!
-//! ```ignore
+//! ```text
 //! // When Encoding.UTF8.GetString(bytes) is called:
 //! // 1. Decode bytes to string
 //! // 2. Capture string with source location info
@@ -1018,7 +1018,7 @@ mod tests {
             EmValue,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     #[test]

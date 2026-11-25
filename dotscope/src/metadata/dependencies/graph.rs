@@ -371,7 +371,7 @@ impl AssemblyDependencyGraph {
     /// This approach uses Tarjan's algorithm to find SCCs and orders them topologically.
     /// Within each SCC, assemblies are ordered by priority heuristics (core assemblies first).
     ///
-    /// Delegates to [`crate::utils::graph::algorithms`] for the core graph algorithms.
+    /// Delegates to [`analyssa::graph::algorithms`] for the core graph algorithms.
     fn scc_based_order(&self) -> Result<Vec<AssemblyIdentity>> {
         let indexed_graph = self.build_indexed_graph()?;
 
@@ -526,7 +526,7 @@ impl AssemblyDependencyGraph {
     ///     rid: 1,
     ///     token: dotscope::metadata::token::Token::new(0x23000001),
     ///     offset: 0,
-    ///     name: "MyLib".to_string(),
+    ///     name: "MyLib".into(),
     ///     culture: None,
     ///     major_version: 2,
     ///     minor_version: 0,
@@ -631,7 +631,7 @@ impl AssemblyDependencyGraph {
 
     /// Perform cycle detection using the generic graph algorithm.
     ///
-    /// Delegates to [`crate::utils::graph::IndexedGraph::find_any_cycle`] which
+    /// Delegates to [`analyssa::graph::IndexedGraph::find_any_cycle`] which
     /// handles all NodeId mapping internally.
     fn detect_cycles_dfs(&self) -> Result<Option<Vec<AssemblyIdentity>>> {
         let graph = self.build_indexed_graph()?;
@@ -756,7 +756,7 @@ mod tests {
     use super::*;
     use crate::{
         metadata::dependencies::DependencyType,
-        test::helpers::dependencies::{create_test_dependency, create_test_identity},
+        testkit::helpers::dependencies::{create_test_dependency, create_test_identity},
     };
 
     #[test]
@@ -825,7 +825,7 @@ mod tests {
 
         let dep_names: Vec<String> = deps
             .iter()
-            .map(|d| d.target_identity.name.clone())
+            .map(|d| d.target_identity.name.to_string())
             .collect();
         assert!(dep_names.contains(&"mscorlib".to_string()));
         assert!(dep_names.contains(&"System".to_string()));
@@ -986,7 +986,7 @@ mod tests {
         let positions: HashMap<String, usize> = order
             .iter()
             .enumerate()
-            .map(|(i, id)| (id.name.clone(), i))
+            .map(|(i, id)| (id.name.to_string(), i))
             .collect();
 
         // Verify ordering constraints

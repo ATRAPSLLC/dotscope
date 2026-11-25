@@ -17,20 +17,29 @@
 //! - **References**: Object references, arrays, and pointers
 //! - **Special**: Generic parameters and analysis-only types
 
-use std::fmt;
+use std::{fmt, sync::OnceLock};
 
-use crate::metadata::{
-    cilobject::CilObject,
-    method::{ExceptionHandlerFlags, Method},
-    signatures::{
-        parse_local_var_signature, CustomModifiers, SignatureArray, SignatureLocalVariable,
-        SignatureMethod, SignatureMethodSpec, SignatureParameter, SignaturePointer,
-        SignatureSzArray, TypeSignature,
+use crate::{
+    metadata::{
+        cilobject::CilObject,
+        method::{ExceptionHandlerFlags, Method},
+        signatures::{
+            parse_local_var_signature, CustomModifiers, SignatureArray, SignatureLocalVariable,
+            SignatureMethod, SignatureParameter, SignaturePointer, SignatureSzArray, TypeSignature,
+        },
+        tables::{MemberRefSignature, StandAloneSigRaw, StandAloneSignature, TableId, TypeSpecRaw},
+        token::Token,
+        typesystem::{wellknown, ArrayDimensions, CilFlavor},
     },
-    tables::{MemberRefSignature, StandAloneSigRaw, StandAloneSignature},
-    token::Token,
-    typesystem::{wellknown, ArrayDimensions, CilFlavor},
+    utils::EnumUtils,
 };
+
+/// How deeply a type may nest before it is treated as unknown.
+///
+/// A TypeSpec is typed from its own signature, which can name further
+/// TypeSpecs. Well-formed metadata stays far below this; malformed metadata
+/// whose TypeSpec names itself would otherwise recurse without end.
+const MAX_TYPE_DEPTH: usize = 64;
 
 /// Reference to a type in metadata.
 ///
@@ -266,8 +275,39 @@ pub struct FnPtrSig {
     pub ret: SsaType,
     /// Parameter types.
     pub params: Vec<SsaType>,
-    /// Calling convention flags.
+    /// The signature's first byte: calling convention kind and flags, as
+    /// [`SignatureMethod::calling_convention`] gives it.
     pub call_conv: u8,
+    /// The return type's custom modifiers. An unmanaged pointer's platform convention
+    /// (`delegate* unmanaged[Cdecl]`) is one of them.
+    pub ret_modifiers: CustomModifiers,
+    /// Each parameter's custom modifiers, in parameter order.
+    pub param_modifiers: Vec<CustomModifiers>,
+}
+
+impl FnPtrSig {
+    /// The function pointer type a method signature describes.
+    fn from_signature(signature: &SignatureMethod, assembly: &CilObject, depth: usize) -> Self {
+        let parameter = |param: &SignatureParameter| {
+            let base = SsaType::from_signature_at(&param.base, assembly, depth);
+            if param.by_ref {
+                SsaType::ByRef(Box::new(base))
+            } else {
+                base
+            }
+        };
+        Self {
+            ret: parameter(&signature.return_type),
+            params: signature.params.iter().map(parameter).collect(),
+            call_conv: signature.calling_convention(),
+            ret_modifiers: signature.return_type.modifiers.clone(),
+            param_modifiers: signature
+                .params
+                .iter()
+                .map(|param| param.modifiers.clone())
+                .collect(),
+        }
+    }
 }
 
 /// Classification of types by their storage requirements.
@@ -299,6 +339,116 @@ pub enum TypeClass {
 }
 
 impl SsaType {
+    /// Calls `visit` with every metadata token the type names, however deep:
+    /// a class or value type, the base and arguments of an instantiation, the
+    /// element or pointee of an array, pointer or reference, and a function
+    /// pointer's return and parameter types and custom modifiers. A load or
+    /// store of the type, or the TypeSpec interned for it, writes them.
+    pub fn visit_tokens(&self, visit: &mut impl FnMut(Token)) {
+        match self {
+            Self::Class(type_ref) | Self::ValueType(type_ref) => visit(type_ref.token()),
+            Self::GenericInst(base, args) => {
+                base.visit_tokens(visit);
+                for arg in args {
+                    arg.visit_tokens(visit);
+                }
+            }
+            Self::Array(element, _) | Self::Pointer(element) | Self::ByRef(element) => {
+                element.visit_tokens(visit);
+            }
+            Self::FnPtr(signature) => {
+                signature.ret.visit_tokens(visit);
+                for param in &signature.params {
+                    param.visit_tokens(visit);
+                }
+                for modifier in signature
+                    .ret_modifiers
+                    .iter()
+                    .chain(signature.param_modifiers.iter().flatten())
+                {
+                    visit(modifier.modifier_type);
+                }
+            }
+            Self::Void
+            | Self::Bool
+            | Self::I8
+            | Self::U8
+            | Self::I16
+            | Self::U16
+            | Self::I32
+            | Self::U32
+            | Self::I64
+            | Self::U64
+            | Self::NativeInt
+            | Self::NativeUInt
+            | Self::F32
+            | Self::F64
+            | Self::Char
+            | Self::Object
+            | Self::String
+            | Self::TypedReference
+            | Self::GenericParam(_)
+            | Self::MethodGenericParam(_)
+            | Self::Null
+            | Self::Unknown
+            | Self::Varying => {}
+        }
+    }
+
+    /// This type with its generic parameters replaced by the arguments of the
+    /// instantiation it was read through: `!n` by `type_args[n]` and `!!n` by
+    /// `method_args[n]`.
+    ///
+    /// A member's signature is written in its declaring type's own terms, so a
+    /// field declared `class Node<!0>` read through `Node<!!0>` holds a
+    /// `Node<!!0>`. Both kinds are replaced in one pass, since the arguments
+    /// belong to the reader's context: the `!!0` a class argument brings in
+    /// is the reader's own, not the called method's. `None` leaves that kind
+    /// of parameter as it is; a parameter the instantiation does not supply
+    /// becomes `Unknown`.
+    #[must_use]
+    pub fn substitute_generic_params(
+        self,
+        type_args: Option<&[SsaType]>,
+        method_args: Option<&[SsaType]>,
+    ) -> SsaType {
+        let substitute = |ty: SsaType| ty.substitute_generic_params(type_args, method_args);
+        match self {
+            Self::GenericParam(idx) => match type_args {
+                Some(args) => args.get(idx as usize).cloned().unwrap_or(Self::Unknown),
+                None => Self::GenericParam(idx),
+            },
+            Self::MethodGenericParam(idx) => match method_args {
+                Some(args) => args.get(idx as usize).cloned().unwrap_or(Self::Unknown),
+                None => Self::MethodGenericParam(idx),
+            },
+            Self::Array(elem, rank) => Self::Array(Box::new(substitute(*elem)), rank),
+            Self::ByRef(inner) => Self::ByRef(Box::new(substitute(*inner))),
+            Self::Pointer(inner) => Self::Pointer(Box::new(substitute(*inner))),
+            Self::GenericInst(base, args) => Self::GenericInst(
+                Box::new(substitute(*base)),
+                args.into_iter().map(substitute).collect(),
+            ),
+            Self::FnPtr(sig) => {
+                let FnPtrSig {
+                    ret,
+                    params,
+                    call_conv,
+                    ret_modifiers,
+                    param_modifiers,
+                } = *sig;
+                Self::FnPtr(Box::new(FnPtrSig {
+                    ret: substitute(ret),
+                    params: params.into_iter().map(substitute).collect(),
+                    call_conv,
+                    ret_modifiers,
+                    param_modifiers,
+                }))
+            }
+            other => other,
+        }
+    }
+
     /// Returns `true` if this is a primitive numeric or boolean type.
     #[must_use]
     pub const fn is_primitive(&self) -> bool {
@@ -435,6 +585,116 @@ impl SsaType {
             Self::I32 | Self::U32 | Self::F32 => Some(4),
             Self::I64 | Self::U64 | Self::F64 => Some(8),
             // NativeInt/NativeUInt and pointers are platform-dependent
+            _ => None,
+        }
+    }
+
+    /// The class this type computes in as an operand of arithmetic, when it
+    /// can be one: `int32` for every integer up to 32 bits, `int64`,
+    /// `native int`, the float it is, or the pointer it is.
+    #[must_use]
+    pub fn arithmetic_class(&self) -> Option<Self> {
+        match self {
+            Self::Bool
+            | Self::I8
+            | Self::U8
+            | Self::I16
+            | Self::U16
+            | Self::Char
+            | Self::I32
+            | Self::U32 => Some(Self::I32),
+            Self::I64 | Self::U64 => Some(Self::I64),
+            Self::NativeInt | Self::NativeUInt => Some(Self::NativeInt),
+            Self::F32 | Self::F64 | Self::Pointer(_) | Self::ByRef(_) => Some(self.clone()),
+            _ => None,
+        }
+    }
+
+    /// The value type a value of this type is, plain or instantiated: an enum
+    /// nested in a generic type (`Outer<T>.Flags`) is an instantiation of it.
+    /// An enum's integer is stated only by its definition, which this names.
+    #[must_use]
+    pub fn value_type_ref(&self) -> Option<TypeRef> {
+        match self {
+            Self::ValueType(type_ref) => Some(*type_ref),
+            Self::GenericInst(base, _) => match **base {
+                Self::ValueType(type_ref) => Some(type_ref),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a value of this type computes as a number the type does not
+    /// state: an enum ([`Self::value_type_ref`]), or a generic parameter,
+    /// whose instantiation says. Two values of one such type compute as a
+    /// value of it.
+    fn computes_unstated(&self) -> bool {
+        self.value_type_ref().is_some()
+            || matches!(self, Self::GenericParam(_) | Self::MethodGenericParam(_))
+    }
+
+    /// The result type of a unary numeric operation on an operand of this
+    /// type (a negation, a complement or a shift of the value, ECMA-335
+    /// III.1.5): the operand's class, and a value of its own type for an enum
+    /// or a generic parameter, whose number is the one its values are. `None`
+    /// for a type that is no number.
+    #[must_use]
+    pub fn unary_numeric(&self) -> Option<Self> {
+        if self.computes_unstated() {
+            return Some(self.clone());
+        }
+        self.arithmetic_class()
+    }
+
+    /// The result type of a binary numeric operation on operands of types
+    /// `left` and `right`, by ECMA-335's binary numeric table (III.1.5).
+    ///
+    /// Equal integer classes keep their class, `int32` with `native int` is
+    /// `native int`, floats are the wider float, and - for `add` and `sub`
+    /// (`additive`) - a pointer moved by an integer stays that pointer while
+    /// the distance between two pointers is a `native int`. A value type -
+    /// an enum - with an integer computes in that integer's class; two values
+    /// of one enum or generic parameter are a value of it, and of two enums a
+    /// value of the first, whose integer a valid program shares with the
+    /// second. `None` for a combination the table does not allow.
+    #[must_use]
+    pub fn binary_numeric(left: &Self, right: &Self, additive: bool) -> Option<Self> {
+        // An enum is its underlying integer on the stack, which its type here
+        // does not say; computing with an integer, it is that integer's class
+        // (`flags & 0x...L` is a `long`).
+        let integer = |ty: &Self| matches!(ty, Self::I32 | Self::I64 | Self::NativeInt);
+        let (a, b) = match (left.arithmetic_class(), right.arithmetic_class()) {
+            (Some(a), Some(b)) => (a, b),
+            // Two values of one enum, or of one generic parameter, compute as
+            // its number, whichever that is, and the result is a value of it.
+            // Two enums' values compute as the one integer a valid program
+            // gives both, which the first names as well as the second.
+            (None, None)
+                if left.computes_unstated() && left == right
+                    || left.value_type_ref().is_some() && right.value_type_ref().is_some() =>
+            {
+                return Some(left.clone());
+            }
+            (Some(a), None) if right.value_type_ref().is_some() && integer(&a) => (a.clone(), a),
+            (None, Some(b)) if left.value_type_ref().is_some() && integer(&b) => (b.clone(), b),
+            _ => return None,
+        };
+        let pointer = |ty: &Self| matches!(ty, Self::Pointer(_) | Self::ByRef(_));
+        let integer = |ty: &Self| matches!(ty, Self::I32 | Self::NativeInt);
+        match (&a, &b) {
+            (Self::F32 | Self::F64, Self::F32 | Self::F64) => {
+                if a == Self::F64 || b == Self::F64 {
+                    Some(Self::F64)
+                } else {
+                    Some(Self::F32)
+                }
+            }
+            _ if a == b && !pointer(&a) => Some(a),
+            (Self::I32, Self::NativeInt) | (Self::NativeInt, Self::I32) => Some(Self::NativeInt),
+            _ if additive && pointer(&a) && integer(&b) => Some(a),
+            _ if additive && integer(&a) && pointer(&b) => Some(b),
+            _ if additive && pointer(&a) && pointer(&b) => Some(Self::NativeInt),
             _ => None,
         }
     }
@@ -658,35 +918,33 @@ impl SsaType {
             Self::TypedReference => TypeSignature::TypedByRef,
             Self::GenericParam(idx) => TypeSignature::GenericParamType(*idx),
             Self::MethodGenericParam(idx) => TypeSignature::GenericParamMethod(*idx),
-            Self::FnPtr(sig) => TypeSignature::FnPtr(Box::new(SignatureMethod {
-                has_this: false,
-                explicit_this: false,
-                default: true,
-                vararg: false,
-                cdecl: false,
-                stdcall: false,
-                thiscall: false,
-                fastcall: false,
-                param_count_generic: 0,
+            Self::FnPtr(sig) => {
+                let mut signature = SignatureMethod::default();
+                // The byte came from a signature, so it names a method signature kind.
+                if signature.set_calling_convention(sig.call_conv).is_err() {
+                    signature.default = true;
+                }
                 // Safe: .NET methods have at most ~65535 parameters
                 #[allow(clippy::cast_possible_truncation)]
-                param_count: sig.params.len() as u32,
-                return_type: SignatureParameter {
-                    modifiers: CustomModifiers::default(),
+                let param_count = sig.params.len() as u32;
+                signature.param_count = param_count;
+                signature.return_type = SignatureParameter {
+                    modifiers: sig.ret_modifiers.clone(),
                     by_ref: false,
                     base: sig.ret.to_type_signature(),
-                },
-                params: sig
+                };
+                signature.params = sig
                     .params
                     .iter()
-                    .map(|p| SignatureParameter {
-                        modifiers: CustomModifiers::default(),
+                    .enumerate()
+                    .map(|(index, param)| SignatureParameter {
+                        modifiers: sig.param_modifiers.get(index).cloned().unwrap_or_default(),
                         by_ref: false,
-                        base: p.to_type_signature(),
+                        base: param.to_type_signature(),
                     })
-                    .collect(),
-                varargs: Vec::new(),
-            })),
+                    .collect();
+                TypeSignature::FnPtr(Box::new(signature))
+            }
             // Object and analysis-only types. Runtime-handle variants have
             // been removed from `SsaType` — construction sites now always
             // produce `ValueType(token)` for them via
@@ -764,6 +1022,39 @@ impl SsaType {
     /// * `assembly` - Assembly context for resolving type tokens
     #[must_use]
     pub fn from_type_signature(signature: &TypeSignature, assembly: &CilObject) -> Self {
+        Self::from_signature_at(signature, assembly, 0)
+    }
+
+    /// The type of a local variable: its type, behind a managed pointer for a `ref` local.
+    #[must_use]
+    pub fn from_local(local: &SignatureLocalVariable, assembly: &CilObject) -> Self {
+        let base = Self::from_type_signature(&local.base, assembly);
+        if local.is_byref {
+            Self::ByRef(Box::new(base))
+        } else {
+            base
+        }
+    }
+
+    /// The type of a parameter or return value: its type, behind a managed pointer when the
+    /// signature passes it by reference (`ref T`, ECMA-335 II.23.2.10).
+    #[must_use]
+    pub fn from_parameter(param: &SignatureParameter, assembly: &CilObject) -> Self {
+        let base = Self::from_type_signature(&param.base, assembly);
+        if param.by_ref {
+            Self::ByRef(Box::new(base))
+        } else {
+            base
+        }
+    }
+
+    /// [`from_type_signature`](Self::from_type_signature) for a type `depth`
+    /// levels down.
+    fn from_signature_at(signature: &TypeSignature, assembly: &CilObject, depth: usize) -> Self {
+        if depth > MAX_TYPE_DEPTH {
+            return Self::Unknown;
+        }
+        let nested = depth.saturating_add(1);
         match signature {
             // Primitive types
             TypeSignature::Void => Self::Void,
@@ -787,28 +1078,40 @@ impl SsaType {
             TypeSignature::Object | TypeSignature::Type | TypeSignature::Boxed => Self::Object,
             TypeSignature::TypedByRef => Self::TypedReference,
 
-            // Class/ValueType with token
-            TypeSignature::Class(token) | TypeSignature::ValueType(token) => {
-                Self::from_type_token(*token, assembly)
+            // Class/ValueType with token. The element type says which of the
+            // two the type is, and it is the only thing that does for a type
+            // imported from another assembly: the registry has no definition
+            // to read the kind from and guesses, so a `System.DateTime` it
+            // cannot see comes back a class. Primitives are still recognised
+            // by name, since `valuetype System.Int32` is an `int32`.
+            TypeSignature::Class(token) => match Self::from_token_at(*token, assembly, nested) {
+                Self::ValueType(type_ref) => Self::Class(type_ref),
+                other => other,
+            },
+            TypeSignature::ValueType(token) => {
+                match Self::from_token_at(*token, assembly, nested) {
+                    Self::Class(type_ref) => Self::ValueType(type_ref),
+                    other => other,
+                }
             }
 
             // Arrays
             TypeSignature::SzArray(sz_array) => {
-                let elem_type = Self::from_type_signature(&sz_array.base, assembly);
+                let elem_type = Self::from_signature_at(&sz_array.base, assembly, nested);
                 Self::Array(Box::new(elem_type), 1)
             }
             TypeSignature::Array(array) => {
-                let elem_type = Self::from_type_signature(&array.base, assembly);
+                let elem_type = Self::from_signature_at(&array.base, assembly, nested);
                 Self::Array(Box::new(elem_type), array.rank)
             }
 
             // Pointers and references
             TypeSignature::Ptr(ptr) => {
-                let inner = Self::from_type_signature(&ptr.base, assembly);
+                let inner = Self::from_signature_at(&ptr.base, assembly, nested);
                 Self::Pointer(Box::new(inner))
             }
             TypeSignature::ByRef(inner) => {
-                let inner_type = Self::from_type_signature(inner, assembly);
+                let inner_type = Self::from_signature_at(inner, assembly, nested);
                 Self::ByRef(Box::new(inner_type))
             }
 
@@ -818,22 +1121,28 @@ impl SsaType {
 
             // Generic instantiation - preserve both base type and type arguments
             TypeSignature::GenericInst(base_type, type_args) => {
-                let base = Self::from_type_signature(base_type, assembly);
+                let base = Self::from_signature_at(base_type, assembly, nested);
                 let args = type_args
                     .iter()
-                    .map(|a| Self::from_type_signature(a, assembly))
+                    .map(|a| Self::from_signature_at(a, assembly, nested))
                     .collect();
                 Self::GenericInst(Box::new(base), args)
             }
 
             // Pinned - unwrap to inner type
-            TypeSignature::Pinned(inner) => Self::from_type_signature(inner, assembly),
+            TypeSignature::Pinned(inner) => Self::from_signature_at(inner, assembly, nested),
 
-            // Function pointers, modifiers, and special types - not representable
-            TypeSignature::FnPtr(_)
-            | TypeSignature::ModifiedRequired(_)
-            | TypeSignature::ModifiedOptional(_)
-            | TypeSignature::Sentinel
+            TypeSignature::FnPtr(signature) => Self::FnPtr(Box::new(FnPtrSig::from_signature(
+                signature, assembly, nested,
+            ))),
+
+            // A modifier does not change the value's representation
+            TypeSignature::ModifiedRequired(_, base) | TypeSignature::ModifiedOptional(_, base) => {
+                Self::from_signature_at(base, assembly, nested)
+            }
+
+            // Special types - not representable
+            TypeSignature::Sentinel
             | TypeSignature::Unknown
             | TypeSignature::Internal
             | TypeSignature::Modifier
@@ -847,6 +1156,12 @@ impl SsaType {
     /// Handles TypeDef (0x02), TypeRef (0x01), and TypeSpec (0x1B) tokens.
     #[must_use]
     pub fn from_type_token(token: Token, assembly: &CilObject) -> Self {
+        Self::from_token_at(token, assembly, 0)
+    }
+
+    /// [`from_type_token`](Self::from_type_token) for a type `depth` levels
+    /// down.
+    fn from_token_at(token: Token, assembly: &CilObject, depth: usize) -> Self {
         let table_id = token.table();
 
         match table_id {
@@ -874,19 +1189,47 @@ impl SsaType {
                 }
             }
 
-            // TypeSpec - generic instantiation or complex type
+            // TypeSpec - generic instantiation or complex type, typed from its
+            // own signature. The registry's entry for it carries a flavor
+            // alone, and `GenericInstance` reads as a class whatever is being
+            // instantiated: `Nullable<T>` and `List<T>.Enumerator` are structs.
+            0x1B if depth <= MAX_TYPE_DEPTH => match Self::typespec_signature(token, assembly) {
+                Some(signature) => {
+                    Self::from_signature_at(&signature, assembly, depth.saturating_add(1))
+                }
+                None => assembly
+                    .types()
+                    .get(&token)
+                    .map_or(Self::Unknown, |cil_type| {
+                        Self::from_cil_flavor(cil_type.flavor(), token)
+                    }),
+            },
+
             // 0xF0 - artificial types created by TypeResolver for constructed types
             //         (generic instances, arrays, pointers, etc.)
-            0x1B | 0xF0 => {
+            0xF0 => {
                 let Some(cil_type) = assembly.types().get(&token) else {
                     return Self::Unknown;
                 };
-                Self::from_cil_flavor(cil_type.flavor(), token)
+                match cil_type.flavor() {
+                    CilFlavor::FnPtr { signature } => Self::FnPtr(Box::new(
+                        FnPtrSig::from_signature(signature, assembly, depth.saturating_add(1)),
+                    )),
+                    flavor => Self::from_cil_flavor(flavor, token),
+                }
             }
 
-            // Unknown table
+            // Unknown table, or nesting too deep to be well-formed
             _ => Self::Unknown,
         }
+    }
+
+    /// The signature a TypeSpec token stands for, read from its row.
+    fn typespec_signature(token: Token, assembly: &CilObject) -> Option<TypeSignature> {
+        let table = assembly.tables()?.table::<TypeSpecRaw>()?;
+        let raw = table.get(token.row()).ok().flatten()?;
+        let owned = raw.to_owned(assembly.blob()?).ok()?;
+        Some(owned.signature.base.clone())
     }
 
     /// Matches a System namespace type name to its SSA primitive type.
@@ -954,9 +1297,10 @@ impl fmt::Display for SsaType {
 /// `"System.RuntimeFieldHandle"`) to [`SsaType::ValueType`] with a real
 /// TypeRef / TypeDef token.
 ///
-/// Prefers a TypeRef row (table `0x01`) whose fullname matches — that's
-/// the import the rest of the assembly already references, and it keeps
-/// the signatures we emit pointing at the row that survives cleanup.
+/// Prefers the TypeRef importing the type from the module's core library
+/// (see [`TypeRegistry::get_corelib_typeref`](crate::metadata::typesystem::TypeRegistry::get_corelib_typeref)):
+/// that's the import the rest of the assembly already references, and it
+/// keeps the signatures we emit pointing at the row that survives cleanup.
 /// Falls back to `TypeRegistry::get_by_fullname` (which filters TypeRefs
 /// out but returns any TypeDef / external match of the same fullname).
 /// Returns [`SsaType::Unknown`] only when no row matches; callers log a
@@ -971,13 +1315,10 @@ impl fmt::Display for SsaType {
 #[must_use]
 pub fn resolve_corelib_valuetype(assembly: &CilObject, fullname: &str) -> SsaType {
     let registry = assembly.types();
-    for entry in registry.iter() {
-        let ty = entry.value();
-        if ty.token.table() == 0x01 && &*ty.fullname() == fullname {
-            return SsaType::ValueType(TypeRef::new(ty.token));
-        }
-    }
-    if let Some(ty) = registry.get_by_fullname(fullname, true) {
+    if let Some(ty) = registry
+        .get_corelib_typeref(fullname)
+        .or_else(|| registry.get_by_fullname(fullname, true))
+    {
         return SsaType::ValueType(TypeRef::new(ty.token));
     }
     log::warn!(
@@ -1016,9 +1357,30 @@ pub trait TypeProvider {
     /// Returns the assembly reference, if available.
     fn assembly(&self) -> Option<&CilObject>;
 
+    /// Returns the integer an enum value type is on the evaluation stack: its
+    /// underlying type (ECMA-335 II.14.3, I.8.5.2), or `None` for a value type
+    /// that is no enum or whose definition is not known.
+    ///
+    /// An enum's values compute as that integer, so `flags1 & flags2` of a
+    /// `ulong` enum is a `long`; the value type alone does not say which
+    /// integer it is. `None` by default, for a provider with no metadata.
+    fn enum_underlying(&self, _value_type: &TypeRef) -> Option<SsaType> {
+        None
+    }
+
     /// Returns the original local variable type signatures for code generation.
     fn local_type_signatures(&self) -> Option<Vec<SignatureLocalVariable>> {
         None
+    }
+
+    /// Returns `true` when the runtime zeroes the method's locals before it
+    /// runs (the body's `.locals init` flag), so a local read before any write
+    /// holds zero or null.
+    ///
+    /// Without the flag a local's initial contents are unspecified, and nothing
+    /// may be assumed about a read of one.
+    fn locals_zero_initialized(&self) -> bool {
+        true
     }
 
     /// Returns the exception type for a catch handler, identified by its handler index.
@@ -1042,24 +1404,40 @@ pub trait TypeProvider {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
-/// let ctx = TypeContext::new(&method, &assembly);
+/// ```
+/// use dotscope::{analysis::TypeContext, CilObject};
+///
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// # let entry = assembly.methods().iter().next().expect("the sample has methods");
+/// # let method = entry.value();
+/// let ctx = TypeContext::new(method, &assembly);
 /// let arg0_type = ctx.arg_type(0);
 /// let local2_type = ctx.local_type(2);
-/// let ret_type = ctx.call_return_type(call_token);
+/// let ret_type = ctx.call_return_type(method.token);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct TypeContext<'a> {
     /// The method being converted to SSA form.
     method: &'a Method,
     /// The assembly containing the method.
     assembly: &'a CilObject,
+    /// The method's local variable signatures, read from its LocalVarSig blob the first time
+    /// they are asked for: the lift asks for a local's type at every load and store of it.
+    local_signatures: OnceLock<Option<Vec<SignatureLocalVariable>>>,
+    /// Each local's type, resolved from those signatures once.
+    local_types: OnceLock<Box<[SsaType]>>,
 }
 
 impl<'a> TypeContext<'a> {
     /// Creates a new type context for SSA construction.
     #[must_use]
     pub fn new(method: &'a Method, assembly: &'a CilObject) -> Self {
-        Self { method, assembly }
+        Self {
+            method,
+            assembly,
+            local_signatures: OnceLock::new(),
+            local_types: OnceLock::new(),
+        }
     }
 
     /// Returns the assembly reference.
@@ -1079,19 +1457,27 @@ impl<'a> TypeContext<'a> {
         // For instance methods, arg 0 is 'this'
         if self.method.signature.has_this {
             if idx == 0 {
-                // 'this' pointer - get type from declaring class
+                // 'this' is the declaring type's instance, or a managed pointer to it
+                // when the type is a value type (ECMA-335 II.13.3)
                 return self
                     .method
                     .declaring_type_rc()
-                    .map_or(SsaType::Object, |dt| SsaType::Class(TypeRef::new(dt.token)));
+                    .map_or(SsaType::Object, |dt| {
+                        let declaring = SsaType::from_type_token(dt.token, self.assembly);
+                        if dt.flavor().is_value_type() {
+                            SsaType::ByRef(Box::new(declaring))
+                        } else {
+                            declaring
+                        }
+                    });
             }
             // Adjust for 'this' offset
             if let Some(param) = self.method.signature.params.get(idx.saturating_sub(1)) {
-                let ty = SsaType::from_type_signature(&param.base, self.assembly);
+                let ty = SsaType::from_parameter(param, self.assembly);
                 return self.validate_generic_params(ty);
             }
         } else if let Some(param) = self.method.signature.params.get(idx) {
-            let ty = SsaType::from_type_signature(&param.base, self.assembly);
+            let ty = SsaType::from_parameter(param, self.assembly);
             return self.validate_generic_params(ty);
         }
 
@@ -1104,21 +1490,30 @@ impl<'a> TypeContext<'a> {
     /// lossy round-trip through `to_signature_local()` → `type_ref_to_signature()`,
     /// which produces artificial 0xF0 tokens for constructed types (generic
     /// instances, arrays, pointers).
+    ///
+    /// Every local's type is resolved the first time one is asked for, and kept.
     #[must_use]
     pub fn local_type(&self, idx: u16) -> SsaType {
-        // Prefer raw blob signatures which preserve original metadata tokens.
-        // Fall back to Method::get_local_type_signatures() only when the raw
-        // blob path is unavailable (e.g., missing body or local_var_sig_token).
-        let signatures = self
-            .local_type_signatures()
-            .or_else(|| self.method.get_local_type_signatures());
-
-        signatures
-            .and_then(|types| types.into_iter().nth(idx as usize))
-            .map_or(SsaType::Unknown, |sig| {
-                let ty = SsaType::from_type_signature(&sig.base, self.assembly);
-                self.validate_generic_params(ty)
+        self.local_types
+            .get_or_init(|| {
+                let resolve = |sig: &SignatureLocalVariable| {
+                    self.validate_generic_params(SsaType::from_local(sig, self.assembly))
+                };
+                // Prefer raw blob signatures which preserve original metadata tokens.
+                // Fall back to Method::get_local_type_signatures() only when the raw
+                // blob path is unavailable (e.g., missing body or local_var_sig_token).
+                match self.parsed_local_signatures() {
+                    Some(signatures) => signatures.iter().map(resolve).collect(),
+                    None => self
+                        .method
+                        .get_local_type_signatures()
+                        .map(|signatures| signatures.iter().map(resolve).collect())
+                        .unwrap_or_default(),
+                }
             })
+            .get(usize::from(idx))
+            .cloned()
+            .unwrap_or(SsaType::Unknown)
     }
 
     /// Returns the return type of a called method.
@@ -1136,27 +1531,19 @@ impl<'a> TypeContext<'a> {
                 .get(&token)
                 .map_or(SsaType::Unknown, |entry| {
                     let method = entry.value();
-                    SsaType::from_type_signature(&method.signature.return_type.base, self.assembly)
+                    SsaType::from_parameter(&method.signature.return_type, self.assembly)
                 }),
 
-            // MemberRef - look up and get signature
+            // MemberRef - the signature's return type, in the terms of the
+            // instantiation the method is called through
             0x0A => self
-                .assembly
-                .refs_members()
-                .get(&token)
-                .and_then(|entry| {
-                    let member_ref = entry.value();
-                    match &member_ref.signature {
-                        MemberRefSignature::Method(sig) => Some(SsaType::from_type_signature(
-                            &sig.return_type.base,
-                            self.assembly,
-                        )),
-                        MemberRefSignature::Field(_) => None,
-                    }
-                })
-                .unwrap_or(SsaType::Unknown),
+                .member_ref_return(token)
+                .map_or(SsaType::Unknown, |(ret, type_args)| {
+                    ret.substitute_generic_params(type_args.as_deref(), None)
+                }),
 
-            // MethodSpec - resolve to underlying method and substitute generic params
+            // MethodSpec - the underlying method's return type with the class
+            // and method arguments substituted together
             0x2B => {
                 let Some(entry) = self.assembly.method_specs().get(&token) else {
                     return SsaType::Unknown;
@@ -1165,8 +1552,21 @@ impl<'a> TypeContext<'a> {
                 let Some(method_token) = spec.method.token() else {
                     return SsaType::Unknown;
                 };
-                let base_type = self.call_return_type(method_token);
-                Self::resolve_method_generic_params(base_type, &spec.instantiation, self.assembly)
+                let method_args: Vec<SsaType> = spec
+                    .instantiation
+                    .generic_args
+                    .iter()
+                    .map(|arg| SsaType::from_type_signature(arg, self.assembly))
+                    .collect();
+                let (ret, type_args) = if method_token.table() == 0x0A {
+                    match self.member_ref_return(method_token) {
+                        Some(found) => found,
+                        None => return SsaType::Unknown,
+                    }
+                } else {
+                    (self.call_return_type(method_token), None)
+                };
+                ret.substitute_generic_params(type_args.as_deref(), Some(&method_args))
             }
 
             _ => SsaType::Unknown,
@@ -1188,7 +1588,7 @@ impl<'a> TypeContext<'a> {
                 .get(&ctor_token)
                 .and_then(|entry| entry.value().declaring_type_rc().map(|dt| dt.token))
                 .map_or(SsaType::Object, |type_token| {
-                    SsaType::Class(TypeRef::new(type_token))
+                    SsaType::from_type_token(type_token, self.assembly)
                 }),
 
             // MemberRef - get declaring type from member ref
@@ -1226,23 +1626,28 @@ impl<'a> TypeContext<'a> {
             // Field table (0x04) - look up through type registry
             0x04 => self
                 .assembly
-                .types()
-                .get_field_signature(&field_token)
-                .map_or(SsaType::Unknown, |sig| {
-                    SsaType::from_type_signature(&sig, self.assembly)
+                .fields()
+                .get(&field_token)
+                .map_or(SsaType::Unknown, |entry| {
+                    SsaType::from_type_signature(&entry.value().signature.base, self.assembly)
                 }),
 
-            // MemberRef table (0x0A) - external field reference
+            // MemberRef table (0x0A) - a field reached through a reference,
+            // typed in the terms of the instantiation it is read through
             0x0A => self
                 .assembly
                 .refs_members()
                 .get(&field_token)
                 .and_then(|entry| {
-                    if let MemberRefSignature::Field(field_sig) = &entry.value().signature {
-                        Some(SsaType::from_type_signature(&field_sig.base, self.assembly))
-                    } else {
-                        None
-                    }
+                    let member_ref = entry.value();
+                    let MemberRefSignature::Field(field_sig) = &member_ref.signature else {
+                        return None;
+                    };
+                    let type_args = self.instantiation_args(member_ref.declaredby.token());
+                    Some(
+                        SsaType::from_type_signature(&field_sig.base, self.assembly)
+                            .substitute_generic_params(type_args.as_deref(), None),
+                    )
                 })
                 .unwrap_or(SsaType::Unknown),
 
@@ -1277,50 +1682,32 @@ impl<'a> TypeContext<'a> {
         };
         match &owned.parsed_signature {
             StandAloneSignature::Method(sig) => {
-                SsaType::from_type_signature(&sig.return_type.base, self.assembly)
+                SsaType::from_parameter(&sig.return_type, self.assembly)
             }
             _ => SsaType::Unknown,
         }
     }
 
-    /// Substitutes method generic parameters (`!!idx`) with concrete type arguments.
-    ///
-    /// When a `MethodSpec` instantiates a generic method, the base method's return
-    /// type may contain `MethodGenericParam(idx)` placeholders. This method replaces
-    /// them with the actual types from the `SignatureMethodSpec` instantiation.
-    fn resolve_method_generic_params(
-        ty: SsaType,
-        spec: &SignatureMethodSpec,
-        assembly: &CilObject,
-    ) -> SsaType {
-        match ty {
-            SsaType::MethodGenericParam(idx) => spec
-                .generic_args
-                .get(idx as usize)
-                .map_or(SsaType::Unknown, |sig| {
-                    SsaType::from_type_signature(sig, assembly)
-                }),
-            SsaType::Array(elem, rank) => {
-                let resolved = Self::resolve_method_generic_params(*elem, spec, assembly);
-                SsaType::Array(Box::new(resolved), rank)
-            }
-            SsaType::ByRef(inner) => {
-                let resolved = Self::resolve_method_generic_params(*inner, spec, assembly);
-                SsaType::ByRef(Box::new(resolved))
-            }
-            SsaType::Pointer(inner) => {
-                let resolved = Self::resolve_method_generic_params(*inner, spec, assembly);
-                SsaType::Pointer(Box::new(resolved))
-            }
-            SsaType::GenericInst(base, args) => {
-                let resolved_base = Self::resolve_method_generic_params(*base, spec, assembly);
-                let resolved_args = args
-                    .into_iter()
-                    .map(|a| Self::resolve_method_generic_params(a, spec, assembly))
-                    .collect();
-                SsaType::GenericInst(Box::new(resolved_base), resolved_args)
-            }
-            other => other,
+    /// A method MemberRef's declared return type, unsubstituted, and the type
+    /// arguments of the instantiation it names the method through (`None`
+    /// when its parent is not a generic instance).
+    fn member_ref_return(&self, token: Token) -> Option<(SsaType, Option<Vec<SsaType>>)> {
+        let entry = self.assembly.refs_members().get(&token)?;
+        let member_ref = entry.value();
+        let MemberRefSignature::Method(sig) = &member_ref.signature else {
+            return None;
+        };
+        let ret = SsaType::from_parameter(&sig.return_type, self.assembly);
+        Some((ret, self.instantiation_args(member_ref.declaredby.token())))
+    }
+
+    /// The type arguments of a generic instantiation TypeSpec, or `None` for
+    /// any other parent (a plain type supplies no arguments to substitute).
+    fn instantiation_args(&self, parent: Option<Token>) -> Option<Vec<SsaType>> {
+        let parent = parent.filter(|token| token.table() == 0x1B)?;
+        match SsaType::from_type_token(parent, self.assembly) {
+            SsaType::GenericInst(_, args) => Some(args),
+            _ => None,
         }
     }
 
@@ -1376,20 +1763,24 @@ impl<'a> TypeContext<'a> {
     /// back to metadata, rather than artificial tokens created by the `TypeResolver`.
     #[must_use]
     pub fn local_type_signatures(&self) -> Option<Vec<SignatureLocalVariable>> {
-        let body = self.method.body.get()?;
-        if body.local_var_sig_token == 0 {
-            return None;
-        }
-        let tables = self.assembly.tables()?;
-        let table = tables.table::<StandAloneSigRaw>()?;
-        let raw = table
-            .get(body.local_var_sig_token & 0x00FF_FFFF)
-            .ok()
-            .flatten()?;
-        let blob = self.assembly.blob()?;
-        let sig_data = blob.get(raw.signature as usize).ok()?;
-        let locals_sig = parse_local_var_signature(sig_data).ok()?;
-        Some(locals_sig.locals)
+        self.parsed_local_signatures().cloned()
+    }
+
+    /// The local signatures [`Self::local_type_signatures`] returns, parsed from the
+    /// LocalVarSig blob once.
+    fn parsed_local_signatures(&self) -> Option<&Vec<SignatureLocalVariable>> {
+        self.local_signatures
+            .get_or_init(|| {
+                let sig_rid = self.method.body.get()?.local_var_sig_rid()?;
+                let tables = self.assembly.tables()?;
+                let table = tables.table::<StandAloneSigRaw>()?;
+                let raw = table.get(sig_rid).ok().flatten()?;
+                let blob = self.assembly.blob()?;
+                let sig_data = blob.get(raw.signature as usize).ok()?;
+                let locals_sig = parse_local_var_signature(sig_data).ok()?;
+                Some(locals_sig.locals)
+            })
+            .as_ref()
     }
 
     /// Returns the catch handler's exception type as an `SsaType`.
@@ -1448,8 +1839,35 @@ impl TypeProvider for TypeContext<'_> {
         Some(self.assembly)
     }
 
+    /// Read through the loader: a reference resolves to its definition in
+    /// this assembly, or else in an external registry the loader holds.
+    fn enum_underlying(&self, value_type: &TypeRef) -> Option<SsaType> {
+        let types = self.assembly.types();
+        let named = types.resolve(&value_type.token())?;
+        let definition = if named.token.is_table(TableId::TypeRef) {
+            types
+                .get_by_fullname(&named.fullname(), true)
+                .unwrap_or(named)
+        } else {
+            named
+        };
+        if !EnumUtils::is_enum_type(&definition, Some(&types)) {
+            return None;
+        }
+        let underlying = SsaType::from_type_signature(definition.enum_underlying()?, self.assembly);
+        (underlying.is_integer() || matches!(underlying, SsaType::Bool | SsaType::Char))
+            .then_some(underlying)
+    }
+
     fn local_type_signatures(&self) -> Option<Vec<SignatureLocalVariable>> {
         TypeContext::local_type_signatures(self)
+    }
+
+    fn locals_zero_initialized(&self) -> bool {
+        self.method
+            .body
+            .get()
+            .is_some_and(|body| body.is_init_local)
     }
 
     fn handler_catch_type(&self, handler_index: usize) -> SsaType {
@@ -1460,9 +1878,212 @@ impl TypeProvider for TypeContext<'_> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        analysis::ssa::types::{SsaType, TypeClass, TypeRef},
-        metadata::{signatures::TypeSignature, token::Token},
+        analysis::ssa::types::{SsaType, TypeClass, TypeContext, TypeRef},
+        metadata::{
+            signatures::TypeSignature,
+            tables::{MemberRefSignature, TableAccess, TypeSpecRaw},
+            token::Token,
+        },
+        testkit::helpers::test_assembly_arc,
     };
+
+    /// ECMA-335's binary numeric table: equal classes keep their class,
+    /// `int32` with `native int` widens, floats take the wider, a pointer
+    /// moved by an integer stays a pointer and two pointers differ by a
+    /// `native int`; an enum, plain or instantiated, takes the integer it is
+    /// computed with, two values of one enum or one generic parameter compute
+    /// as it, and of two enums as the first; the rest combine to nothing. A
+    /// unary operation keeps its operand's class, an enum's or a parameter's
+    /// value its type.
+    #[test]
+    fn binary_numeric_follows_the_ecma_table() {
+        let pointer = SsaType::Pointer(Box::new(SsaType::I32));
+        let flags = SsaType::ValueType(TypeRef::new(Token::new(0x0200_0001)));
+        let other_flags = SsaType::ValueType(TypeRef::new(Token::new(0x0200_0002)));
+        let nested = SsaType::GenericInst(Box::new(flags.clone()), vec![SsaType::GenericParam(0)]);
+        let parameter = SsaType::MethodGenericParam(0);
+        let cases = [
+            (SsaType::I32, SsaType::U16, false, Some(SsaType::I32)),
+            (SsaType::U64, SsaType::I64, false, Some(SsaType::I64)),
+            (
+                SsaType::I32,
+                SsaType::NativeInt,
+                false,
+                Some(SsaType::NativeInt),
+            ),
+            (SsaType::F32, SsaType::F32, false, Some(SsaType::F32)),
+            (SsaType::F32, SsaType::F64, false, Some(SsaType::F64)),
+            (pointer.clone(), SsaType::I32, true, Some(pointer.clone())),
+            (
+                pointer.clone(),
+                pointer.clone(),
+                true,
+                Some(SsaType::NativeInt),
+            ),
+            (pointer.clone(), SsaType::I32, false, None),
+            (flags.clone(), SsaType::I64, false, Some(SsaType::I64)),
+            (flags.clone(), flags.clone(), false, Some(flags.clone())),
+            (
+                flags.clone(),
+                other_flags.clone(),
+                false,
+                Some(flags.clone()),
+            ),
+            (nested.clone(), SsaType::I32, false, Some(SsaType::I32)),
+            (nested.clone(), nested.clone(), false, Some(nested.clone())),
+            (
+                parameter.clone(),
+                parameter.clone(),
+                true,
+                Some(parameter.clone()),
+            ),
+            (parameter.clone(), SsaType::I32, true, None),
+            (SsaType::I32, SsaType::I64, false, None),
+            (SsaType::I32, SsaType::F64, false, None),
+        ];
+        for (left, right, additive, expected) in cases {
+            assert_eq!(
+                SsaType::binary_numeric(&left, &right, additive),
+                expected,
+                "{left:?} with {right:?}"
+            );
+        }
+        assert_eq!(SsaType::U16.unary_numeric(), Some(SsaType::I32));
+        assert_eq!(flags.unary_numeric(), Some(flags.clone()));
+        assert_eq!(nested.unary_numeric(), Some(nested.clone()));
+        assert_eq!(parameter.unary_numeric(), Some(parameter.clone()));
+        assert_eq!(SsaType::String.unary_numeric(), None);
+    }
+
+    #[test]
+    fn a_member_of_an_instantiation_is_typed_in_its_terms() {
+        let assembly = test_assembly_arc();
+        let method = assembly
+            .methods()
+            .iter()
+            .next()
+            .map(|entry| entry.value().clone())
+            .expect("the sample has methods");
+        let ctx = TypeContext::new(&method, &assembly);
+
+        let mut checked = 0;
+        for entry in assembly.refs_members().iter() {
+            let member_ref = entry.value();
+            let MemberRefSignature::Method(sig) = &member_ref.signature else {
+                continue;
+            };
+            // A method returning its class's own parameter, like `List<T>.get_Item`.
+            let TypeSignature::GenericParamType(idx) = sig.return_type.base else {
+                continue;
+            };
+            let Some(parent) = member_ref.declaredby.token().filter(|t| t.table() == 0x1B) else {
+                continue;
+            };
+            let SsaType::GenericInst(_, args) = SsaType::from_type_token(parent, &assembly) else {
+                continue;
+            };
+            let expected = args[idx as usize].clone();
+            if matches!(
+                expected,
+                SsaType::GenericParam(_) | SsaType::MethodGenericParam(_)
+            ) {
+                continue;
+            }
+            assert_eq!(
+                ctx.call_return_type(member_ref.token),
+                expected,
+                "{:?} returns !{idx} of {args:?}",
+                member_ref.token,
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "the sample calls a member of a concrete instantiation"
+        );
+    }
+
+    #[test]
+    fn class_and_method_arguments_are_substituted_together() {
+        // `Foo<!!0>::Bar<int32>` returning `Pair<!0, !!0>`: the class argument
+        // is the caller's `!!0`, which the method's `int32` must not replace.
+        let ret = SsaType::GenericInst(
+            Box::new(SsaType::Class(TypeRef::new(Token::new(0x0100_0001)))),
+            vec![SsaType::GenericParam(0), SsaType::MethodGenericParam(0)],
+        );
+        let substituted = ret.substitute_generic_params(
+            Some(&[SsaType::MethodGenericParam(0)]),
+            Some(&[SsaType::I32]),
+        );
+        assert_eq!(
+            substituted,
+            SsaType::GenericInst(
+                Box::new(SsaType::Class(TypeRef::new(Token::new(0x0100_0001)))),
+                vec![SsaType::MethodGenericParam(0), SsaType::I32],
+            )
+        );
+    }
+
+    #[test]
+    fn an_instantiated_struct_is_a_value_type() {
+        let assembly = test_assembly_arc();
+        let tables = assembly.tables().expect("tables");
+        let blob = assembly.blob().expect("blob heap");
+        let table = <_ as TableAccess<TypeSpecRaw>>::table(tables).expect("TypeSpec table");
+        let struct_instances: Vec<Token> = table
+            .into_iter()
+            .flatten()
+            .filter(|row| {
+                row.to_owned(blob).is_ok_and(|spec| {
+                    matches!(
+                        &spec.signature.base,
+                        TypeSignature::GenericInst(base, _)
+                            if matches!(**base, TypeSignature::ValueType(_))
+                    )
+                })
+            })
+            .map(|row| row.token)
+            .collect();
+        assert!(
+            !struct_instances.is_empty(),
+            "the sample instantiates a struct"
+        );
+
+        for token in struct_instances {
+            let ty = SsaType::from_type_token(token, &assembly);
+            assert!(
+                matches!(&ty, SsaType::GenericInst(base, _) if matches!(**base, SsaType::ValueType(_))),
+                "{token:?} typed as {ty:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_signature_says_whether_an_imported_type_is_a_struct() {
+        let assembly = test_assembly_arc();
+        let imported = |name: &str| {
+            assembly
+                .types()
+                .iter()
+                .map(|entry| entry.value().clone())
+                .find(|ty| ty.token.table() == 0x01 && ty.fullname() == name)
+                .map(|ty| ty.token)
+                .unwrap_or_else(|| panic!("{name} is imported"))
+        };
+        let date_time = imported("System.DateTime");
+        let enum_base = imported("System.Enum");
+
+        assert_eq!(
+            SsaType::from_type_signature(&TypeSignature::ValueType(date_time), &assembly),
+            SsaType::ValueType(TypeRef::new(date_time)),
+        );
+        // `System.Enum` is the reference type every enum derives from, whatever
+        // its name suggests.
+        assert_eq!(
+            SsaType::from_type_signature(&TypeSignature::Class(enum_base), &assembly),
+            SsaType::Class(TypeRef::new(enum_base)),
+        );
+    }
 
     #[test]
     fn test_primitive_types() {

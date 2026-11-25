@@ -353,264 +353,252 @@ impl MethodSpecBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
+        testkit::fixture,
     };
 
     #[test]
     fn test_method_spec_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a basic method specification
-            let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef); // Generic method
-            let instantiation_blob = vec![0x01, 0x08]; // Single int32 argument
+        // Create a basic method specification
+        let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef); // Generic method
+        let instantiation_blob = vec![0x01, 0x08]; // Single int32 argument
 
-            let ref_ = MethodSpecBuilder::new()
-                .method(method_ref)
-                .instantiation(&instantiation_blob)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MethodSpecBuilder::new()
+            .method(method_ref)
+            .instantiation(&instantiation_blob)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
     }
 
     #[test]
     fn test_method_spec_builder_different_methods() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let instantiation_blob = vec![0x01, 0x08]; // Single int32 argument
+        let instantiation_blob = vec![0x01, 0x08]; // Single int32 argument
 
-            // Test MethodDef
-            let methoddef = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
-            let ref1 = MethodSpecBuilder::new()
-                .method(methoddef)
-                .instantiation(&instantiation_blob)
-                .build(&mut assembly)
-                .unwrap();
+        // Test MethodDef
+        let methoddef = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
+        let ref1 = MethodSpecBuilder::new()
+            .method(methoddef)
+            .instantiation(&instantiation_blob)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Test MemberRef
-            let memberref = CodedIndex::new(TableId::MemberRef, 1, CodedIndexType::MethodDefOrRef);
-            let ref2 = MethodSpecBuilder::new()
-                .method(memberref)
-                .instantiation(&instantiation_blob)
-                .build(&mut assembly)
-                .unwrap();
+        // Test MemberRef
+        let memberref = CodedIndex::new(TableId::MemberRef, 1, CodedIndexType::MethodDefOrRef);
+        let ref2 = MethodSpecBuilder::new()
+            .method(memberref)
+            .instantiation(&instantiation_blob)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Both should succeed with MethodSpec table reference
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-        }
+        // Both should succeed with MethodSpec table reference
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
     }
 
     #[test]
     fn test_method_spec_builder_convenience_methods() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
+        let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
 
-            // Test simple instantiation
-            let ref1 = MethodSpecBuilder::new()
-                .method(method_ref.clone())
-                .simple_instantiation(0x08) // int32
-                .build(&mut assembly)
-                .unwrap();
+        // Test simple instantiation
+        let ref1 = MethodSpecBuilder::new()
+            .method(method_ref.clone())
+            .simple_instantiation(0x08) // int32
+            .build(&mut assembly)
+            .unwrap();
 
-            // Test multiple primitives
-            let ref2 = MethodSpecBuilder::new()
-                .method(method_ref.clone())
-                .multiple_primitives(&[0x08, 0x0E]) // int32, string
-                .build(&mut assembly)
-                .unwrap();
+        // Test multiple primitives
+        let ref2 = MethodSpecBuilder::new()
+            .method(method_ref.clone())
+            .multiple_primitives(&[0x08, 0x0E]) // int32, string
+            .build(&mut assembly)
+            .unwrap();
 
-            // Test array instantiation
-            let ref3 = MethodSpecBuilder::new()
-                .method(method_ref)
-                .array_instantiation(0x08) // int32[]
-                .build(&mut assembly)
-                .unwrap();
+        // Test array instantiation
+        let ref3 = MethodSpecBuilder::new()
+            .method(method_ref)
+            .array_instantiation(0x08) // int32[]
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-            assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-        }
+        // All should succeed
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
+        assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
     }
 
     #[test]
     fn test_method_spec_builder_complex_instantiations() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let method_ref = CodedIndex::new(TableId::MemberRef, 1, CodedIndexType::MethodDefOrRef);
+        let method_ref = CodedIndex::new(TableId::MemberRef, 1, CodedIndexType::MethodDefOrRef);
 
-            // Complex instantiation with multiple type arguments
-            let complex_instantiation = vec![
-                0x03, // 3 generic arguments
-                0x08, // ELEMENT_TYPE_I4 (int32)
-                0x0E, // ELEMENT_TYPE_STRING
-                0x1D, // ELEMENT_TYPE_SZARRAY
-                0x08, // Array element type: int32
-            ];
+        // Complex instantiation with multiple type arguments
+        let complex_instantiation = vec![
+            0x03, // 3 generic arguments
+            0x08, // ELEMENT_TYPE_I4 (int32)
+            0x0E, // ELEMENT_TYPE_STRING
+            0x1D, // ELEMENT_TYPE_SZARRAY
+            0x08, // Array element type: int32
+        ];
 
-            let ref_ = MethodSpecBuilder::new()
-                .method(method_ref)
-                .instantiation(&complex_instantiation)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MethodSpecBuilder::new()
+            .method(method_ref)
+            .instantiation(&complex_instantiation)
+            .build(&mut assembly)
+            .unwrap();
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
     }
 
     #[test]
     fn test_method_spec_builder_missing_method() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let instantiation_blob = vec![0x01, 0x08];
+        let instantiation_blob = vec![0x01, 0x08];
 
-            let result = MethodSpecBuilder::new()
-                .instantiation(&instantiation_blob)
-                // Missing method
-                .build(&mut assembly);
+        let result = MethodSpecBuilder::new()
+            .instantiation(&instantiation_blob)
+            // Missing method
+            .build(&mut assembly);
 
-            // Should fail because method is required
-            assert!(result.is_err());
-        }
+        // Should fail because method is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_spec_builder_missing_instantiation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
+        let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
 
-            let result = MethodSpecBuilder::new()
-                .method(method_ref)
-                // Missing instantiation
-                .build(&mut assembly);
+        let result = MethodSpecBuilder::new()
+            .method(method_ref)
+            // Missing instantiation
+            .build(&mut assembly);
 
-            // Should fail because instantiation is required
-            assert!(result.is_err());
-        }
+        // Should fail because instantiation is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_spec_builder_empty_instantiation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
-            let empty_blob = vec![]; // Empty instantiation
+        let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
+        let empty_blob = vec![]; // Empty instantiation
 
-            let result = MethodSpecBuilder::new()
-                .method(method_ref)
-                .instantiation(&empty_blob)
-                .build(&mut assembly);
+        let result = MethodSpecBuilder::new()
+            .method(method_ref)
+            .instantiation(&empty_blob)
+            .build(&mut assembly);
 
-            // Should fail because instantiation cannot be empty
-            assert!(result.is_err());
-        }
+        // Should fail because instantiation cannot be empty
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_spec_builder_invalid_method_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Use a table type that's not valid for MethodDefOrRef
-            let invalid_method = CodedIndex::new(TableId::Field, 1, CodedIndexType::MethodDefOrRef); // Field not in MethodDefOrRef
-            let instantiation_blob = vec![0x01, 0x08];
+        // Use a table type that's not valid for MethodDefOrRef
+        let invalid_method = CodedIndex::new(TableId::Field, 1, CodedIndexType::MethodDefOrRef); // Field not in MethodDefOrRef
+        let instantiation_blob = vec![0x01, 0x08];
 
-            let result = MethodSpecBuilder::new()
-                .method(invalid_method)
-                .instantiation(&instantiation_blob)
-                .build(&mut assembly);
+        let result = MethodSpecBuilder::new()
+            .method(invalid_method)
+            .instantiation(&instantiation_blob)
+            .build(&mut assembly);
 
-            // Should fail because method type is not valid for MethodDefOrRef
-            assert!(result.is_err());
-        }
+        // Should fail because method type is not valid for MethodDefOrRef
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_spec_builder_zero_generic_args() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
-            let zero_args_blob = vec![0x00]; // Zero generic arguments
+        let method_ref = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
+        let zero_args_blob = vec![0x00]; // Zero generic arguments
 
-            let result = MethodSpecBuilder::new()
-                .method(method_ref)
-                .instantiation(&zero_args_blob)
-                .build(&mut assembly);
+        let result = MethodSpecBuilder::new()
+            .method(method_ref)
+            .instantiation(&zero_args_blob)
+            .build(&mut assembly);
 
-            // Should fail because generic argument count cannot be zero
-            assert!(result.is_err());
-        }
+        // Should fail because generic argument count cannot be zero
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_spec_builder_realistic_scenarios() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Scenario 1: List<T>.Add(T) instantiated with int
-            let list_add = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
-            let ref1 = MethodSpecBuilder::new()
-                .method(list_add)
-                .simple_instantiation(0x08) // int32
-                .build(&mut assembly)
-                .unwrap();
+        // Scenario 1: List<T>.Add(T) instantiated with int
+        let list_add = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::MethodDefOrRef);
+        let ref1 = MethodSpecBuilder::new()
+            .method(list_add)
+            .simple_instantiation(0x08) // int32
+            .build(&mut assembly)
+            .unwrap();
 
-            // Scenario 2: Dictionary<TKey, TValue>.TryGetValue instantiated with string, int
-            let dict_tryget =
-                CodedIndex::new(TableId::MemberRef, 1, CodedIndexType::MethodDefOrRef);
-            let ref2 = MethodSpecBuilder::new()
-                .method(dict_tryget)
-                .multiple_primitives(&[0x0E, 0x08]) // string, int32
-                .build(&mut assembly)
-                .unwrap();
+        // Scenario 2: Dictionary<TKey, TValue>.TryGetValue instantiated with string, int
+        let dict_tryget = CodedIndex::new(TableId::MemberRef, 1, CodedIndexType::MethodDefOrRef);
+        let ref2 = MethodSpecBuilder::new()
+            .method(dict_tryget)
+            .multiple_primitives(&[0x0E, 0x08]) // string, int32
+            .build(&mut assembly)
+            .unwrap();
 
-            // Scenario 3: Generic method with array type
-            let array_method =
-                CodedIndex::new(TableId::MethodDef, 2, CodedIndexType::MethodDefOrRef);
-            let ref3 = MethodSpecBuilder::new()
-                .method(array_method)
-                .array_instantiation(0x0E) // string[]
-                .build(&mut assembly)
-                .unwrap();
+        // Scenario 3: Generic method with array type
+        let array_method = CodedIndex::new(TableId::MethodDef, 2, CodedIndexType::MethodDefOrRef);
+        let ref3 = MethodSpecBuilder::new()
+            .method(array_method)
+            .array_instantiation(0x0E) // string[]
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed with proper references
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
-            assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
+        // All should succeed with proper references
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
+        assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::MethodSpec));
 
-            // All should be different references
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
-            assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
-        }
+        // All should be different references
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
+        assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
     }
 }

@@ -176,7 +176,7 @@ mod tests {
             signatures::TypeSignature,
             typesystem::{CilPrimitive, CilPrimitiveKind, ELEMENT_TYPE},
         },
-        test::{
+        testkit::{
             builders::ConstantBuilder,
             factories::table::constant::{
                 create_boolean_field, create_i4_field, create_object_field, create_r4_field,

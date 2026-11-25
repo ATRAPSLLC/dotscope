@@ -58,9 +58,12 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use dotscope::emulation::loader::{PeLoader, DataLoader};
-//! use dotscope::emulation::memory::{AddressSpace, MemoryProtection};
+//! ```
+//! use dotscope::emulation::PeLoader;
+//! use dotscope::emulation::DataLoader;
+//! use dotscope::emulation::AddressSpace;
+//! use dotscope::emulation::MemoryProtection;
+//! use std::path::Path;
 //!
 //! // Create an address space
 //! let address_space = AddressSpace::new();
@@ -68,7 +71,7 @@
 //! // Load a PE file
 //! let loader = PeLoader::new();
 //! let image = loader.load_file(
-//!     Path::new("target.exe"),
+//!     Path::new("tests/samples/crafted_2.exe"),
 //!     &address_space,
 //! )?;
 //! println!("Loaded {} at 0x{:X}", image.name, image.base_address);
@@ -81,6 +84,7 @@
 //!     "stack",
 //!     MemoryProtection::READ | MemoryProtection::WRITE,
 //! )?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 mod data;

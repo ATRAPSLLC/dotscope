@@ -3,7 +3,8 @@
 //! This module provides the main entry point for executing cleanup operations
 //! on a [`CilAssembly`]. It coordinates the process of:
 //!
-//! 1. Expanding type deletions to include all their members
+//! 1. Deciding which requested types are deleted (closed over nesting, minus the types
+//!    surviving code names and their enclosing types) and expanding those to their members
 //! 2. Applying explicit deletions to the assembly changes
 //! 3. Removing orphaned metadata entries
 //!
@@ -19,17 +20,18 @@ use crate::{
             orphans::{self, DeletionContext},
             references::{
                 collect_pre_deletion_references, collect_typedefs_from_field_signatures,
-                scan_method_body_tokens,
+                collect_typedefs_from_typespec_signatures, scan_method_body_tokens,
             },
-            utils::{is_cctor_method, list_range, try_remove},
+            utils::{is_cctor_method, try_remove},
             CleanupRequest, CleanupStats,
         },
+        modifications::TableModifications,
         CilAssembly,
     },
     metadata::{
         tables::{
-            skip_unreadable, CustomAttributeRaw, FieldRaw, InterfaceImplRaw, MethodDefRaw,
-            MethodImplRaw, MethodSemanticsRaw, MethodSpecRaw, NestedClassRaw, TableId, TypeDefRaw,
+            skip_unreadable, CustomAttributeRaw, InterfaceImplRaw, MemberList, MethodImplRaw,
+            MethodSemanticsRaw, MethodSpecRaw, NestedClassRaw, TableId, TypeDefRaw,
         },
         token::Token,
     },
@@ -43,8 +45,10 @@ use crate::{
 ///
 /// # Process
 ///
-/// 1. **Expand types**: When a type is marked for deletion, all its methods
-///    and fields are also collected for deletion.
+/// 1. **Decide and expand types**: The requested types, closed over nesting, minus every
+///    type the surviving methods name or that is protected (with its enclosing chain),
+///    decided to a fixed point before any member is deleted. The methods and fields of the
+///    types that go are collected for deletion; a requested type that stays keeps them.
 ///
 /// 2. **Apply deletions**: Deletions are applied in order:
 ///    - Methods (sorted by RID descending)
@@ -67,16 +71,7 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use dotscope::cilassembly::cleanup::{CleanupRequest, execute_cleanup};
-///
-/// let mut request = CleanupRequest::new();
-/// request.add_type(protection_type_token);
-///
-/// let stats = execute_cleanup(&mut assembly, &request)?;
-/// println!("Removed {} types, {} methods",
-///     stats.get(TableId::TypeDef), stats.get(TableId::MethodDef));
-/// ```
+/// The `examples::execute_cleanup_example` test in this module runs this example.
 pub fn execute_cleanup(
     assembly: &mut CilAssembly,
     request: &CleanupRequest,
@@ -87,8 +82,13 @@ pub fn execute_cleanup(
         return Ok(stats);
     }
 
-    // Phase 1: Expand type deletions to include all members
-    let (type_methods, type_fields) = expand_type_members(assembly, request);
+    // The rows deleted before cleanup, so the statistics count only what cleanup deletes
+    let deleted_before = deleted_rows_by_table(assembly);
+
+    // Phase 1: Decide which types go before any member goes with them, then expand those
+    // types to their members. A requested type that surviving code still names stays, whole.
+    let all_types = resolve_type_deletions(assembly, request);
+    let (type_methods, type_fields) = expand_type_members(assembly, &all_types);
 
     // Combine explicit deletions with expanded members (using BTreeSet for sorted order)
     let mut all_methods: BTreeSet<Token> = request.methods().copied().collect();
@@ -96,8 +96,6 @@ pub fn execute_cleanup(
 
     let mut all_fields: BTreeSet<Token> = request.fields().copied().collect();
     all_fields.extend(type_fields);
-
-    let all_types: BTreeSet<Token> = request.types().copied().collect();
 
     // Phase 1.5: Pre-deletion reference scan
     // Collect all tokens referenced by entities about to be deleted.
@@ -167,89 +165,13 @@ pub fn execute_cleanup(
         }
     }
 
-    // Cache body tokens before type removal. This includes:
-    // - Token operands from IL bytecode of surviving methods
-    // - TypeDef/TypeRef tokens from StandAloneSig blobs (local variable signatures)
-    // The latter ensures types referenced only via local variable types are protected
-    // from removal, preventing dangling StandAloneSig references in the output.
-    let body_tokens = scan_method_body_tokens(assembly);
-
-    // Collect TypeDef RIDs that are still referenced by surviving method signatures.
-    // These must not be removed even if explicitly requested, because their removal
-    // would leave invalid type references in StandAloneSig blobs.
-    let sig_referenced_typedefs: HashSet<u32> = body_tokens
-        .iter()
-        .filter(|t| t.is_table(TableId::TypeDef))
-        .map(|t| t.row())
-        .collect();
-
-    // Keeping a nested type alive means keeping its enclosing chain alive with it: a nested
-    // type cannot exist without its enclosing type (ECMA-335 II.22.32), and the cascade below
-    // deletes any nested type whose enclosing type went away. Without this expansion the
-    // enclosing type is deleted here, the cascade takes the nested type with it, and the
-    // signature that named the nested type is left pointing at a row that no longer exists --
-    // which the writer cannot repair, because `typedef_remap` deliberately declines to remap
-    // references to deleted types onto surviving rows.
-    let sig_referenced_typedefs = expand_with_enclosing_types(assembly, sig_referenced_typedefs);
-
-    // 2d: Remove types (in descending RID order)
-    for type_token in request.types() {
-        if request.is_protected(*type_token) {
-            continue;
-        }
-        if sig_referenced_typedefs.contains(&type_token.row()) {
-            continue;
-        }
+    // 2d: Remove the types decided above (in descending RID order). The set is closed over
+    // nesting, so no nested type outlives the type it is nested in, and keeps every type
+    // surviving code names, with its enclosing chain.
+    for type_token in all_types.iter().rev() {
         if try_remove(assembly, TableId::TypeDef, type_token.row()) {
             removed_types.insert(*type_token);
             stats.add(TableId::TypeDef, 1);
-        }
-    }
-
-    // 2d+: Cascade-delete nested types whose enclosing type was deleted.
-    // Without this, nested types survive as orphaned TypeDefs after their
-    // enclosing type is removed. Their members (methods, fields) must also
-    // be removed.
-    let orphaned_nested = orphans::collect_orphaned_nested_types(
-        assembly,
-        &DeletionContext::new(&removed_types, &removed_methods, &removed_fields),
-    );
-    if !orphaned_nested.is_empty() {
-        // Expand nested types to their members
-        let (nested_methods, nested_fields) = {
-            let mut nested_request = CleanupRequest::new();
-            for &t in &orphaned_nested {
-                nested_request.add_type(t);
-            }
-            expand_type_members(assembly, &nested_request)
-        };
-
-        // Remove nested type members (descending RID)
-        let mut nested_methods_sorted: Vec<_> = nested_methods.into_iter().collect();
-        nested_methods_sorted.sort_by(|a, b| b.cmp(a));
-        for method_token in &nested_methods_sorted {
-            if try_remove(assembly, TableId::MethodDef, method_token.row()) {
-                removed_methods.insert(*method_token);
-                stats.add(TableId::MethodDef, 1);
-            }
-        }
-        let mut nested_fields_sorted: Vec<_> = nested_fields.into_iter().collect();
-        nested_fields_sorted.sort_by(|a, b| b.cmp(a));
-        for field_token in &nested_fields_sorted {
-            if try_remove(assembly, TableId::Field, field_token.row()) {
-                removed_fields.insert(*field_token);
-                stats.add(TableId::Field, 1);
-            }
-        }
-
-        // Remove the nested TypeDefs themselves (descending RID)
-        let mut sorted_nested: Vec<_> = orphaned_nested.clone();
-        sorted_nested.sort_by_key(|t| std::cmp::Reverse(t.row()));
-        for type_token in &sorted_nested {
-            if try_remove(assembly, TableId::TypeDef, type_token.row()) {
-                removed_types.insert(*type_token);
-                stats.add(TableId::TypeDef, 1);
-            }
         }
     }
 
@@ -401,7 +323,7 @@ pub fn execute_cleanup(
     // Rescan body tokens after MethodDef cascade — the set may have changed
     // significantly and both Phase 3 (empty types) and Phase 4 (reference
     // cascade) need an accurate snapshot.
-    let body_tokens = scan_method_body_tokens(assembly);
+    let body_tokens = scan_method_body_tokens(assembly, &HashSet::new());
 
     // Phase 3: Remove empty types (if enabled)
     // This MUST run before cascade reference cleanup (Phase 4) so that
@@ -427,16 +349,16 @@ pub fn execute_cleanup(
     // Phase 4: Remove dependent metadata and cascade references (if enabled)
     if request.remove_orphans() {
         let ctx = DeletionContext::new(&removed_types, &removed_methods, &removed_fields);
-        let orphan_stats = orphans::remove_parent_child_dependents(assembly, &ctx, &pre_refs);
+        let orphan_stats =
+            orphans::remove_parent_child_dependents(assembly, &ctx, &pre_refs, &body_tokens);
         stats.merge(&orphan_stats);
 
         let cascade_stats = orphans::cascade_reference_cleanup(assembly, &pre_refs, &body_tokens);
         stats.merge(&cascade_stats);
     }
 
-    // Phase 5: Compact heaps (mark unreferenced entries for removal)
-    // Currently only compacts #Blob and #GUID heaps. #Strings heap compaction
-    // is disabled due to the substring reference problem - see compaction.rs docs.
+    // Phase 5: Compact heaps (mark the #Strings, #Blob and #GUID entries nothing references
+    // for removal; see compaction.rs for what counts as referenced)
     let compaction_stats = mark_unreferenced_heap_entries(assembly)?;
     stats.blobs_compacted = compaction_stats.blobs;
     stats.guids_compacted = compaction_stats.guids;
@@ -445,7 +367,119 @@ pub fn execute_cleanup(
     // Track excluded sections count
     stats.sections_excluded = request.excluded_sections().len();
 
+    // Several passes may delete the same row (an explicitly requested type is also empty, or
+    // nested in another deleted type); each row counts once.
+    let mut removals = deleted_rows_by_table(assembly);
+    for (table, count) in &mut removals {
+        *count = count.saturating_sub(deleted_before.get(table).copied().unwrap_or(0));
+    }
+    removals.retain(|_, count| *count > 0);
+    stats.set_removals(removals);
+
     Ok(stats)
+}
+
+/// The number of rows the pending changes delete, per table.
+fn deleted_rows_by_table(assembly: &CilAssembly) -> HashMap<TableId, usize> {
+    assembly
+        .changes()
+        .table_changes
+        .iter()
+        .filter_map(|(table, modifications)| match modifications {
+            TableModifications::Sparse { deleted_rows, .. } => Some((*table, deleted_rows.len())),
+            TableModifications::Replaced(_) => None,
+        })
+        .collect()
+}
+
+/// The TypeDefs a cleanup request deletes, decided before any member is deleted.
+///
+/// Starts from the requested types that are not protected and closes them over nesting: a
+/// nested type cannot outlive its enclosing type (ECMA-335 II.22.32), at any depth. From
+/// that set it removes every type that must stay, with its enclosing chain:
+///
+/// - a protected type, so a protected nested type keeps the type it is nested in;
+/// - a type the bodies of the surviving methods name (IL operands, local and `calli`
+///   signatures), whether requested or only nested in a requested type.
+///
+/// Which methods survive depends on which types go, and a type that stays keeps its methods,
+/// whose bodies can name further types: the decision runs to a fixed point. The kept set only
+/// grows, so it terminates. A requested type that stays therefore stays whole, members
+/// included, instead of being emptied first and kept as a shell its callers no longer match.
+///
+/// # Arguments
+///
+/// * `assembly` - The assembly the request applies to
+/// * `request` - The cleanup request
+///
+/// # Returns
+///
+/// The TypeDef tokens to delete.
+fn resolve_type_deletions(assembly: &CilAssembly, request: &CleanupRequest) -> BTreeSet<Token> {
+    let nested_of: HashMap<u32, Vec<u32>> = {
+        let view = assembly.view();
+        let mut nested_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        if let Some(nested_table) = view
+            .tables()
+            .and_then(|tables| tables.table::<NestedClassRaw>())
+        {
+            for nested in nested_table.iter().filter_map(skip_unreadable) {
+                nested_of
+                    .entry(nested.enclosing_class)
+                    .or_default()
+                    .push(nested.nested_class);
+            }
+        }
+        nested_of
+    };
+    let typedef = |rid| Token::from_parts(TableId::TypeDef, rid);
+    let explicit_methods: HashSet<Token> = request
+        .methods()
+        .copied()
+        .filter(|token| !request.is_protected(*token))
+        .collect();
+
+    let mut kept: HashSet<u32> = HashSet::new();
+    loop {
+        // The requested types and everything nested in them, short of what must stay
+        // (a protected type met on the way stays, and keeps the types it is nested in)
+        let mut doomed: BTreeSet<u32> = BTreeSet::new();
+        let mut protected: HashSet<u32> = HashSet::new();
+        let mut worklist: Vec<u32> = request.types().map(Token::row).collect();
+        while let Some(rid) = worklist.pop() {
+            if request.is_protected(typedef(rid)) {
+                protected.insert(rid);
+                continue;
+            }
+            if kept.contains(&rid) || !doomed.insert(rid) {
+                continue;
+            }
+            worklist.extend(nested_of.get(&rid).into_iter().flatten().copied());
+        }
+        let doomed_types: BTreeSet<Token> = doomed.iter().map(|rid| typedef(*rid)).collect();
+
+        // What the methods that survive this decision name
+        let (doomed_methods, _) = expand_type_members(assembly, &doomed_types);
+        let mut gone = explicit_methods.clone();
+        gone.extend(
+            doomed_methods
+                .into_iter()
+                .filter(|token| !request.is_protected(*token)),
+        );
+        let mut must_stay: HashSet<u32> = scan_method_body_tokens(assembly, &gone)
+            .iter()
+            .filter(|token| token.is_table(TableId::TypeDef))
+            .map(|token| token.row())
+            .filter(|rid| doomed.contains(rid))
+            .collect();
+        must_stay.extend(protected);
+        let must_stay = expand_with_enclosing_types(assembly, must_stay);
+
+        if must_stay.iter().all(|rid| kept.contains(rid)) {
+            return doomed_types;
+        }
+        kept.extend(must_stay);
+    }
 }
 
 /// Adds the transitive enclosing chain of every nested type in `rids`.
@@ -489,20 +523,20 @@ fn expand_with_enclosing_types(assembly: &CilAssembly, mut rids: HashSet<u32>) -
 
 /// Expands type deletions to include all their members.
 ///
-/// For each type marked for deletion, collects all its methods and fields
-/// so they can be deleted along with the type.
+/// For each type to be deleted, collects all its methods and fields so they can be
+/// deleted along with the type.
 ///
 /// # Arguments
 ///
 /// * `assembly` - The assembly to read type information from
-/// * `request` - The cleanup request containing types to delete
+/// * `types` - The TypeDefs to be deleted
 ///
 /// # Returns
 ///
 /// A tuple of (methods_to_delete, fields_to_delete) tokens.
 fn expand_type_members(
     assembly: &CilAssembly,
-    request: &CleanupRequest,
+    types: &BTreeSet<Token>,
 ) -> (HashSet<Token>, HashSet<Token>) {
     let mut methods = HashSet::new();
     let mut fields = HashSet::new();
@@ -512,38 +546,24 @@ fn expand_type_members(
         return (methods, fields);
     };
 
-    let Some(typedef_table) = tables.table::<TypeDefRaw>() else {
-        return (methods, fields);
-    };
+    // The runs are normalized (clamped to the member tables, non-overlapping) and follow the
+    // Ptr tables of a `#-` stream, so a hostile list column cannot sweep in another type's
+    // members or rows past the table.
+    let method_ranges = tables.member_ranges(MemberList::TypeDefMethods);
+    let field_ranges = tables.member_ranges(MemberList::TypeDefFields);
 
-    let methoddef_count = tables.table::<MethodDefRaw>().map_or(0, |t| t.row_count);
-    let field_count = tables.table::<FieldRaw>().map_or(0, |t| t.row_count);
-    let type_count = typedef_table.row_count;
-
-    for type_token in request.types() {
+    for type_token in types {
         let type_rid = type_token.row();
-
-        let Some(typedef) = typedef_table.get(type_rid).ok().flatten() else {
-            continue;
-        };
-
-        // Get method range for this type
-        let method_range = list_range(type_rid, type_count, methoddef_count, |rid| {
-            typedef_table.get(rid).ok().flatten().map(|t| t.method_list)
-        });
-        // Override start with actual typedef's method_list
-        for method_rid in typedef.method_list..method_range.end {
-            methods.insert(Token::from_parts(TableId::MethodDef, method_rid));
-        }
-
-        // Get field range for this type
-        let field_range = list_range(type_rid, type_count, field_count, |rid| {
-            typedef_table.get(rid).ok().flatten().map(|t| t.field_list)
-        });
-        // Override start with actual typedef's field_list
-        for field_rid in typedef.field_list..field_range.end {
-            fields.insert(Token::from_parts(TableId::Field, field_rid));
-        }
+        methods.extend(
+            tables
+                .member_rids(&method_ranges, type_rid)
+                .map(|rid| Token::from_parts(TableId::MethodDef, rid)),
+        );
+        fields.extend(
+            tables
+                .member_rids(&field_ranges, type_rid)
+                .map(|rid| Token::from_parts(TableId::Field, rid)),
+        );
     }
 
     (methods, fields)
@@ -589,6 +609,18 @@ fn remove_empty_types(
             .map(|t| t.row()),
     );
 
+    // And TypeDef RIDs named by surviving TypeSpec signatures. A type used
+    // only as part of a constructed type - a generic argument, an array
+    // element - is named nowhere else, and removing it leaves the spec
+    // pointing at a row that no longer exists.
+    let typespec_sig_refs = collect_typedefs_from_typespec_signatures(assembly);
+    referenced_typedefs.extend(
+        typespec_sig_refs
+            .iter()
+            .filter(|t| t.is_table(TableId::TypeDef))
+            .map(|t| t.row()),
+    );
+
     // Collect empty type RIDs
     let empty_types: Vec<u32> = {
         let view = assembly.view();
@@ -600,8 +632,8 @@ fn remove_empty_types(
             return (0, HashSet::new());
         };
 
-        let methoddef_count = tables.table::<MethodDefRaw>().map_or(0, |t| t.row_count);
-        let field_count = tables.table::<FieldRaw>().map_or(0, |t| t.row_count);
+        let method_ranges = tables.member_ranges(MemberList::TypeDefMethods);
+        let field_ranges = tables.member_ranges(MemberList::TypeDefFields);
 
         let type_count = typedef_table.row_count;
 
@@ -638,18 +670,14 @@ fn remove_empty_types(
             // Using the raw range (next_type.method_list - this_type.method_list) is
             // incorrect after deletions: a type whose methods were all deleted still
             // has a non-zero range, so we must check each row individually.
-            let method_range = list_range(type_rid, type_count, methoddef_count, |rid| {
-                typedef_table.get(rid).ok().flatten().map(|t| t.method_list)
-            });
-            let live_method_count = (typedef.method_list..method_range.end)
+            let live_method_count = tables
+                .member_rids(&method_ranges, type_rid)
                 .filter(|&rid| !assembly.changes().is_row_deleted(TableId::MethodDef, rid))
                 .count();
 
-            // Calculate field count for this type — same logic.
-            let field_range = list_range(type_rid, type_count, field_count, |rid| {
-                typedef_table.get(rid).ok().flatten().map(|t| t.field_list)
-            });
-            let live_field_count = (typedef.field_list..field_range.end)
+            // Calculate field count for this type: same logic.
+            let live_field_count = tables
+                .member_rids(&field_ranges, type_rid)
                 .filter(|&rid| !assembly.changes().is_row_deleted(TableId::Field, rid))
                 .count();
 
@@ -693,6 +721,18 @@ fn remove_empty_types(
             }
         }
 
+        // A type enclosing a type that stays stays with it, however empty: a nested type
+        // cannot exist without its enclosing type (ECMA-335 II.22.32), and deleting the
+        // enclosing type would drop the NestedClass row and turn the survivor into a
+        // top-level type. The closure walks up the whole enclosing chain of each survivor.
+        let empty_set: HashSet<u32> = empty.iter().copied().collect();
+        let survivors: HashSet<u32> = (1..=type_count)
+            .filter(|rid| !empty_set.contains(rid))
+            .filter(|rid| !assembly.changes().is_row_deleted(TableId::TypeDef, *rid))
+            .collect();
+        let enclosing_survivors = expand_with_enclosing_types(assembly, survivors);
+        empty.retain(|rid| !enclosing_survivors.contains(rid));
+
         empty
     };
 
@@ -726,7 +766,7 @@ fn remove_empty_types(
 ///    overrides on surviving types.
 fn collect_alive_method_tokens(assembly: &CilAssembly) -> HashSet<Token> {
     // Start with IL body tokens (all token operands from surviving method bodies).
-    let body_tokens = scan_method_body_tokens(assembly);
+    let body_tokens = scan_method_body_tokens(assembly, &HashSet::new());
 
     let mut alive: HashSet<Token> = body_tokens
         .iter()
@@ -846,7 +886,7 @@ fn collect_alive_method_tokens(assembly: &CilAssembly) -> HashSet<Token> {
 /// Fields referenced only by FieldRVA/Constant/FieldLayout are dependent
 /// entries that get cleaned up when the field itself is removed.
 fn collect_alive_field_tokens(assembly: &CilAssembly) -> HashSet<Token> {
-    let body_tokens = scan_method_body_tokens(assembly);
+    let body_tokens = scan_method_body_tokens(assembly, &HashSet::new());
     body_tokens
         .into_iter()
         .filter(|t| t.is_table(TableId::Field))
@@ -877,5 +917,47 @@ mod tests {
         assert!(!request.is_empty());
         assert_eq!(request.types_len(), 1);
         assert_eq!(request.methods_len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::{
+        metadata::{token::Token, typesystem::CilTypeRc},
+        testkit::fixture,
+        CilObject, CleanupRequest, Result,
+    };
+
+    /// The type and the types nested in it, recursively.
+    fn with_nested(ty: &CilTypeRc) -> Vec<CilTypeRc> {
+        let mut all = vec![ty.clone()];
+        for (_, nested) in ty.nested_types.iter() {
+            if let Some(nested) = nested.upgrade() {
+                all.extend(with_nested(&nested));
+            }
+        }
+        all
+    }
+
+    /// Deleting a type deletes its methods and the types nested in it, and the statistics
+    /// say so.
+    #[test]
+    fn execute_cleanup_example() -> Result<()> {
+        let sample = fixture("packers/confuserex/1.6.0/original.exe");
+        let doomed = Token::new(0x0200_0002);
+        let object = CilObject::from_path(&sample)?;
+        let removed = with_nested(&object.types().get(&doomed).expect("the type"));
+        let methods: usize = removed.iter().map(|ty| ty.methods.count()).sum();
+        assert!(methods > 0);
+
+        let mut assembly = CilAssembly::from_path(&sample)?;
+        let mut request = CleanupRequest::new();
+        request.add_type(doomed);
+
+        let stats = execute_cleanup(&mut assembly, &request)?;
+        assert_eq!(stats.get(TableId::TypeDef), removed.len());
+        assert_eq!(stats.get(TableId::MethodDef), methods);
+        Ok(())
     }
 }

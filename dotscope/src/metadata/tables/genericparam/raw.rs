@@ -34,7 +34,6 @@ use crate::{
         token::Token,
         typesystem::CilTypeReference,
     },
-    utils::LazyList,
     Result,
 };
 
@@ -168,9 +167,9 @@ impl GenericParamRaw {
             number: self.number,
             flags: GenericParamAttributes::new(self.flags),
             owner,
-            constraints: Arc::new(boxcar::Vec::new()),
-            name: strings.get(self.name as usize)?.to_string(),
-            custom_attributes: LazyList::new(),
+            constraints: Default::default(),
+            name: strings.get_shared(self.name as usize)?,
+            custom_attributes: Default::default(),
         }))
     }
 }

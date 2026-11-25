@@ -64,17 +64,20 @@
 //!
 //! ## Parsing from Metadata
 //!
-//! ```rust,ignore
-//! use dotscope::metadata::tables::AssemblyRef;
+//! ```
 //! use dotscope::metadata::identity::AssemblyIdentity;
+//! use dotscope::CilObject;
+//!
+//! let loaded = CilObject::from_path("tests/samples/crafted_2.exe")?;
 //!
 //! // Parse from AssemblyRef table entry
-//! let assembly_ref: AssemblyRef = // ... loaded from metadata
-//! let identity = AssemblyIdentity::from_assembly_ref(&assembly_ref);
+//! let assembly_ref = loaded.refs_assembly().iter().next().expect("a reference");
+//! let identity = AssemblyIdentity::from_assembly_ref(assembly_ref.value());
 //!
 //! // Parse from Assembly table entry
-//! let assembly: Assembly = // ... loaded from metadata
-//! let identity = AssemblyIdentity::from_assembly(&assembly);
+//! let assembly = loaded.assembly().expect("an assembly manifest");
+//! let identity = AssemblyIdentity::from_assembly(assembly);
+//! println!("{}", identity.display_name());
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
@@ -113,6 +116,7 @@ use std::{fmt, fmt::Write as _, str::FromStr, sync::atomic::Ordering};
 use crate::{
     metadata::{
         identity::cryptographic::Identity,
+        streams::SharedStr,
         tables::{Assembly, AssemblyHashAlgorithm, AssemblyRef},
     },
     Error, Result,
@@ -165,7 +169,7 @@ use crate::{
 ///
 /// // Create identity for a simple library
 /// let identity = AssemblyIdentity {
-///     name: "MyLibrary".to_string(),
+///     name: "MyLibrary".into(),
 ///     version: AssemblyVersion::new(1, 0, 0, 0),
 ///     culture: None,
 ///     strong_name: None,
@@ -184,7 +188,7 @@ pub struct AssemblyIdentity {
     /// The primary identifier used for basic assembly lookup and display.
     /// This name appears in assembly references and is used for file system
     /// resolution when no culture or architecture specificity is required.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Four-part version number for compatibility and binding.
     ///
@@ -203,7 +207,7 @@ pub struct AssemblyIdentity {
     /// - `None` - Culture-neutral assembly (default)
     /// - `Some("en-US")` - US English localized assembly
     /// - `Some("fr-FR")` - French (France) localized assembly
-    pub culture: Option<String>,
+    pub culture: Option<SharedStr>,
 
     /// Cryptographic strong name identity.
     ///
@@ -246,6 +250,30 @@ impl std::hash::Hash for AssemblyIdentity {
         // Note: strong_name is excluded from hash calculation
         // This ensures assemblies with different strong name representations
         // hash to the same value for consistent HashMap behavior
+    }
+}
+
+/// Orders identities by name, then version, culture and processor architecture: the fields
+/// equality compares, so two identities are `Equal` exactly when they are `==`.
+///
+/// The order gives multi-assembly containers a deterministic iteration order (a project
+/// lists its assemblies, and searches them, in this order), independent of load timing.
+impl Ord for AssemblyIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.version.cmp(&other.version))
+            .then_with(|| self.culture.cmp(&other.culture))
+            .then_with(|| {
+                self.processor_architecture
+                    .cmp(&other.processor_architecture)
+            })
+    }
+}
+
+impl PartialOrd for AssemblyIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -323,7 +351,7 @@ pub struct AssemblyVersion {
 /// - **AMD64**: 64-bit x86-64 architecture (Intel/AMD)
 /// - **ARM**: ARM processor architecture
 /// - **ARM64**: 64-bit ARM architecture
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProcessorArchitecture {
     /// Microsoft Intermediate Language - architecture neutral.
     ///
@@ -401,9 +429,9 @@ impl AssemblyIdentity {
     /// );
     /// ```
     pub fn new(
-        name: impl Into<String>,
+        name: impl Into<SharedStr>,
         version: AssemblyVersion,
-        culture: Option<String>,
+        culture: Option<SharedStr>,
         strong_name: Option<Identity>,
         processor_architecture: Option<ProcessorArchitecture>,
     ) -> Self {
@@ -432,11 +460,14 @@ impl AssemblyIdentity {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use dotscope::metadata::identity::AssemblyIdentity;
+    /// use dotscope::CilObject;
     ///
-    /// let assembly_ref = // ... loaded from metadata
-    /// let identity = AssemblyIdentity::from_assembly_ref(&assembly_ref);
+    /// let loaded = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// let assembly_ref = loaded.refs_assembly().iter().next().expect("a reference");
+    /// let identity = AssemblyIdentity::from_assembly_ref(assembly_ref.value());
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn from_assembly_ref(assembly_ref: &AssemblyRef) -> Self {
         // Extract processor architecture from the AssemblyRefProcessor table data if present.
@@ -479,11 +510,14 @@ impl AssemblyIdentity {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use dotscope::metadata::identity::AssemblyIdentity;
+    /// use dotscope::CilObject;
     ///
-    /// let assembly = // ... loaded from metadata
-    /// let identity = AssemblyIdentity::from_assembly(&assembly);
+    /// let loaded = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// let assembly = loaded.assembly().expect("an assembly manifest");
+    /// let identity = AssemblyIdentity::from_assembly(assembly);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn from_assembly(assembly: &Assembly) -> Self {
         // Note: Processor architecture for the Assembly table is stored in the separate
@@ -599,10 +633,8 @@ impl AssemblyIdentity {
                         ));
                     }
 
-                    // Convert 8 bytes to u64 token
-                    let mut token_array = [0u8; 8];
-                    token_array.copy_from_slice(&token_bytes);
-                    let token = u64::from_le_bytes(token_array);
+                    let mut token = [0u8; 8];
+                    token.copy_from_slice(&token_bytes);
                     strong_name = Some(Identity::Token(token));
                 }
             } else if let Some(value) = part.strip_prefix("ProcessorArchitecture=") {
@@ -611,9 +643,9 @@ impl AssemblyIdentity {
         }
 
         Ok(Self {
-            name,
+            name: name.into(),
             version,
-            culture,
+            culture: culture.map(Into::into),
             strong_name,
             processor_architecture,
         })
@@ -637,7 +669,7 @@ impl AssemblyIdentity {
     /// let identity = AssemblyIdentity::new(
     ///     "MyLibrary",
     ///     AssemblyVersion::new(1, 2, 3, 4),
-    ///     Some("en-US".to_string()),
+    ///     Some("en-US".into()),
     ///     None,
     ///     None,
     /// );
@@ -658,41 +690,17 @@ impl AssemblyIdentity {
         let culture_str = self.culture.as_deref().unwrap_or("neutral");
         let _ = write!(result, ", Culture={culture_str}");
 
-        // For PubKey and EcmaKey variants, compute the token using SHA1 (the .NET standard)
-        // Note: Tokens are stored as u64 little-endian internally, but displayed as hex bytes
-        // in their natural order (first byte of the u64 comes first in the hex string).
-        // This matches the .NET display name format where "b77a5c561934e089" represents
-        // the bytes [0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89].
+        // A key's token is computed with SHA-1, as .NET computes it
         result.push_str(", PublicKeyToken=");
-        match &self.strong_name {
-            Some(Identity::Token(token)) => {
-                let bytes = token.to_le_bytes();
-                let _ = write!(
-                    result,
-                    "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
-                );
-            }
+        let token = match &self.strong_name {
+            Some(Identity::Token(token)) => Some(*token),
             Some(identity @ (Identity::PubKey(_) | Identity::EcmaKey(_))) => {
-                match identity.to_token(AssemblyHashAlgorithm::SHA1) {
-                    Ok(token) => {
-                        let bytes = token.to_le_bytes();
-                        let _ = write!(
-                            result,
-                            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                            bytes[0],
-                            bytes[1],
-                            bytes[2],
-                            bytes[3],
-                            bytes[4],
-                            bytes[5],
-                            bytes[6],
-                            bytes[7]
-                        );
-                    }
-                    Err(_) => result.push_str("null"),
-                }
+                identity.to_token(AssemblyHashAlgorithm::SHA1).ok()
             }
+            None => None,
+        };
+        match token {
+            Some(token) => result.push_str(&hex::encode(token)),
             None => result.push_str("null"),
         }
 
@@ -1231,6 +1239,42 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::{testkit::fixture, CilAssemblyView};
+
+    /// A key's token prints as .NET prints it: the ECMA key as `b77a5c561934e089`, not its
+    /// bytes reversed.
+    #[cfg(feature = "legacy-crypto")]
+    #[test]
+    fn a_key_prints_its_token_in_dotnet_order() {
+        let identity = AssemblyIdentity::new(
+            "mscorlib",
+            AssemblyVersion::new(4, 0, 0, 0),
+            None,
+            Some(Identity::EcmaKey(
+                vec![0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0].into(),
+            )),
+            None,
+        );
+        assert!(identity
+            .display_name()
+            .ends_with("PublicKeyToken=b77a5c561934e089"));
+    }
+
+    /// WindowsBase is signed with Microsoft's key, whose token is `31bf3856ad364e35`; the
+    /// mscorlib it references carries the ECMA token.
+    #[cfg(feature = "legacy-crypto")]
+    #[test]
+    fn windowsbase_identities_print_their_tokens() {
+        let view = CilAssemblyView::from_path(fixture("WindowsBase.dll")).unwrap();
+        let identity = view.identity().unwrap().unwrap();
+        assert!(
+            identity
+                .display_name()
+                .contains("PublicKeyToken=31bf3856ad364e35"),
+            "{}",
+            identity.display_name()
+        );
+    }
 
     #[test]
     fn test_assembly_version_new() {
@@ -1442,9 +1486,8 @@ mod tests {
         assert!(identity.strong_name.is_some());
 
         if let Some(Identity::Token(token)) = identity.strong_name {
-            // Token is parsed as little-endian bytes
-            let expected = u64::from_le_bytes([0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
-            assert_eq!(token, expected);
+            // The token's bytes in the order the name shows them
+            assert_eq!(token, [0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
         } else {
             panic!("Expected Token identity");
         }
@@ -1458,7 +1501,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(identity.name, "Resources");
-        assert_eq!(identity.culture, Some("en-US".to_string()));
+        assert_eq!(identity.culture.as_deref(), Some("en-US"));
         assert!(identity.strong_name.is_none());
     }
 
@@ -1580,7 +1623,7 @@ mod tests {
         let identity = AssemblyIdentity::new(
             "Resources",
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("fr-FR".to_string()),
+            Some("fr-FR".into()),
             None,
             None,
         );
@@ -1601,7 +1644,7 @@ mod tests {
             "StrongLib",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::PubKey(pubkey_data)),
+            Some(Identity::PubKey(pubkey_data.into())),
             None,
         );
 
@@ -1633,7 +1676,7 @@ mod tests {
             "FrameworkLib",
             AssemblyVersion::new(4, 0, 0, 0),
             None,
-            Some(Identity::EcmaKey(ecma_data)),
+            Some(Identity::EcmaKey(ecma_data.into())),
             None,
         );
 
@@ -1674,7 +1717,9 @@ mod tests {
             "StrongAssembly",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::Token(0x1234567890ABCDEF)),
+            Some(Identity::Token([
+                0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF,
+            ])),
             None,
         );
         assert!(strong.is_strong_named());
@@ -1694,7 +1739,7 @@ mod tests {
         let localized = AssemblyIdentity::new(
             "Resources",
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("de-DE".to_string()),
+            Some("de-DE".into()),
             None,
             None,
         );
@@ -1748,7 +1793,9 @@ mod tests {
             "TestAssembly",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::Token(0x1234567890ABCDEF)),
+            Some(Identity::Token([
+                0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF,
+            ])),
             None,
         );
 
@@ -1770,7 +1817,9 @@ mod tests {
             "TestAssembly",
             AssemblyVersion::new(1, 0, 0, 0),
             None,
-            Some(Identity::Token(0x1234567890ABCDEF)),
+            Some(Identity::Token([
+                0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF,
+            ])),
             None,
         );
 
@@ -1827,8 +1876,10 @@ mod tests {
         let original = AssemblyIdentity::new(
             "StrongLib",
             AssemblyVersion::new(1, 2, 3, 4),
-            Some("en-US".to_string()),
-            Some(Identity::Token(0xb77a5c561934e089)),
+            Some("en-US".into()),
+            Some(Identity::Token([
+                0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89,
+            ])),
             Some(ProcessorArchitecture::X86),
         );
 
@@ -1870,9 +1921,8 @@ mod tests {
         // Verify the token was parsed
         assert!(identity.strong_name.is_some());
         if let Some(Identity::Token(token)) = identity.strong_name {
-            // The token bytes "b77a5c561934e089" interpreted as little-endian
-            let expected = u64::from_le_bytes([0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
-            assert_eq!(token, expected);
+            // The token's bytes in the order the name shows them
+            assert_eq!(token, [0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89]);
         }
     }
 
@@ -1892,7 +1942,7 @@ mod tests {
     fn test_assembly_identity_parse_case_insensitive_culture() {
         // Culture value should be preserved as-is (case-sensitive)
         let identity = AssemblyIdentity::parse("MyLib, Version=1.0.0.0, Culture=EN-us").unwrap();
-        assert_eq!(identity.culture, Some("EN-us".to_string()));
+        assert_eq!(identity.culture.as_deref(), Some("EN-us"));
     }
 
     #[test]
@@ -2110,7 +2160,7 @@ mod tests {
         let en_us = AssemblyIdentity::new(
             "MyLib".to_string(),
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("en-US".to_string()),
+            Some("en-US".into()),
             None,
             None,
         );
@@ -2118,7 +2168,7 @@ mod tests {
         let fr_fr = AssemblyIdentity::new(
             "MyLib".to_string(),
             AssemblyVersion::new(1, 0, 0, 0),
-            Some("fr-FR".to_string()),
+            Some("fr-FR".into()),
             None,
             None,
         );

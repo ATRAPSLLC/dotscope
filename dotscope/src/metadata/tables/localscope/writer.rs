@@ -46,6 +46,10 @@ use crate::{
 };
 
 impl RowWritable for LocalScopeRaw {
+    fn sort_key(&self, _sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.method, self.start_offset)))
+    }
+
     /// Write a `LocalScope` table row to binary data
     ///
     /// Serializes one `LocalScope` table entry to the metadata tables stream format, handling

@@ -54,6 +54,8 @@ pub fn from_exception_handler(handler: &ExceptionHandler) -> SsaExceptionHandler
         protected_range: None,
         handler_range: None,
         filter_range: None,
+        // The CLR hands a handler no choice among clauses.
+        selector: None,
     }
 }
 
@@ -75,8 +77,9 @@ impl SsaExceptionHandlerCilExt for AnalyssaSsaExceptionHandler<CilTarget> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use analyssa::ir::HandlerKind;
+
+    use super::*;
 
     /// A method-body clause with the given flags and dual-purpose field.
     ///

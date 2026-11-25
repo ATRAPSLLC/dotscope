@@ -29,6 +29,10 @@ use crate::{
 };
 
 impl RowWritable for FieldLayoutRaw {
+    fn sort_key(&self, _sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.field, 0)))
+    }
+
     ///
     /// Serialize a FieldLayout table row to binary format
     ///

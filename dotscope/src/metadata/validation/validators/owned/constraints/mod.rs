@@ -20,18 +20,20 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use dotscope::metadata::validation::validators::owned::constraints::types::OwnedTypeConstraintValidator;
+//! ```no_run
+//! use dotscope::metadata::validation::OwnedTypeConstraintValidator;
 //! use dotscope::metadata::validation::OwnedValidator;
 //!
-//! # fn get_context() -> dotscope::metadata::validation::context::OwnedValidationContext<'static> { unimplemented!() }
-//! let context = get_context();
+//! use dotscope::metadata::validation::OwnedValidationContext;
+//!
+//! # fn example(context: &OwnedValidationContext<'_>) -> dotscope::Result<()> {
 //! let validator = OwnedTypeConstraintValidator::new();
 //!
-//! if validator.should_run(&context) {
-//!     validator.validate_owned(&context)?;
+//! if validator.should_run(context) {
+//!     validator.validate_owned(context)?;
 //! }
-//! # Ok::<(), dotscope::Error>(())
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Integration

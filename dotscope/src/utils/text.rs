@@ -31,15 +31,8 @@
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::truncate_chars;
-///
-/// assert_eq!(truncate_chars("hello", 3), "hel");
-/// assert_eq!(truncate_chars("hello", 10), "hello");
-/// // A byte-offset slice would panic here; this splits between characters.
-/// assert_eq!(truncate_chars("日本語", 2), "日本");
-/// ```
-pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> &str {
+/// The `examples::truncate_chars_example` test in this module runs this example.
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => s.split_at(byte_idx).0,
         None => s,
@@ -107,5 +100,20 @@ mod tests {
             );
             assert!(got.chars().count() <= n);
         }
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn truncate_chars_example() -> Result<()> {
+        assert_eq!(truncate_chars("hello", 3), "hel");
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        // A byte-offset slice would panic here; this splits between characters.
+        assert_eq!(truncate_chars("日本語", 2), "日本");
+        Ok(())
     }
 }

@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 #
-# Regenerate all obfuscator test samples via a Windows SSH host.
+# Regenerate the .NET Reactor test samples via a Windows SSH host.
 #
-# This script copies the shared TestApp source, configs, and generation scripts
-# to a Windows machine, runs each obfuscator's generate.ps1 remotely, then
-# copies the resulting .exe files back into the local test sample directories.
+# .NET Reactor is commercial and runs only on a licensed Windows install, so its samples
+# are made remotely: this script copies the shared TestApp source and the generation
+# script to a Windows machine, runs netreactor/generate.ps1 there, and copies the
+# resulting .exe files back.
+#
+# Every other protector (ConfuserEx, BitMono, Obfuscar, JIEJIE.NET) is generated on Linux
+# by `../factory/build.sh`, which runs each as its .NET Framework build under Wine and checks
+# every sample against the CLR. Their former generate.ps1 scripts ran BitMono, Obfuscar and
+# JIEJIE on .NET (Core), which binds the code they inject to that runtime, so the samples
+# did not load on the .NET Framework they target.
 #
 # Environment variables (required):
 #   WINDOWS_HOST  - SSH host string, e.g. "user@host" or "user@host -p 2222"
@@ -13,14 +20,11 @@
 # Usage:
 #   export WINDOWS_HOST="user@host -p 22"
 #   export REMOTE_DIR="C:/Users/you/dotscope_samples"
-#   ./regenerate.sh                        # Regenerate all obfuscators
-#   ./regenerate.sh confuserex             # Regenerate ConfuserEx only
-#   ./regenerate.sh bitmono obfuscar       # Regenerate BitMono and Obfuscar
-#   ./regenerate.sh jiejie                 # Regenerate JIEJIE.NET only
+#   ./regenerate.sh                        # Regenerate the .NET Reactor samples
 #
 # Prerequisites:
 #   - SSH key-based auth configured for the Windows host
-#   - Windows host has: .NET SDK 8.0+, .NET Framework 4.8 SDK, Git
+#   - Windows host has: .NET SDK 8.0+, .NET Framework 4.8 SDK, a licensed .NET Reactor
 
 set -euo pipefail
 
@@ -50,16 +54,8 @@ if [ -z "${REMOTE_DIR:-}" ]; then
     exit 1
 fi
 
-# Local paths — scripts live at the obfuscator level, configs/samples in version subdirs
+# Local paths
 TESTAPP_DIR="$SCRIPT_DIR/source/TestApp"
-CONFUSEREX_SCRIPT="$SCRIPT_DIR/confuserex/generate.ps1"
-CONFUSEREX_SAMPLES="$SCRIPT_DIR/confuserex/1.6.0"
-BITMONO_SCRIPT="$SCRIPT_DIR/bitmono/generate.ps1"
-BITMONO_SAMPLES="$SCRIPT_DIR/bitmono/0.39.0"
-OBFUSCAR_SCRIPT="$SCRIPT_DIR/obfuscar/generate.ps1"
-OBFUSCAR_SAMPLES="$SCRIPT_DIR/obfuscar/2.2.50"
-JIEJIE_SCRIPT="$SCRIPT_DIR/jiejie/source/generate.ps1"
-JIEJIE_SAMPLES="$SCRIPT_DIR/jiejie/source"
 NETREACTOR_SCRIPT="$SCRIPT_DIR/netreactor/generate.ps1"
 NETREACTOR_SAMPLES="$SCRIPT_DIR/netreactor/7.5.0"
 
@@ -122,7 +118,7 @@ download_exes() {
 # Determine which obfuscators to regenerate
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
-    TARGETS=(confuserex bitmono obfuscar jiejie netreactor)
+    TARGETS=(netreactor)
 fi
 
 build_ssh_args
@@ -151,106 +147,6 @@ ok "TestApp source uploaded."
 
 # ── Step 4: Run each obfuscator ──────────────────────────────────────────────
 
-regenerate_confuserex() {
-    log "=== ConfuserEx ==="
-
-    # Upload generation script and configs
-    run_ssh "New-Item -ItemType Directory -Path '${REMOTE_DIR}/confuserex/configs' -Force | Out-Null"
-    run_scp_to "$CONFUSEREX_SCRIPT" "$REMOTE_DIR/confuserex/"
-    for f in "$CONFUSEREX_SAMPLES"/*.crproj; do
-        run_scp_to "$f" "$REMOTE_DIR/confuserex/configs/"
-    done
-
-    # Run generation
-    log "Running ConfuserEx generate.ps1..."
-    run_ssh "& '${REMOTE_DIR}/confuserex/generate.ps1' \
-        -TestAppPath '${REMOTE_DIR}/TestApp/TestApp.csproj' \
-        -OutputDir '${REMOTE_DIR}/output/confuserex' \
-        -ConfigDir '${REMOTE_DIR}/confuserex/configs'"
-
-    # Download results
-    log "Downloading ConfuserEx samples..."
-    download_exes "$REMOTE_DIR/output/confuserex" "$CONFUSEREX_SAMPLES"
-
-    local count
-    count=$(ls "$CONFUSEREX_SAMPLES"/*.exe 2>/dev/null | wc -l | tr -d ' ')
-    ok "ConfuserEx: $count samples in place."
-}
-
-regenerate_bitmono() {
-    log "=== BitMono ==="
-
-    # Upload generation script and configs
-    run_ssh "New-Item -ItemType Directory -Path '${REMOTE_DIR}/bitmono/configs' -Force | Out-Null"
-    run_scp_to "$BITMONO_SCRIPT" "$REMOTE_DIR/bitmono/"
-    for f in "$BITMONO_SAMPLES"/*.json; do
-        run_scp_to "$f" "$REMOTE_DIR/bitmono/configs/"
-    done
-
-    # Run generation
-    log "Running BitMono generate.ps1..."
-    run_ssh "& '${REMOTE_DIR}/bitmono/generate.ps1' \
-        -TestAppPath '${REMOTE_DIR}/TestApp/TestApp.csproj' \
-        -OutputDir '${REMOTE_DIR}/output/bitmono' \
-        -ConfigDir '${REMOTE_DIR}/bitmono/configs'"
-
-    # Download results
-    log "Downloading BitMono samples..."
-    download_exes "$REMOTE_DIR/output/bitmono" "$BITMONO_SAMPLES"
-
-    local count
-    count=$(ls "$BITMONO_SAMPLES"/*.exe 2>/dev/null | wc -l | tr -d ' ')
-    ok "BitMono: $count samples in place."
-}
-
-regenerate_obfuscar() {
-    log "=== Obfuscar ==="
-
-    # Upload generation script and configs
-    run_ssh "New-Item -ItemType Directory -Path '${REMOTE_DIR}/obfuscar/configs' -Force | Out-Null"
-    run_scp_to "$OBFUSCAR_SCRIPT" "$REMOTE_DIR/obfuscar/"
-    for f in "$OBFUSCAR_SAMPLES"/*.xml; do
-        run_scp_to "$f" "$REMOTE_DIR/obfuscar/configs/"
-    done
-
-    # Run generation
-    log "Running Obfuscar generate.ps1..."
-    run_ssh "& '${REMOTE_DIR}/obfuscar/generate.ps1' \
-        -TestAppPath '${REMOTE_DIR}/TestApp/TestApp.csproj' \
-        -OutputDir '${REMOTE_DIR}/output/obfuscar' \
-        -ConfigDir '${REMOTE_DIR}/obfuscar/configs'"
-
-    # Download results
-    log "Downloading Obfuscar samples..."
-    download_exes "$REMOTE_DIR/output/obfuscar" "$OBFUSCAR_SAMPLES"
-
-    local count
-    count=$(ls "$OBFUSCAR_SAMPLES"/*.exe 2>/dev/null | wc -l | tr -d ' ')
-    ok "Obfuscar: $count samples in place."
-}
-
-regenerate_jiejie() {
-    log "=== JIEJIE.NET ==="
-
-    # Upload generation script (JIEJIE has no separate config files)
-    run_ssh "New-Item -ItemType Directory -Path '${REMOTE_DIR}/jiejie' -Force | Out-Null"
-    run_scp_to "$JIEJIE_SCRIPT" "$REMOTE_DIR/jiejie/"
-
-    # Run generation
-    log "Running JIEJIE.NET generate.ps1..."
-    run_ssh "& '${REMOTE_DIR}/jiejie/generate.ps1' \
-        -TestAppPath '${REMOTE_DIR}/TestApp/TestApp.csproj' \
-        -OutputDir '${REMOTE_DIR}/output/jiejie'"
-
-    # Download results
-    log "Downloading JIEJIE.NET samples..."
-    download_exes "$REMOTE_DIR/output/jiejie" "$JIEJIE_SAMPLES"
-
-    local count
-    count=$(ls "$JIEJIE_SAMPLES"/*.exe 2>/dev/null | wc -l | tr -d ' ')
-    ok "JIEJIE.NET: $count samples in place."
-}
-
 regenerate_netreactor() {
     log "=== .NET Reactor ==="
 
@@ -275,13 +171,9 @@ regenerate_netreactor() {
 
 for target in "${TARGETS[@]}"; do
     case "$target" in
-        confuserex)  regenerate_confuserex ;;
-        bitmono)     regenerate_bitmono ;;
-        obfuscar)    regenerate_obfuscar ;;
-        jiejie)      regenerate_jiejie ;;
         netreactor)  regenerate_netreactor ;;
         *)
-            err "Unknown target: $target (valid: confuserex, bitmono, obfuscar, jiejie, netreactor)"
+            err "Unknown target: $target (valid: netreactor; the others are made by ../factory/build.sh)"
             exit 1
             ;;
     esac
@@ -294,9 +186,6 @@ ok "Regeneration complete for: ${TARGETS[*]}"
 log ""
 log "Verify with:"
 for target in "${TARGETS[@]}"; do
-    log "  cargo test --release --test $target"
+    log "  cargo test --profile ci-test --test $target"
 done
-log ""
-log "Or all at once:"
-log "  cargo test --release --test confuserex --test bitmono --test obfuscar --test jiejie --test netreactor"
 log "════════════════════════════════════════════════════════════════"

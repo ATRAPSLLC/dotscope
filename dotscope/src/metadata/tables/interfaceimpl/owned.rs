@@ -4,14 +4,13 @@
 //! entries with all type references resolved and data owned. Unlike [`crate::metadata::tables::interfaceimpl::raw::InterfaceImplRaw`], this
 //! structure contains resolved type references for both implementing classes and implemented interfaces.
 
-use std::sync::Arc;
-
 use crate::{
     metadata::{
         customattributes::CustomAttributeValueList,
         token::Token,
         typesystem::{CilTypeRc, CilTypeRef},
     },
+    utils::RowList,
     Result,
 };
 
@@ -35,7 +34,7 @@ pub struct InterfaceEntry {
 }
 
 /// Thread-safe list for storing [`InterfaceEntry`] instances on a type.
-pub type InterfaceEntryList = Arc<boxcar::Vec<InterfaceEntry>>;
+pub type InterfaceEntryList = RowList<InterfaceEntry>;
 
 /// Owned `InterfaceImpl` table entry with resolved type references and owned data.
 ///
@@ -98,10 +97,13 @@ impl InterfaceImpl {
     ///
     /// This function never returns an error; it always returns `Ok(())`.
     pub fn apply(&self) -> Result<()> {
-        self.class.interfaces.push(InterfaceEntry {
-            interface: CilTypeRef::new(&self.interface),
-            custom_attributes: self.custom_attributes.clone(),
-        });
+        self.class.interfaces.push_row(
+            self.token,
+            InterfaceEntry {
+                interface: CilTypeRef::new(&self.interface),
+                custom_attributes: self.custom_attributes.clone(),
+            },
+        );
         Ok(())
     }
 }

@@ -2,15 +2,19 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     analysis::{
-        CallGraph, ConstValue, ConstValueCilExt, MethodRef, SsaFunctionBuilder, SsaOp, SsaType,
-        SsaVarId,
+        AccessQualifiers, Budget, CallData, CallGraph, Callee, CilTarget, CmpKind, ConstValue,
+        ConstValueCilExt, FieldRef, MethodRef, SsaFunction, SsaFunctionBuilder, SsaOp, SsaType,
+        SsaVarId, SsaVerifier, VerifierError, VerifyLevel, WorkBudget,
     },
     compiler::{
-        passes::constants::{fold_rem, AlgebraicResult, ConstantPropagationPass, IntOperand},
-        CompilerContext, EventLog, SsaPass,
+        passes::constants::{AlgebraicResult, ConstantPropagationPass, StringFoldOp},
+        CompilerContext, EventKind, EventLog, SsaPass,
     },
     metadata::{token::Token, typesystem::PointerSize},
-    test::helpers::test_assembly_arc,
+    testkit::{
+        helpers::{method_token, mono_mscorlib, test_assembly_arc},
+        passes::run_verified,
+    },
 };
 
 /// Creates a test compiler context with the standard test assembly
@@ -26,14 +30,14 @@ fn test_context() -> CompilerContext {
 
 #[test]
 fn test_pass_creation() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     assert_eq!(pass.name(), "constant-propagation");
     assert!(!pass.description().is_empty());
 }
 
 #[test]
 fn test_pass_default() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     assert_eq!(pass.name(), "constant-propagation");
 }
 
@@ -88,7 +92,7 @@ fn test_conv_to_f32() {
     let operand: ConstValue = ConstValue::I32(42);
     assert_eq!(
         operand.convert_to(&SsaType::F32, false, 8),
-        Some(ConstValue::F32(42.0))
+        Some(ConstValue::from(42.0_f32))
     );
 }
 
@@ -148,7 +152,7 @@ fn test_conv_f64() {
     let operand: ConstValue = ConstValue::I32(42);
     assert_eq!(
         operand.convert_to(&SsaType::F64, false, 8),
-        Some(ConstValue::F64(42.0))
+        Some(ConstValue::from(42.0_f64))
     );
 }
 
@@ -359,7 +363,8 @@ fn test_add_ovf_no_overflow() {
         flags: None,
     };
 
-    let result = ConstantPropagationPass::check_overflow_op(&op, &constants, PointerSize::Bit64);
+    let result =
+        ConstantPropagationPass::check_overflow_op(&op, &constants, CilTarget::x64().machine());
     assert!(result.is_some());
 }
 
@@ -381,25 +386,26 @@ fn test_mul_ovf_with_zero() {
     };
 
     // x * 0 = 0, even with overflow check
-    let result = ConstantPropagationPass::check_overflow_op(&op, &constants, PointerSize::Bit64);
+    let result =
+        ConstantPropagationPass::check_overflow_op(&op, &constants, CilTarget::x64().machine());
     assert_eq!(result, Some((v2, ConstValue::I32(0))));
 }
 
 #[test]
 fn test_pass_empty_function() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     let mut ssa = SsaFunctionBuilder::new(0, 0).build_with(|_f| {}).unwrap();
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
     assert!(!result.unwrap());
 }
 
 #[test]
 fn test_pass_simple_folding() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Create a block with: v0 = 5, v1 = 3, v2 = add v0, v1
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -415,7 +421,7 @@ fn test_pass_simple_folding() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that v2 was folded to constant 8
@@ -434,7 +440,7 @@ fn test_pass_simple_folding() {
 
 #[test]
 fn test_pass_branch_simplification() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = true, branch v0, B1, B2
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -450,7 +456,7 @@ fn test_pass_branch_simplification() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that branch was simplified to jump
@@ -464,7 +470,7 @@ fn test_pass_branch_simplification() {
 
 #[test]
 fn test_pass_switch_simplification() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = 1, switch v0, [B1, B2, B3], default=B4
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -483,7 +489,7 @@ fn test_pass_switch_simplification() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that switch was simplified to jump to target 2 (index 1)
@@ -497,7 +503,7 @@ fn test_pass_switch_simplification() {
 
 #[test]
 fn test_constants_cached_in_context() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     let (mut ssa, v0) = {
         let mut v0_out = SsaVarId::from_index(0);
         let ssa = SsaFunctionBuilder::new(0, 0)
@@ -515,11 +521,17 @@ fn test_constants_cached_in_context() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
-    // Check that constant was cached
-    assert!(ctx.known_value_is(method_token, v0, |v| *v == ConstValue::I32(42)));
+    // What the pass proved is recorded on the value it proved it about, in the
+    // function the pass was handed - not in a table beside it, which would
+    // describe whichever value inherited the id after the next renumbering.
+    assert_eq!(
+        ssa.variable(v0)
+            .and_then(|variable| variable.facts().known_value()),
+        Some(&ConstValue::I32(42))
+    );
 }
 
 #[test]
@@ -661,7 +673,7 @@ fn test_identity_sub_zero() {
 
 #[test]
 fn test_chained_constant_folding() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // v0 = 2, v1 = 3, v2 = v0 + v1, v3 = 2, v4 = v2 * v3, v5 = 0, v6 = v4 + v5
     let (mut ssa, v4) = {
         let mut v4_out = SsaVarId::from_index(0);
@@ -687,16 +699,20 @@ fn test_chained_constant_folding() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
-    // Check that v4 was folded to 10
-    assert!(ctx.known_value_is(method_token, v4, |v| *v == ConstValue::I32(10)));
+    // Check that v4 was folded to 10, on the value itself.
+    assert_eq!(
+        ssa.variable(v4)
+            .and_then(|variable| variable.facts().known_value()),
+        Some(&ConstValue::I32(10))
+    );
 }
 
 #[test]
 fn test_branch_false_condition() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = false, branch v0, B1, B2
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -712,7 +728,7 @@ fn test_branch_false_condition() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that branch was simplified to jump to false branch (target 2)
@@ -726,7 +742,7 @@ fn test_branch_false_condition() {
 
 #[test]
 fn test_switch_out_of_range_uses_default() {
-    let pass = ConstantPropagationPass::new(10);
+    let pass = ConstantPropagationPass;
     // Block 0: v0 = 100 (out of range), switch v0, [B1, B2, B3], default=B4
     let mut ssa = SsaFunctionBuilder::new(0, 0)
         .build_with(|f| {
@@ -745,7 +761,7 @@ fn test_switch_out_of_range_uses_default() {
     let method_token = Token::new(0x0600_0001);
     let ctx = test_context();
 
-    let result = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx);
+    let result = run_verified(&pass, &mut ssa, &MethodRef::from(method_token), &ctx);
     assert!(result.is_ok());
 
     // Check that switch was simplified to jump to default (target 4)
@@ -757,255 +773,210 @@ fn test_switch_out_of_range_uses_default() {
     }
 }
 
+/// The fixed-width integer types the conversion rules reason about.
+const INTEGERS: [SsaType; 9] = [
+    SsaType::I8,
+    SsaType::U8,
+    SsaType::I16,
+    SsaType::U16,
+    SsaType::Char,
+    SsaType::I32,
+    SsaType::U32,
+    SsaType::I64,
+    SsaType::U64,
+];
+
+/// Every value of an 8- or 16-bit type, and the edges of a wider one, as constants of it.
+fn values_of(ty: &SsaType) -> Vec<ConstValue> {
+    let edges: [i64; 10] = [
+        0,
+        1,
+        -1,
+        127,
+        -128,
+        255,
+        i64::from(i32::MAX),
+        i64::from(i32::MIN),
+        i64::MAX,
+        i64::MIN,
+    ];
+    match ty {
+        SsaType::I8 => (i8::MIN..=i8::MAX).map(ConstValue::I8).collect(),
+        SsaType::U8 => (u8::MIN..=u8::MAX).map(ConstValue::U8).collect(),
+        SsaType::I16 => (i16::MIN..=i16::MAX).map(ConstValue::I16).collect(),
+        SsaType::U16 | SsaType::Char => (u16::MIN..=u16::MAX).map(ConstValue::U16).collect(),
+        SsaType::I32 => edges.iter().map(|&v| ConstValue::I32(v as i32)).collect(),
+        SsaType::U32 => edges.iter().map(|&v| ConstValue::U32(v as u32)).collect(),
+        SsaType::I64 => edges.iter().map(|&v| ConstValue::I64(v)).collect(),
+        _ => edges.iter().map(|&v| ConstValue::U64(v as u64)).collect(),
+    }
+}
+
+/// The IR's integer conversion of a constant, the target's kernel that constant folding and
+/// the evaluator share: an oracle independent of the rules under test.
+fn convert(value: &ConstValue, target: &SsaType, unsigned: bool) -> Option<ConstValue> {
+    value.convert_to(target, unsigned, 8)
+}
+
+/// The `int32` (or `int64`) the evaluation stack holds a value of `ty` as: its bits read
+/// with its own signedness.
+fn stack_form(value: &ConstValue, ty: &SsaType) -> Option<ConstValue> {
+    let unsigned = matches!(
+        ty,
+        SsaType::U8 | SsaType::U16 | SsaType::Char | SsaType::U32 | SsaType::U64
+    );
+    let wide = if ty.size_bytes() == Some(8) {
+        SsaType::I64
+    } else {
+        SsaType::I32
+    };
+    convert(value, &wide, unsigned)
+}
+
+/// A conversion becomes a copy exactly when the evaluation stack holds its result as it
+/// holds its operand: for every value, the operand's stack form is the result's. A width
+/// change is never a copy, whatever it computes.
 #[test]
-fn test_types_match_identical() {
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I64,
-        &SsaType::I64
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::F32,
-        &SsaType::F32
-    ));
-    assert!(ConstantPropagationPass::types_match(
+fn a_conversion_is_a_copy_exactly_when_the_stack_holds_both_alike() {
+    for source in &INTEGERS {
+        let values = values_of(source);
+        for target in &INTEGERS {
+            for unsigned in [false, true] {
+                let rule = ConstantPropagationPass::conversion_is_copy(source, target);
+                let same_width = source.size_bytes() == target.size_bytes();
+                let alike = values.iter().all(|value| {
+                    convert(value, target, unsigned)
+                        .and_then(|converted| stack_form(&converted, target))
+                        == stack_form(value, source)
+                });
+                assert_eq!(
+                    rule,
+                    same_width && alike,
+                    "{source:?} to {target:?} unsigned={unsigned}"
+                );
+            }
+        }
+    }
+    assert!(ConstantPropagationPass::conversion_is_copy(
         &SsaType::F64,
         &SsaType::F64
     ));
-}
-
-#[test]
-fn test_types_match_stack_equivalence() {
-    // Small integers promote to I32 on the stack
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I8,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U8,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I16,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U16,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::Bool,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::Char,
-        &SsaType::I32
-    ));
-
-    // U32 and I32 are interchangeable
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U32,
-        &SsaType::I32
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::U32
-    ));
-
-    // I64 and U64 are interchangeable
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::I64,
-        &SsaType::U64
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::U64,
-        &SsaType::I64
-    ));
-
-    // Native int types
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::NativeInt,
-        &SsaType::NativeUInt
-    ));
-    assert!(ConstantPropagationPass::types_match(
-        &SsaType::NativeUInt,
-        &SsaType::NativeInt
-    ));
-}
-
-#[test]
-fn test_types_no_match() {
-    // Floats don't match integers
-    assert!(!ConstantPropagationPass::types_match(
+    assert!(!ConstantPropagationPass::conversion_is_copy(
         &SsaType::F32,
         &SsaType::I32
     ));
-    assert!(!ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::F32
-    ));
-
-    // Different sizes don't match
-    assert!(!ConstantPropagationPass::types_match(
-        &SsaType::I32,
-        &SsaType::I64
-    ));
-    assert!(!ConstantPropagationPass::types_match(
-        &SsaType::I64,
-        &SsaType::I32
+    assert!(ConstantPropagationPass::conversion_is_copy(
+        &SsaType::NativeInt,
+        &SsaType::NativeUInt
     ));
 }
 
+/// The cases named: an `int8` widened to an `int32` stays the conversion it is, however it
+/// reads its operand; `int32` and `uint32` restate one another's bits.
 #[test]
-fn test_is_safe_widening_chain_same_sign() {
-    // Unsigned widening: source <= inner < outer
-    // conv.u32(conv.u8(x)) where x is u8 - both conversions widen
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U8,  // inner target (same as source - no-op)
-        &SsaType::U32, // outer target
-        true,
-        true
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U16, // inner target
-        &SsaType::U64, // outer target
-        true,
-        true
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U16, // source
-        &SsaType::U32, // inner target
-        &SsaType::U64, // outer target
-        true,
-        true
-    ));
-
-    // Signed widening: source <= inner < outer
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I8,  // inner target
-        &SsaType::I32, // outer target
-        false,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I16, // inner target
-        &SsaType::I64, // outer target
-        false,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I16, // source
-        &SsaType::I32, // inner target
-        &SsaType::I64, // outer target
-        false,
-        false
-    ));
+fn a_widening_is_never_a_copy() {
+    let is_copy = ConstantPropagationPass::conversion_is_copy;
+    assert!(!is_copy(&SsaType::I8, &SsaType::I32));
+    assert!(!is_copy(&SsaType::U8, &SsaType::I32));
+    assert!(!is_copy(&SsaType::Bool, &SsaType::I32));
+    assert!(is_copy(&SsaType::U32, &SsaType::I32));
+    assert!(is_copy(&SsaType::I64, &SsaType::U64));
+    assert!(is_copy(&SsaType::Char, &SsaType::U16));
+    assert!(!is_copy(&SsaType::Char, &SsaType::I16));
+    assert!(!is_copy(&SsaType::I8, &SsaType::U8));
 }
 
+/// Whenever the rule skips the inner conversion of `outer(inner(x))`, the one conversion it
+/// keeps gives the same result for every value `x` can hold; and wherever one conversion of
+/// either reading does, the rule finds it. Every integer source, wider-or-equal inner target,
+/// wider outer target, and both readings of each conversion are tried.
 #[test]
-fn test_is_safe_widening_chain_unsigned_to_signed() {
-    // unsigned to signed widening is safe (zero extend then reinterpret)
-    // conv.i32(conv.u8(x)) where x is u8
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U8,  // inner target
-        &SsaType::I32, // outer target
-        true,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U16, // inner target
-        &SsaType::I64, // outer target
-        true,
-        false
-    ));
-    assert!(ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U16, // source
-        &SsaType::U32, // inner target
-        &SsaType::I64, // outer target
-        true,
-        false
-    ));
+fn a_widening_chain_is_one_conversion_exactly_when_one_computes_both() {
+    for source in &INTEGERS {
+        let values = values_of(source);
+        for inner in &INTEGERS {
+            if inner.size_bytes() < source.size_bytes() {
+                continue;
+            }
+            for outer in &INTEGERS {
+                if outer.size_bytes() <= inner.size_bytes() {
+                    continue;
+                }
+                for inner_unsigned in [false, true] {
+                    for outer_unsigned in [false, true] {
+                        let chain = |value: &ConstValue| {
+                            convert(value, inner, inner_unsigned)
+                                .and_then(|mid| convert(&mid, outer, outer_unsigned))
+                        };
+                        let one = |unsigned: bool| {
+                            values
+                                .iter()
+                                .all(|value| chain(value) == convert(value, outer, unsigned))
+                        };
+                        let rule = ConstantPropagationPass::widening_chain_reading(
+                            source,
+                            inner,
+                            inner_unsigned,
+                            outer,
+                            outer_unsigned,
+                        );
+                        let case = format!(
+                            "{source:?} through {inner:?} (unsigned={inner_unsigned}) to {outer:?} (unsigned={outer_unsigned})"
+                        );
+                        match rule {
+                            Some(unsigned) => {
+                                assert!(one(unsigned), "{case} is skipped and differs")
+                            }
+                            None => assert!(
+                                !one(false) && !one(true),
+                                "{case} is one conversion and kept"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
+/// The chains named: an `int16` -1 sign-extended to 32 bits and zero-extended from there is
+/// `0xFFFFFFFF`, no single conversion of it; zero-extended first, any extension after is a
+/// zero-extension; a source wider than the inner target is truncated; floats are kept.
 #[test]
-fn test_is_safe_widening_chain_signed_to_unsigned() {
-    // signed to unsigned widening is NOT safe (sign extend vs zero extend)
-    // conv.u32(conv.i8(x)) where x is i8 - inner is signed, outer is unsigned
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I8,  // inner target
-        &SsaType::U32, // outer target
-        false,
-        true
-    ));
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I8,  // source
-        &SsaType::I16, // inner target
-        &SsaType::U64, // outer target
-        false,
-        true
-    ));
-}
-
-#[test]
-fn test_is_safe_widening_chain_narrowing_rejected() {
-    // Outer narrowing is NOT safe - inner >= outer means data loss
-    // conv.i32(conv.i64(x)) where x is i32 - outer narrows from i64 to i32
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I32, // source
-        &SsaType::I64, // inner target
-        &SsaType::I32, // outer target (narrowing!)
-        false,
-        false
-    ));
-    // conv.u8(conv.u32(x)) where x is u8 - outer narrows from u32 to u8
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::U8,  // source
-        &SsaType::U32, // inner target
-        &SsaType::U8,  // outer target (narrowing!)
-        true,
-        true
-    ));
-
-    // Inner narrowing is also NOT safe - source > inner means truncation
-    // conv.i32(conv.u1(x)) where x is i32 - inner truncates i32 to u8
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I32, // source (larger than inner!)
-        &SsaType::U8,  // inner target (truncates source)
-        &SsaType::I32, // outer target
-        true,
-        false
-    ));
-}
-
-#[test]
-fn test_is_safe_widening_chain_float_rejected() {
-    // Float conversions are NOT safe - precision loss
-    // conv.f64(conv.f32(x)) - float widening can lose precision
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::F32, // source
-        &SsaType::F32, // inner target
-        &SsaType::F64, // outer target
-        false,
-        false
-    ));
-    // conv.f64(conv.i32(x)) - int to float conversion
-    assert!(!ConstantPropagationPass::is_safe_widening_chain(
-        &SsaType::I32, // source
-        &SsaType::I32, // inner target
-        &SsaType::F64, // outer target
-        false,
-        false
-    ));
+fn widening_chains_keep_the_extension_each_step_makes() {
+    let reading = |source, inner, inner_unsigned, outer, outer_unsigned| {
+        ConstantPropagationPass::widening_chain_reading(
+            &source,
+            &inner,
+            inner_unsigned,
+            &outer,
+            outer_unsigned,
+        )
+    };
+    assert_eq!(
+        reading(SsaType::I16, SsaType::I32, false, SsaType::U64, true),
+        None
+    );
+    assert_eq!(
+        reading(SsaType::I8, SsaType::U32, true, SsaType::I64, false),
+        Some(true)
+    );
+    assert_eq!(
+        reading(SsaType::I16, SsaType::I16, false, SsaType::U64, true),
+        Some(true)
+    );
+    assert_eq!(
+        reading(SsaType::I8, SsaType::I16, false, SsaType::U64, false),
+        Some(false)
+    );
+    assert_eq!(
+        reading(SsaType::I32, SsaType::U8, true, SsaType::I32, true),
+        None
+    );
+    assert_eq!(
+        reading(SsaType::F32, SsaType::F32, false, SsaType::F64, false),
+        None
+    );
 }
 
 #[test]
@@ -1254,11 +1225,13 @@ fn test_fold_string_operations_with_decrypted_concat() {
                     dest: v1,
                     value: ConstValue::DecryptedString("tem".into()),
                 });
-                b.op(SsaOp::Call {
-                    dest: Some(v2),
-                    method: MethodRef::new(Token::new(0x0A000099)), // fake MemberRef
-                    args: vec![v0, v1],
-                });
+                b.op(CallData::new(
+                    Some(v2),
+                    // fake MemberRef
+                    Callee::Direct(MethodRef::new(Token::new(0x0A000099))),
+                    vec![v0, v1],
+                )
+                .into());
                 b.ret();
             });
         })
@@ -1287,50 +1260,117 @@ fn test_fold_string_operations_with_decrypted_concat() {
     );
 }
 
-/// `rem.un` reads its operands as unsigned at their own width.
-///
-/// Reaching them through a sign-extending accessor turns `I32(-1)` into
-/// `0xFFFF_FFFF_FFFF_FFFF`, so `-1 rem.un 7` folds to `1` instead of the `3` that
-/// `0xFFFF_FFFF % 7` gives. That is a wrong constant on the default deobfuscation path —
-/// modulus-with-a-key is the canonical decryptor shape.
+/// A function returning `left rem right` (`rem.un` when `unsigned`), and the
+/// remainder it returns.
+fn remainder_function(
+    left: ConstValue,
+    right: ConstValue,
+    unsigned: bool,
+) -> (SsaFunction, SsaVarId) {
+    let mut remainder = None;
+    let ssa = SsaFunctionBuilder::new(0, 0)
+        .build_with(|f| {
+            f.block(0, |b| {
+                let (l, r) = (b.const_val(left), b.const_val(right));
+                let v = if unsigned {
+                    b.rem_un(l, r)
+                } else {
+                    b.rem(l, r)
+                };
+                remainder = Some(v);
+                b.ret_val(v);
+            });
+        })
+        .unwrap();
+    (ssa, remainder.unwrap())
+}
+
+/// The constant `remainder` is defined as, if any.
+fn folded(ssa: &SsaFunction, remainder: SsaVarId) -> Option<ConstValue> {
+    match ssa.get_definition(remainder) {
+        Some(SsaOp::Const { value, .. }) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// What the pass folds `left rem right` to, or `None` when it leaves the
+/// remainder in place.
+fn folded_rem(left: ConstValue, right: ConstValue, unsigned: bool) -> Option<ConstValue> {
+    let (mut ssa, remainder) = remainder_function(left, right, unsigned);
+    run_verified(
+        &ConstantPropagationPass,
+        &mut ssa,
+        &MethodRef::from(Token::new(0x0600_0001)),
+        &test_context(),
+    )
+    .unwrap();
+    folded(&ssa, remainder)
+}
+
+/// `rem.un` reads its operands as unsigned at their own width: `-1 rem.un 7`
+/// is `0xFFFF_FFFF % 7`, 3, where a sign-extending read gives 1. Modulus with
+/// a key is the canonical decryptor shape. Signed, the remainder takes the
+/// dividend's sign, in Rust and CIL alike.
 #[test]
 fn rem_un_treats_i32_operands_as_unsigned_32_bit() {
-    let l = IntOperand::from_const(&ConstValue::I32(-1)).unwrap();
-    let r = IntOperand::from_const(&ConstValue::I32(7)).unwrap();
-
-    assert_eq!(fold_rem(l, r, true), Some(ConstValue::I32(3)));
-    // Signed: Rust and CIL agree that the remainder takes the dividend's sign.
-    assert_eq!(fold_rem(l, r, false), Some(ConstValue::I32(-1)));
+    assert_eq!(
+        folded_rem(ConstValue::I32(-1), ConstValue::I32(7), true),
+        Some(ConstValue::I32(3))
+    );
+    assert_eq!(
+        folded_rem(ConstValue::I32(-1), ConstValue::I32(7), false),
+        Some(ConstValue::I32(-1))
+    );
 }
 
-/// The folded constant keeps the operands' width.
-///
-/// Narrowing a 64-bit remainder to `I32` is worse than a wrong value: codegen then emits
-/// `ldc.i4` where the stack type requires `ldc.i8`, which fails verification.
+/// The folded constant keeps the operands' width: a 64-bit remainder
+/// narrowed to `I32` would be emitted as `ldc.i4` where the stack holds an
+/// `int64`, which fails verification.
 #[test]
 fn rem_keeps_the_operand_width() {
-    let wide = IntOperand::from_const(&ConstValue::I64(0x1_0000_0000 + 5)).unwrap();
-    let divisor = IntOperand::from_const(&ConstValue::I64(0x1_0000_0000)).unwrap();
-
-    assert_eq!(fold_rem(wide, divisor, false), Some(ConstValue::I64(5)));
+    assert_eq!(
+        folded_rem(
+            ConstValue::I64(0x1_0000_0000 + 5),
+            ConstValue::I64(0x1_0000_0000),
+            false
+        ),
+        Some(ConstValue::I64(5))
+    );
 }
 
-/// Cases the runtime turns into an exception must not be folded away.
+/// What the runtime turns into an exception is not folded away.
 #[test]
-fn rem_refuses_to_fold_faulting_and_unverifiable_cases() {
-    let one = IntOperand::from_const(&ConstValue::I32(1)).unwrap();
-    let zero = IntOperand::from_const(&ConstValue::I32(0)).unwrap();
-    let min = IntOperand::from_const(&ConstValue::I32(i32::MIN)).unwrap();
-    let neg_one = IntOperand::from_const(&ConstValue::I32(-1)).unwrap();
-    let wide = IntOperand::from_const(&ConstValue::I64(1)).unwrap();
+fn rem_refuses_to_fold_faulting_cases() {
+    let (one, zero) = (ConstValue::I32(1), ConstValue::I32(0));
+    assert_eq!(folded_rem(one.clone(), zero.clone(), false), None);
+    assert_eq!(folded_rem(one, zero, true), None);
+    assert_eq!(
+        folded_rem(ConstValue::I32(i32::MIN), ConstValue::I32(-1), false),
+        None
+    );
+}
 
-    // DivideByZeroException
-    assert_eq!(fold_rem(one, zero, false), None);
-    assert_eq!(fold_rem(one, zero, true), None);
-    // OverflowException
-    assert_eq!(fold_rem(min, neg_one, false), None);
-    // Mixed widths are unverifiable IL; folding would invent a promotion.
-    assert_eq!(fold_rem(one, wide, false), None);
+/// A remainder of an `int32` by an `int64` is unverifiable IL: the verifier
+/// rejects it before any pass runs, and the pass handed it regardless leaves
+/// it in place.
+#[test]
+fn rem_of_mixed_widths_is_rejected_and_left_unfolded() {
+    let (mut ssa, remainder) = remainder_function(ConstValue::I32(7), ConstValue::I64(2), false);
+    let findings = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| matches!(finding, VerifierError::InvalidOperandWidths { .. })),
+        "{findings:?}"
+    );
+    ConstantPropagationPass
+        .run_on_method(
+            &mut ssa,
+            &MethodRef::from(Token::new(0x0600_0001)),
+            &test_context(),
+        )
+        .unwrap();
+    assert_eq!(folded(&ssa, remainder), None);
 }
 
 /// An overflow-checked op must test overflow at the operands' width, signed or unsigned.
@@ -1400,4 +1440,227 @@ fn mul_ovf_by_zero_folds_at_the_operand_width() {
         wide_zero.mul_checked(&wide_hundred, false, ptr),
         Some(ConstValue::I64(0))
     );
+}
+
+#[test]
+fn chained_involution_chains_resolve_to_the_innermost_value() {
+    // `b = not(not(neg(neg x)))`: two even chains, the second reading the
+    // first's result. Each cancels, and `b`'s use must end at `x` rather than
+    // at the removed `neg(neg x)`.
+    let mut x_out = SsaVarId::from_index(0);
+    let mut ssa = SsaFunctionBuilder::new(1, 0)
+        .build_with(|f| {
+            let x = f.arg(0, SsaType::I32);
+            x_out = x;
+            f.block(0, |b| {
+                let n1 = b.neg(x);
+                let n2 = b.neg(n1);
+                let c1 = b.not(n2);
+                let c2 = b.not(c1);
+                b.ret_val(c2);
+            });
+        })
+        .unwrap();
+
+    let mut changes = EventLog::new();
+    ConstantPropagationPass::simplify_involutory_ops(
+        &mut ssa,
+        Token::new(0x0600_0001),
+        &mut changes,
+    );
+
+    let returned = ssa
+        .block(0)
+        .unwrap()
+        .instructions()
+        .iter()
+        .find_map(|instr| match instr.op() {
+            SsaOp::Return { value, .. } => *value,
+            _ => None,
+        })
+        .expect("a return");
+    assert_eq!(returned, x_out, "not(not(neg(neg x))) is x");
+    assert!(
+        ssa.blocks()
+            .iter()
+            .flat_map(|b| b.instructions())
+            .all(|i| matches!(i.op(), SsaOp::Nop | SsaOp::Return { .. })),
+        "every chain member is gone"
+    );
+}
+
+#[test]
+fn an_odd_chain_after_an_even_one_reads_the_resolved_operand() {
+    // `b = not(not(not(neg(neg x))))`: the even `neg` chain cancels to `x`,
+    // and the odd `not` chain keeps one `not`, which must read `x`.
+    let mut x_out = SsaVarId::from_index(0);
+    let mut ssa = SsaFunctionBuilder::new(1, 0)
+        .build_with(|f| {
+            let x = f.arg(0, SsaType::I32);
+            x_out = x;
+            f.block(0, |b| {
+                let n1 = b.neg(x);
+                let n2 = b.neg(n1);
+                let c1 = b.not(n2);
+                let c2 = b.not(c1);
+                let c3 = b.not(c2);
+                b.ret_val(c3);
+            });
+        })
+        .unwrap();
+
+    let mut changes = EventLog::new();
+    ConstantPropagationPass::simplify_involutory_ops(
+        &mut ssa,
+        Token::new(0x0600_0001),
+        &mut changes,
+    );
+
+    let survivors: Vec<&SsaOp> = ssa
+        .blocks()
+        .iter()
+        .flat_map(|b| b.instructions())
+        .map(|i| i.op())
+        .filter(|op| !matches!(op, SsaOp::Nop | SsaOp::Return { .. }))
+        .collect();
+    assert!(
+        matches!(survivors.as_slice(), [SsaOp::Not { operand, .. }] if *operand == x_out),
+        "one `not x` remains: {survivors:?}"
+    );
+}
+
+#[test]
+fn a_call_that_writes_a_static_is_not_replaced_by_its_result() {
+    // `int F(int x) { Counter = x; return x + 1; }` evaluates to `x + 1`, but a
+    // call to it also sets `Counter`. Folding the call would lose the write.
+    let writes = SsaFunctionBuilder::new(1, 0)
+        .build_with(|f| {
+            let x = f.arg(0, SsaType::I32);
+            f.block(0, |b| {
+                b.op(SsaOp::StoreStaticField {
+                    field: FieldRef::new(Token::new(0x0400_0001)),
+                    value: x,
+                    access: AccessQualifiers::FLAT,
+                });
+                let one = b.const_i32(1);
+                let result = b.add(x, one);
+                b.ret_val(result);
+            });
+        })
+        .unwrap();
+    assert_eq!(
+        ConstantPropagationPass::evaluate_pure_function(
+            &writes,
+            &[ConstValue::I32(4)],
+            CilTarget::x64().machine()
+        ),
+        None
+    );
+
+    // The same arithmetic without the write is a value, and folds.
+    let pure = SsaFunctionBuilder::new(1, 0)
+        .build_with(|f| {
+            let x = f.arg(0, SsaType::I32);
+            f.block(0, |b| {
+                let one = b.const_i32(1);
+                let result = b.add(x, one);
+                b.ret_val(result);
+            });
+        })
+        .unwrap();
+    assert_eq!(
+        ConstantPropagationPass::evaluate_pure_function(
+            &pure,
+            &[ConstValue::I32(4)],
+            CilTarget::x64().machine()
+        ),
+        Some(ConstValue::I32(5))
+    );
+}
+
+/// Only `System.String`'s own methods are string operations to fold.
+/// `StringBuilder.Replace(string, string)` has `String.Replace`'s name and
+/// arity, and its declaring type's name contains `String`; the substring test
+/// this replaced took it for `String.Replace`.
+#[test]
+fn only_system_string_methods_are_string_operations() {
+    let mscorlib = mono_mscorlib();
+    let string_replace = method_token(&mscorlib, "System.String", "Replace", 2);
+    let builder_replace = method_token(&mscorlib, "System.Text.StringBuilder", "Replace", 2);
+    assert!(matches!(
+        ConstantPropagationPass::identify_string_op(&MethodRef::new(string_replace), 3, &mscorlib),
+        Some(StringFoldOp::Replace)
+    ));
+    assert!(
+        ConstantPropagationPass::identify_string_op(&MethodRef::new(builder_replace), 3, &mscorlib)
+            .is_none(),
+        "StringBuilder.Replace is not String.Replace"
+    );
+}
+
+/// A compare-and-branch on constants folds as the runtime compares: `-1 <
+/// 1` read unsigned is `0xFFFF_FFFF < 1`, false, and two floats compare as
+/// floats. Each pair was left unfolded when the comparison went through a
+/// 64-bit integer reading of its operands.
+#[test]
+fn constant_compares_fold_at_their_own_width_and_kind() {
+    let fold = |left: ConstValue, right: ConstValue, unsigned: bool| {
+        let mut ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    let (v0, v1) = (b.const_val(left), b.const_val(right));
+                    b.op(SsaOp::BranchCmp {
+                        left: v0,
+                        right: v1,
+                        cmp: CmpKind::Lt,
+                        unsigned,
+                        true_target: 1,
+                        false_target: 2,
+                    });
+                });
+                f.block(1, |b| b.ret());
+                f.block(2, |b| b.ret());
+            })
+            .unwrap();
+        run_verified(
+            &ConstantPropagationPass,
+            &mut ssa,
+            &MethodRef::from(Token::new(0x0600_0001)),
+            &test_context(),
+        )
+        .unwrap();
+        match ssa.block(0).unwrap().control_terminator() {
+            Some(SsaOp::Jump { target }) => Some(*target),
+            _ => None,
+        }
+    };
+    assert_eq!(fold(ConstValue::I32(-1), ConstValue::I32(1), true), Some(2));
+    assert_eq!(
+        fold(ConstValue::I32(-1), ConstValue::I32(1), false),
+        Some(1)
+    );
+    assert_eq!(
+        fold(ConstValue::from(0.5_f64), ConstValue::from(0.75_f64), false),
+        Some(1)
+    );
+}
+
+/// **Folding out of rounds says so, to the host.** Allowed no folding round,
+/// the pass reports its budget exhausted through the host's events; allowed
+/// the default, the same function settles and reports nothing.
+#[test]
+fn folding_out_of_rounds_reports_its_budget_to_the_host() {
+    let exhausted = |budget: WorkBudget| {
+        let (mut ssa, _) = remainder_function(ConstValue::I32(7), ConstValue::I32(2), false);
+        let ctx = test_context().with_budget(budget);
+        ConstantPropagationPass
+            .run_on_method(&mut ssa, &MethodRef::from(Token::new(0x0600_0001)), &ctx)
+            .unwrap();
+        ctx.events.count_kind(EventKind::BudgetExhausted)
+    };
+    assert_eq!(
+        exhausted(WorkBudget::DEFAULT.with_limit(Budget::FoldRounds, 0)),
+        1
+    );
+    assert_eq!(exhausted(WorkBudget::DEFAULT), 0);
 }

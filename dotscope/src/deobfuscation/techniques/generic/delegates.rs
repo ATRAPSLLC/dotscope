@@ -22,7 +22,7 @@
 //! `Activator.CreateInstance`, or `FieldInfo.GetValue/SetValue`.
 //!
 //! Produces [`ReflectionFindings`] consumed by the engine-owned
-//! [`ReflectionDevirtualizationPass`](crate::deobfuscation::passes::ReflectionDevirtualizationPass).
+//! [`ReflectionDevirtualizationPass`].
 //!
 //! ## Detection
 //!
@@ -40,7 +40,7 @@ use std::{
 use log::debug;
 
 use crate::{
-    analysis::{CilTarget, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     cilassembly::CleanupRequest,
     compiler::{CompilerContext, PassPhase, SsaPass},
     deobfuscation::{
@@ -50,7 +50,6 @@ use crate::{
             ReflectionDevirtualizationPass,
         },
         techniques::{Detection, Evidence, Technique, TechniqueCategory},
-        utils::is_method_named,
     },
     metadata::token::Token,
     CilObject,
@@ -78,7 +77,7 @@ pub struct ReflectionFindings {
 ///
 /// `GenericDelegateProxy::detect_ssa()` produces this because both analyses
 /// share the same SSA scanning pass. The engine extracts [`ReflectionFindings`]
-/// to create [`ReflectionDevirtualizationPass`](crate::deobfuscation::passes::ReflectionDevirtualizationPass);
+/// to create [`ReflectionDevirtualizationPass`];
 /// the technique uses [`DelegateProxyFindings`] for [`DelegateProxyResolutionPass`].
 #[derive(Debug)]
 pub struct CallIndirectionFindings {
@@ -135,31 +134,32 @@ fn traces_to_argument(ssa: &SsaFunction, var: SsaVarId) -> bool {
 
 /// Checks if a method's SSA matches the delegate wrapper pattern.
 ///
-/// A wrapper method contains a `CallVirt` to an `Invoke` method where the
+/// A wrapper method contains a `callvirt` to an `Invoke` method where the
 /// object (first arg) traces back to a `LoadArg`, meaning it receives the
 /// delegate as a parameter and calls its `Invoke`. This is checked purely
 /// via SSA def-use chains, making it immune to junk code insertions.
 fn is_delegate_wrapper_ssa(ssa: &SsaFunction, assembly: &CilObject) -> bool {
     for block in ssa.blocks() {
         for instr in block.instructions() {
-            let SsaOp::CallVirt { method, args, .. } = instr.op() else {
+            // The receiver of a virtual call is the object (delegate instance).
+            let Some((method_token, obj_var)) = instr
+                .op()
+                .method_call()
+                .and_then(|(token, call)| Some((token, call.receiver()?)))
+            else {
                 continue;
             };
 
             // Check if the target method is "Invoke" on a delegate type
-            let Some(method_name) = assembly.resolve_method_name(method.token()) else {
+            let Some(method_name) = assembly.resolve_method_name(method_token) else {
                 continue;
             };
             if method_name != "Invoke" {
                 continue;
             }
 
-            // The first arg of CallVirt is the object (delegate instance).
-            // It must trace back to a method argument — meaning the wrapper
-            // receives the delegate as a parameter and calls its Invoke.
-            let Some(&obj_var) = args.first() else {
-                continue;
-            };
+            // The receiver must trace back to a method argument - meaning the
+            // wrapper receives the delegate as a parameter and calls its Invoke.
             if traces_to_argument(ssa, obj_var) {
                 return true;
             }
@@ -175,8 +175,8 @@ fn is_delegate_wrapper_ssa(ssa: &SsaFunction, assembly: &CilObject) -> bool {
 fn has_delegate_proxy_calls(ssa: &SsaFunction, wrapper_methods: &HashMap<Token, Token>) -> bool {
     for block in ssa.blocks() {
         for instr in block.instructions() {
-            if let SsaOp::Call { method, .. } = instr.op() {
-                if wrapper_methods.contains_key(&method.token()) {
+            if let Some((method_token, _)) = instr.op().method_call() {
+                if wrapper_methods.contains_key(&method_token) {
                     return true;
                 }
             }
@@ -217,7 +217,7 @@ impl Technique for GenericDelegateProxy {
         // A delegate proxy type:
         // - Inherits from System.MulticastDelegate (is_delegate())
         // - Has at least one static field (the singleton instance)
-        // - Has a static wrapper method whose SSA contains CallVirt(Invoke)
+        // - Has a static wrapper method whose SSA contains callvirt(Invoke)
         //   where the delegate object comes from a LoadArg parameter
         let mut delegate_types: HashMap<Token, DelegateTypeInfo> = HashMap::new();
         let mut wrapper_to_delegate: HashMap<Token, Token> = HashMap::new();
@@ -248,7 +248,7 @@ impl Technique for GenericDelegateProxy {
             has_static_field = has_static_field.saturating_add(1);
 
             // Find the wrapper method: static (not .cctor/.ctor), whose SSA
-            // shows a CallVirt(Invoke) pattern with the delegate from a parameter.
+            // shows a callvirt(Invoke) pattern with the delegate from a parameter.
             let wrapper_method_token = ty.methods.iter().find_map(|(_, method_ref)| {
                 let method = method_ref.upgrade()?;
                 if !method.is_static() || method.is_cctor() || method.is_ctor() {
@@ -311,14 +311,14 @@ impl Technique for GenericDelegateProxy {
                 delegate_affected.insert(method_token);
             }
 
-            // Reflection patterns: CallIndirect with ResolveMethod chain (P1)
+            // Reflection patterns: calli with ResolveMethod chain (P1)
             let calli_count = count_resolve_method_calli_sites(ssa, assembly);
             if calli_count > 0 {
                 reflection_affected.insert(method_token);
                 reflection_site_count = reflection_site_count.saturating_add(calli_count);
             }
 
-            // Reflection patterns: Call/CallVirt to reflection APIs (P2, P3, P5, P6)
+            // Reflection patterns: call/callvirt to reflection APIs (P2, P3, P5, P6)
             let api_count = count_reflection_api_calls(ssa, assembly);
             if api_count > 0 {
                 reflection_affected.insert(method_token);
@@ -421,29 +421,29 @@ impl Technique for GenericDelegateProxy {
 
 /// Counts reflection API call sites in an SSA function (P2, P3, P5, P6).
 ///
-/// Matches `Call`/`CallVirt` to `MethodInfo.Invoke`, `Activator.CreateInstance`,
+/// Matches `call`/`callvirt` to `MethodInfo.Invoke`, `Activator.CreateInstance`,
 /// `FieldInfo.GetValue`, and `FieldInfo.SetValue` where the target comes from
 /// a traceable reflection chain.
 fn count_reflection_api_calls(ssa: &SsaFunction, assembly: &CilObject) -> usize {
     let mut count: usize = 0;
     for block in ssa.blocks() {
         for instr in block.instructions() {
-            let (method_token, arg_count) = match instr.op() {
-                SsaOp::Call { method, args, .. } | SsaOp::CallVirt { method, args, .. } => {
-                    (method.token(), args.len())
-                }
-                _ => continue,
+            let Some((method_token, call)) = instr.op().method_call() else {
+                continue;
             };
+            let arg_count = call.args.len();
 
             let Some(name) = assembly.resolve_method_name(method_token) else {
                 continue;
             };
+            let declaring = assembly.resolve_method_declaring_type(method_token);
+            let declared_by = |fullname: &str| declaring.as_deref() == Some(fullname);
 
             // P2/P3: MethodInfo.Invoke with 3 args (this, obj, params[])
             if name == "Invoke" && arg_count == 3 {
                 // Verify this is MethodBase/MethodInfo.Invoke, not Delegate.Invoke
-                if is_method_named(assembly, method_token, "MethodBase")
-                    || is_method_named(assembly, method_token, "MethodInfo")
+                if declared_by("System.Reflection.MethodBase")
+                    || declared_by("System.Reflection.MethodInfo")
                 {
                     count = count.saturating_add(1);
                     continue;
@@ -451,16 +451,14 @@ fn count_reflection_api_calls(ssa: &SsaFunction, assembly: &CilObject) -> usize 
             }
 
             // P5: Activator.CreateInstance
-            if name.contains("CreateInstance")
-                && is_method_named(assembly, method_token, "Activator")
-            {
+            if name.contains("CreateInstance") && declared_by("System.Activator") {
                 count = count.saturating_add(1);
                 continue;
             }
 
             // P6: FieldInfo.GetValue / SetValue
             if (name == "GetValue" || name == "SetValue")
-                && is_method_named(assembly, method_token, "FieldInfo")
+                && declared_by("System.Reflection.FieldInfo")
             {
                 count = count.saturating_add(1);
             }
@@ -471,18 +469,20 @@ fn count_reflection_api_calls(ssa: &SsaFunction, assembly: &CilObject) -> usize 
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{
+        analysis::{Callee, MethodRef, SsaFunctionBuilder},
         compiler::PassPhase,
         deobfuscation::techniques::{
             generic::delegates::{CallIndirectionFindings, GenericDelegateProxy},
             Technique, TechniqueCategory,
         },
-        test::helpers::load_sample,
+        testkit::helpers::{load_sample, method_token, mono_mscorlib},
     };
 
     #[test]
     fn test_detect_negative_confuserex_original() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = GenericDelegateProxy;
         let detection = technique.detect(&asm);
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_obfuscar_sample() {
-        let asm = load_sample("tests/samples/packers/obfuscar/2.2.50/obfuscar_strings_only.exe");
+        let asm = load_sample("packers/obfuscar/2.2.50/obfuscar_strings_only.exe");
 
         let technique = GenericDelegateProxy;
         let detection = technique.detect(&asm);
@@ -531,5 +531,35 @@ mod tests {
             Some(PassPhase::Inline),
             "GenericDelegateProxy should run in the Inline SSA phase"
         );
+    }
+
+    /// Reflection calls count by the type that declares them: `MethodBase.Invoke`,
+    /// `Activator.CreateInstance` and `FieldInfo.GetValue` do, and a delegate's
+    /// `Invoke` of the same arity does not. The check once asked whether the
+    /// method's *name* contained the type's, which no reflection call's does,
+    /// so none was counted.
+    #[test]
+    fn reflection_calls_count_by_their_declaring_type() {
+        let mscorlib = mono_mscorlib();
+        let count = |token: Token, args: usize| {
+            let ssa = SsaFunctionBuilder::new(0, 0)
+                .build_with(|f| {
+                    f.block(0, |b| {
+                        let args: Vec<SsaVarId> = (0..args).map(|_| b.const_i32(0)).collect();
+                        b.call_void(Callee::Direct(MethodRef::new(token)), &args);
+                        b.ret();
+                    });
+                })
+                .unwrap();
+            count_reflection_api_calls(&ssa, &mscorlib)
+        };
+        let invoke = method_token(&mscorlib, "System.Reflection.MethodBase", "Invoke", 2);
+        let create = method_token(&mscorlib, "System.Activator", "CreateInstance", 1);
+        let get_value = method_token(&mscorlib, "System.Reflection.FieldInfo", "GetValue", 1);
+        let func_invoke = method_token(&mscorlib, "System.Func`3", "Invoke", 2);
+        assert_eq!(count(invoke, 3), 1, "MethodBase.Invoke");
+        assert_eq!(count(create, 1), 1, "Activator.CreateInstance");
+        assert_eq!(count(get_value, 2), 1, "FieldInfo.GetValue");
+        assert_eq!(count(func_invoke, 3), 0, "a delegate's Invoke");
     }
 }

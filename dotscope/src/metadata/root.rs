@@ -66,12 +66,11 @@ const FLAGS_FIELD_SIZE: usize = 2;
 /// Size of the stream count field.
 const STREAM_COUNT_FIELD_SIZE: usize = 2;
 
-/// Maximum allowed length for the version string.
+/// The most bytes the version string takes with its terminator (ECMA-335 II.24.2.1).
 const MAX_VERSION_STRING_LENGTH: usize = 255;
 
-/// Maximum number of metadata streams allowed per ECMA-335.
-/// Valid streams are: #Strings, #US, #Blob, #GUID, #~, #-
-const MAX_STREAM_COUNT: u16 = 6;
+/// The stream whose presence makes the runtime read the first of repeated heap headers.
+const SCHEMA_STREAM_NAME: &str = "#Schema";
 
 /// Minimum size in bytes for a valid stream header.
 /// This includes: offset(4) + size(4) + name(min 1 char + null terminator = 2, aligned to 4).
@@ -79,9 +78,6 @@ const MIN_STREAM_HEADER_SIZE: usize = 12;
 
 /// Size of the fixed fields in a stream header (offset + size).
 const STREAM_HEADER_FIXED_SIZE: usize = 8;
-
-/// Maximum length for a stream name.
-const MAX_STREAM_NAME_LENGTH: usize = 32;
 
 /// Field offsets within the root header for fixed-position fields.
 const FIELD_OFFSET_MAJOR_VERSION: usize = 4;
@@ -166,14 +162,12 @@ const FIELD_OFFSET_RESERVED: usize = 8;
 /// # let metadata_bytes = &[0u8; 100]; // placeholder
 /// let root = Root::read(metadata_bytes)?;
 ///
-/// // Find specific streams
-/// if let Some(tables_stream) = root.stream_headers.iter()
-///     .find(|s| s.name == "#~" || s.name == "#-") {
+/// // The streams the runtime reads (a directory may repeat a name; see `Root::stream`)
+/// if let Some(tables_stream) = root.tables_stream() {
 ///     println!("Tables stream at offset 0x{:X}", tables_stream.offset);
 /// }
 ///
-/// if let Some(strings_stream) = root.stream_headers.iter()
-///     .find(|s| s.name == "#Strings") {
+/// if let Some(strings_stream) = root.stream("#Strings") {
 ///     println!("Strings heap at offset 0x{:X}", strings_stream.offset);
 /// }
 /// # Ok::<(), dotscope::Error>(())
@@ -183,9 +177,11 @@ const FIELD_OFFSET_RESERVED: usize = 8;
 ///
 /// The Root structure performs automatic validation during parsing:
 /// - Verifies the magic signature matches `0x424A5342`
-/// - Ensures version string length is within reasonable bounds
-/// - Validates stream count and directory consistency
-/// - Checks for proper null-termination of the version string
+/// - Reads the version string as UTF-8 up to its null terminator, and refuses one that takes
+///   more than 255 bytes with it
+/// - Refuses the stream directories the runtime refuses: a header reaching past the
+///   metadata, a name longer than 32 bytes with its terminator, more than one tables
+///   stream, and `#Schema` before the tables stream
 ///
 /// # Thread Safety
 ///
@@ -228,7 +224,8 @@ pub struct Root {
     /// align the following fields to 4-byte boundaries.
     pub length: u32,
 
-    /// Version string identifying the .NET runtime version.
+    /// Version string identifying the .NET runtime version: the field's text up to its null
+    /// terminator, without the padding that follows.
     ///
     /// Common values include:
     /// - `"v2.0.50727"` for .NET Framework 2.0/3.0/3.5
@@ -248,15 +245,25 @@ pub struct Root {
     /// This count determines how many [`crate::metadata::streams::StreamHeader`] entries follow.
     pub stream_number: u16,
 
-    /// Directory of all metadata streams in this assembly.
+    /// Every stream header of the directory, in directory order.
     ///
-    /// Each entry describes a metadata stream's name, offset, and size. Common streams include:
+    /// A directory may repeat a name and hold names the runtime gives no stream; the header
+    /// the runtime reads for a name is [`Root::stream`]'s answer, and the rest are
+    /// [`Root::unread_streams`]. Common streams include:
     /// - `#~` or `#-`: Compressed metadata tables
     /// - `#Strings`: String heap for identifiers  
     /// - `#GUID`: GUID heap for type references
     /// - `#Blob`: Binary blob heap for signatures
     /// - `#US`: User strings heap for literals
     pub stream_headers: Vec<StreamHeader>,
+}
+
+/// The stream names the runtime gives a stream; any other is ignored.
+const KNOWN_STREAM_NAMES: [&str; 6] = ["#~", "#-", "#Strings", "#US", "#Blob", "#GUID"];
+
+/// Whether `name` names a tables stream.
+fn is_tables_stream(name: &str) -> bool {
+    name == "#~" || name == "#-"
 }
 
 impl Root {
@@ -281,10 +288,11 @@ impl Root {
     /// This method performs extensive validation during parsing:
     /// - Verifies minimum required data length (36 bytes)
     /// - Validates magic signature matches [`CIL_HEADER_MAGIC`] (`0x424A5342`)
-    /// - Checks version string length for overflow and bounds
-    /// - Ensures proper null-termination of version string
-    /// - Validates stream count and directory consistency
-    /// - Verifies stream header alignment and bounds
+    /// - Reads the version string as UTF-8 up to its null terminator, and refuses one that
+    ///   takes more than 255 bytes with it
+    /// - Refuses the stream directories the runtime refuses: a header reaching past the
+    ///   metadata, a name longer than 32 bytes with its terminator, more than one tables
+    ///   stream, and `#Schema` before the tables stream
     ///
     /// # Binary Format
     ///
@@ -331,9 +339,7 @@ impl Root {
     /// let root = Root::read(metadata_bytes)?;
     ///
     /// // Find the tables stream
-    /// let tables_stream = root.stream_headers.iter()
-    ///     .find(|stream| stream.name == "#~" || stream.name == "#-")
-    ///     .expect("Tables stream not found");
+    /// let tables_stream = root.tables_stream().expect("Tables stream not found");
     ///
     /// println!("Tables stream at offset 0x{:X}, size {} bytes",
     ///          tables_stream.offset, tables_stream.size);
@@ -401,74 +407,58 @@ impl Root {
             }
         }
 
-        let mut version_string: String = String::with_capacity(version_string_length as usize);
-        for counter in 0..version_string_length {
-            let mut pos = usize::from(VERSION_STRING_OFFSET)
-                .checked_add(counter as usize)
-                .ok_or_else(|| invalid("version_string_offset", "offset overflow".into()))?;
-            version_string.push(char::from(read_le_at::<u8>(data, &mut pos)?));
-        }
+        // The field holds UTF-8 text up to its null terminator, then padding to four bytes
+        let field_end = usize::from(VERSION_STRING_OFFSET)
+            .checked_add(version_string_length as usize)
+            .ok_or_else(|| invalid("version_string_offset", "offset overflow".into()))?;
+        let field = data
+            .get(usize::from(VERSION_STRING_OFFSET)..field_end)
+            .ok_or_else(oob)?;
+        let text = field.split(|&b| b == 0).next().unwrap_or_default();
+        // Any text is a version: the .NET Framework 4.8, CoreCLR and Mono run an image whose
+        // version is empty, does not start with `v`, or is not ASCII
+        let version_string = String::from_utf8_lossy(text).into_owned();
 
-        // Validate version string format and content
-        if version_string.is_empty() {
-            return Err(invalid(
-                "version_string",
-                "version string cannot be empty [ECMA-335 §II.24.2.1]".into(),
-            )
-            .into());
-        }
-
-        // Check for common malformed version strings
-        if !version_string.starts_with('v') {
-            return Err(invalid(
-                "version_string",
-                format!("'{version_string}' must start with 'v' [ECMA-335 §II.24.2.1]",),
-            )
-            .into());
-        }
-
-        // Validate version string contains reasonable content
-        if version_string.len() > MAX_VERSION_STRING_LENGTH {
+        if text.len() >= MAX_VERSION_STRING_LENGTH {
             return Err(invalid(
                 "version_string",
                 format!(
-                    "length {} exceeds reasonable limit ({}) [ECMA-335 §II.24.2.1]",
-                    version_string.len(),
-                    MAX_VERSION_STRING_LENGTH
+                    "{} bytes with its terminator, where at most {MAX_VERSION_STRING_LENGTH} \
+                     are allowed [ECMA-335 §II.24.2.1]",
+                    text.len().saturating_add(1),
                 ),
             )
             .into());
         }
 
-        // Stream count is located after: version_string + FLAGS_FIELD_SIZE
-        let mut stream_count_offset = version_string
-            .len()
-            .checked_add(usize::from(VERSION_STRING_OFFSET))
-            .and_then(|v| v.checked_add(FLAGS_FIELD_SIZE))
+        // Stream count is located after: the version field + FLAGS_FIELD_SIZE
+        let mut stream_count_offset = field_end
+            .checked_add(FLAGS_FIELD_SIZE)
             .ok_or_else(|| invalid("stream_count_offset", "offset overflow".into()))?;
         let stream_count = read_le_at::<u16>(data, &mut stream_count_offset)?;
 
-        // Validate stream count: must have at least one stream, no more than MAX_STREAM_COUNT
+        // Every header takes at least twelve bytes, so the root's own bytes bound the count;
+        // the runtime sets no other limit (a 45-header directory loads).
         let stream_count_size = (stream_count as usize)
             .checked_mul(MIN_STREAM_HEADER_SIZE)
             .ok_or_else(|| invalid("stream_count", "size overflow".into()))?;
-        if stream_count == 0 || stream_count > MAX_STREAM_COUNT || stream_count_size > data.len() {
+        if stream_count == 0 || stream_count_size > data.len() {
             return Err(invalid(
                 "stream_count",
-                format!("{stream_count} (must be 1-{MAX_STREAM_COUNT}) [ECMA-335 §II.24.2.1]",),
+                format!(
+                    "{stream_count} stream headers do not fit the metadata root's {} bytes",
+                    data.len()
+                ),
             )
             .into());
         }
 
         let mut streams = Vec::with_capacity(stream_count as usize);
-        // Stream directory starts after: version_string + FLAGS_FIELD_SIZE + STREAM_COUNT_FIELD_SIZE
-        let mut stream_offset = version_string
-            .len()
-            .checked_add(usize::from(VERSION_STRING_OFFSET))
-            .and_then(|v| v.checked_add(FLAGS_FIELD_SIZE))
+        // Stream directory starts after: the version field + FLAGS_FIELD_SIZE + STREAM_COUNT_FIELD_SIZE
+        let mut stream_offset = field_end
+            .checked_add(FLAGS_FIELD_SIZE)
             .and_then(|v| v.checked_add(STREAM_COUNT_FIELD_SIZE))
             .ok_or_else(|| invalid("stream_directory_offset", "offset overflow".into()))?;
-        let mut streams_seen = [false; MAX_STREAM_COUNT as usize];
 
         for _i in 0..stream_count {
             if stream_offset > data.len() {
@@ -479,66 +469,24 @@ impl Root {
                 .get(stream_offset..)
                 .ok_or_else(|| Error::from(oob()))?;
             let new_stream = StreamHeader::from(stream_data)?;
-            if new_stream.offset as usize > data.len()
-                || new_stream.size as usize > data.len()
-                || new_stream.name.len() > MAX_STREAM_NAME_LENGTH
-            {
-                return Err(oob().into());
-            }
 
-            match u32::checked_add(new_stream.offset, new_stream.size) {
-                Some(range) => {
-                    if range as usize > data.len() {
-                        return Err(oob().into());
-                    }
-                }
-                None => {
-                    return Err(invalid(
-                        "stream_extent",
-                        format!(
-                            "stream '{}' offset {} + size {} causes integer overflow [ECMA-335 §II.24.2.2]",
-                            new_stream.name, new_stream.offset, new_stream.size
-                        ),
-                    )
-                    .into())
-                }
-            }
-
-            let stream_index = match new_stream.name.as_str() {
-                "#Strings" => 0usize,
-                "#US" => 1,
-                "#Blob" => 2,
-                "#GUID" => 3,
-                "#~" => 4,
-                "#-" => 5,
-                _ => {
-                    return Err(invalid(
-                        "stream_name",
-                        format!(
-                            "unrecognized stream '{}' [ECMA-335 §II.24.2.2]",
-                            new_stream.name
-                        ),
-                    )
-                    .into())
-                }
-            };
-
-            if *streams_seen
-                .get(stream_index)
-                .ok_or_else(|| Error::from(oob()))?
-            {
+            // The runtime refuses a header whose stream reaches past the metadata, whatever
+            // its name and whether or not it then reads that stream.
+            let in_bounds = u32::checked_add(new_stream.offset, new_stream.size)
+                .is_some_and(|end| end as usize <= data.len());
+            if !in_bounds {
                 return Err(invalid(
-                    "stream_name",
+                    "stream_extent",
                     format!(
-                        "duplicate stream '{}' [ECMA-335 §II.24.2.2]",
-                        new_stream.name
+                        "stream '{}' at offset {} with size {} reaches past the metadata's {} bytes [ECMA-335 §II.24.2.2]",
+                        new_stream.name,
+                        new_stream.offset,
+                        new_stream.size,
+                        data.len()
                     ),
                 )
                 .into());
             }
-            *streams_seen
-                .get_mut(stream_index)
-                .ok_or_else(|| Error::from(oob()))? = true;
 
             let name_aligned = new_stream
                 .name
@@ -555,6 +503,38 @@ impl Root {
             streams.push(new_stream);
         }
 
+        // The two directory shapes the runtime refuses outright.
+        let tables: Vec<usize> = streams
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| is_tables_stream(&s.name))
+            .map(|(index, _)| index)
+            .collect();
+        if tables.len() > 1 {
+            return Err(invalid(
+                "stream_name",
+                format!(
+                    "{} tables streams; the runtime reads only a directory with one",
+                    tables.len()
+                ),
+            )
+            .into());
+        }
+        if let Some(&table) = tables.first() {
+            if streams
+                .iter()
+                .take(table)
+                .any(|s| s.name == SCHEMA_STREAM_NAME)
+            {
+                return Err(invalid(
+                    "stream_name",
+                    "'#Schema' stands before the tables stream, a directory the runtime refuses"
+                        .into(),
+                )
+                .into());
+            }
+        }
+
         if streams.is_empty() {
             return Err(invalid(
                 "streams",
@@ -563,9 +543,7 @@ impl Root {
             .into());
         }
 
-        let flags_offset = usize::from(VERSION_STRING_OFFSET)
-            .checked_add(version_string.len())
-            .ok_or_else(|| invalid("flags_offset", "offset overflow".into()))?;
+        let flags_offset = field_end;
 
         Ok(Root {
             signature,
@@ -581,12 +559,7 @@ impl Root {
                 data.get(FIELD_OFFSET_RESERVED..)
                     .ok_or_else(|| Error::from(oob()))?,
             )?,
-            length: u32::try_from(version_string.len()).map_err(|_| {
-                invalid(
-                    "version_string_length",
-                    "string length too large [ECMA-335 §II.24.2.1]".into(),
-                )
-            })?,
+            length: version_string_length,
             flags: read_le::<u16>(data.get(flags_offset..).ok_or_else(|| Error::from(oob()))?)?,
             stream_number: u16::try_from(streams.len()).map_err(|_| {
                 invalid(
@@ -597,6 +570,54 @@ impl Root {
             stream_headers: streams,
             version: version_string,
         })
+    }
+
+    /// The tables stream (`#~` or `#-`), if the directory has one. [`Root::read`] refuses a
+    /// directory with more than one.
+    #[must_use]
+    pub fn tables_stream(&self) -> Option<&StreamHeader> {
+        self.stream_headers
+            .iter()
+            .find(|s| is_tables_stream(&s.name))
+    }
+
+    /// The header the runtime reads for the stream named `name`, or `None` if the directory
+    /// has none of that name.
+    ///
+    /// A directory may repeat a heap's name, and the runtime reads one header of it by a
+    /// rule measured on the .NET Framework 4.8 and CoreCLR (they agree; see
+    /// `tests/samples/factory/README.md`): the first such header when the tables stream is
+    /// uncompressed (`#-`) or the directory has a `#Schema` stream, and the last otherwise.
+    /// The others are never read.
+    #[must_use]
+    pub fn stream(&self, name: &str) -> Option<&StreamHeader> {
+        if is_tables_stream(name) {
+            return self.tables_stream().filter(|s| s.name == name);
+        }
+        let mut named = self.stream_headers.iter().filter(|s| s.name == name);
+        if self.reads_first_of_repeated_heaps() {
+            named.next()
+        } else {
+            named.next_back()
+        }
+    }
+
+    /// The headers the runtime does not read: names it gives no stream, and the repeats of a
+    /// heap's name that [`Root::stream`] does not answer.
+    pub fn unread_streams(&self) -> impl Iterator<Item = &StreamHeader> {
+        self.stream_headers.iter().filter(move |header| {
+            !KNOWN_STREAM_NAMES.contains(&header.name.as_str())
+                || !self
+                    .stream(&header.name)
+                    .is_some_and(|read| std::ptr::eq(read, *header))
+        })
+    }
+
+    /// Whether the runtime reads the first of repeated heap headers rather than the last.
+    fn reads_first_of_repeated_heaps(&self) -> bool {
+        self.stream_headers
+            .iter()
+            .any(|s| s.name == "#-" || s.name == SCHEMA_STREAM_NAME)
     }
 
     /// Validates that loaded streams do not overlap in memory
@@ -781,18 +802,9 @@ impl Root {
         // Reserved (4 bytes)
         writer.write_all(&self.reserved.to_le_bytes())?;
 
-        // Version string length (padded to 4-byte boundary)
+        // Version string length: the string, its terminator and padding to 4 bytes
         let version_bytes = self.version.as_bytes();
-        let padded_len =
-            version_bytes
-                .len()
-                .checked_add(3)
-                .ok_or_else(|| ParseFailure::InvalidField {
-                    stage: ParseStage::MetadataRoot,
-                    field: "version_string_length",
-                    reason: "padded length overflow".into(),
-                })?
-                & !3usize;
+        let padded_len = self.version_field_size();
         let padded_len_u32 = u32::try_from(padded_len).map_err(|_| ParseFailure::InvalidField {
             stage: ParseStage::MetadataRoot,
             field: "version_string_length",
@@ -800,7 +812,7 @@ impl Root {
         })?;
         writer.write_all(&padded_len_u32.to_le_bytes())?;
 
-        // Version string + null padding to 4-byte boundary
+        // Version string, then its terminator and the padding
         writer.write_all(version_bytes)?;
         let padding = padded_len.saturating_sub(version_bytes.len());
         if padding > 0 {
@@ -819,6 +831,13 @@ impl Root {
         }
 
         Ok(())
+    }
+
+    /// The bytes the version field takes when written: the version string, its null
+    /// terminator and padding to a multiple of four (ECMA-335 II.24.2.1).
+    #[must_use]
+    pub fn version_field_size(&self) -> usize {
+        self.version.len().saturating_add(4) & !3usize
     }
 
     /// Returns the total serialized size of this metadata root header in bytes.
@@ -859,8 +878,7 @@ impl Root {
         // Fixed fields: signature(4) + major(2) + minor(2) + reserved(4) + length(4) + flags(2) + stream_number(2)
         let fixed_size = 20usize;
 
-        // Version string padded to 4-byte boundary
-        let version_padded = self.version.len().saturating_add(3) & !3usize;
+        let version_padded = self.version_field_size();
 
         // Stream headers
         let streams_size: usize = self
@@ -913,8 +931,91 @@ mod tests {
         assert_eq!(parsed_header.stream_headers[0].name, "#~");
     }
 
+    /// The version is the field's UTF-8 text up to its terminator, and the stream directory
+    /// follows the whole field: "v4.0é" is six bytes, then two of padding.
     #[test]
-    fn duplicate_stream_names_should_fail() {
+    fn the_version_is_utf8_text_up_to_its_terminator() {
+        #[rustfmt::skip]
+        let header_bytes = [
+            0x42, 0x53, 0x4A, 0x42,
+            0x01, 0x00,
+            0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00,
+            b'v', b'4', b'.', b'0', 0xC3, 0xA9, 0x00, 0x00,
+            0x00, 0x00,
+            0x01, 0x00,
+            0x28, 0x00, 0x00, 0x00, // StreamHeader
+            0x04, 0x00, 0x00, 0x00,
+            0x23, 0x7E, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let root = Root::read(&header_bytes).unwrap();
+
+        assert_eq!(root.version, "v4.0\u{e9}");
+        assert_eq!(root.length, 8);
+        assert_eq!(root.stream_headers[0].name, "#~");
+        assert_eq!(root.stream_headers[0].offset, 0x28);
+    }
+
+    /// The runtimes run an image whose version is empty or does not start with `v` (measured
+    /// on the .NET Framework 4.8, CoreCLR and Mono with TestApp's version field rewritten), so
+    /// it reads.
+    #[test]
+    fn any_version_text_reads() {
+        for version in [
+            &b"\0\0\0\0"[..],
+            b"x4.0\0\0\0\0",
+            b"Standard CLI 2005\0\0\0",
+        ] {
+            let mut header_bytes = vec![0x42, 0x53, 0x4A, 0x42, 0x01, 0x00, 0x01, 0x00];
+            header_bytes.extend_from_slice(&[0; 4]);
+            header_bytes.extend_from_slice(&u32::try_from(version.len()).unwrap().to_le_bytes());
+            header_bytes.extend_from_slice(version);
+            let directory = header_bytes.len() + 4 + 12;
+            header_bytes.extend_from_slice(&[0, 0, 1, 0]);
+            header_bytes.extend_from_slice(&u32::try_from(directory).unwrap().to_le_bytes());
+            header_bytes.extend_from_slice(&[4, 0, 0, 0, 0x23, 0x7E, 0, 0, 0, 0, 0, 0]);
+
+            let root = Root::read(&header_bytes).unwrap();
+
+            let text = version.split(|&b| b == 0).next().unwrap();
+            assert_eq!(root.version.as_bytes(), text);
+            assert_eq!(root.stream_headers[0].name, "#~");
+        }
+    }
+
+    /// A version whose length is a multiple of four is written with its terminator, in a
+    /// field four bytes longer, and reads back as itself.
+    #[test]
+    fn a_written_version_keeps_its_terminator() {
+        let root = Root {
+            signature: CIL_HEADER_MAGIC,
+            major_version: 1,
+            minor_version: 1,
+            reserved: 0,
+            length: 8,
+            version: "v1.2".to_string(),
+            flags: 0,
+            stream_number: 1,
+            stream_headers: vec![StreamHeader {
+                offset: 0x28,
+                size: 4,
+                name: "#~".to_string(),
+            }],
+        };
+        let mut buffer = Vec::new();
+        root.write_to(&mut buffer).unwrap();
+        assert_eq!(&buffer[12..24], b"\x08\0\0\0v1.2\0\0\0\0");
+        assert_eq!(root.serialized_size(), buffer.len());
+        buffer.resize(0x2C, 0);
+        assert_eq!(Root::read(&buffer).unwrap(), root);
+    }
+
+    /// The runtime refuses a directory with two tables streams (`metadata/streams/tables_*`).
+    #[test]
+    fn two_tables_streams_are_refused() {
         #[rustfmt::skip]
         let mut header_bytes = vec![
             0x42, 0x53, 0x4A, 0x42,  // CIL_HEADER_MAGIC
@@ -941,13 +1042,97 @@ mod tests {
         header_bytes.resize(98, 0x00);
 
         let result = Root::read(&header_bytes);
-        let err = result.expect_err("Expected error for duplicate stream names");
-        let error_string = err.to_string();
+        let err = result.expect_err("a directory with two tables streams is refused");
         assert!(
-            error_string.contains("duplicate stream") && error_string.contains("#~"),
-            "Expected error about duplicate stream '#~', got: {}",
-            error_string
+            err.to_string().contains("2 tables streams"),
+            "unexpected error: {err}"
         );
+    }
+
+    /// A metadata root whose directory holds `names` in order, each stream four bytes of
+    /// data after the directory.
+    fn directory(names: &[&str]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        for name in names {
+            let mut entry = vec![0u8; 8];
+            entry.extend(name.as_bytes());
+            entry.push(0);
+            while !entry.len().is_multiple_of(4) {
+                entry.push(0);
+            }
+            headers.push(entry);
+        }
+        let start = 16 + 4 + 4 + headers.iter().map(Vec::len).sum::<usize>();
+        let mut bytes = vec![0x42, 0x53, 0x4A, 0x42, 1, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0, 0];
+        bytes.extend(b"v4\0\0");
+        bytes.extend([0, 0]);
+        bytes.extend(u16::try_from(names.len()).unwrap().to_le_bytes());
+        for (index, mut entry) in headers.into_iter().enumerate() {
+            let offset = u32::try_from(start + index * 4).unwrap();
+            entry[..4].copy_from_slice(&offset.to_le_bytes());
+            entry[4..8].copy_from_slice(&4u32.to_le_bytes());
+            bytes.extend(entry);
+        }
+        bytes.resize(start + names.len() * 4, 0);
+        bytes
+    }
+
+    /// The position in `names` of the header `Root::stream` answers for `name`.
+    fn read_index(names: &[&str], name: &str) -> Option<usize> {
+        let root = Root::read(&directory(names)).unwrap();
+        let read = root.stream(name)?;
+        root.stream_headers
+            .iter()
+            .position(|h| std::ptr::eq(h, read))
+    }
+
+    /// Repeated heap headers: the last in `#~` metadata, the first in `#-` metadata or when
+    /// the directory has `#Schema` (`metadata/streams/{us,blob,guid,strings}_*`).
+    #[test]
+    fn repeated_heaps_read_the_header_the_runtime_reads() {
+        let tilde = ["#~", "#US", "#Strings", "#US"];
+        assert_eq!(read_index(&tilde, "#US"), Some(3));
+        assert_eq!(read_index(&tilde, "#Strings"), Some(2));
+        let uncompressed = ["#-", "#US", "#Strings", "#US"];
+        assert_eq!(read_index(&uncompressed, "#US"), Some(1));
+        let schema = ["#~", "#US", "#Schema", "#US"];
+        assert_eq!(read_index(&schema, "#US"), Some(1));
+        assert_eq!(read_index(&schema, "#~"), Some(0));
+        assert_eq!(read_index(&schema, "#Blob"), None);
+    }
+
+    /// Names the runtime gives no stream are read and left unread; a directory may hold any
+    /// number of headers (45 load: `metadata/streams/unknown_after_40.exe`).
+    #[test]
+    fn unknown_names_and_long_directories_load() {
+        let mut names = vec!["#Foo", "#~", "#Strings"];
+        names.extend(std::iter::repeat_n("#Unknown", 42));
+        let root = Root::read(&directory(&names)).unwrap();
+        assert_eq!(root.stream_headers.len(), 45);
+        assert_eq!(root.unread_streams().count(), 43);
+        assert!(root
+            .unread_streams()
+            .all(|s| s.name == "#Foo" || s.name == "#Unknown"));
+    }
+
+    /// The runtime refuses `#Schema` before the tables stream
+    /// (`metadata/streams/schema_before*.exe`), and accepts it after.
+    #[test]
+    fn schema_before_the_tables_stream_is_refused() {
+        assert!(Root::read(&directory(&["#Foo", "#Schema", "#~"])).is_err());
+        assert!(Root::read(&directory(&["#~", "#Schema", "#Strings"])).is_ok());
+    }
+
+    /// The runtime refuses a header whose stream reaches past the metadata, whatever its
+    /// name (`metadata/streams/*_bad_*.exe`).
+    #[test]
+    fn a_stream_past_the_metadata_is_refused_whatever_its_name() {
+        for name in ["#Foo", "#US"] {
+            let mut bytes = directory(&["#~", name]);
+            let size_field = 16 + 4 + 4 + 12 + 4;
+            bytes[size_field..size_field + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+            assert!(Root::read(&bytes).is_err(), "{name}");
+        }
     }
 
     #[test]

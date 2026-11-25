@@ -11,7 +11,7 @@
 //!
 //! # Overview
 //!
-//! Native hooks are registered with the [`HookManager`](super::HookManager) using the
+//! Native hooks are registered with the [`HookManager`] using the
 //! [`register`] function. They use the [`NativeMethodMatcher`](super::NativeMethodMatcher)
 //! to match P/Invoke calls by DLL name and function name.
 //!
@@ -41,19 +41,12 @@
 //!
 //! ## Using Native Hooks
 //!
-//! ```ignore
-//! use dotscope::emulation::runtime::{HookManager, native};
-//!
-//! let manager = HookManager::new();
-//! native::register(&manager).unwrap();
-//!
-//! // VirtualProtect, IsDebuggerPresent, etc. are now hooked
-//! ```
+//! The `examples::module_example` test in this module runs this example.
 //!
 //! ## Adding Custom Native Hooks
 //!
-//! ```ignore
-//! use dotscope::emulation::{Hook, PreHookResult, EmValue};
+//! ```
+//! use dotscope::emulation::{EmValue, Hook, HookManager, PreHookResult};
 //!
 //! let manager = HookManager::new();
 //!
@@ -64,7 +57,8 @@
 //!             // Return a fixed tick count for deterministic emulation
 //!             PreHookResult::Bypass(Some(EmValue::I32(12345678)))
 //!         })
-//! );
+//! )?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Use Cases
@@ -141,7 +135,17 @@ pub struct NativeFunctionRegistry {
     next_module: Arc<AtomicU64>,
 }
 
+impl Default for NativeFunctionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NativeFunctionRegistry {
+    /// Creates an empty registry.
+    ///
+    /// Fake function addresses are handed out upward from `PROC_ADDRESS_BASE`, module
+    /// handles from `LOADED_LIBRARY` and native function tokens from 1.
     pub fn new() -> Self {
         Self {
             address_to_name: Arc::new(DashMap::new()),
@@ -782,7 +786,7 @@ mod tests {
             EmValue,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     fn create_native_context<'a>(dll: &'a str, function: &'a str) -> HookContext<'a> {
@@ -907,5 +911,23 @@ mod tests {
             ),
             "GetModuleHandleA(null) should return base address"
         );
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::{emulation::HookManager, Result};
+
+    /// Registering the native hooks fills the hook manager.
+    #[test]
+    fn module_example() -> Result<()> {
+        let manager = HookManager::new();
+        let registry = NativeFunctionRegistry::new();
+        register(&manager, &registry)?;
+
+        // VirtualProtect, IsDebuggerPresent, etc. are now hooked
+        assert!(!manager.is_empty());
+        Ok(())
     }
 }

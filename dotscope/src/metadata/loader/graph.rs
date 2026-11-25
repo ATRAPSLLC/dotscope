@@ -21,10 +21,7 @@
 //! - Construction: Single-threaded only
 //! - Generated plans: Thread-safe for parallel execution
 //!
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Write,
-};
+use std::collections::{HashMap, HashSet};
 
 use analyssa::graph::IndexedGraph;
 
@@ -40,7 +37,7 @@ use crate::{
 /// enabling the dependency graph to handle both types appropriately while maintaining
 /// correct execution order and dependency relationships.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum LoaderKey {
+pub enum LoaderKey {
     /// Regular loader that processes a specific metadata table
     Table(TableId),
 
@@ -73,7 +70,7 @@ pub(crate) enum LoaderKey {
 /// Graph construction is single-threaded only. Generated execution plans are
 /// thread-safe for coordinating parallel loader execution.
 #[derive(Default)]
-pub(crate) struct LoaderGraph<'a> {
+pub struct LoaderGraph<'a> {
     /// Maps a `LoaderKey` to its loader
     loaders: HashMap<LoaderKey, &'a dyn MetadataLoader>,
     /// Maps a `TableId` to the set of `LoaderKeys` that depend on it (reverse dependencies)
@@ -126,7 +123,7 @@ impl<'a> LoaderGraph<'a> {
     /// Builds dependency relationships after all loaders have been added.
     ///
     /// Queries each loader for dependencies, validates all dependencies have loaders,
-    /// and constructs bidirectional mappings. In debug builds, also performs cycle detection.
+    /// constructs bidirectional mappings, and checks the table dependencies for cycles.
     ///
     /// # Returns
     ///
@@ -135,7 +132,7 @@ impl<'a> LoaderGraph<'a> {
     /// # Errors
     ///
     /// Returns `GraphError` if a loader depends on a table without a registered loader,
-    /// or if circular dependencies are detected (debug builds).
+    /// or if circular dependencies are detected.
     pub fn build_relationships(&mut self) -> Result<()> {
         self.dependencies.values_mut().for_each(HashSet::clear);
         self.dependents.values_mut().for_each(HashSet::clear);
@@ -175,20 +172,14 @@ impl<'a> LoaderGraph<'a> {
             }
         }
 
-        #[cfg(debug_assertions)]
-        {
-            // Only in debug builds, we check for circular dependencies and
-            // generate the graph as string
-            self.check_circular_dependencies()?;
-            let _test = self.dump_execution_plan()?;
-        }
+        self.check_circular_dependencies()?;
 
         Ok(())
     }
 
     /// Checks for circular dependencies using the generic graph algorithm.
     ///
-    /// Delegates to [`crate::utils::graph::IndexedGraph::find_any_cycle`] for cycle detection
+    /// Delegates to [`analyssa::graph::IndexedGraph::find_any_cycle`] for cycle detection
     /// which handles all NodeId mapping internally.
     ///
     /// # Returns
@@ -360,47 +351,5 @@ impl<'a> LoaderGraph<'a> {
             })
             .cloned()
             .collect()
-    }
-
-    /// Returns the execution plan as a formatted string for debugging.
-    ///
-    /// # Returns
-    ///
-    /// A formatted string showing each execution level and its loaders with dependencies,
-    /// or an error if the graph is in an invalid state.
-    pub fn dump_execution_plan(&self) -> Result<String> {
-        let levels = self.topological_levels()?;
-        let mut result = String::new();
-
-        for (level_idx, level) in levels.iter().enumerate() {
-            let _ = writeln!(result, "Level {level_idx}: [");
-            for loader in level {
-                // Find the LoaderKey for this loader
-                let Some(loader_key) = self
-                    .loaders
-                    .iter()
-                    .find(|(_, &l)| std::ptr::eq(*loader, l))
-                    .map(|(key, _)| key)
-                else {
-                    let _ = writeln!(result, "  <unknown loader> (depends on: ?)");
-                    continue;
-                };
-
-                let deps = self.dependencies.get(loader_key).map_or_else(
-                    || "None".to_string(),
-                    |d| {
-                        d.iter()
-                            .map(|id| format!("{id:?}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    },
-                );
-
-                let _ = writeln!(result, "  {loader_key:?} (depends on: {deps})");
-            }
-            let _ = writeln!(result, "]");
-        }
-
-        Ok(result)
     }
 }

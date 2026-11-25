@@ -52,7 +52,7 @@ use std::{
 };
 
 use crate::{
-    analysis::{CilTarget, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     cilassembly::CleanupRequest,
     compiler::{CompilerContext, PassPhase, SsaPass},
     deobfuscation::{
@@ -148,12 +148,13 @@ fn collect_initialization_only_methods(
         for block in entry.value().blocks() {
             for instr in block.instructions() {
                 let callee = match instr.op() {
-                    SsaOp::Call { method, .. }
-                    | SsaOp::CallVirt { method, .. }
-                    | SsaOp::LoadFunctionPtr { method, .. }
+                    SsaOp::LoadFunctionPtr { method, .. }
                     | SsaOp::LoadVirtFunctionPtr { method, .. } => method.token(),
                     SsaOp::NewObj { ctor, .. } => ctor.token(),
-                    _ => continue,
+                    op => match op.method_call() {
+                        Some((token, _)) => token,
+                        None => continue,
+                    },
                 };
                 callers.entry(callee).or_default().insert(caller);
             }
@@ -259,7 +260,7 @@ fn identify_sentinel_method(ssa: &SsaFunction) -> Option<Token> {
     // Find the Return terminator
     let terminator = block.control_terminator()?;
     let return_var = match terminator {
-        SsaOp::Return { value: Some(v) } => *v,
+        SsaOp::Return { value: Some(v), .. } => *v,
         _ => return None,
     };
 
@@ -342,8 +343,10 @@ fn collect_sentinel_info(
         }
         let has_sentinel_call = entry.value().blocks().iter().any(|block| {
             block.instructions().iter().any(|instr| {
-                matches!(instr.op(), SsaOp::Call { method, .. }
-                    if sentinel_methods.contains_key(&method.token()))
+                instr
+                    .op()
+                    .method_call()
+                    .is_some_and(|(token, _)| sentinel_methods.contains_key(&token))
             })
         });
         if has_sentinel_call {
@@ -367,6 +370,10 @@ pub struct OpaquePredicateFindings {
     /// Sentinel method token → sentinel field token mapping (Variant B).
     /// The method body is `ldsfld → ldnull → ceq → ret` (always returns true if field is null).
     pub sentinel_methods: HashMap<Token, Token>,
+    /// Fields stored outside type initialization, each as the code names it and, for a
+    /// MemberRef, as the FieldDef it resolves to. A chain through one of them holds a value
+    /// the program changes at runtime, which a warmed-up value must not stand for.
+    pub runtime_stored_fields: Vec<Token>,
 }
 
 /// Detects static field chain opaque predicates via SSA def-use analysis.
@@ -392,7 +399,7 @@ impl Technique for GenericOpaquePredicates {
     }
 
     fn detect_ssa(&self, ctx: &AnalysisContext, assembly: &CilObject) -> Detection {
-        // --- Variant A: Static field chain predicates ---
+        // Variant A: Static field chain predicates
         let mut affected_fields: HashSet<Token> = HashSet::new();
         let mut affected_methods: HashSet<Token> = HashSet::new();
 
@@ -450,7 +457,7 @@ impl Technique for GenericOpaquePredicates {
             }
         }
 
-        // --- Variant B: Sentinel null-check methods ---
+        // Variant B: Sentinel null-check methods
         let (sentinel_methods, sentinel_call_sites) = collect_sentinel_info(&ctx.ssa_functions);
 
         // Merge sentinel call site methods into affected_methods
@@ -523,11 +530,22 @@ impl Technique for GenericOpaquePredicates {
             )));
         }
 
+        let runtime_stored_fields: Vec<Token> = stored_fields
+            .iter()
+            .flat_map(|&token| {
+                let resolved = token
+                    .is_table(TableId::MemberRef)
+                    .then(|| assembly.resolver().resolve_field(token))
+                    .flatten();
+                std::iter::once(token).chain(resolved)
+            })
+            .collect();
         let findings = OpaquePredicateFindings {
             affected_field_tokens: affected_fields.into_iter().collect(),
             affected_methods: affected_methods.into_iter().collect(),
             owning_type_tokens: owning_types.into_iter().collect(),
             sentinel_methods,
+            runtime_stored_fields,
         };
 
         Detection::new_detected(
@@ -611,6 +629,7 @@ impl Technique for GenericOpaquePredicates {
             needed_static_fields,
             affected_methods,
             findings.sentinel_methods.clone(),
+            findings.runtime_stored_fields.iter().copied().collect(),
         ))]
     }
 
@@ -645,7 +664,7 @@ mod tests {
     use crate::{
         compiler::PassPhase,
         deobfuscation::techniques::{Technique, TechniqueCategory},
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     /// Pins the contract that the non-SSA `detect` entry point reports nothing.
@@ -660,7 +679,7 @@ mod tests {
     /// `AnalysisContext` with built SSA functions and belongs in the integration suite.
     #[test]
     fn detect_without_ssa_reports_nothing_by_contract() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = GenericOpaquePredicates;
         let detection = technique.detect(&asm);
@@ -705,7 +724,7 @@ mod tests {
     /// assertion in this suite would notice. This pins the predicate that exclusion rests on.
     #[test]
     fn static_constructors_are_identified_for_the_store_scan() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let cctors: Vec<_> = asm
             .query_methods()

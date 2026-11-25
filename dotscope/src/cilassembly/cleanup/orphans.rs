@@ -25,9 +25,10 @@ use crate::{
             references::{
                 collect_referenced_standalonesig_rids,
                 collect_typerefs_from_deleted_memberref_sigs, remove_unreferenced_memberrefs,
-                remove_unreferenced_typerefs, remove_unreferenced_typespecs, PreDeletionRefs,
+                remove_unreferenced_typerefs, remove_unreferenced_typespecs, rows_of,
+                scan_metadata_keepers, PreDeletionRefs,
             },
-            utils::{list_range, remove_candidates_not_alive, try_remove},
+            utils::{remove_candidates_not_alive, try_remove},
             CleanupStats,
         },
         CilAssembly,
@@ -38,9 +39,9 @@ use crate::{
             ClassLayoutRaw, ConstantRaw, CustomAttributeRaw, DeclSecurityRaw, EventMapRaw,
             EventRaw, ExportedTypeRaw, FieldLayoutRaw, FieldMarshalRaw, FieldRvaRaw,
             GenericParamConstraintRaw, GenericParamRaw, ImplMapRaw, InterfaceImplRaw,
-            ManifestResourceRaw, MemberRefRaw, MethodDefRaw, MethodImplRaw, MethodSemanticsRaw,
-            MethodSpecRaw, NestedClassRaw, ParamRaw, PropertyMapRaw, PropertyRaw, RowReadable,
-            StandAloneSigRaw, TableAccess, TableId, TypeRefRaw,
+            ManifestResourceRaw, MemberList, MemberRefRaw, MethodDefRaw, MethodImplRaw,
+            MethodSemanticsRaw, MethodSpecRaw, NestedClassRaw, ParamRaw, PropertyMapRaw,
+            PropertyRaw, RowReadable, StandAloneSigRaw, TableAccess, TableId, TypeRefRaw,
         },
         token::Token,
     },
@@ -54,7 +55,7 @@ use crate::{
 /// This struct holds references to the deleted token sets to avoid
 /// unnecessary copying during cleanup operations.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct DeletionContext<'a> {
+pub struct DeletionContext<'a> {
     /// Types (TypeDef) that have been deleted.
     types: &'a HashSet<Token>,
     /// Methods (MethodDef) that have been deleted.
@@ -66,7 +67,7 @@ pub(super) struct DeletionContext<'a> {
 impl<'a> DeletionContext<'a> {
     /// Creates a new deletion context from references to deleted token sets.
     #[must_use]
-    pub(super) fn new(
+    pub fn new(
         deleted_types: &'a HashSet<Token>,
         deleted_methods: &'a HashSet<Token>,
         deleted_fields: &'a HashSet<Token>,
@@ -82,25 +83,25 @@ impl<'a> DeletionContext<'a> {
     ///
     /// Checks all three token sets (types, methods, fields).
     #[must_use]
-    pub(super) fn is_deleted(&self, token: Token) -> bool {
+    pub fn is_deleted(&self, token: Token) -> bool {
         self.types.contains(&token) || self.methods.contains(&token) || self.fields.contains(&token)
     }
 
     /// Returns true if the given type token has been deleted.
     #[must_use]
-    pub(super) fn is_type_deleted(&self, token: Token) -> bool {
+    pub fn is_type_deleted(&self, token: Token) -> bool {
         self.types.contains(&token)
     }
 
     /// Returns true if the given method token has been deleted.
     #[must_use]
-    pub(super) fn is_method_deleted(&self, token: Token) -> bool {
+    pub fn is_method_deleted(&self, token: Token) -> bool {
         self.methods.contains(&token)
     }
 
     /// Returns true if the given field token has been deleted.
     #[must_use]
-    pub(super) fn is_field_deleted(&self, token: Token) -> bool {
+    pub fn is_field_deleted(&self, token: Token) -> bool {
         self.fields.contains(&token)
     }
 }
@@ -123,10 +124,7 @@ impl<'a> DeletionContext<'a> {
 /// # Returns
 ///
 /// The count of removed entries.
-pub(super) fn remove_orphan_entries<T>(
-    assembly: &mut CilAssembly,
-    is_orphan: impl Fn(&T) -> bool,
-) -> usize
+pub fn remove_orphan_entries<T>(assembly: &mut CilAssembly, is_orphan: impl Fn(&T) -> bool) -> usize
 where
     T: RowReadable,
     for<'a> TablesHeader<'a>: TableAccess<'a, T>,
@@ -179,7 +177,7 @@ where
 /// is immutable by the time this runs. Without the RIDs, every such dependent
 /// outlives the parameter it names and leaves a reference to a row that no
 /// longer exists.
-pub(super) fn remove_orphan_params(
+pub fn remove_orphan_params(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
 ) -> (usize, HashSet<u32>) {
@@ -199,7 +197,7 @@ pub(super) fn remove_orphan_params(
         }
 
         let method_count = methoddef_table.row_count;
-        let param_count = tables.table::<ParamRaw>().map_or(0, |t| t.row_count);
+        let param_ranges = tables.member_ranges(MemberList::MethodDefParams);
 
         let mut params = Vec::new();
         for method_rid in 1..=method_count {
@@ -209,15 +207,7 @@ pub(super) fn remove_orphan_params(
                 continue;
             }
 
-            let range = list_range(method_rid, method_count, param_count, |rid| {
-                methoddef_table
-                    .get(rid)
-                    .ok()
-                    .flatten()
-                    .map(|m| m.param_list)
-            });
-
-            params.extend(range);
+            params.extend(tables.member_rids(&param_ranges, method_rid));
         }
         params
     };
@@ -252,7 +242,7 @@ fn names_removed_param(parent: Token, removed_params: &HashSet<u32>) -> bool {
 /// Custom attributes reference their parent via the `parent` coded index,
 /// and their constructor via the `constructor` coded index.
 /// When either the parent or constructor is deleted, the attribute becomes orphaned.
-pub(super) fn remove_orphan_attributes(
+pub fn remove_orphan_attributes(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
     removed_params: &HashSet<u32>,
@@ -273,10 +263,7 @@ pub(super) fn remove_orphan_attributes(
 }
 
 /// Removes orphaned ClassLayout entries for deleted types.
-pub(super) fn remove_orphan_classlayouts(
-    assembly: &mut CilAssembly,
-    ctx: &DeletionContext,
-) -> usize {
+pub fn remove_orphan_classlayouts(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<ClassLayoutRaw>(assembly, |layout| {
         let parent_token = Token::from_parts(TableId::TypeDef, layout.parent);
         ctx.is_type_deleted(parent_token)
@@ -284,7 +271,7 @@ pub(super) fn remove_orphan_classlayouts(
 }
 
 /// Removes orphaned FieldRVA entries for deleted fields.
-pub(super) fn remove_orphan_fieldrvas(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
+pub fn remove_orphan_fieldrvas(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<FieldRvaRaw>(assembly, |rva| {
         let field_token = Token::from_parts(TableId::Field, rva.field);
         ctx.is_field_deleted(field_token)
@@ -292,10 +279,7 @@ pub(super) fn remove_orphan_fieldrvas(assembly: &mut CilAssembly, ctx: &Deletion
 }
 
 /// Removes orphaned NestedClass entries for deleted types.
-pub(super) fn remove_orphan_nestedclass(
-    assembly: &mut CilAssembly,
-    ctx: &DeletionContext,
-) -> usize {
+pub fn remove_orphan_nestedclass(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<NestedClassRaw>(assembly, |nested| {
         let nested_token = Token::from_parts(TableId::TypeDef, nested.nested_class);
         let enclosing_token = Token::from_parts(TableId::TypeDef, nested.enclosing_class);
@@ -303,46 +287,8 @@ pub(super) fn remove_orphan_nestedclass(
     })
 }
 
-/// Collects nested TypeDef tokens whose enclosing type was deleted.
-///
-/// These nested types should be cascade-deleted because they can't exist
-/// without their enclosing type. Returns only nested types that aren't
-/// already in the deletion set.
-pub(super) fn collect_orphaned_nested_types(
-    assembly: &CilAssembly,
-    ctx: &DeletionContext,
-) -> Vec<Token> {
-    let view = assembly.view();
-    let Some(tables) = view.tables() else {
-        return Vec::new();
-    };
-    let Some(nested_table) = tables.table::<NestedClassRaw>() else {
-        return Vec::new();
-    };
-
-    let mut orphaned = Vec::new();
-    for nested in nested_table.iter() {
-        let nested = match nested {
-            Ok(row) => row,
-            Err(e) => {
-                log::warn!("skipping unreadable metadata row: {e}");
-                continue;
-            }
-        };
-        let enclosing_token = Token::from_parts(TableId::TypeDef, nested.enclosing_class);
-        let nested_token = Token::from_parts(TableId::TypeDef, nested.nested_class);
-        if ctx.is_type_deleted(enclosing_token) && !ctx.is_type_deleted(nested_token) {
-            orphaned.push(nested_token);
-        }
-    }
-    orphaned
-}
-
 /// Removes orphaned InterfaceImpl entries for deleted types.
-pub(super) fn remove_orphan_interfaceimpl(
-    assembly: &mut CilAssembly,
-    ctx: &DeletionContext,
-) -> usize {
+pub fn remove_orphan_interfaceimpl(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<InterfaceImplRaw>(assembly, |impl_| {
         let class_token = Token::from_parts(TableId::TypeDef, impl_.class);
         ctx.is_type_deleted(class_token)
@@ -350,7 +296,7 @@ pub(super) fn remove_orphan_interfaceimpl(
 }
 
 /// Removes orphaned MethodImpl entries for deleted types or methods.
-pub(super) fn remove_orphan_methodimpl(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
+pub fn remove_orphan_methodimpl(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<MethodImplRaw>(assembly, |impl_| {
         let class_token = Token::from_parts(TableId::TypeDef, impl_.class);
 
@@ -365,7 +311,7 @@ pub(super) fn remove_orphan_methodimpl(assembly: &mut CilAssembly, ctx: &Deletio
 ///
 /// Checks both the `method` field (MethodDef that was deleted) and the `association`
 /// field (Event or Property that was deleted).
-pub(super) fn remove_orphan_methodsemantics(
+pub fn remove_orphan_methodsemantics(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
     deleted_events: &HashSet<Token>,
@@ -380,7 +326,7 @@ pub(super) fn remove_orphan_methodsemantics(
 }
 
 /// Removes orphaned Constant entries for deleted fields, properties or params.
-pub(super) fn remove_orphan_constant(
+pub fn remove_orphan_constant(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
     removed_params: &HashSet<u32>,
@@ -392,7 +338,7 @@ pub(super) fn remove_orphan_constant(
 }
 
 /// Removes orphaned FieldMarshal entries for deleted fields or params.
-pub(super) fn remove_orphan_fieldmarshal(
+pub fn remove_orphan_fieldmarshal(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
     removed_params: &HashSet<u32>,
@@ -404,10 +350,7 @@ pub(super) fn remove_orphan_fieldmarshal(
 }
 
 /// Removes orphaned FieldLayout entries for deleted fields.
-pub(super) fn remove_orphan_fieldlayout(
-    assembly: &mut CilAssembly,
-    ctx: &DeletionContext,
-) -> usize {
+pub fn remove_orphan_fieldlayout(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<FieldLayoutRaw>(assembly, |layout| {
         let field_token = Token::from_parts(TableId::Field, layout.field);
         ctx.is_field_deleted(field_token)
@@ -417,7 +360,7 @@ pub(super) fn remove_orphan_fieldlayout(
 /// Removes orphaned GenericParam entries for deleted types or methods.
 ///
 /// Returns the set of removed GenericParam RIDs for cascading to constraints.
-pub(super) fn remove_orphan_genericparam(
+pub fn remove_orphan_genericparam(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
 ) -> (usize, HashSet<u32>) {
@@ -459,7 +402,7 @@ pub(super) fn remove_orphan_genericparam(
 }
 
 /// Removes orphaned GenericParamConstraint entries for removed GenericParams.
-pub(super) fn remove_orphan_genericparamconstraint(
+pub fn remove_orphan_genericparamconstraint(
     assembly: &mut CilAssembly,
     removed_genericparams: &HashSet<u32>,
 ) -> usize {
@@ -469,29 +412,26 @@ pub(super) fn remove_orphan_genericparamconstraint(
 }
 
 /// Removes orphaned MethodSpec entries for deleted methods.
-pub(super) fn remove_orphan_methodspec(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
+pub fn remove_orphan_methodspec(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<MethodSpecRaw>(assembly, |spec| ctx.is_deleted(spec.method.token))
 }
 
 /// Removes orphaned DeclSecurity entries for deleted types or methods.
-pub(super) fn remove_orphan_declsecurity(
-    assembly: &mut CilAssembly,
-    ctx: &DeletionContext,
-) -> usize {
+pub fn remove_orphan_declsecurity(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<DeclSecurityRaw>(assembly, |security| {
         ctx.is_deleted(security.parent.token)
     })
 }
 
 /// Removes orphaned ImplMap entries for deleted methods (P/Invoke).
-pub(super) fn remove_orphan_implmap(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
+pub fn remove_orphan_implmap(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<ImplMapRaw>(assembly, |implmap| {
         ctx.is_deleted(implmap.member_forwarded.token)
     })
 }
 
 /// Removes orphaned EventMap entries for deleted types.
-pub(super) fn remove_orphan_eventmap(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
+pub fn remove_orphan_eventmap(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<EventMapRaw>(assembly, |eventmap| {
         let parent_token = Token::from_parts(TableId::TypeDef, eventmap.parent);
         ctx.is_type_deleted(parent_token)
@@ -499,10 +439,7 @@ pub(super) fn remove_orphan_eventmap(assembly: &mut CilAssembly, ctx: &DeletionC
 }
 
 /// Removes orphaned PropertyMap entries for deleted types.
-pub(super) fn remove_orphan_propertymap(
-    assembly: &mut CilAssembly,
-    ctx: &DeletionContext,
-) -> usize {
+pub fn remove_orphan_propertymap(assembly: &mut CilAssembly, ctx: &DeletionContext) -> usize {
     remove_orphan_entries::<PropertyMapRaw>(assembly, |propmap| {
         let parent_token = Token::from_parts(TableId::TypeDef, propmap.parent);
         ctx.is_type_deleted(parent_token)
@@ -515,7 +452,7 @@ pub(super) fn remove_orphan_propertymap(
 /// When a type is deleted, its events become orphaned.
 ///
 /// Returns a tuple of (count_removed, set_of_deleted_event_tokens).
-pub(super) fn remove_orphan_events(
+pub fn remove_orphan_events(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
 ) -> (usize, HashSet<Token>) {
@@ -534,7 +471,7 @@ pub(super) fn remove_orphan_events(
         }
 
         let map_count = eventmap_table.row_count;
-        let event_count = tables.table::<EventRaw>().map_or(0, |t| t.row_count);
+        let event_ranges = tables.member_ranges(MemberList::EventMapEvents);
         let mut events = Vec::new();
 
         for map_rid in 1..=map_count {
@@ -546,11 +483,7 @@ pub(super) fn remove_orphan_events(
                 continue;
             }
 
-            let range = list_range(map_rid, map_count, event_count, |rid| {
-                eventmap_table.get(rid).ok().flatten().map(|m| m.event_list)
-            });
-
-            events.extend(range);
+            events.extend(tables.member_rids(&event_ranges, map_rid));
         }
         events
     };
@@ -576,7 +509,7 @@ pub(super) fn remove_orphan_events(
 /// When a type is deleted, its properties become orphaned.
 ///
 /// Returns a tuple of (count_removed, set_of_deleted_property_tokens).
-pub(super) fn remove_orphan_properties(
+pub fn remove_orphan_properties(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
 ) -> (usize, HashSet<Token>) {
@@ -595,7 +528,7 @@ pub(super) fn remove_orphan_properties(
         }
 
         let map_count = propertymap_table.row_count;
-        let property_count = tables.table::<PropertyRaw>().map_or(0, |t| t.row_count);
+        let property_ranges = tables.member_ranges(MemberList::PropertyMapProperties);
         let mut props = Vec::new();
 
         for map_rid in 1..=map_count {
@@ -607,15 +540,7 @@ pub(super) fn remove_orphan_properties(
                 continue;
             }
 
-            let range = list_range(map_rid, map_count, property_count, |rid| {
-                propertymap_table
-                    .get(rid)
-                    .ok()
-                    .flatten()
-                    .map(|m| m.property_list)
-            });
-
-            props.extend(range);
+            props.extend(tables.member_rids(&property_ranges, map_rid));
         }
         props
     };
@@ -637,21 +562,21 @@ pub(super) fn remove_orphan_properties(
 
 /// Removes orphaned StandAloneSig entries using cascade-from-deleted semantics.
 ///
-/// Only considers StandAloneSig RIDs that were referenced by methods being deleted
-/// (collected in `PreDeletionRefs.standalonesig_rids`). Of those candidates, only
-/// removes entries no longer referenced by any surviving method body.
+/// Of the `candidates`, removes the entries no surviving method body uses, through its
+/// header's local variable signature or a `calli` operand among `body_tokens`.
 ///
 /// This preserves pre-existing orphaned StandAloneSigs that may be used via
 /// reflection or dynamic code generation.
-pub(super) fn remove_orphan_standalonesigs(
+pub fn remove_orphan_standalonesigs(
     assembly: &mut CilAssembly,
     candidates: &BTreeSet<u32>,
+    body_tokens: &HashSet<Token>,
 ) -> usize {
     if candidates.is_empty() {
         return 0;
     }
 
-    let alive = collect_referenced_standalonesig_rids(assembly);
+    let alive = collect_referenced_standalonesig_rids(assembly, body_tokens);
 
     let mut removed: usize = 0;
     for &rid in candidates.iter().rev() {
@@ -666,55 +591,18 @@ pub(super) fn remove_orphan_standalonesigs(
 /// Removes cascade-candidate `ModuleRef` entries that are no longer referenced.
 ///
 /// Only removes ModuleRef entries that are in the `candidates` set AND are not
-/// referenced by any surviving `ImplMap` entry or `TypeRef` resolution scope.
+/// referenced by any surviving `ImplMap`, `MemberRef` class or `TypeRef` resolution scope.
 ///
-/// Must be called **after** `remove_orphan_implmap` and `remove_unreferenced_typerefs`
-/// to ensure cascaded deletions are accounted for.
-pub(super) fn remove_orphan_modulerefs(
-    assembly: &mut CilAssembly,
-    candidates: &BTreeSet<u32>,
-) -> usize {
+/// Must be called **after** `remove_orphan_implmap`, `remove_unreferenced_memberrefs` and
+/// `remove_unreferenced_typerefs` to ensure cascaded deletions are accounted for.
+pub fn remove_orphan_modulerefs(assembly: &mut CilAssembly, candidates: &BTreeSet<u32>) -> usize {
     if candidates.is_empty() {
         return 0;
     }
 
     // Collect ModuleRef RIDs still referenced by surviving ImplMap and TypeRef entries
-    let alive: HashSet<u32> = {
-        let view = assembly.view();
-        let Some(tables) = view.tables() else {
-            return 0;
-        };
-
-        let mut alive = HashSet::new();
-
-        // ImplMap.import_scope references ModuleRef by raw RID
-        if let Some(implmap_table) = tables.table::<ImplMapRaw>() {
-            for rid in 1..=implmap_table.row_count {
-                if assembly.changes().is_row_deleted(TableId::ImplMap, rid) {
-                    continue;
-                }
-                if let Some(implmap) = implmap_table.get(rid).ok().flatten() {
-                    alive.insert(implmap.import_scope);
-                }
-            }
-        }
-
-        // TypeRef.resolution_scope can reference ModuleRef
-        if let Some(typeref_table) = tables.table::<TypeRefRaw>() {
-            for rid in 1..=typeref_table.row_count {
-                if assembly.changes().is_row_deleted(TableId::TypeRef, rid) {
-                    continue;
-                }
-                if let Some(typeref) = typeref_table.get(rid).ok().flatten() {
-                    if typeref.resolution_scope.tag == TableId::ModuleRef {
-                        alive.insert(typeref.resolution_scope.row);
-                    }
-                }
-            }
-        }
-
-        alive
-    };
+    let alive: HashSet<u32> =
+        rows_of(&scan_metadata_keepers(assembly), TableId::ModuleRef).collect();
 
     let (removed, _) =
         remove_candidates_not_alive(assembly, TableId::ModuleRef, candidates, &alive);
@@ -724,42 +612,18 @@ pub(super) fn remove_orphan_modulerefs(
 /// Removes cascade-candidate `AssemblyRef` entries that are no longer referenced.
 ///
 /// Only removes AssemblyRef entries that are in the `candidates` set AND are not
-/// referenced by any surviving `TypeRef` resolution scope.
+/// referenced by any surviving `TypeRef` resolution scope, `ExportedType` (a type forwarder)
+/// or `ManifestResource` another assembly holds.
 ///
 /// Must be called **after** `remove_unreferenced_typerefs` to ensure cascaded
 /// TypeRef deletions are accounted for.
-pub(super) fn remove_orphan_assemblyrefs(
-    assembly: &mut CilAssembly,
-    candidates: &BTreeSet<u32>,
-) -> usize {
+pub fn remove_orphan_assemblyrefs(assembly: &mut CilAssembly, candidates: &BTreeSet<u32>) -> usize {
     if candidates.is_empty() {
         return 0;
     }
 
-    let alive: HashSet<u32> = {
-        let view = assembly.view();
-        let Some(tables) = view.tables() else {
-            return 0;
-        };
-
-        let mut alive = HashSet::new();
-
-        // TypeRef.resolution_scope can reference AssemblyRef
-        if let Some(typeref_table) = tables.table::<TypeRefRaw>() {
-            for rid in 1..=typeref_table.row_count {
-                if assembly.changes().is_row_deleted(TableId::TypeRef, rid) {
-                    continue;
-                }
-                if let Some(typeref) = typeref_table.get(rid).ok().flatten() {
-                    if typeref.resolution_scope.tag == TableId::AssemblyRef {
-                        alive.insert(typeref.resolution_scope.row);
-                    }
-                }
-            }
-        }
-
-        alive
-    };
+    let alive: HashSet<u32> =
+        rows_of(&scan_metadata_keepers(assembly), TableId::AssemblyRef).collect();
     let (removed, _) =
         remove_candidates_not_alive(assembly, TableId::AssemblyRef, candidates, &alive);
     removed
@@ -772,7 +636,7 @@ pub(super) fn remove_orphan_assemblyrefs(
 /// the ExportedType becomes invalid.
 ///
 /// Returns a tuple of (count_removed, set_of_deleted_rids) for cascading to File.
-pub(super) fn remove_orphan_exportedtypes(assembly: &mut CilAssembly) -> (usize, HashSet<u32>) {
+pub fn remove_orphan_exportedtypes(assembly: &mut CilAssembly) -> (usize, HashSet<u32>) {
     // Two-pass: collect then remove (can't use remove_orphan_entries because
     // the closure needs assembly access for is_row_deleted)
     let orphan_rids: Vec<u32> = {
@@ -823,7 +687,7 @@ pub(super) fn remove_orphan_exportedtypes(assembly: &mut CilAssembly) -> (usize,
 /// the ManifestResource becomes invalid.
 ///
 /// Returns a tuple of (count_removed, set_of_deleted_rids) for cascading to File.
-pub(super) fn remove_orphan_manifestresources(assembly: &mut CilAssembly) -> (usize, HashSet<u32>) {
+pub fn remove_orphan_manifestresources(assembly: &mut CilAssembly) -> (usize, HashSet<u32>) {
     let orphan_rids: Vec<u32> = {
         let view = assembly.view();
         let Some(tables) = view.tables() else {
@@ -869,55 +733,12 @@ pub(super) fn remove_orphan_manifestresources(assembly: &mut CilAssembly) -> (us
 ///
 /// Only removes File entries that are in the `candidates` set AND are not
 /// referenced by any surviving ExportedType or ManifestResource entry.
-pub(super) fn remove_orphan_files(assembly: &mut CilAssembly, candidates: &BTreeSet<u32>) -> usize {
+pub fn remove_orphan_files(assembly: &mut CilAssembly, candidates: &BTreeSet<u32>) -> usize {
     if candidates.is_empty() {
         return 0;
     }
 
-    let alive: HashSet<u32> = {
-        let view = assembly.view();
-        let Some(tables) = view.tables() else {
-            return 0;
-        };
-
-        let mut alive = HashSet::new();
-
-        // ExportedType.implementation can reference File
-        if let Some(table) = tables.table::<ExportedTypeRaw>() {
-            for rid in 1..=table.row_count {
-                if assembly
-                    .changes()
-                    .is_row_deleted(TableId::ExportedType, rid)
-                {
-                    continue;
-                }
-                if let Some(entry) = table.get(rid).ok().flatten() {
-                    if entry.implementation.token.is_table(TableId::File) {
-                        alive.insert(entry.implementation.token.row());
-                    }
-                }
-            }
-        }
-
-        // ManifestResource.implementation can reference File
-        if let Some(table) = tables.table::<ManifestResourceRaw>() {
-            for rid in 1..=table.row_count {
-                if assembly
-                    .changes()
-                    .is_row_deleted(TableId::ManifestResource, rid)
-                {
-                    continue;
-                }
-                if let Some(entry) = table.get(rid).ok().flatten() {
-                    if entry.implementation.token.is_table(TableId::File) {
-                        alive.insert(entry.implementation.token.row());
-                    }
-                }
-            }
-        }
-
-        alive
-    };
+    let alive: HashSet<u32> = rows_of(&scan_metadata_keepers(assembly), TableId::File).collect();
 
     let (removed, _) = remove_candidates_not_alive(assembly, TableId::File, candidates, &alive);
     removed
@@ -931,10 +752,7 @@ pub(super) fn remove_orphan_files(assembly: &mut CilAssembly, candidates: &BTree
 ///
 /// Called from both the main orphan pass and the empty-types pass to ensure
 /// both paths stay in sync.
-pub(super) fn remove_type_dependents(
-    assembly: &mut CilAssembly,
-    ctx: &DeletionContext,
-) -> CleanupStats {
+pub fn remove_type_dependents(assembly: &mut CilAssembly, ctx: &DeletionContext) -> CleanupStats {
     let mut stats = CleanupStats::new();
     stats.add(
         TableId::NestedClass,
@@ -984,11 +802,13 @@ pub(super) fn remove_type_dependents(
 /// This handles parent-child cleanup: params, attributes, ClassLayout, FieldRVA,
 /// NestedClass, InterfaceImpl, EventMap, PropertyMap, Event/Property rows,
 /// MethodImpl, MethodSemantics, ImplMap, DeclSecurity, MethodSpec, StandAloneSig,
-/// field-related tables, GenericParam and GenericParamConstraint.
-pub(super) fn remove_parent_child_dependents(
+/// field-related tables, GenericParam and GenericParamConstraint. `body_tokens` are the
+/// tokens surviving method bodies reference.
+pub fn remove_parent_child_dependents(
     assembly: &mut CilAssembly,
     ctx: &DeletionContext,
     _pre_refs: &PreDeletionRefs,
+    body_tokens: &HashSet<Token>,
 ) -> CleanupStats {
     let mut stats = CleanupStats::new();
 
@@ -1039,8 +859,8 @@ pub(super) fn remove_parent_child_dependents(
         remove_orphan_declsecurity(assembly, ctx),
     );
     stats.add(TableId::MethodSpec, remove_orphan_methodspec(assembly, ctx));
-    // StandAloneSig entries are only referenced from method body headers
-    // (local_var_sig_token). After method deletion and body regeneration,
+    // StandAloneSig entries are referenced from method bodies only: a header's local
+    // variable signature or a `calli` operand. After method deletion and body regeneration,
     // old SAS entries become orphaned. Scan ALL SAS entries as candidates
     // since there is no reflection mechanism that references SAS by token.
     {
@@ -1061,7 +881,7 @@ pub(super) fn remove_parent_child_dependents(
         };
         stats.add(
             TableId::StandAloneSig,
-            remove_orphan_standalonesigs(assembly, &all_sas_rids),
+            remove_orphan_standalonesigs(assembly, &all_sas_rids, body_tokens),
         );
     }
 
@@ -1099,7 +919,7 @@ pub(super) fn remove_parent_child_dependents(
 /// Uses pre-deletion reference data combined with full table scans to include
 /// ALL non-deleted entries as candidates, catching entries orphaned by both
 /// entity deletion and method body regeneration.
-pub(super) fn cascade_reference_cleanup(
+pub fn cascade_reference_cleanup(
     assembly: &mut CilAssembly,
     pre_refs: &PreDeletionRefs,
     body_tokens: &HashSet<Token>,

@@ -79,9 +79,10 @@
 use crate::{
     metadata::{
         method::{
-            MethodAccessFlags, MethodImplCodeType, MethodImplOptions, MethodModifiers,
+            Method, MethodAccessFlags, MethodImplCodeType, MethodImplOptions, MethodModifiers,
             MethodVtableFlags,
         },
+        typesystem::CilTypeReference,
         validation::{
             context::{OwnedValidationContext, ValidationContext},
             traits::OwnedValidator,
@@ -89,6 +90,10 @@ use crate::{
     },
     Error, Result,
 };
+
+/// The attribute marking a method the runtime implements as an accessor of
+/// another type's member (.NET 8): `static extern`, with no body.
+const UNSAFE_ACCESSOR_ATTRIBUTE: &str = "System.Runtime.CompilerServices.UnsafeAccessorAttribute";
 
 /// Foundation validator for method definitions, signatures, and implementation requirements.
 ///
@@ -108,6 +113,21 @@ use crate::{
 pub struct OwnedMethodValidator;
 
 impl OwnedMethodValidator {
+    /// Whether `method` carries `UnsafeAccessorAttribute`: a body the runtime
+    /// supplies, so the method has none in the image.
+    fn is_unsafe_accessor(method: &Method) -> bool {
+        method.custom_attributes.iter().any(|(_, attribute)| {
+            let declaring = match &attribute.constructor {
+                CilTypeReference::MethodDef(constructor) => constructor
+                    .upgrade()
+                    .and_then(|constructor| constructor.declaring_type_fullname()),
+                CilTypeReference::MemberRef(constructor) => constructor.declaredby.fullname(),
+                _ => None,
+            };
+            declaring.as_deref() == Some(UNSAFE_ACCESSOR_ATTRIBUTE)
+        })
+    }
+
     /// Creates a new method validator instance.
     ///
     /// Initializes a validator instance that can be used to validate method definitions
@@ -146,7 +166,7 @@ impl OwnedMethodValidator {
     /// Returns [`crate::Error::ValidationOwnedFailed`] if:
     /// - Method names are empty
     /// - Parameter types are unresolved or have empty names
-    /// - Return types are unresolved (Unknown type signatures)
+    /// - Return or parameter types name types that do not resolve
     /// - Local variable types are unresolved or have empty names
     fn validate_method_signatures(&self, context: &OwnedValidationContext) -> Result<()> {
         let methods = context.object().methods();
@@ -162,6 +182,21 @@ impl OwnedMethodValidator {
                         entry.key().value()
                     ),
                 });
+            }
+
+            // Every parameter's type must resolve, whether or not a Param row describes it.
+            for (index, param) in method.signature.params.iter().enumerate() {
+                if let Some(token) = context.unresolved_type(|out| param.type_tokens(out)) {
+                    return Err(Error::ValidationOwnedFailed {
+                        validator: self.name().to_string(),
+                        message: format!(
+                            "Method '{}' parameter {} has unresolved type 0x{:08X}",
+                            method.name,
+                            index,
+                            token.value()
+                        ),
+                    });
+                }
             }
 
             for (index, (_, param)) in method.params.iter().enumerate() {
@@ -196,13 +231,16 @@ impl OwnedMethodValidator {
                 }
             }
 
-            if let crate::metadata::signatures::TypeSignature::Unknown =
-                &method.signature.return_type.base
+            if let Some(token) =
+                context.unresolved_type(|out| method.signature.return_type.type_tokens(out))
             {
                 let method_name = &method.name;
                 return Err(Error::ValidationOwnedFailed {
                     validator: self.name().to_string(),
-                    message: format!("Method '{method_name}' has unresolved return type"),
+                    message: format!(
+                        "Method '{method_name}' has unresolved return type 0x{:08X}",
+                        token.value()
+                    ),
                 });
             }
 
@@ -267,7 +305,13 @@ impl OwnedMethodValidator {
                 });
             }
 
-            if method.is_static() {
+            // An interface may declare static virtual and static abstract
+            // members (since .NET 7); everywhere else a static method has no
+            // slot.
+            let in_interface = method
+                .declaring_type_rc()
+                .is_some_and(|declaring| declaring.flags.is_interface());
+            if method.is_static() && !in_interface {
                 if method.is_virtual() {
                     return Err(Error::ValidationOwnedFailed {
                         validator: self.name().to_string(),
@@ -447,7 +491,7 @@ impl OwnedMethodValidator {
                 && !method
                     .flags_modifiers
                     .contains(MethodModifiers::SPECIAL_NAME)
-                && !method.impl_code_type.contains(MethodImplCodeType::RUNTIME)
+                && method.impl_code_type != MethodImplCodeType::RUNTIME
                 && !method
                     .impl_options
                     .contains(MethodImplOptions::INTERNAL_CALL)
@@ -524,7 +568,7 @@ impl OwnedMethodValidator {
                             });
                         }
 
-                        if method.impl_code_type.contains(MethodImplCodeType::RUNTIME)
+                        if (method.impl_code_type == MethodImplCodeType::RUNTIME)
                             && method.rva.is_some()
                         {
                             return Err(Error::ValidationOwnedFailed {
@@ -540,11 +584,12 @@ impl OwnedMethodValidator {
                             && !method
                                 .flags_modifiers
                                 .contains(MethodModifiers::PINVOKE_IMPL)
-                            && !method.impl_code_type.contains(MethodImplCodeType::RUNTIME)
+                            && method.impl_code_type != MethodImplCodeType::RUNTIME
                             && !method
                                 .impl_options
                                 .contains(MethodImplOptions::INTERNAL_CALL)
                             && method.rva.is_none()
+                            && !Self::is_unsafe_accessor(method)
                         {
                             return Err(Error::ValidationOwnedFailed {
                                 validator: self.name().to_string(),
@@ -593,19 +638,17 @@ impl Default for OwnedMethodValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::members_method::owned_method_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_method_validator() -> Result<()> {
         let validator = OwnedMethodValidator::new();
         let config = ValidationConfig {
@@ -616,7 +659,6 @@ mod tests {
         owned_validator_test(
             owned_method_validator_file_factory,
             "OwnedMethodValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

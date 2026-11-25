@@ -87,8 +87,8 @@ use crate::{
     compiler::{EventKind, EventLog},
     deobfuscation::{
         techniques::{
-            confuserex::helpers, Detection, Detections, Evidence, Technique, TechniqueCategory,
-            WorkingAssembly,
+            confuserex::helpers, Detection, Evidence, Technique, TechniqueCapability,
+            TechniqueCategory, WorkingAssembly,
         },
         utils::find_methods_calling_apis,
     },
@@ -131,6 +131,10 @@ impl Technique for ConfuserExAntiTamper {
 
     fn category(&self) -> TechniqueCategory {
         TechniqueCategory::Protection
+    }
+
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![TechniqueCapability::ByteTransform]
     }
 
     fn requires(&self) -> &[&'static str] {
@@ -210,9 +214,10 @@ impl Technique for ConfuserExAntiTamper {
                     }
 
                     let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
-                    if code_type.contains(MethodImplCodeType::NATIVE)
-                        || code_type.contains(MethodImplCodeType::RUNTIME)
-                    {
+                    if matches!(
+                        code_type,
+                        MethodImplCodeType::NATIVE | MethodImplCodeType::RUNTIME
+                    ) {
                         continue;
                     }
 
@@ -301,8 +306,7 @@ impl Technique for ConfuserExAntiTamper {
     fn byte_transform(
         &self,
         assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
 
@@ -600,12 +604,12 @@ mod tests {
             confuserex::tamper::{AntiTamperFindings, ConfuserExAntiTamper},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_antitamper.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_antitamper.exe");
 
         let technique = ConfuserExAntiTamper;
         let detection = technique.detect(&assembly);
@@ -631,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = ConfuserExAntiTamper;
         let detection = technique.detect(&assembly);

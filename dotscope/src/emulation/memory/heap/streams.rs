@@ -3,7 +3,7 @@
 //! This module provides operations for Stream (MemoryStream), CryptoStream,
 //! and CompressedStream (DeflateStream/GZipStream) objects on [`ManagedHeap`].
 
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc};
 
 use crate::{
     emulation::{
@@ -57,7 +57,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::Stream { data, position }) => Some((data.clone(), *position)),
             _ => None,
         })
@@ -77,7 +77,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { data, position }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { data, position }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             if let Some(&byte) = data.get(*position) {
                 *position = position.saturating_add(1);
                 return Ok(Some(byte));
@@ -100,7 +102,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { data, position }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { data, position }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             if let Some(end) = position.checked_add(N) {
                 if let Some(slice) = data.get(*position..end) {
                     let mut buf = [0u8; N];
@@ -128,7 +132,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { data, position }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { data, position }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             let available = data.len().saturating_sub(*position);
             let to_read = count.min(available);
             let end = position.saturating_add(to_read);
@@ -156,7 +162,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { data, .. }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { data, .. }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             return Ok(Some(data.len()));
         }
         Ok(None)
@@ -176,7 +184,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { position, .. }) = state.objects.get(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { position, .. }) =
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref)
+        {
             return Ok(Some(*position));
         }
         Ok(None)
@@ -203,7 +213,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { data, position }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { data, position }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             return Ok(Some(f(data, position)));
         }
         Ok(None)
@@ -231,7 +243,9 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { position, .. }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { position, .. }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             *position = new_position;
             Ok(true)
         } else {
@@ -264,19 +278,20 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { data, position }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { data, position }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             let write_len = bytes.len();
 
-            // Ensure capacity
+            // A write past the end grows the stream to it, zero-filling any gap a position
+            // past the end left, within the heap's budget
             let required_len =
                 position
                     .checked_add(write_len)
                     .ok_or(EmulationError::InternalError {
                         description: "stream write length overflow".into(),
                     })?;
-            if data.len() < required_len {
-                data.resize(required_len, 0);
-            }
+            self.grow_stream(data, required_len)?;
 
             // Copy bytes to the stream
             let dst =
@@ -293,6 +308,32 @@ impl ManagedHeap {
         } else {
             Ok(0)
         }
+    }
+
+    /// Grows a stream's bytes to `new_len`, zero-filled, as every stream write and length
+    /// change past the end does: the growth is checked against the heap's budget before any
+    /// host memory is asked for, and charged to it once allocated. A position the program set
+    /// far past the end therefore fails within the budget on the next write instead of
+    /// resizing the stream to gigabytes. Nothing happens when `data` is already as long.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmulationError::HeapMemoryLimitExceeded`] if the growth would exceed the
+    /// budget or the host cannot reserve it.
+    fn grow_stream(&self, data: &mut Vec<u8>, new_len: usize) -> Result<()> {
+        let growth = new_len.saturating_sub(data.len());
+        if growth == 0 {
+            return Ok(());
+        }
+        self.check_allocation(growth)?;
+        data.try_reserve(growth)
+            .map_err(|_| EmulationError::HeapMemoryLimitExceeded {
+                current: self.current_size.load(Ordering::Relaxed),
+                limit: self.max_size,
+            })?;
+        data.resize(new_len, 0);
+        self.current_size.fetch_add(growth, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Truncates or extends the stream to the given length.
@@ -321,32 +362,18 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        if let Some(HeapObject::Stream { data, position }) = state.objects.get_mut(&heap_ref.id()) {
+        if let Some(HeapObject::Stream { data, position }) =
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
+        {
             let old_length = data.len();
             if new_length > old_length {
-                let growth = new_length.saturating_sub(old_length);
-                let current = self.current_size.load(Ordering::Relaxed);
-                if current.saturating_add(growth) > self.max_size {
-                    return Err(EmulationError::HeapMemoryLimitExceeded {
-                        current,
-                        limit: self.max_size,
-                    }
-                    .into());
-                }
-                data.try_reserve(growth)
-                    .map_err(|_| EmulationError::HeapMemoryLimitExceeded {
-                        current,
-                        limit: self.max_size,
-                    })?;
-                self.current_size.fetch_add(growth, Ordering::Relaxed);
+                self.grow_stream(data, new_length)?;
             } else {
                 // Shrinking returns budget so a grow/shrink cycle cannot ratchet the
-                // accounted size upwards.
-                //
-                // Saturating, not `fetch_sub`: in-place stream writes do not currently update
-                // `current_size`, so a stream can hold more bytes than were ever charged.
-                // Crediting those back with a wrapping subtract would underflow the counter to
-                // near `usize::MAX` and make every later allocation fail.
+                // accounted size upwards. Saturating, not `fetch_sub`: a stream built by a
+                // constructor from an existing array holds bytes its allocation charged
+                // differently, and a wrapping subtract would underflow the counter to near
+                // `usize::MAX` and make every later allocation fail.
                 let refund = old_length.saturating_sub(new_length);
                 let _ =
                     self.current_size
@@ -391,11 +418,11 @@ impl ManagedHeap {
         let id = heap_ref.id();
         Self::preserve_original_type(&mut state, id);
 
-        if let Some(old_obj) = state.objects.get(&id) {
+        if let Some(old_obj) = state.objects.get(&id).map(Arc::as_ref) {
             let old_size = old_obj.estimated_size();
             let new_obj = HeapObject::Stream { data, position: 0 };
             let new_size = new_obj.estimated_size();
-            state.objects.insert(id, new_obj);
+            state.objects.insert(id, Arc::new(new_obj));
 
             // Update size tracking atomically
             if new_size >= old_size {
@@ -441,6 +468,7 @@ impl ManagedHeap {
                 transformed_data: None,
                 transformed_pos: 0,
                 write_buffer: Vec::new(),
+                final_block_transformed: false,
             },
             type_token,
         )
@@ -469,7 +497,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CryptoStream {
                 underlying_stream,
                 transform,
@@ -511,7 +539,7 @@ impl ManagedHeap {
             })?;
         let id = heap_ref.id();
         Self::preserve_original_type(&mut state, id);
-        if let Some(old_obj) = state.objects.get(&id) {
+        if let Some(old_obj) = state.objects.get(&id).map(Arc::as_ref) {
             let old_size = old_obj.estimated_size();
             let new_obj = HeapObject::CryptoStream {
                 underlying_stream,
@@ -520,9 +548,10 @@ impl ManagedHeap {
                 transformed_data: None,
                 transformed_pos: 0,
                 write_buffer: Vec::new(),
+                final_block_transformed: false,
             };
             let new_size = new_obj.estimated_size();
-            state.objects.insert(id, new_obj);
+            state.objects.insert(id, Arc::new(new_obj));
 
             // Update size tracking atomically
             if new_size >= old_size {
@@ -557,7 +586,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CryptoStream {
                 transformed_data: Some(data),
                 transformed_pos,
@@ -588,7 +617,7 @@ impl ManagedHeap {
         let new_size = data.len();
 
         // Get old size first
-        let old_size = match state.objects.get(&heap_ref.id()) {
+        let old_size = match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CryptoStream {
                 transformed_data, ..
             }) => transformed_data.as_ref().map_or(0, Vec::len),
@@ -600,7 +629,7 @@ impl ManagedHeap {
             transformed_data,
             transformed_pos,
             ..
-        }) = state.objects.get_mut(&heap_ref.id())
+        }) = state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             *transformed_data = Some(data);
             *transformed_pos = 0; // Reset position when setting new data
@@ -645,7 +674,7 @@ impl ManagedHeap {
             transformed_data: Some(data),
             transformed_pos,
             ..
-        }) = state.objects.get_mut(&heap_ref.id())
+        }) = state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             let available = data.len().saturating_sub(*transformed_pos);
             let to_read = count.min(available);
@@ -681,14 +710,42 @@ impl ManagedHeap {
 
         // Mutate the object
         if let Some(HeapObject::CryptoStream { write_buffer, .. }) =
-            state.objects.get_mut(&heap_ref.id())
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
-            write_buffer.extend_from_slice(data);
-            // Update size tracking atomically
-            self.current_size.fetch_add(data_len, Ordering::Relaxed);
+            self.grow_stream(write_buffer, write_buffer.len().saturating_add(data_len))?;
+            let start = write_buffer.len().saturating_sub(data_len);
+            if let Some(tail) = write_buffer.get_mut(start..) {
+                tail.copy_from_slice(data);
+            }
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Marks a CryptoStream's final block transformed, as `FlushFinalBlock` and `Dispose` do.
+    ///
+    /// # Returns
+    ///
+    /// Whether the final block already was transformed, or `None` if the object is not a
+    /// CryptoStream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmulationError::LockPoisoned`] if the internal `RwLock` is poisoned.
+    pub fn mark_crypto_stream_final_block(&self, heap_ref: HeapRef) -> Result<Option<bool>> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "managed heap",
+            })?;
+        match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
+            Some(HeapObject::CryptoStream {
+                final_block_transformed,
+                ..
+            }) => Ok(Some(std::mem::replace(final_block_transformed, true))),
+            _ => Ok(None),
         }
     }
 
@@ -708,7 +765,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CryptoStream { write_buffer, .. }) => Some(write_buffer.clone()),
             _ => None,
         })
@@ -732,14 +789,14 @@ impl ManagedHeap {
             })?;
 
         // Get buffer size first
-        let buffer_len = match state.objects.get(&heap_ref.id()) {
+        let buffer_len = match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CryptoStream { write_buffer, .. }) => write_buffer.len(),
             _ => return Ok(false),
         };
 
         // Clear the buffer
         if let Some(HeapObject::CryptoStream { write_buffer, .. }) =
-            state.objects.get_mut(&heap_ref.id())
+            state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             write_buffer.clear();
         }
@@ -783,7 +840,7 @@ impl ManagedHeap {
             })?;
         let id = heap_ref.id();
         Self::preserve_original_type(&mut state, id);
-        if let Some(old_obj) = state.objects.get(&id) {
+        if let Some(old_obj) = state.objects.get(&id).map(Arc::as_ref) {
             let old_size = old_obj.estimated_size();
             let new_obj = HeapObject::CompressedStream {
                 underlying_stream,
@@ -793,7 +850,7 @@ impl ManagedHeap {
                 read_position: 0,
             };
             let new_size = new_obj.estimated_size();
-            state.objects.insert(id, new_obj);
+            state.objects.insert(id, Arc::new(new_obj));
 
             // Update size tracking atomically
             if new_size >= old_size {
@@ -833,7 +890,7 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get(&heap_ref.id()) {
+        Ok(match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CompressedStream {
                 underlying_stream,
                 compression_type,
@@ -864,7 +921,7 @@ impl ManagedHeap {
         let data_len = data.len();
 
         // Get old cached size
-        let old_cached_size = match state.objects.get(&heap_ref.id()) {
+        let old_cached_size = match state.objects.get(&heap_ref.id()).map(Arc::as_ref) {
             Some(HeapObject::CompressedStream {
                 decompressed_data, ..
             }) => decompressed_data.as_ref().map_or(0, Vec::len),
@@ -873,7 +930,7 @@ impl ManagedHeap {
 
         if let Some(HeapObject::CompressedStream {
             decompressed_data, ..
-        }) = state.objects.get_mut(&heap_ref.id())
+        }) = state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut)
         {
             *decompressed_data = Some(data);
         }
@@ -917,24 +974,26 @@ impl ManagedHeap {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "managed heap",
             })?;
-        Ok(match state.objects.get_mut(&heap_ref.id()) {
-            Some(HeapObject::CompressedStream {
-                decompressed_data: Some(data),
-                read_position,
-                ..
-            }) => {
-                let available = data.len().saturating_sub(*read_position);
-                let to_read = count.min(available);
-                let end = read_position.saturating_add(to_read);
-                let bytes = data
-                    .get(*read_position..end)
-                    .map(<[u8]>::to_vec)
-                    .unwrap_or_default();
-                *read_position = end;
-                Some(bytes)
-            }
-            _ => None,
-        })
+        Ok(
+            match state.objects.get_mut(&heap_ref.id()).map(Arc::make_mut) {
+                Some(HeapObject::CompressedStream {
+                    decompressed_data: Some(data),
+                    read_position,
+                    ..
+                }) => {
+                    let available = data.len().saturating_sub(*read_position);
+                    let to_read = count.min(available);
+                    let end = read_position.saturating_add(to_read);
+                    let bytes = data
+                        .get(*read_position..end)
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or_default();
+                    *read_position = end;
+                    Some(bytes)
+                }
+                _ => None,
+            },
+        )
     }
 
     /// Checks if a CompressedStream has cached decompressed data.
@@ -958,7 +1017,7 @@ impl ManagedHeap {
                 description: "managed heap",
             })?;
         Ok(matches!(
-            state.objects.get(&heap_ref.id()),
+            state.objects.get(&heap_ref.id()).map(Arc::as_ref),
             Some(HeapObject::CompressedStream {
                 decompressed_data: Some(_),
                 ..

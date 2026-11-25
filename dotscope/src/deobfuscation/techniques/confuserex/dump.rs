@@ -191,7 +191,7 @@ mod tests {
             confuserex::dump::{AntiDumpFindings, ConfuserExAntiDump},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
         // In mkaring_maximum.exe, anti-tamper encrypts most method bodies,
         // so anti-dump detection requires readable method bodies. We attempt
         // detection and verify findings structure when it succeeds.
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_maximum.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_maximum.exe");
 
         let technique = ConfuserExAntiDump;
         let detection = technique.detect(&assembly);
@@ -229,7 +229,7 @@ mod tests {
     fn test_no_false_positive_on_antidebug() {
         // Anti-debug uses VirtualProtect + GetHINSTANCE + get_Module but
         // does NOT use Marshal.Copy. Verify the differentiator works.
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_minimal.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_minimal.exe");
 
         let technique = ConfuserExAntiDump;
         let detection = technique.detect(&assembly);
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = ConfuserExAntiDump;
         let detection = technique.detect(&assembly);

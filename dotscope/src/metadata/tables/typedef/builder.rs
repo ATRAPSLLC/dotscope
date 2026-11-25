@@ -136,6 +136,9 @@ impl TypeDefBuilder {
     ///
     /// * `field_list` - Index into the Field table marking the first field of this type
     ///
+    /// Without it, the type starts an empty list at the next Field row, so the fields added
+    /// after it are its own (ECMA-335 II.22.37).
+    ///
     /// # Returns
     ///
     /// Self for method chaining.
@@ -150,6 +153,9 @@ impl TypeDefBuilder {
     /// # Arguments
     ///
     /// * `method_list` - Index into the MethodDef table marking the first method of this type
+    ///
+    /// Without it, the type starts an empty list at the next MethodDef row, so the methods
+    /// added after it are its own (ECMA-335 II.22.37).
     ///
     /// # Returns
     ///
@@ -262,8 +268,14 @@ impl TypeDefBuilder {
             extends: self
                 .extends
                 .unwrap_or_else(|| CodedIndex::null(CodedIndexType::TypeDefOrRef)), // No base type
-            field_list: self.field_list.unwrap_or(1), // Default field list start
-            method_list: self.method_list.unwrap_or(1), // Default method list start
+            field_list: match self.field_list {
+                Some(list) => list,
+                None => assembly.next_rid(TableId::Field)?,
+            },
+            method_list: match self.method_list {
+                Some(list) => list,
+                None => assembly.next_rid(TableId::MethodDef)?,
+            },
         };
 
         // Add the row to the assembly and return the token
@@ -273,7 +285,6 @@ impl TypeDefBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
@@ -282,113 +293,108 @@ mod tests {
             cilassemblyview::CilAssemblyView,
             tables::{TableId, TypeAttributes},
         },
+        testkit::fixture,
     };
 
     #[test]
     fn test_typedef_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeDefBuilder::new()
-                .name("TestClass")
-                .namespace("TestNamespace")
-                .public_class()
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = TypeDefBuilder::new()
+            .name("TestClass")
+            .namespace("TestNamespace")
+            .public_class()
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
     }
 
     #[test]
     fn test_typedef_builder_interface() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeDefBuilder::new()
-                .name("ITestInterface")
-                .namespace("TestNamespace")
-                .public_interface()
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = TypeDefBuilder::new()
+            .name("ITestInterface")
+            .namespace("TestNamespace")
+            .public_interface()
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
     }
 
     #[test]
     fn test_typedef_builder_value_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeDefBuilder::new()
-                .name("TestStruct")
-                .namespace("TestNamespace")
-                .public_value_type()
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = TypeDefBuilder::new()
+            .name("TestStruct")
+            .namespace("TestNamespace")
+            .public_value_type()
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
     }
 
     #[test]
     fn test_typedef_builder_with_base_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let base_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // Assume System.Object
-            let ref_ = TypeDefBuilder::new()
-                .name("DerivedClass")
-                .namespace("TestNamespace")
-                .extends(base_type)
-                .flags(TypeAttributes::PUBLIC | TypeAttributes::CLASS)
-                .build(&mut assembly)
-                .unwrap();
+        let base_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // Assume System.Object
+        let ref_ = TypeDefBuilder::new()
+            .name("DerivedClass")
+            .namespace("TestNamespace")
+            .extends(base_type)
+            .flags(TypeAttributes::PUBLIC | TypeAttributes::CLASS)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
     }
 
     #[test]
     fn test_typedef_builder_missing_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = TypeDefBuilder::new()
-                .namespace("TestNamespace")
-                .public_class()
-                .build(&mut assembly);
+        let result = TypeDefBuilder::new()
+            .namespace("TestNamespace")
+            .public_class()
+            .build(&mut assembly);
 
-            // Should fail because name is required
-            assert!(result.is_err());
-        }
+        // Should fail because name is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_typedef_builder_global_namespace() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeDefBuilder::new()
-                .name("GlobalClass")
-                .namespace("") // Empty namespace = global
-                .public_class()
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = TypeDefBuilder::new()
+            .name("GlobalClass")
+            .namespace("") // Empty namespace = global
+            .public_class()
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeDef));
     }
 }

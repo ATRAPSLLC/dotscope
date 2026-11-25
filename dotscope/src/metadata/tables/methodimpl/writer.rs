@@ -29,6 +29,10 @@ use crate::{
 };
 
 impl RowWritable for MethodImplRaw {
+    fn sort_key(&self, _sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.class, 0)))
+    }
+
     /// Serialize a MethodImpl table row to binary format
     ///
     /// Writes the row data according to ECMA-335 §II.22.27 specification:
@@ -55,11 +59,7 @@ impl RowWritable for MethodImplRaw {
         write_le_at_dyn(data, offset, self.class, sizes.is_large(TableId::TypeDef))?;
 
         // Write MethodDefOrRef coded index for method_body
-        let method_body_value = sizes.encode_coded_index(
-            self.method_body.tag,
-            self.method_body.row,
-            CodedIndexType::MethodDefOrRef,
-        )?;
+        let method_body_value = self.method_body.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,
@@ -68,11 +68,7 @@ impl RowWritable for MethodImplRaw {
         )?;
 
         // Write MethodDefOrRef coded index for method_declaration
-        let method_declaration_value = sizes.encode_coded_index(
-            self.method_declaration.tag,
-            self.method_declaration.row,
-            CodedIndexType::MethodDefOrRef,
-        )?;
+        let method_declaration_value = self.method_declaration.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

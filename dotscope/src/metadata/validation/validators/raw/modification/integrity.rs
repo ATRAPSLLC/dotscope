@@ -2,16 +2,15 @@
 //!
 //! This validator ensures the structural integrity and consistency of an assembly
 //! after all modifications have been applied. It validates that the final state
-//! maintains referential integrity, proper heap structure, and conflict-free operations.
+//! maintains referential integrity and conflict-free operations.
 //! This validator runs with priority 100 and only operates during modification validation.
 //!
 //! # Architecture
 //!
 //! The change integrity validation system implements comprehensive post-change integrity validation in sequential order:
 //! 1. **Table Consistency** - Validates final table states maintain proper RID sequences and critical table requirements
-//! 2. **Heap Integrity** - Ensures heap modifications don't create invalid references or exceed size limits
-//! 3. **Cross-Table References** - Validates references remain valid after changes and relationships are consistent
-//! 4. **Operation Conflicts** - Detects conflicts between concurrent operations and validates proper sequencing
+//! 2. **Cross-Table References** - Validates references remain valid after changes and relationships are consistent
+//! 3. **Operation Conflicts** - Detects conflicts between concurrent operations and validates proper sequencing
 //!
 //! The implementation validates the assembly's final state according to ECMA-335
 //! specifications, ensuring that modifications don't corrupt metadata integrity.
@@ -21,7 +20,6 @@
 //!
 //! - [`crate::metadata::validation::validators::raw::modification::integrity::RawChangeIntegrityValidator`] - Main validator implementation providing comprehensive post-change validation
 //! - [`crate::metadata::validation::validators::raw::modification::integrity::RawChangeIntegrityValidator::validate_table_integrity`] - Table state validation with RID sequence checking
-//! - [`crate::metadata::validation::validators::raw::modification::integrity::RawChangeIntegrityValidator::validate_heap_integrity`] - Heap consistency validation with size limit enforcement
 //! - [`crate::metadata::validation::validators::raw::modification::integrity::RawChangeIntegrityValidator::validate_reference_integrity`] - Cross-reference validation for relationship consistency
 //! - [`crate::metadata::validation::validators::raw::modification::integrity::RawChangeIntegrityValidator::validate_change_conflicts`] - Conflict detection with logical validation
 //!
@@ -45,11 +43,9 @@
 //!
 //! This validator returns [`crate::Error::ValidationRawFailed`] for:
 //! - Broken referential integrity after modifications (orphaned fields/methods)
-//! - Invalid heap state after changes (excessive additions, size violations)
 //! - RID sequence violations or gaps (sparse sequences, conflicting RIDs)
 //! - Cross-table reference inconsistencies (invalid parent-child relationships)
 //! - Operation ordering violations indicating data corruption (non-chronological timestamps)
-//! - Excessive operation clustering indicating systemic issues (>10,000 operations)
 //! - Critical table integrity violations (empty Module/Assembly tables)
 //!
 //! # Thread Safety
@@ -220,70 +216,15 @@ impl RawChangeIntegrityValidator {
                         ));
                     }
 
-                    if rows.len() > 1_000_000 {
+                    // A row's RID is 24 bits wide (ECMA-335 II.22)
+                    if rows.len() > 0x00FF_FFFF {
                         return Err(malformed_error!(
-                            "Table {:?} integrity violation: Replacement table too large ({} rows) - potential corruption",
+                            "Table {:?} integrity violation: Replacement table has {} rows, more than a 24-bit RID addresses",
                             table_id,
                             rows.len()
                         ));
                     }
                 }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Validates heap integrity after modifications have been applied.
-    ///
-    /// Ensures that heap modifications maintain proper structure and don't create
-    /// invalid references or corrupt existing heap data. Validates string, blob,
-    /// GUID, and user string heap consistency.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - Raw validation context containing assembly changes via [`crate::metadata::validation::context::RawValidationContext`]
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - All heap modifications maintain integrity
-    /// * `Err(`[`crate::Error::ValidationRawFailed`]`)` - Heap integrity violations found
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::ValidationRawFailed`] if:
-    /// - String heap additions exceed reasonable size limits (>100,000 additions)
-    /// - Blob heap additions exceed reasonable size limits (>50,000 additions)
-    /// - GUID heap additions exceed reasonable size limits (>10,000 additions)
-    /// - UserString heap additions exceed reasonable size limits (>50,000 additions)
-    fn validate_heap_integrity(context: &RawValidationContext) -> Result<()> {
-        if let Some(changes) = context.changes() {
-            if changes.string_heap_changes.additions_count() > 100_000 {
-                return Err(malformed_error!(
-                    "String heap integrity violation: Too many string additions ({}) - potential memory exhaustion",
-                    changes.string_heap_changes.additions_count()
-                ));
-            }
-
-            if changes.blob_heap_changes.additions_count() > 50_000 {
-                return Err(malformed_error!(
-                    "Blob heap integrity violation: Too many blob additions ({}) - potential memory exhaustion",
-                    changes.blob_heap_changes.additions_count()
-                ));
-            }
-
-            if changes.guid_heap_changes.additions_count() > 10_000 {
-                return Err(malformed_error!(
-                    "GUID heap integrity violation: Too many GUID additions ({}) - potential memory exhaustion",
-                    changes.guid_heap_changes.additions_count()
-                ));
-            }
-
-            if changes.userstring_heap_changes.additions_count() > 50_000 {
-                return Err(malformed_error!(
-                    "User string heap integrity violation: Too many user string additions ({}) - potential memory exhaustion",
-                    changes.userstring_heap_changes.additions_count()
-                ));
             }
         }
 
@@ -380,7 +321,7 @@ impl RawChangeIntegrityValidator {
     /// Validates that change operations maintain proper ordering and don't indicate corruption.
     ///
     /// Validates operation sequencing and detects signs of potential data corruption
-    /// or excessive operation clustering that could indicate systemic issues.
+    /// that could indicate systemic issues.
     /// Focuses on logical conflicts rather than timing-based detection to avoid
     /// false positives on fast systems or automated tooling.
     ///
@@ -397,7 +338,6 @@ impl RawChangeIntegrityValidator {
     ///
     /// Returns [`crate::Error::ValidationRawFailed`] if:
     /// - Operations are not chronologically ordered (indicates data corruption)
-    /// - Excessive operation clustering (>10,000 ops) suggests systemic issues
     /// - Operation sequences create impossible logical states
     ///
     /// # Design Notes
@@ -435,15 +375,6 @@ impl RawChangeIntegrityValidator {
                             next_time
                         ));
                     }
-                }
-
-                let total_operations = operations.len();
-                if total_operations > 10_000 {
-                    return Err(malformed_error!(
-                        "Change conflict detected: Table {:?} has excessive operations ({}) - potential conflict storm",
-                        table_id,
-                        total_operations
-                    ));
                 }
             }
         }
@@ -570,17 +501,29 @@ impl RawChangeIntegrityValidator {
                     .map_or(1, |max| max.saturating_add(1))
             };
 
+            // A list starts at a row of the table or one past its end (an empty list at the
+            // end); 0 is not a row (ECMA-335 II.22.37)
+            let past_end = field_rids
+                .iter()
+                .max()
+                .map_or(1, |max| max.saturating_add(1));
+            if field_list_start == 0 || field_list_start > past_end {
+                return Err(malformed_error!(
+                    "Field ownership violation: TypeDef RID {} starts its field list at {}, outside the Field table (1 to {})",
+                    typedef_rid,
+                    field_list_start,
+                    past_end
+                ));
+            }
+
             // Validate that all fields in this range exist
-            if field_list_start > 0 {
-                // field_list of 0 means no fields
-                for field_rid in field_list_start..field_list_end {
-                    if !field_rids.contains(&field_rid) {
-                        return Err(malformed_error!(
-                            "Field ownership violation: TypeDef RID {} expects field RID {} but field was deleted",
-                            typedef_rid,
-                            field_rid
-                        ));
-                    }
+            for field_rid in field_list_start..field_list_end {
+                if !field_rids.contains(&field_rid) {
+                    return Err(malformed_error!(
+                        "Field ownership violation: TypeDef RID {} expects field RID {} but field was deleted",
+                        typedef_rid,
+                        field_rid
+                    ));
                 }
             }
         }
@@ -653,7 +596,6 @@ impl RawValidator for RawChangeIntegrityValidator {
             let table_changes = &changes.table_changes;
 
             Self::validate_table_integrity(table_changes)?;
-            Self::validate_heap_integrity(context)?;
             Self::validate_reference_integrity(table_changes)?;
             Self::validate_change_conflicts(table_changes)?;
         }
@@ -684,8 +626,6 @@ impl Default for RawChangeIntegrityValidator {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use rayon::ThreadPoolBuilder;
-
     use super::*;
     use crate::{
         cilassembly::{AssemblyChanges, Operation, TableModifications, TableOperation},
@@ -697,14 +637,13 @@ mod tests {
                 context::RawValidationContext, scanner::ReferenceScanner, ValidationConfig,
             },
         },
-        test::{
+        testkit::{
             factories::validation::raw_modification_integrity::{
                 create_dummy_field, create_dummy_method, create_dummy_typedef,
                 raw_change_integrity_validator_file_factory,
             },
             get_testfile_wb, validator_test,
         },
-        Error,
     };
 
     /// Direct corruption testing for RawChangeIntegrityValidator bypassing file I/O.
@@ -834,28 +773,6 @@ mod tests {
             assert!(test_validator_with_corrupted_changes(&validator, corrupted_changes).is_err());
         }
 
-        {
-            let mut corrupted_changes = AssemblyChanges::new();
-
-            let mut huge_table = Vec::new();
-            for _ in 0..1_000_001 {
-                huge_table.push(TableDataOwned::TypeDef(create_dummy_typedef(1)?));
-            }
-
-            let replaced_modifications = TableModifications::Replaced(huge_table);
-            corrupted_changes
-                .table_changes
-                .insert(TableId::TypeDef, replaced_modifications);
-
-            assert!(test_validator_with_corrupted_changes(&validator, corrupted_changes).is_err());
-        }
-
-        // Test 7-10: Heap excessive additions tests
-        // Note: These tests validate heap size limits, but implementing them requires
-        // deeper knowledge of the HeapChanges structure and how to create excessive additions.
-        // For now, we focus on table integrity tests which are the core functionality.
-        // The heap validation logic exists and will catch excessive additions in practice.
-
         // Test 11: Orphaned fields (fields exist but no TypeDef entries)
         {
             let mut corrupted_changes = AssemblyChanges::new();
@@ -971,7 +888,9 @@ mod tests {
                 .table_changes
                 .insert(TableId::TypeDef, sparse_modifications);
 
-            assert!(test_validator_with_corrupted_changes(&validator, corrupted_changes).is_err());
+            // Many operations are not a fault: ECMA-335 bounds a table by its 24-bit RIDs only.
+            let result = test_validator_with_corrupted_changes(&validator, corrupted_changes);
+            assert!(result.is_ok(), "{result:?}");
         }
 
         // Test 12: Field ownership validation - TypeDef points to deleted field
@@ -1022,16 +941,12 @@ mod tests {
                 .insert(TableId::Field, field_modifications);
 
             let result = test_validator_with_corrupted_changes(&validator, corrupted_changes);
-            if result.is_ok() {
-                println!(
-                    "WARNING: Field ownership validation did not detect the expected violation"
-                );
-            }
-            // Comment out the assertion temporarily to see if other tests pass
-            // assert!(result.is_err());
+            assert!(
+                matches!(&result, Err(e) if e.to_string().contains("starts its field list at 100")),
+                "{result:?}"
+            );
         }
 
-        println!("All RawChangeIntegrityValidator corruption tests passed successfully!");
         Ok(())
     }
 
@@ -1039,9 +954,7 @@ mod tests {
         validator: &RawChangeIntegrityValidator,
         corrupted_changes: AssemblyChanges,
     ) -> Result<()> {
-        let Some(clean_testfile) = get_testfile_wb() else {
-            return Err(Error::Other("WindowsBase.dll not available".to_string()));
-        };
+        let clean_testfile = get_testfile_wb();
 
         let view = CilAssemblyView::from_path(&clean_testfile)?;
         let config = ValidationConfig {
@@ -1050,13 +963,11 @@ mod tests {
         };
 
         let scanner = ReferenceScanner::from_view(&view)?;
-        let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let context = RawValidationContext::new_for_modification(
             &view,
             &corrupted_changes,
             &scanner,
             &config,
-            &thread_pool,
         );
 
         validator.validate_raw(&context)
@@ -1073,7 +984,6 @@ mod tests {
         validator_test(
             raw_change_integrity_validator_file_factory,
             "RawChangeIntegrityValidator",
-            "Parse",
             config,
             |context| validator.validate_raw(context),
         )

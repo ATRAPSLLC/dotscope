@@ -275,29 +275,36 @@ impl EnumBuilder {
             typedef_builder = typedef_builder.namespace(namespace);
         }
 
-        // Set extends to System.Enum as required by ECMA-335
-        // Find or create the core library reference and System.Enum TypeRef
-        if let Some(core_lib_ref) = assembly.find_core_library_ref() {
-            // Create TypeRef for System.Enum in the core library
-            let system_enum_typeref = TypeRefBuilder::new()
-                .name("Enum")
-                .namespace("System")
-                .resolution_scope(core_lib_ref)
-                .build(assembly)?;
+        // Set extends to System.Enum as required by ECMA-335, reusing the core
+        // library's System.Enum TypeRef when the module already imports it
+        let system_enum = match assembly.find_corelib_typeref("System", "Enum") {
+            Some(existing) => Some(existing),
+            None => match assembly.find_core_library_ref() {
+                Some(core_lib_ref) => {
+                    let system_enum_typeref = TypeRefBuilder::new()
+                        .name("Enum")
+                        .namespace("System")
+                        .resolution_scope(core_lib_ref)
+                        .build(assembly)?;
 
-            // Get placeholder token for the typeref row
-            let typeref_placeholder = system_enum_typeref.placeholder_token().ok_or_else(|| {
-                Error::ModificationInvalid(
-                    "Failed to get placeholder token for System.Enum typeref".to_string(),
-                )
-            })?;
-
-            // Create coded index for TypeDefOrRef pointing to the System.Enum TypeRef
-            let extends_index = CodedIndex::new(
-                TableId::TypeRef,
-                typeref_placeholder.row(),
-                CodedIndexType::TypeDefOrRef,
-            );
+                    // Get placeholder token for the typeref row
+                    let typeref_placeholder =
+                        system_enum_typeref.placeholder_token().ok_or_else(|| {
+                            Error::ModificationInvalid(
+                                "Failed to get placeholder token for System.Enum typeref"
+                                    .to_string(),
+                            )
+                        })?;
+                    Some(CodedIndex::new(
+                        TableId::TypeRef,
+                        typeref_placeholder.row(),
+                        CodedIndexType::TypeDefOrRef,
+                    ))
+                }
+                None => None,
+            },
+        };
+        if let Some(extends_index) = system_enum {
             typedef_builder = typedef_builder.extends(extends_index);
         }
 
@@ -441,16 +448,16 @@ impl Default for EnumBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{changes::ChangeRefKind, CilAssembly},
         metadata::{cilassemblyview::CilAssemblyView, signatures::TypeSignature, tables::TableId},
+        testkit::fixture,
     };
 
     fn get_test_assembly() -> Result<CilAssembly> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path)?;
         Ok(CilAssembly::new(view))
     }

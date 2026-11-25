@@ -7,7 +7,7 @@ use crate::{
     emulation::engine::{context::EmulationContext, error::EmulationError, exceptions},
     metadata::{
         method::Method,
-        signatures::SignatureMethod,
+        streams::SharedStr,
         tables::TableId,
         token::Token,
         typesystem::{CilFlavor, CilType, CilTypeRc, PointerSize},
@@ -306,7 +306,7 @@ impl EmulationContext {
             .query_methods()
             .virtual_methods()
             .name(method_name)
-            .filter(|m| Self::signatures_match(&m.signature, &base_method.signature))
+            .filter(|m| m.signature.has_same_parameters(&base_method.signature))
             .find_first()
         {
             return Some(method.token);
@@ -325,43 +325,12 @@ impl EmulationContext {
         None
     }
 
-    /// Checks if two method signatures are compatible for override purposes.
-    ///
-    /// Two signatures match if they have the same parameter count and
-    /// compatible parameter types. Return type covariance is allowed per
-    /// ECMA-335 but we use exact matching for simplicity.
-    fn signatures_match(candidate: &SignatureMethod, base: &SignatureMethod) -> bool {
-        // Parameter count must match
-        if candidate.param_count != base.param_count {
-            return false;
-        }
-
-        // Generic parameter count must match
-        if candidate.param_count_generic != base.param_count_generic {
-            return false;
-        }
-
-        // Parameter types must match (compare each parameter)
-        if candidate.params.len() != base.params.len() {
-            return false;
-        }
-
-        for (candidate_param, base_param) in candidate.params.iter().zip(base.params.iter()) {
-            if candidate_param.base != base_param.base {
-                return false;
-            }
-        }
-
-        // All checks passed - signatures are compatible
-        true
-    }
-
     /// Gets type information useful for casting operations.
     ///
     /// Returns the type's namespace and name, which is useful for
     /// error messages in cast failures.
     #[must_use]
-    pub fn get_type_name(&self, type_token: Token) -> Option<(String, String)> {
+    pub fn get_type_name(&self, type_token: Token) -> Option<(SharedStr, SharedStr)> {
         self.get_type(type_token)
             .map(|t| (t.namespace.clone(), t.name.clone()))
     }
@@ -447,7 +416,7 @@ impl EmulationContext {
 /// collision with real TypeDef/TypeRef/TypeSpec tokens.
 ///
 /// Distinct from synthetic exception tokens (`0x7F01_00xx`) which have their own
-/// hierarchy in [`exceptions`](crate::emulation::engine::exceptions).
+/// hierarchy in [`exceptions`].
 fn is_bcl_wrapper_token(token: Token) -> bool {
     token.value() & 0xFFFF_0000 == 0x7F00_0000
 }

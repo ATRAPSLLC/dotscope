@@ -22,8 +22,8 @@ use crate::{
         method::MethodMap,
         streams::Strings,
         tables::{
-            CodedIndex, CodedIndexType, FieldMap, FieldPtrMap, MetadataTable, MethodPtrMap,
-            TableId, TableInfoRef, TableRow, TypeAttributes,
+            CodedIndex, CodedIndexType, FieldMap, FieldPtrMap, MemberRanges, MethodPtrMap, TableId,
+            TableInfoRef, TableRow, TypeAttributes,
         },
         token::Token,
         typesystem::{CilType, CilTypeRc, CilTypeRef, CilTypeReference},
@@ -120,7 +120,11 @@ impl TypeDefRaw {
     /// * `field_ptr` - Map of `FieldPtr` entries for indirection resolution
     /// * `methods` - Map of all processed Method entries indexed by token
     /// * `method_ptr` - Map of `MethodPtr` entries for indirection resolution
-    /// * `defs` - The complete `TypeDef` table for determining field/method ranges
+    /// * `field_ranges` - The normalized `FieldList` runs of the whole `TypeDef` table
+    ///   ([`TablesHeader::member_ranges`](crate::metadata::streams::TablesHeader::member_ranges)
+    ///   with [`MemberList::TypeDefFields`](crate::metadata::tables::MemberList::TypeDefFields)), which also decide whether `field_ptr` is consulted
+    /// * `method_ranges` - The normalized `MethodList` runs
+    ///   ([`MemberList::TypeDefMethods`](crate::metadata::tables::MemberList::TypeDefMethods))
     /// * `resolve_base_type` - Whether to resolve the base type during creation (for two-phase loading)
     /// * `external_reference` - The external reference (usually current assembly) this type belongs to
     ///
@@ -131,9 +135,9 @@ impl TypeDefRaw {
     /// ## Errors
     /// Returns an error if:
     /// - Type name or namespace cannot be resolved from the strings heap
-    /// - Next row in the `TypeDef` table cannot be found for range calculation
-    /// - Field or method tokens cannot be resolved through pointer indirection
-    /// - Token value arithmetic overflows during resolution
+    /// - A position in the type's field or method run names a `FieldPtr`/`MethodPtr` row or a
+    ///   field/method that is not loaded (the run itself is always in range: the ranges are
+    ///   normalized)
     #[allow(clippy::too_many_arguments)]
     pub fn to_owned<F>(
         &self,
@@ -143,154 +147,24 @@ impl TypeDefRaw {
         field_ptr: &FieldPtrMap,
         methods: &MethodMap,
         method_ptr: &MethodPtrMap,
-        defs: &MetadataTable<TypeDefRaw>,
+        field_ranges: &MemberRanges,
+        method_ranges: &MemberRanges,
         resolve_base_type: bool,
         external_reference: Option<CilTypeReference>,
     ) -> Result<CilTypeRc>
     where
         F: Fn(&CodedIndex) -> CilTypeReference,
     {
-        let next_rid = self.rid.checked_add(1).ok_or_else(|| {
-            malformed_error!("TypeDef rid overflow when computing next rid: {}", self.rid)
-        })?;
+        let type_fields = LazyList::new();
+        for field in field_ranges.members(self.rid, field_ptr, |ptr| ptr.field, fields) {
+            _ = type_fields.push(field?);
+        }
 
-        let (end_fields, end_methods) = if next_rid > defs.row_count {
-            let fields_end = fields
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| malformed_error!("Field count overflow: {}", fields.len()))?;
-            let methods_end = methods
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| malformed_error!("Method count overflow: {}", methods.len()))?;
-            (fields_end, methods_end)
-        } else {
-            match defs.get(next_rid)? {
-                Some(next_row) => (next_row.field_list as usize, next_row.method_list as usize),
-                None => {
-                    return Err(malformed_error!(
-                        "Failed to resolve fields_end from next row - {}",
-                        next_rid
-                    ))
-                }
-            }
-        };
-
-        let start_fields = self.field_list as usize;
-        let fields_len_plus_one = fields
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| malformed_error!("Field count overflow: {}", fields.len()))?;
-        let type_fields = if self.field_list == 0
-            || fields.is_empty()
-            || end_fields > fields_len_plus_one
-            || start_fields > fields.len()
-            || end_fields <= start_fields
-        {
-            Arc::new(boxcar::Vec::new())
-        } else {
-            let capacity = end_fields.checked_sub(start_fields).ok_or_else(|| {
-                malformed_error!(
-                    "TypeDef field range invalid: end {} < start {}",
-                    end_fields,
-                    start_fields
-                )
-            })?;
-            let type_fields = Arc::new(boxcar::Vec::with_capacity(capacity));
-            for counter in start_fields..end_fields {
-                let field_rid = u32::try_from(counter)
-                    .map_err(|_| malformed_error!("Field row index out of range: {}", counter))?;
-                let actual_field_token = if field_ptr.is_empty() {
-                    Token::from_parts(TableId::Field, field_rid)
-                } else {
-                    let field_ptr_token = Token::from_parts(TableId::FieldPtr, field_rid);
-
-                    match field_ptr.get(&field_ptr_token) {
-                        Some(field_ptr_entry) => {
-                            Token::from_parts(TableId::Field, field_ptr_entry.value().field)
-                        }
-                        None => {
-                            return Err(malformed_error!(
-                                "Failed to resolve FieldPtr - {}",
-                                field_ptr_token.value()
-                            ))
-                        }
-                    }
-                };
-
-                match fields.get(&actual_field_token) {
-                    Some(field) => _ = type_fields.push(field.value().clone()),
-                    None => {
-                        return Err(malformed_error!(
-                            "Failed to resolve field - {}",
-                            actual_field_token.value()
-                        ))
-                    }
-                }
-            }
-
-            type_fields
-        };
-
-        let start_methods = self.method_list as usize;
-        let methods_len_plus_one = methods
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| malformed_error!("Method count overflow: {}", methods.len()))?;
-        let type_methods = if self.method_list == 0
-            || methods.is_empty()
-            || end_methods > methods_len_plus_one
-            || start_methods > methods.len()
-            || end_methods < start_methods
-        {
-            LazyList::new()
-        } else {
-            let capacity = end_methods.checked_sub(start_methods).ok_or_else(|| {
-                malformed_error!(
-                    "TypeDef method range invalid: end {} < start {}",
-                    end_methods,
-                    start_methods
-                )
-            })?;
-            // `LazyList` has no with_capacity: the point is to not allocate until first push.
-            let _ = capacity;
-            let type_methods = LazyList::new();
-            for counter in start_methods..end_methods {
-                let method_rid = u32::try_from(counter)
-                    .map_err(|_| malformed_error!("Method row index out of range: {}", counter))?;
-                let actual_method_token = if method_ptr.is_empty() {
-                    Token::from_parts(TableId::MethodDef, method_rid)
-                } else {
-                    // Built from the TableId enum rather than a hand-written prefix so the
-                    // table id cannot drift from the value `MethodPtrReader` keys rows under.
-                    let method_ptr_token = Token::from_parts(TableId::MethodPtr, method_rid);
-
-                    match method_ptr.get(&method_ptr_token) {
-                        Some(method_ptr_entry) => {
-                            Token::from_parts(TableId::MethodDef, method_ptr_entry.value().method)
-                        }
-                        None => {
-                            return Err(malformed_error!(
-                                "Failed to resolve MethodPtr - {}",
-                                method_ptr_token.value()
-                            ))
-                        }
-                    }
-                };
-
-                match methods.get(&actual_method_token) {
-                    Some(method) => _ = type_methods.push(method.value().clone().into()),
-                    None => {
-                        return Err(malformed_error!(
-                            "Failed to resolve method - {}",
-                            actual_method_token.value()
-                        ))
-                    }
-                }
-            }
-
-            type_methods
-        };
+        // `LazyList` has no with_capacity: the point is to not allocate until first push.
+        let type_methods = LazyList::new();
+        for method in method_ranges.members(self.rid, method_ptr, |ptr| ptr.method, methods) {
+            _ = type_methods.push(method?.into());
+        }
 
         let base_type = if resolve_base_type && self.extends.row != 0 {
             match get_ref(&self.extends) {
@@ -305,8 +179,8 @@ impl TypeDefRaw {
 
         let cil_type = Arc::new(CilType::new(
             self.token,
-            strings.get(self.type_namespace as usize)?.to_string(),
-            strings.get(self.type_name as usize)?.to_string(),
+            strings.get_shared(self.type_namespace as usize)?,
+            strings.get_shared(self.type_name as usize)?,
             external_reference,
             base_type,
             TypeAttributes::new(self.flags),

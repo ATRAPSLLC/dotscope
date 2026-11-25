@@ -35,7 +35,7 @@ mod binaryreader;
 mod binarywriter;
 mod compression;
 mod filestream;
-mod stream;
+pub mod stream;
 
 use crate::{emulation::runtime::hook::HookManager, Result};
 

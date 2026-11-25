@@ -50,14 +50,16 @@
 //! 2. **Pre-Hook**: Execute pre-hook (can bypass original method)
 //! 3. **Original Method**: Execute if not bypassed
 //! 4. **Post-Hook**: Execute post-hook (can modify return value)
-//! 5. **Default Behavior**: Apply [`UnknownMethodBehavior`] if no hook matches
+//! 5. **Default Behavior**: Apply [`UnknownMethodBehavior`](crate::emulation::UnknownMethodBehavior) if no hook matches
 //!
 //! # Examples
 //!
 //! ## Basic Runtime Setup
 //!
-//! ```ignore
-//! use dotscope::emulation::runtime::{RuntimeState, RuntimeStateBuilder};
+//! ```
+//! use dotscope::emulation::EmulationConfig;
+//! use dotscope::emulation::RuntimeState;
+//! use dotscope::emulation::RuntimeStateBuilder;
 //!
 //! // Create runtime with default BCL hooks
 //! let runtime = RuntimeState::new();
@@ -65,22 +67,27 @@
 //! // Or use the builder for custom configuration
 //! let runtime = RuntimeStateBuilder::new()
 //!     .config(EmulationConfig::minimal())
-//!     .build();
+//!     .build()?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Registering Custom Hooks
 //!
-//! ```ignore
-//! use dotscope::emulation::runtime::{RuntimeState, Hook, PreHookResult};
+//! ```
+//! use dotscope::emulation::EmValue;
+//! use dotscope::emulation::RuntimeState;
+//! use dotscope::emulation::Hook;
+//! use dotscope::emulation::PreHookResult;
 //!
 //! let runtime = RuntimeState::new();
 //! runtime.hooks().register(
 //!     Hook::new("my-hook")
 //!         .match_name("MyNamespace", "MyType", "MyMethod")
-//!         .pre(|ctx, thread| {
+//!         .pre(|_ctx, _thread| {
 //!             PreHookResult::Bypass(Some(EmValue::I32(42)))
 //!         })
-//! );
+//! )?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Use Cases
@@ -121,4 +128,5 @@ pub use hook::{
     NameMatcher, NativeMethodMatcher, PostHookFn, PostHookResult, PreHookFn, PreHookResult,
     RuntimeMatcher, SignatureMatcher,
 };
+pub use native::{NativeFunction, NativeFunctionRegistry};
 pub use state::{RuntimeState, RuntimeStateBuilder};

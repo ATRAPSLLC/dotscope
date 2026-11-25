@@ -36,8 +36,8 @@ use log::debug;
 
 use crate::{
     analysis::{
-        resolve_corelib_valuetype, CilTarget, ConstValue, DefSite, MethodRef, SsaFunction,
-        SsaInstruction, SsaOp, SsaVarId, TypeRef, VariableOrigin,
+        resolve_corelib_valuetype, CallData, Callee, CilTarget, ConstValue, DefSite, MethodRef,
+        SsaFunction, SsaInstruction, SsaOp, SsaOpCilExt, SsaVarId, TypeRef, VariableOrigin,
     },
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
@@ -117,8 +117,9 @@ impl SsaPass<CilTarget, CompilerContext> for TypeOfRestorationPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::Call { dest, method, args } = instr.op() {
-                    if method.token() != self.accessor_token {
+                if let Some((method_token, call)) = instr.op().method_call() {
+                    let (dest, args) = (&call.dest, &call.args);
+                    if method_token != self.accessor_token {
                         continue;
                     }
 
@@ -162,7 +163,7 @@ impl SsaPass<CilTarget, CompilerContext> for TypeOfRestorationPass {
         for (block_idx, instr_idx, type_token, orig_dest) in &replacements {
             // Create a temporary variable for the RuntimeTypeHandle (LoadToken result).
             // Resolve the corelib TypeRef now so the SSA variable carries a
-            // proper `valuetype [mscorlib]System.RuntimeTypeHandle` token —
+            // proper `valuetype [mscorlib]System.RuntimeTypeHandle` token -
             // a tokenless placeholder would produce invalid CIL if this
             // variable ever spilled to a local slot downstream.
             let handle_type = resolve_corelib_valuetype(assembly, "System.RuntimeTypeHandle");
@@ -185,11 +186,14 @@ impl SsaPass<CilTarget, CompilerContext> for TypeOfRestorationPass {
 
             // Insert a Call(GetTypeFromHandle) instruction right after the LoadToken.
             // This converts RuntimeTypeHandle → System.Type, matching what GetTypeInstance did.
-            let call_instr = SsaInstruction::synthetic(SsaOp::Call {
-                dest: Some(*orig_dest),
-                method: MethodRef::new(self.get_type_from_handle_token),
-                args: vec![handle_var],
-            });
+            let call_instr = SsaInstruction::synthetic(
+                CallData::new(
+                    Some(*orig_dest),
+                    Callee::Direct(MethodRef::new(self.get_type_from_handle_token)),
+                    vec![handle_var],
+                )
+                .into(),
+            );
 
             let block = ssa.blocks_mut().get_mut(*block_idx).ok_or_else(|| {
                 Error::Deobfuscation(format!(

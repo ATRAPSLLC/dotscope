@@ -13,7 +13,6 @@ use crate::{
         token::Token,
         typesystem::{CilTypeReference, TypeRegistry, TypeResolver},
     },
-    utils::LazyList,
     Result,
 };
 
@@ -142,7 +141,7 @@ impl MethodSpecRaw {
             offset: self.offset,
             method: method.clone(),
             instantiation,
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
             generic_args,
         });
 

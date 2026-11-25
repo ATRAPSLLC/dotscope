@@ -108,23 +108,25 @@ impl NestedClassRaw {
     /// - The relationship violates .NET type system constraints
     ///
     pub fn apply(classes: &MetadataTable<NestedClassRaw>, types: &TypeRegistry) -> Result<()> {
-        let mut mapping: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut mapping: BTreeMap<u32, Vec<(Token, u32)>> = BTreeMap::new();
 
         for row in classes {
             let row = row?;
             mapping
                 .entry(row.enclosing_class | 0x0200_0000)
                 .or_default()
-                .push(row.nested_class | 0x0200_0000);
+                .push((row.token, row.nested_class | 0x0200_0000));
         }
 
         for (enclosing, nested_classes) in mapping {
             match types.get(&Token::new(enclosing)) {
                 Some(cil_type) => {
-                    for nested_class in nested_classes {
+                    for (row_token, nested_class) in nested_classes {
                         match types.get(&Token::new(nested_class)) {
                             Some(nested_type) => {
-                                _ = cil_type.nested_types.push(nested_type.clone().into());
+                                cil_type
+                                    .nested_types
+                                    .push_row(row_token, nested_type.clone().into());
                             }
                             None => {
                                 return Err(malformed_error!(

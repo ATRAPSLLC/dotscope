@@ -142,7 +142,9 @@ impl GenericParamConstraint {
     /// - **Circular Dependency**: If the constraint creates an invalid circular reference
     /// - **Validation Failure**: If constraint validation encounters other issues
     pub fn apply(&self) -> Result<()> {
-        self.owner.constraints.push(self.constraint.clone().into());
+        self.owner
+            .constraints
+            .push_row(self.token, self.constraint.clone().into());
         Ok(())
     }
 }

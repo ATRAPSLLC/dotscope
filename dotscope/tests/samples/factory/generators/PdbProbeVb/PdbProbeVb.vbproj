@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The Visual Basic counterpart of PdbProbe, for the records only Visual Basic writes: the
+    DefaultNamespace custom debug information (from RootNamespace), XML namespace imports, and
+    project-level imports.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>VbProbe.Root</RootNamespace>
+    <OptionStrict>On</OptionStrict>
+    <EmbedAllSources>true</EmbedAllSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Import Include="System.Text" />
+  </ItemGroup>
+</Project>

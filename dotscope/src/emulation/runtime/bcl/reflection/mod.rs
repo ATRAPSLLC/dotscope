@@ -18,8 +18,8 @@
 //! | [`modules`] | `Module`, `Assembly`, `ModuleHandle`, `Debugger`, `StackFrame` |
 //!
 //! Shared helper functions used across submodules (e.g., token extraction, type
-//! normalization, value boxing/unboxing) are defined in [`helpers`] and
-//! re-exported as `pub(crate)`.
+//! normalization, value boxing/unboxing) are defined in [`helpers`] and re-exported
+//! here; the module is private to the BCL, so they stay internal.
 //!
 //! # Deobfuscation Use Cases
 //!
@@ -71,7 +71,7 @@ mod methods;
 mod modules;
 mod types;
 
-pub(crate) use helpers::{
+pub use helpers::{
     alloc_type_array_from_tokens, box_value_if_needed, extract_type_token, find_method_by_name,
     normalize_type_token, resolve_attribute_type_token, resolve_method_from_token, unbox_value,
 };
@@ -90,7 +90,7 @@ use crate::{
 /// Used for `MethodBase.op_Equality`, `MethodInfo.op_Equality`, `Assembly.op_Equality`,
 /// and similar reference-type comparison operators. Compares by heap reference identity:
 /// two non-null references are equal iff they point to the same heap object.
-pub(crate) fn object_ref_equality_pre(
+pub fn object_ref_equality_pre(
     ctx: &HookContext<'_>,
     _thread: &mut EmulationThread,
 ) -> PreHookResult {
@@ -107,7 +107,7 @@ pub(crate) fn object_ref_equality_pre(
 ///
 /// Used for `MethodBase.op_Inequality`, `MethodInfo.op_Inequality`, `Assembly.op_Inequality`,
 /// and similar reference-type comparison operators.
-pub(crate) fn object_ref_inequality_pre(
+pub fn object_ref_inequality_pre(
     ctx: &HookContext<'_>,
     _thread: &mut EmulationThread,
 ) -> PreHookResult {
@@ -146,6 +146,6 @@ mod tests {
     fn test_register_hooks() {
         let manager = HookManager::new();
         register(&manager).unwrap();
-        assert_eq!(manager.len(), 143);
+        assert_eq!(manager.len(), 141);
     }
 }

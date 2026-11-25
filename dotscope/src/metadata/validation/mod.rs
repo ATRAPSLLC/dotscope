@@ -173,12 +173,15 @@ mod validators;
 
 pub use config::ValidationConfig;
 pub use context::{
-    MethodTypeMapping, OwnedValidationContext, RawValidationContext, ValidationContext,
-    ValidationStage,
+    FirstUnresolved, MethodTypeMapping, OwnedValidationContext, RawValidationContext,
+    ValidationContext, ValidationStage,
 };
 pub use engine::{factory, EngineStatistics, ValidationEngine};
 pub use result::{TwoStageValidationResult, ValidationOutcome, ValidationResult};
-pub use scanner::{ReferenceScanner, ScannerStatistics};
-pub use shared::{ReferenceValidator, SchemaValidator, TokenValidator};
+pub use scanner::{HeapSizes, ReferenceScanner, ScannerStatistics};
+pub use shared::{
+    ReferenceAnalysis, ReferenceStatistics, ReferenceValidator, SchemaValidationStatistics,
+    SchemaValidator, TokenValidationResult, TokenValidator,
+};
 pub use traits::{OwnedValidator, RawValidator, ValidatorCollection};
 pub use validators::*;

@@ -310,7 +310,7 @@ mod tests {
         )
         .with_args(&args);
 
-        let mut thread = crate::test::emulation::create_test_thread();
+        let mut thread = crate::testkit::emulation::create_test_thread();
         let result = gchandle_alloc_pre(&ctx, &mut thread);
 
         match result {
@@ -330,7 +330,7 @@ mod tests {
         )
         .with_this(Some(&EmValue::NativeInt(0x1000)));
 
-        let mut thread = crate::test::emulation::create_test_thread();
+        let mut thread = crate::testkit::emulation::create_test_thread();
         let result = gchandle_addr_of_pinned_object_pre(&ctx, &mut thread);
 
         match result {
@@ -350,7 +350,7 @@ mod tests {
         )
         .with_this(Some(&EmValue::NativeInt(42)));
 
-        let mut thread = crate::test::emulation::create_test_thread();
+        let mut thread = crate::testkit::emulation::create_test_thread();
         let result = gchandle_get_target_pre(&ctx, &mut thread);
 
         match result {
@@ -370,7 +370,7 @@ mod tests {
         )
         .with_this(Some(&EmValue::NativeInt(0)));
 
-        let mut thread = crate::test::emulation::create_test_thread();
+        let mut thread = crate::testkit::emulation::create_test_thread();
         let result = gchandle_get_target_pre(&ctx, &mut thread);
 
         match result {
@@ -388,7 +388,7 @@ mod tests {
             "Free",
             PointerSize::Bit64,
         );
-        let mut thread = crate::test::emulation::create_test_thread();
+        let mut thread = crate::testkit::emulation::create_test_thread();
         let result = gchandle_free_pre(&ctx, &mut thread);
         assert!(matches!(result, PreHookResult::Bypass(None)));
     }
@@ -402,7 +402,7 @@ mod tests {
             "get_IsAllocated",
             PointerSize::Bit64,
         );
-        let mut thread = crate::test::emulation::create_test_thread();
+        let mut thread = crate::testkit::emulation::create_test_thread();
         let result = gchandle_is_allocated_pre(&ctx, &mut thread);
         assert!(matches!(
             result,
@@ -424,7 +424,7 @@ mod tests {
         )
         .with_args(&args);
 
-        let mut thread = crate::test::emulation::create_test_thread();
+        let mut thread = crate::testkit::emulation::create_test_thread();
         let handle = match gchandle_alloc_pre(&alloc_ctx, &mut thread) {
             PreHookResult::Bypass(Some(v)) => v,
             _ => panic!("Expected Bypass"),

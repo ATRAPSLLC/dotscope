@@ -9,7 +9,7 @@
 //! # Lifecycle
 //!
 //! 1. Created after technique initialization (Phase 3.5)
-//! 2. Warmed up once — runs `<Module>.cctor` and all registered warmup methods
+//! 2. Warmed up once - runs `<Module>.cctor` and all registered warmup methods
 //! 3. Stored in [`AnalysisContext::template_pool`]
 //! 4. Passes call [`fork()`](EmulationTemplatePool::fork) to get independent copies
 //! 5. Released after the SSA pipeline completes
@@ -22,7 +22,7 @@
 //! once and forks are zero-cost (CoW memory sharing).
 //!
 //! [`DecryptionPass`]: crate::deobfuscation::passes::DecryptionPass
-//! [`OpaqueFieldPredicatePass`]: crate::deobfuscation::passes::opaquefields::OpaqueFieldPredicatePass
+//! [`OpaqueFieldPredicatePass`]: crate::deobfuscation::OpaqueFieldPredicatePass
 //! [`AnalysisContext::template_pool`]: crate::deobfuscation::context::AnalysisContext::template_pool
 
 use std::{
@@ -34,14 +34,12 @@ use cowfile::CowFile;
 use log::debug;
 
 use crate::{
-    deobfuscation::{
-        config::EngineConfig, context::HookFactory, statemachine::StateMachineProvider,
-    },
+    deobfuscation::{config::EngineConfig, context::HookFactory},
     emulation::{
         EmValue, EmulationError, EmulationOutcome, EmulationProcess, Hook, HookPriority,
         PreHookResult, ProcessBuilder,
     },
-    metadata::{tables::ModuleRaw, token::Token},
+    metadata::{streams::SharedStr, tables::ModuleRaw, token::Token},
     CilObject, Error, Result,
 };
 
@@ -70,9 +68,6 @@ pub struct EmulationTemplatePool {
     /// Warmup methods from technique initialization.
     warmup_methods: Arc<boxcar::Vec<(Token, Vec<EmValue>)>>,
 
-    /// State machine providers.
-    statemachine_providers: Arc<boxcar::Vec<Arc<dyn StateMachineProvider>>>,
-
     /// Engine config.
     config: EngineConfig,
 }
@@ -80,7 +75,7 @@ pub struct EmulationTemplatePool {
 impl EmulationTemplatePool {
     /// Creates a new template pool.
     ///
-    /// Does **not** perform warmup — call [`warmup()`](Self::warmup) separately.
+    /// Does **not** perform warmup - call [`warmup()`](Self::warmup) separately.
     ///
     /// # Arguments
     ///
@@ -88,7 +83,6 @@ impl EmulationTemplatePool {
     /// * `original_pe_cow` - Forked CowFile of the original PE bytes (for VirtualFs)
     /// * `hooks` - Hook factories from technique detection
     /// * `warmup_methods` - Methods to execute during warmup
-    /// * `statemachine_providers` - State machine providers for order-dependent decryption
     /// * `config` - Engine configuration
     #[must_use]
     pub fn new(
@@ -96,7 +90,6 @@ impl EmulationTemplatePool {
         original_pe_cow: CowFile,
         hooks: Arc<boxcar::Vec<HookFactory>>,
         warmup_methods: Arc<boxcar::Vec<(Token, Vec<EmValue>)>>,
-        statemachine_providers: Arc<boxcar::Vec<Arc<dyn StateMachineProvider>>>,
         config: EngineConfig,
     ) -> Self {
         Self {
@@ -105,7 +98,6 @@ impl EmulationTemplatePool {
             original_pe_cow,
             hooks,
             warmup_methods,
-            statemachine_providers,
             config,
         }
     }
@@ -115,8 +107,8 @@ impl EmulationTemplatePool {
     /// Creates an [`EmulationProcess`] with all technique hooks, maps the
     /// original PE into the virtual filesystem, then runs:
     ///
-    /// 1. `<Module>.cctor` — initializes delegate proxy tables, opaque fields, etc.
-    /// 2. All registered warmup methods — multi-pass fork-based warmup handles
+    /// 1. `<Module>.cctor` - initializes delegate proxy tables, opaque fields, etc.
+    /// 2. All registered warmup methods - multi-pass fork-based warmup handles
     ///    dependency chains between .cctors and decryptor init calls
     ///
     /// After warmup, the template is stored and subsequent [`fork()`](Self::fork)
@@ -125,7 +117,7 @@ impl EmulationTemplatePool {
     /// # Errors
     ///
     /// Returns an error if process creation fails. Warmup method failures are
-    /// tolerated (partial state is adopted) — only process creation failure is fatal.
+    /// tolerated (partial state is adopted) - only process creation failure is fatal.
     pub fn warmup(&self) -> Result<()> {
         let assembly = self
             .assembly
@@ -135,14 +127,9 @@ impl EmulationTemplatePool {
             .ok_or_else(|| Error::Deobfuscation("template pool assembly already released".into()))?
             .clone();
 
-        let warmup_instruction_limit = self.config.emulation.max_instructions;
-
         let mut builder = ProcessBuilder::new()
             .assembly_arc(assembly.clone())
-            .with_max_instructions(warmup_instruction_limit)
-            .with_max_call_depth(100)
-            .with_timeout_ms(self.config.emulation.warmup_timeout.as_millis() as u64)
-            .with_max_heap_bytes(512 * 1024 * 1024)
+            .with_limits(self.config.emulation.limits.clone())
             .name("template_pool");
 
         // Add tracing configuration if provided
@@ -170,42 +157,43 @@ impl EmulationTemplatePool {
                 .pre(|_ctx, _thread| PreHookResult::Bypass(Some(EmValue::I32(1)))),
         );
 
-        // Map original PE as virtual file via CowFile::fork().
-        // For mmap-backed: re-opens the same file (zero-copy, OS shares pages).
-        // For vec-backed: clones the data.
+        // Map the original PE as a virtual file once, via CowFile::fork(): for mmap-backed
+        // files this re-opens the same file (zero-copy, OS shares pages), for vec-backed ones
+        // it clones the data. The original filename and the .NET module name (what
+        // Assembly.Location returns and anti-tamper checks open) name the same file, so they
+        // are aliases of it rather than further copies, each forked with every process.
+        const PE_PATH: &str = "assembly.exe";
         if let Ok(pe_cow) = self.original_pe_cow.fork() {
-            builder = builder.with_virtual_file_cow("assembly.exe", pe_cow);
-        }
+            builder = builder.with_virtual_file_cow(PE_PATH, pe_cow);
 
-        // Also map under the original filename if known
-        if let Some(path) = self.original_pe_cow.source_path() {
-            if let Some(filename) = path.file_name() {
-                if let Ok(pe_cow2) = self.original_pe_cow.fork() {
-                    builder = builder.with_virtual_file_cow(&filename.to_string_lossy(), pe_cow2);
-                }
+            if let Some(filename) = self
+                .original_pe_cow
+                .source_path()
+                .and_then(|path| path.file_name())
+            {
+                builder = builder.with_virtual_file_alias(&filename.to_string_lossy(), PE_PATH);
             }
-        }
 
-        // Also map under the .NET module name (e.g., "ClassLibrary4.dll").
-        // This is what Assembly.Location returns and what anti-tamper checks open.
-        // Try owned metadata first, fall back to raw Module table for obfuscated binaries.
-        let module_name = assembly.module().map(|m| m.name.clone()).or_else(|| {
-            let tables = assembly.tables()?;
-            let strings = assembly.strings()?;
-            let module_table = tables.table::<ModuleRaw>()?;
-            // Module is RID 1 by definition (ECMA-335 II.22.30).
-            let module_row = module_table.get(1).ok().flatten()?;
-            strings.get(module_row.name as usize).ok().map(String::from)
-        });
-        if let Some(ref name) = module_name {
-            if let Ok(pe_cow) = self.original_pe_cow.fork() {
-                builder = builder.with_virtual_file_cow(name, pe_cow);
+            // Try owned metadata first, fall back to raw Module table for obfuscated binaries.
+            let module_name = assembly.module().map(|m| m.name.clone()).or_else(|| {
+                let tables = assembly.tables()?;
+                let strings = assembly.strings()?;
+                let module_table = tables.table::<ModuleRaw>()?;
+                // Module is RID 1 by definition (ECMA-335 II.22.30).
+                let module_row = module_table.get(1).ok().flatten()?;
+                strings
+                    .get(module_row.name as usize)
+                    .ok()
+                    .map(SharedStr::from)
+            });
+            if let Some(ref name) = module_name {
+                builder = builder.with_virtual_file_alias(name, PE_PATH);
             }
         }
 
         let mut process = builder.build()?;
 
-        // Run Module.cctor first — initializes delegate proxy tables, opaque
+        // Run Module.cctor first - initializes delegate proxy tables, opaque
         // fields, and other runtime state that decryptors depend on.
         if let Some(module_cctor) = assembly.types().module_cctor() {
             let fork = process.fork()?;
@@ -219,14 +207,14 @@ impl EmulationTemplatePool {
                 }
                 Ok(outcome) => {
                     debug!(
-                        "Template warmup: <Module>.cctor did not complete: {} — adopting partial state",
+                        "Template warmup: <Module>.cctor did not complete: {} - adopting partial state",
                         outcome
                     );
                     process = fork;
                 }
                 Err(e) => {
                     debug!(
-                        "Template warmup: <Module>.cctor error: {} — adopting partial state",
+                        "Template warmup: <Module>.cctor error: {} - adopting partial state",
                         e
                     );
                     process = fork;
@@ -265,8 +253,7 @@ impl EmulationTemplatePool {
 
         match *guard {
             Some(ref template) => {
-                let limits = self.config.emulation.execution_limits(template.limits());
-                template.fork_with_limits(limits)
+                template.fork_with_limits(self.config.emulation.execution_limits())
             }
             None => Err(Error::Emulation(Box::new(EmulationError::InternalError {
                 description: "template pool not warmed up".to_string(),
@@ -290,12 +277,12 @@ impl EmulationTemplatePool {
     /// The forked process with targeted warmup applied, or `None` if
     /// the template is unavailable.
     ///
-    /// [`OpaqueFieldPredicatePass`]: crate::deobfuscation::passes::opaquefields::OpaqueFieldPredicatePass
+    /// [`OpaqueFieldPredicatePass`]: crate::deobfuscation::OpaqueFieldPredicatePass
     pub fn fork_for_targeted_warmup(&self, cctors: &[Token]) -> Option<EmulationProcess> {
         let guard = self.template.read().ok()?;
         let template = guard.as_ref()?;
         // Targeted warmup runs extra `.cctor`s on the fork, so it gets the warmup budget
-        // rather than the per-method one — that is what the longer budget is *for*.
+        // rather than the per-method one - that is what the longer budget is *for*.
         let mut process = match template.fork() {
             Ok(p) => p,
             Err(e) => {
@@ -338,8 +325,10 @@ impl EmulationTemplatePool {
                     }
                     Ok(EmulationOutcome::UnhandledException { instructions, .. }) => {
                         debug!(
-                            "Targeted warmup: .cctor 0x{:08X} threw after {} instructions — adopting partial state (pass {})",
-                            cctor.value(), instructions, pass
+                            "Targeted warmup: .cctor 0x{:08X} threw after {} instructions - adopting partial state (pass {})",
+                            cctor.value(),
+                            instructions,
+                            pass
                         );
                         process = fork;
                         permanently_failed.insert(*cctor);
@@ -347,8 +336,10 @@ impl EmulationTemplatePool {
                     }
                     Ok(EmulationOutcome::LimitReached { ref limit, .. }) => {
                         debug!(
-                            "Targeted warmup: .cctor 0x{:08X} hit limit: {} — adopting partial state (pass {})",
-                            cctor.value(), limit, pass
+                            "Targeted warmup: .cctor 0x{:08X} hit limit: {} - adopting partial state (pass {})",
+                            cctor.value(),
+                            limit,
+                            pass
                         );
                         process = fork;
                         permanently_failed.insert(*cctor);
@@ -403,12 +394,6 @@ impl EmulationTemplatePool {
     #[must_use]
     pub fn assembly(&self) -> Option<Arc<CilObject>> {
         self.assembly.read().ok()?.clone()
-    }
-
-    /// Returns a reference to the state machine providers.
-    #[must_use]
-    pub fn statemachine_providers(&self) -> &Arc<boxcar::Vec<Arc<dyn StateMachineProvider>>> {
-        &self.statemachine_providers
     }
 
     /// Releases all references held by the pool.
@@ -472,8 +457,10 @@ impl EmulationTemplatePool {
                     }
                     Ok(EmulationOutcome::UnhandledException { instructions, .. }) => {
                         debug!(
-                            "Template warmup: 0x{:08X} threw after {} instructions — adopting partial state (pass {})",
-                            warmup_token.value(), instructions, pass
+                            "Template warmup: 0x{:08X} threw after {} instructions - adopting partial state (pass {})",
+                            warmup_token.value(),
+                            instructions,
+                            pass
                         );
                         *process = fork;
                         permanently_failed.insert(*warmup_token);
@@ -481,8 +468,10 @@ impl EmulationTemplatePool {
                     }
                     Ok(EmulationOutcome::LimitReached { ref limit, .. }) => {
                         debug!(
-                            "Template warmup: 0x{:08X} hit limit: {} — adopting partial state (pass {})",
-                            warmup_token.value(), limit, pass
+                            "Template warmup: 0x{:08X} hit limit: {} - adopting partial state (pass {})",
+                            warmup_token.value(),
+                            limit,
+                            pass
                         );
                         *process = fork;
                         permanently_failed.insert(*warmup_token);
@@ -509,8 +498,10 @@ impl EmulationTemplatePool {
                         );
                         if is_resource_limit {
                             debug!(
-                                "Template warmup: 0x{:08X} hit resource limit: {} — adopting partial state (pass {})",
-                                warmup_token.value(), e, pass
+                                "Template warmup: 0x{:08X} hit resource limit: {} - adopting partial state (pass {})",
+                                warmup_token.value(),
+                                e,
+                                pass
                             );
                             *process = fork;
                             permanently_failed.insert(*warmup_token);

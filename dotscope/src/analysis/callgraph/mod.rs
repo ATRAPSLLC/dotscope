@@ -24,12 +24,15 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```
 //! use dotscope::analysis::CallGraph;
 //! use dotscope::CilObject;
 //!
-//! let assembly = CilObject::from_path("assembly.dll")?;
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
 //! let call_graph = CallGraph::build(&assembly)?;
+//! # let Some(&method_token) = call_graph.topological_order().first() else {
+//! #     return Ok(());
+//! # };
 //!
 //! // Find all methods called by a specific method
 //! for callee in call_graph.callees(method_token) {
@@ -44,6 +47,7 @@
 //! // Iterate in topological order (bottom-up)
 //! for method in call_graph.topological_order() {
 //!     // Process callees before callers
+//!     let _ = method;
 //! }
 //!
 //! // Check for recursion
@@ -52,6 +56,7 @@
 //!         println!("Recursive method: {:?}", method);
 //!     }
 //! }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 mod graph;

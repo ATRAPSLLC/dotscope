@@ -133,7 +133,9 @@ use dashmap::DashMap;
 use crate::{
     metadata::{
         method::MethodRc,
+        streams::SharedStr,
         tables::{AssemblyRef, AssemblyRefRc, File, FileRc, Module, ModuleRef, ModuleRefRc},
+        texthash::TextHash,
         token::Token,
         typesystem::{CilTypeRc, CilTypeReference},
     },
@@ -361,9 +363,9 @@ pub struct Import {
     /// The metadata token identifying this import in the assembly.
     pub token: Token,
     /// The name of the imported entity (may differ from original export name).
-    pub name: String,
+    pub name: SharedStr,
     /// The namespace of the imported entity (empty for global namespace).
-    pub namespace: String,
+    pub namespace: SharedStr,
     /// The specific method or type being imported.
     pub import: ImportType,
     /// Identifier for the source of this import (avoids reference cycles).
@@ -402,11 +404,23 @@ impl Import {
     ///
     /// This method is thread-safe and can be called concurrently from multiple threads.
     #[must_use]
-    pub fn fullname(&self) -> String {
+    pub fn fullname(&self) -> SharedStr {
         if self.namespace.is_empty() {
             self.name.clone()
         } else {
-            format!("{}.{}", self.namespace, self.name)
+            SharedStr::from(format!("{}.{}", self.namespace, self.name))
+        }
+    }
+
+    /// The [`TextHash`] of [`Self::fullname`], from the shared names without joining them.
+    fn fullname_hash(&self) -> TextHash {
+        if self.namespace.is_empty() {
+            self.name.text_hash()
+        } else {
+            self.namespace
+                .text_hash()
+                .then(TextHash::of(b"."))
+                .then(self.name.text_hash())
         }
     }
 }
@@ -543,11 +557,11 @@ pub struct Imports {
     data: SkipMap<Token, ImportRc>,
 
     /// Index for lookup by simple name
-    by_name: DashMap<String, Vec<Token>>,
+    by_name: DashMap<SharedStr, Vec<Token>>,
     /// Index for lookup by full qualified name
-    by_fullname: DashMap<String, Vec<Token>>,
+    by_fullname: DashMap<TextHash, Vec<Token>>,
     /// Index for lookup by namespace
-    by_namespace: DashMap<String, Vec<Token>>,
+    by_namespace: DashMap<SharedStr, Vec<Token>>,
 
     /// Group imports by their source assembly/module
     by_source: DashMap<ImportSourceId, Vec<Token>>,
@@ -777,7 +791,7 @@ impl Imports {
     /// let token = Token::new(0x0A000001);
     ///
     /// imports.add_method(
-    ///     "GetProcessId".to_string(),
+    ///     "GetProcessId".into(),
     ///     &token,
     ///     method,
     ///     &kernel32
@@ -796,7 +810,7 @@ impl Imports {
     /// This method is thread-safe and can be called concurrently from multiple threads.
     pub fn add_method(
         &self,
-        name: String,
+        name: SharedStr,
         token: &Token,
         method: MethodRc,
         module: &ModuleRefRc,
@@ -810,7 +824,7 @@ impl Imports {
         let import_rc = Arc::new(Import {
             token: *token,
             name,
-            namespace: String::new(),
+            namespace: SharedStr::default(),
             import: ImportType::Method(method),
             source_id,
         });
@@ -830,7 +844,7 @@ impl Imports {
             .push(import_rc.token);
 
         self.by_fullname
-            .entry(import_rc.fullname())
+            .entry(import_rc.fullname_hash())
             .or_default()
             .push(import_rc.token);
 
@@ -1076,7 +1090,7 @@ impl Imports {
     /// }
     /// ```
     pub fn by_fullname(&self, name: &str) -> Option<ImportRc> {
-        if let Some(tokens) = self.by_fullname.get(name) {
+        if let Some(tokens) = self.by_fullname.get(&TextHash::of(name.as_bytes())) {
             if let Some(first) = tokens.first() {
                 if let Some(token) = self.data.get(first) {
                     return Some(token.value().clone());
@@ -1091,7 +1105,7 @@ impl Imports {
     /// ## Arguments
     /// * 'name' - The imported name to look for
     pub fn all_by_fullname(&self, name: &str) -> Vec<ImportRc> {
-        if let Some(tokens) = self.by_fullname.get(name) {
+        if let Some(tokens) = self.by_fullname.get(&TextHash::of(name.as_bytes())) {
             return tokens
                 .iter()
                 .filter_map(|token| self.data.get(token).map(|entry| entry.value().clone()))
@@ -1278,10 +1292,9 @@ impl Clone for Imports {
                 .or_default()
                 .push(token);
 
-            let fullname = import.fullname();
             new_imports
                 .by_fullname
-                .entry(fullname)
+                .entry(import.fullname_hash())
                 .or_default()
                 .push(token);
 
@@ -1383,7 +1396,7 @@ pub trait ImportContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::{
+    use crate::testkit::{
         create_assembly_ref, create_cil_type, create_file, create_method, create_module_ref,
     };
 
@@ -1395,12 +1408,7 @@ mod tests {
         let token = Token::new(0x0A000001);
 
         imports
-            .add_method(
-                "GetProcessId".to_string(),
-                &token,
-                method.clone(),
-                &module_ref,
-            )
+            .add_method("GetProcessId".into(), &token, method.clone(), &module_ref)
             .unwrap();
 
         assert_eq!(imports.len(), 1);
@@ -1650,7 +1658,13 @@ mod tests {
 
         // Verify it was added as a nested type
         assert_eq!(type_ref.nested_types.count(), 1);
-        assert_eq!(type_ref.nested_types[0].token().unwrap(), nested_token);
+        assert_eq!(
+            type_ref
+                .nested_types
+                .get(0)
+                .and_then(|nested| nested.token()),
+            Some(nested_token)
+        );
     }
 
     #[test]
@@ -1668,20 +1682,15 @@ mod tests {
         let token3 = Token::new(0x0A000003);
 
         imports
-            .add_method("GetProcessId".to_string(), &token1, method1, &module_ref)
+            .add_method("GetProcessId".into(), &token1, method1, &module_ref)
             .unwrap();
 
         imports
-            .add_method(
-                "GetCurrentProcess".to_string(),
-                &token2,
-                method2,
-                &module_ref,
-            )
+            .add_method("GetCurrentProcess".into(), &token2, method2, &module_ref)
             .unwrap();
 
         imports
-            .add_method("ExitProcess".to_string(), &token3, method3, &module_ref)
+            .add_method("ExitProcess".into(), &token3, method3, &module_ref)
             .unwrap();
 
         assert_eq!(imports.len(), 3);
@@ -1732,12 +1741,7 @@ mod tests {
         let method_token = Token::new(0x0A000001);
         let method = create_method("GetProcessId");
         imports
-            .add_method(
-                "GetProcessId".to_string(),
-                &method_token,
-                method,
-                &module_ref,
-            )
+            .add_method("GetProcessId".into(), &method_token, method, &module_ref)
             .unwrap();
 
         // Test that we can iterate over all imports

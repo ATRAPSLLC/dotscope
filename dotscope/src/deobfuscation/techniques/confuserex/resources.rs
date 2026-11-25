@@ -40,7 +40,7 @@ use crate::{
     cilassembly::GeneratorConfig,
     compiler::{EventKind, EventLog},
     deobfuscation::techniques::{
-        confuserex::hooks::create_lzma_hook, Detection, Detections, Evidence, Technique,
+        confuserex::hooks::create_lzma_hook, Detection, Evidence, Technique, TechniqueCapability,
         TechniqueCategory, WorkingAssembly,
     },
     emulation::{EmulationOutcome, ProcessBuilder},
@@ -81,6 +81,10 @@ impl Technique for ConfuserExResources {
 
     fn category(&self) -> TechniqueCategory {
         TechniqueCategory::Protection
+    }
+
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![TechniqueCapability::ByteTransform]
     }
 
     fn detect(&self, assembly: &CilObject) -> Detection {
@@ -166,8 +170,7 @@ impl Technique for ConfuserExResources {
     fn byte_transform(
         &self,
         assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
 
@@ -241,8 +244,18 @@ impl Technique for ConfuserExResources {
             .iter()
             .map(|r| r.name.as_str())
             .collect();
-        let rids_to_remove = find_manifest_resources_by_name(&cil_assembly, &names_to_insert);
-        for rid in rids_to_remove {
+        let replaced = find_manifest_resources_by_name(&cil_assembly, &names_to_insert);
+        // The rows being replaced are in the application's own order, which
+        // `GetManifestResourceNames` returns; the hidden assembly's order is
+        // ConfuserEx's. A resource no row named goes after them, as found.
+        let position = |name: &str| {
+            replaced
+                .iter()
+                .position(|(_, replaced_name)| replaced_name == name)
+                .unwrap_or(usize::MAX)
+        };
+        extracted_resources.sort_by_key(|resource| position(&resource.name));
+        for (rid, _) in replaced {
             if let Err(e) = cil_assembly.table_row_remove(TableId::ManifestResource, rid) {
                 log::warn!("Failed to remove existing ManifestResource row {rid}: {e}");
             }
@@ -361,7 +374,7 @@ fn try_emulate_resource_handler(
             }
             if let Some(resource_data) = hidden_resources.get_data(manifest) {
                 resources.push(ExtractedResource {
-                    name: manifest.name.clone(),
+                    name: manifest.name.to_string(),
                     flags: manifest.flags,
                     data: resource_data.to_vec(),
                 });
@@ -372,11 +385,12 @@ fn try_emulate_resource_handler(
     Ok(resources)
 }
 
-/// Finds ManifestResource row IDs matching any of the given names.
+/// Finds the ManifestResource rows named by any of the given names, as
+/// `(row id, name)` in table order.
 fn find_manifest_resources_by_name(
     cil_assembly: &crate::cilassembly::CilAssembly,
     names: &std::collections::HashSet<&str>,
-) -> Vec<u32> {
+) -> Vec<(u32, String)> {
     let view = cil_assembly.view();
     let Some(strings) = view.strings() else {
         return Vec::new();
@@ -396,7 +410,7 @@ fn find_manifest_resources_by_name(
                 .get(row.name as usize)
                 .ok()
                 .filter(|name| names.contains(*name))
-                .map(|_| row.rid)
+                .map(|name| (row.rid, name.to_string()))
         })
         .collect()
 }
@@ -409,16 +423,15 @@ fn resolve_call_name(assembly: &CilObject, token: Token) -> Option<String> {
         // MethodDef
         0x06 => {
             let method = assembly.method(&token).ok()?;
-            Some(method.name.clone())
+            Some(method.name.to_string())
         }
         // MemberRef
         0x0A => {
             let member_ref = assembly.member_ref(&token)?;
-            let type_name = member_ref
-                .declaredby
-                .fullname()
-                .unwrap_or_else(|| "Unknown".to_string());
-            Some(format!("{}::{}", type_name, member_ref.name))
+            Some(match member_ref.declaredby.fullname() {
+                Some(type_name) => format!("{type_name}::{}", member_ref.name),
+                None => format!("Unknown::{}", member_ref.name),
+            })
         }
         _ => None,
     }
@@ -431,12 +444,12 @@ mod tests {
             confuserex::resources::{ConfuserExResources, ResourceFindings},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_resources.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_resources.exe");
 
         let technique = ConfuserExResources;
         let detection = technique.detect(&assembly);
@@ -462,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = ConfuserExResources;
         let detection = technique.detect(&assembly);

@@ -173,11 +173,18 @@ pub struct TableInfo {
     /// When `true`, all blob heap references use 4 bytes; when `false`, 2 bytes.
     is_large_index_blob: bool,
 
+    /// Every index column is four bytes wide, whatever the row counts and heap sizes say.
+    ///
+    /// The CLR reads uncompressed (`#-`) tables this way when the stream directory also has
+    /// a `#JTD` stream, its "minimal delta" marker. The stream directory decides it, so the
+    /// caller of [`TableInfo::new`] passes it; the tables header does not record it.
+    wide_columns: bool,
+
     /// Bit mask of the tables this `TableInfo` actually describes.
     ///
     /// [`Self::row_count`] cannot answer this: it returns 0 both for a table that is present
     /// and empty and for one this `TableInfo` says nothing about. Those are different facts,
-    /// and code that bounds a row against `row_count` needs the second one — a `TableInfo`
+    /// and code that bounds a row against `row_count` needs the second one - a `TableInfo`
     /// reconstructed for a writer round-trip or a unit test describes only the tables it was
     /// given, so treating "not described" as "has no rows" rejects valid data.
     declared: u64,
@@ -229,6 +236,8 @@ impl TableInfo {
     ///
     /// * `data` - Raw metadata tables header bytes starting from the tables header
     /// * `valid_bitvec` - 64-bit mask indicating which tables are present (bit N = `TableId` N)
+    /// * `wide_columns` - Every index column is four bytes wide, as the CLR reads uncompressed
+    ///   (`#-`) tables beside a `#JTD` stream (see the `wide_columns` field)
     ///
     /// ## Returns
     ///
@@ -241,13 +250,41 @@ impl TableInfo {
     /// ## Reference
     ///
     /// * [ECMA-335 Partition II, Section 24.2.6](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - #~ Stream
-    pub fn new(data: &[u8], valid_bitvec: u64) -> Result<Self> {
+    pub fn new(data: &[u8], valid_bitvec: u64, wide_columns: bool) -> Result<Self> {
+        Self::read(data, valid_bitvec, wide_columns, None)
+    }
+
+    /// Reads a Portable PDB's tables header: its own tables' row counts from `data`, and the
+    /// row counts of the assembly tables its columns index from `external_rows` (the `#Pdb`
+    /// stream's, by [`TableId`]), so an index into a type-system table the PDB does not hold
+    /// is as wide as that table needs.
+    ///
+    /// # Errors
+    ///
+    /// As [`TableInfo::new`].
+    pub fn with_external_rows(
+        data: &[u8],
+        valid_bitvec: u64,
+        external_rows: &[u32; 64],
+    ) -> Result<Self> {
+        Self::read(data, valid_bitvec, false, Some(external_rows))
+    }
+
+    /// Reads the row counts `data` declares, and takes those of the tables it does not
+    /// declare from `external_rows`.
+    fn read(
+        data: &[u8],
+        valid_bitvec: u64,
+        wide_columns: bool,
+        external_rows: Option<&[u32; 64]>,
+    ) -> Result<Self> {
         // Reject bits that name no table before reading a single row count.
         //
         // `TableId` covers 0x00-0x2C and 0x30-0x37; the gaps at 0x2D-0x2F and 0x38-0x3F have no
         // variant. The loop below consumes a `u32` only for bits that map to a known `TableId`,
-        // but `TablesHeader::from` computes where table data starts as
-        // `24 + valid_bitvec.count_ones() * 4` — which counts them. A single gap bit therefore
+        // but `TablesHeader::from` computes where table data starts from
+        // `valid_bitvec.count_ones()` row-count words (plus the ExtraData word when HeapSizes
+        // sets 0x40) - which counts them. A single gap bit therefore
         // makes the two disagree about how many row-count words the header holds, shifting
         // every subsequent row count onto the wrong table and mis-locating the table data.
         // Rejecting the mask keeps them in agreement by construction, rather than requiring
@@ -289,6 +326,19 @@ impl TableInfo {
             *slot = TableRowInfo::new(row_count);
         }
 
+        // A Portable PDB's columns index the assembly's tables, which the PDB does not hold
+        if let Some(external_rows) = external_rows {
+            for table_id in TableId::iter() {
+                let rows = external_rows.get(table_id as usize).copied().unwrap_or(0);
+                if rows != 0 && valid_bitvec & (1 << table_id as usize) == 0 {
+                    let slot = table_info
+                        .get_mut(table_id as usize)
+                        .ok_or(out_of_bounds_error!())?;
+                    *slot = TableRowInfo::new(rows);
+                }
+            }
+        }
+
         let heap_size_flags = read_le::<u8>(data.get(6..).ok_or(out_of_bounds_error!())?)?;
         let mut table_info = TableInfo {
             rows: table_info,
@@ -299,6 +349,7 @@ impl TableInfo {
             is_large_index_str: heap_size_flags & 1 == 1,
             is_large_index_guid: heap_size_flags & 2 == 2,
             is_large_index_blob: heap_size_flags & 4 == 4,
+            wide_columns,
         };
 
         table_info.calculate_coded_index_bits();
@@ -306,7 +357,7 @@ impl TableInfo {
         Ok(table_info)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     /// Special constructor for unit tests with controlled table configuration.
     ///
     /// This method allows precise control over table sizes and heap configurations
@@ -330,16 +381,22 @@ impl TableInfo {
         large_guid: bool,
     ) -> Self {
         let mut table_info = TableInfo {
-            rows: vec![TableRowInfo::default(); TableId::CustomDebugInformation as usize + 1],
+            rows: vec![
+                TableRowInfo::default();
+                (TableId::CustomDebugInformation as usize).saturating_add(1)
+            ],
             declared: 0,
             coded_indexes: vec![0; CodedIndexType::COUNT],
             is_large_index_str: large_str,
             is_large_index_guid: large_guid,
             is_large_index_blob: large_blob,
+            wide_columns: false,
         };
 
         for valid_table in valid_tables {
-            table_info.rows[valid_table.0 as usize] = TableRowInfo::new(valid_table.1);
+            if let Some(row) = table_info.rows.get_mut(valid_table.0 as usize) {
+                *row = TableRowInfo::new(valid_table.1);
+            }
             table_info.declared |= 1u64 << (valid_table.0 as usize);
         }
 
@@ -362,7 +419,7 @@ impl TableInfo {
     /// │   (upper bits)      │(lower bits)│
     /// └─────────────────────┴────────────┘
     ///
-    /// Tag bits = ceil(log2(number_of_tables_in_union))
+    /// Tag bits = CodedIndexType::tag_bits (enough for every tag, unused ones included)
     /// Row bits = remaining bits
     /// ```
     ///
@@ -373,13 +430,9 @@ impl TableInfo {
     ///
     /// ## Returns
     ///
-    /// A tuple containing (`TableId`, `row_index`) where:
-    /// - `TableId` - The specific table identified by the tag
-    /// - `row_index` - The 1-based row index within that table
-    ///
-    /// ## Errors
-    ///
-    /// - [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] - Tag value exceeds the number of tables in the coded index union
+    /// `Some((table, row))`, or `None` when the tag is one this coded index assigns to no
+    /// table: a value past its last tag, or `CustomAttributeType`'s unused tags 0, 1 and 4.
+    /// The CLR reads such an index as a null reference.
     ///
     /// ## Reference
     ///
@@ -388,27 +441,11 @@ impl TableInfo {
         &self,
         value: u32,
         coded_index_type: CodedIndexType,
-    ) -> Result<(TableId, u32)> {
-        let tables = coded_index_type.tables();
-        // Calculate the number of bits needed for the tag
-        // This casting is intentional for the coded index calculation
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let tag_bits = (tables.len() as f32).log2().ceil() as u8;
+    ) -> Option<(TableId, u32)> {
+        let tag_bits = coded_index_type.tag_bits();
         let tag_mask = (1u32 << tag_bits).saturating_sub(1);
-
-        let tag = value & tag_mask;
-        let index = value >> tag_bits;
-
-        if tag as usize >= tables.len() {
-            return Err(out_of_bounds_error!());
-        }
-
-        let table = *tables.get(tag as usize).ok_or(out_of_bounds_error!())?;
-        Ok((table, index))
+        let table = coded_index_type.table_for_tag(value & tag_mask)?;
+        Some((table, value >> tag_bits))
     }
 
     /// Encodes a table identifier and row index into a coded index value.
@@ -453,43 +490,10 @@ impl TableInfo {
         row: u32,
         coded_index_type: CodedIndexType,
     ) -> Result<u32> {
-        // CustomAttributeType has a special encoding per ECMA-335 §II.24.2.6:
-        // The coded index uses 3 bits for the tag, but only tags 2 and 3 are valid:
-        // - Tag 2: MethodDef
-        // - Tag 3: MemberRef
-        // Tags 0, 1, 4-7 are "unused" but the tables array has placeholders.
-        // We must return the canonical tag, not the first position.
-        if coded_index_type == CodedIndexType::CustomAttributeType {
-            let tag: u32 = match table_id {
-                TableId::MethodDef => 2,
-                TableId::MemberRef => 3,
-                _ => return Err(out_of_bounds_error!()),
-            };
-            // CustomAttributeType uses 3 bits for the tag (5 entries -> ceil(log2(5)) = 3)
-            let encoded = row
-                .checked_shl(3)
-                .filter(|shifted| (shifted >> 3) == row)
-                .ok_or_else(|| {
-                    malformed_error!("Row {} does not fit a CustomAttributeType coded index", row)
-                })?;
-            return Ok(encoded | tag);
-        }
-
-        let tables = coded_index_type.tables();
-
-        let tag = tables
-            .iter()
-            .position(|&table| table == table_id)
+        let tag = coded_index_type
+            .tag_for_table(table_id)
             .ok_or(out_of_bounds_error!())?;
-
-        // Calculate the number of bits needed for the tag
-        // This casting is intentional for the coded index calculation
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let tag_bits = (tables.len() as f32).log2().ceil() as u8;
+        let tag_bits = coded_index_type.tag_bits();
 
         // Encode: (row << tag_bits) | tag
         //
@@ -506,10 +510,6 @@ impl TableInfo {
                     tag_bits
                 )
             })?;
-
-        // Tag cast is safe as table count is limited by metadata format
-        #[allow(clippy::cast_possible_truncation)]
-        let tag = tag as u32;
 
         Ok(encoded | tag)
     }
@@ -529,7 +529,7 @@ impl TableInfo {
     /// `false` if 2-byte indices are sufficient.
     #[must_use]
     pub fn is_large(&self, id: TableId) -> bool {
-        self.rows.get(id as usize).is_some_and(|info| info.is_large)
+        self.wide_columns || self.rows.get(id as usize).is_some_and(|info| info.is_large)
     }
 
     /// Returns whether the #String heap uses large (4-byte) indices.
@@ -542,7 +542,7 @@ impl TableInfo {
     /// `true` if string heap references use 4 bytes, `false` if they use 2 bytes.
     #[must_use]
     pub fn is_large_str(&self) -> bool {
-        self.is_large_index_str
+        self.wide_columns || self.is_large_index_str
     }
 
     /// Returns whether the #GUID heap uses large (4-byte) indices.
@@ -555,7 +555,7 @@ impl TableInfo {
     /// `true` if GUID heap references use 4 bytes, `false` if they use 2 bytes.
     #[must_use]
     pub fn is_large_guid(&self) -> bool {
-        self.is_large_index_guid
+        self.wide_columns || self.is_large_index_guid
     }
 
     /// Returns whether the #Blob heap uses large (4-byte) indices.
@@ -568,7 +568,7 @@ impl TableInfo {
     /// `true` if blob heap references use 4 bytes, `false` if they use 2 bytes.
     #[must_use]
     pub fn is_large_blob(&self) -> bool {
-        self.is_large_index_blob
+        self.wide_columns || self.is_large_index_blob
     }
 
     /// Returns the byte size of #String heap indices.
@@ -578,7 +578,7 @@ impl TableInfo {
     /// `4` if the string heap uses large indices, `2` otherwise.
     #[must_use]
     pub fn str_bytes(&self) -> u8 {
-        if self.is_large_index_str {
+        if self.is_large_str() {
             4
         } else {
             2
@@ -592,7 +592,7 @@ impl TableInfo {
     /// `4` if the GUID heap uses large indices, `2` otherwise.
     #[must_use]
     pub fn guid_bytes(&self) -> u8 {
-        if self.is_large_index_guid {
+        if self.is_large_guid() {
             4
         } else {
             2
@@ -606,7 +606,7 @@ impl TableInfo {
     /// `4` if the blob heap uses large indices, `2` otherwise.
     #[must_use]
     pub fn blob_bytes(&self) -> u8 {
-        if self.is_large_index_blob {
+        if self.is_large_blob() {
             4
         } else {
             2
@@ -653,6 +653,9 @@ impl TableInfo {
     /// The number of bits required to represent table indices (1-32).
     #[must_use]
     pub fn table_index_bits(&self, table_id: TableId) -> u8 {
+        if self.wide_columns {
+            return 32;
+        }
         self.rows.get(table_id as usize).map_or(1, |info| info.bits)
     }
 
@@ -670,7 +673,7 @@ impl TableInfo {
     /// Either `2` for small tables or `4` for large tables.
     #[must_use]
     pub fn table_index_bytes(&self, table_id: TableId) -> u8 {
-        let bits = self.rows.get(table_id as usize).map_or(1, |info| info.bits);
+        let bits = self.table_index_bits(table_id);
         if bits > 16 {
             4
         } else {
@@ -693,6 +696,9 @@ impl TableInfo {
     /// The number of bits required to represent coded indices of this type.
     #[must_use]
     pub fn coded_index_bits(&self, coded_index_type: CodedIndexType) -> u8 {
+        if self.wide_columns {
+            return 32;
+        }
         self.coded_indexes
             .get(coded_index_type as usize)
             .copied()
@@ -713,11 +719,7 @@ impl TableInfo {
     /// Either `2` for coded indices that fit in 16 bits or `4` for larger coded indices.
     #[must_use]
     pub fn coded_index_bytes(&self, coded_index_type: CodedIndexType) -> u8 {
-        let bits = self
-            .coded_indexes
-            .get(coded_index_type as usize)
-            .copied()
-            .unwrap_or(0);
+        let bits = self.coded_index_bits(coded_index_type);
         if bits > 16 {
             4
         } else {
@@ -739,21 +741,13 @@ impl TableInfo {
     ///
     /// The total number of bits required for coded indices of this type.
     fn calculate_coded_index_size(&self, coded_index_type: CodedIndexType) -> u8 {
-        let tables = coded_index_type.tables();
-        let max_bits = tables
+        let max_bits = coded_index_type
+            .tables()
             .iter()
             .map(|table| self.table_index_bits(*table))
             .max()
             .unwrap_or(1);
-
-        // Safe cast: tables.len() is limited by the enum size, log2 result is small
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let tag_bits = (tables.len() as f32).log2().ceil() as u8;
-        max_bits.saturating_add(tag_bits)
+        max_bits.saturating_add(coded_index_type.tag_bits())
     }
 
     /// Calculates and caches the bit sizes required for all coded index types.
@@ -783,10 +777,15 @@ impl TableInfo {
     ///
     /// ## Examples
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # use std::io::Write;
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let table_info = &assembly.tables().expect("a tables stream").info;
+    /// # let mut writer = Vec::new();
     /// let heap_sizes = table_info.heap_sizes();
     /// // Use in tables stream header serialization
     /// writer.write_all(&[heap_sizes])?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn heap_sizes(&self) -> u8 {
@@ -815,7 +814,7 @@ impl TableInfo {
     ///
     /// **A 0 here is ambiguous**: it means either "this table is present and empty" or "this
     /// `TableInfo` does not describe this table". Do not bound a row index against this value
-    /// without first asking [`Self::is_declared`] — a `TableInfo` built for a writer
+    /// without first asking [`Self::is_declared`] - a `TableInfo` built for a writer
     /// round-trip or a test describes only some tables, and rejecting rows that reference the
     /// others would reject valid metadata.
     #[must_use]
@@ -848,15 +847,18 @@ impl TableInfo {
     ///
     /// ## Example
     ///
-    /// ```rust,ignore
+    /// ```
     /// use std::collections::HashMap;
     /// use dotscope::metadata::tables::TableId;
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let original_info = &assembly.tables().expect("a tables stream").info;
     ///
     /// let mut new_counts = HashMap::new();
     /// new_counts.insert(TableId::TypeDef, 50);
     /// new_counts.insert(TableId::MethodDef, 100);
     ///
     /// let modified_info = original_info.with_modified_row_counts(new_counts.iter().map(|(k, v)| (*k, *v)));
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn with_modified_row_counts(
@@ -878,6 +880,7 @@ impl TableInfo {
             is_large_index_str: self.is_large_index_str,
             is_large_index_guid: self.is_large_index_guid,
             is_large_index_blob: self.is_large_index_blob,
+            wide_columns: false,
         };
 
         new_info.calculate_coded_index_bits();
@@ -889,7 +892,7 @@ impl TableInfo {
     /// ECMA-335 II.24.2.6 selects a 4-byte heap index once a heap exceeds 0xFFFF bytes. The
     /// widths on `self` come from the *input* file's `HeapSizes` byte and are copied verbatim by
     /// [`with_modified_row_counts`](Self::with_modified_row_counts), so a writer that appends
-    /// past the threshold — new type and method names, decrypted literals, rebuilt signatures —
+    /// past the threshold - new type and method names, decrypted literals, rebuilt signatures -
     /// keeps emitting 2-byte indices while resolving offsets that no longer fit them.
     ///
     /// Call this with the byte counts actually written for `#Strings`, `#GUID` and `#Blob`,
@@ -920,6 +923,7 @@ impl TableInfo {
             is_large_index_str: self.is_large_index_str || strings_bytes > LARGE_HEAP_THRESHOLD,
             is_large_index_guid: self.is_large_index_guid || guid_bytes > LARGE_HEAP_THRESHOLD,
             is_large_index_blob: self.is_large_index_blob || blob_bytes > LARGE_HEAP_THRESHOLD,
+            wide_columns: false,
         };
 
         new_info.calculate_coded_index_bits();
@@ -935,7 +939,7 @@ mod heap_size_tests {
     ///
     /// Without this the emitted `HeapSizes` byte keeps the *input* file's widths, every
     /// heap-reference field is written 2 bytes wide, and any offset at or above 0x10000 is
-    /// masked — producing a file that parses cleanly while its names and signatures point at
+    /// masked - producing a file that parses cleanly while its names and signatures point at
     /// arbitrary earlier heap positions.
     #[test]
     fn heap_index_widens_past_the_threshold() {
@@ -972,5 +976,27 @@ mod heap_size_tests {
         assert!(narrowed.is_large_str());
         assert!(narrowed.is_large_guid());
         assert!(narrowed.is_large_blob());
+    }
+
+    /// A Portable PDB's columns index the assembly's tables by the `#Pdb` stream's row
+    /// counts: past 65535 MethodDef rows a LocalScope's method index is four bytes, and the
+    /// tables the stream declares keep their own counts.
+    #[test]
+    fn external_rows_size_indexes_into_the_assembly() {
+        // A tables header declaring one LocalScope row
+        let mut header = vec![0u8; 24];
+        let valid = 1u64 << (TableId::LocalScope as u8);
+        header[8..16].copy_from_slice(&valid.to_le_bytes());
+        header.extend_from_slice(&1u32.to_le_bytes());
+
+        let mut external = [0u32; 64];
+        external[TableId::MethodDef as usize] = 70_000;
+        let wide = TableInfo::with_external_rows(&header, valid, &external).unwrap();
+        assert_eq!(wide.table_index_bytes(TableId::MethodDef), 4);
+        assert_eq!(wide.row_count(TableId::LocalScope), 1);
+
+        external[TableId::MethodDef as usize] = 100;
+        let narrow = TableInfo::with_external_rows(&header, valid, &external).unwrap();
+        assert_eq!(narrow.table_index_bytes(TableId::MethodDef), 2);
     }
 }

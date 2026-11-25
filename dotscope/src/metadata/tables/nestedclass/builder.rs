@@ -303,7 +303,7 @@ mod tests {
     use crate::{
         cilassembly::ChangeRefKind,
         metadata::tables::{TableId, TypeAttributes},
-        test::factories::table::assemblyref::get_test_assembly,
+        testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

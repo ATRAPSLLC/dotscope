@@ -108,15 +108,15 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        signatures::{SignatureMethod, SignatureMethodSpec},
+        signatures::{SignatureArray, SignatureMethod, SignatureMethodSpec},
+        streams::SharedStr,
         tables::MethodSpec,
         token::Token,
         typesystem::{
-            CilFlavor, CilModifier, CilPrimitiveKind, CilTypeRc, CilTypeReference,
-            CompleteTypeSpec, TypeRegistry, TypeSource,
+            ArrayDimensions, CilFlavor, CilModifier, CilPrimitiveKind, CilTypeRc, CilTypeReference,
+            CompleteTypeSpec, TypeRegistry, TypeResolver, TypeSource,
         },
     },
-    utils::{truncate_chars, LazyList},
     Error::TypeError,
     Result,
 };
@@ -409,8 +409,8 @@ impl TypeBuilder {
         self.current_type = Some(self.registry.get_or_create_type(&CompleteTypeSpec {
             token_init: self.token_init.take(),
             flavor: CilFlavor::Class,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+            namespace: namespace.into(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -466,8 +466,8 @@ impl TypeBuilder {
         self.current_type = Some(self.registry.get_or_create_type(&CompleteTypeSpec {
             token_init: self.token_init.take(),
             flavor: CilFlavor::ValueType,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+            namespace: namespace.into(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -524,8 +524,8 @@ impl TypeBuilder {
         self.current_type = Some(self.registry.get_or_create_type(&CompleteTypeSpec {
             token_init: self.token_init.take(),
             flavor: CilFlavor::Interface,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+            namespace: namespace.into(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -589,7 +589,7 @@ impl TypeBuilder {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::Pointer,
                 namespace: base_type.namespace.clone(),
-                name: format!("{}*", base_type.name),
+                name: format!("{}*", base_type.name).into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: Some(base_type),
@@ -614,7 +614,7 @@ impl TypeBuilder {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::ByRef,
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -643,7 +643,7 @@ impl TypeBuilder {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::Pinned,
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -719,15 +719,20 @@ impl TypeBuilder {
             let name = format!("{}[]", base_type.name);
             let namespace = base_type.namespace.clone();
 
+            // The flavor the resolver gives a vector (`SZARRAY`): one dimension, from zero.
+            // A rank-1 array stating no dimension is the general array `T[*]`.
             let array_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                 token_init: self.token_init.take(),
                 flavor: CilFlavor::Array {
                     element_type: Box::new(base_type.flavor().clone()),
                     rank: 1,
-                    dimensions: vec![],
+                    dimensions: vec![ArrayDimensions {
+                        size: None,
+                        lower_bound: None,
+                    }],
                 },
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -743,22 +748,21 @@ impl TypeBuilder {
         Ok(self)
     }
 
-    /// Create a multi-dimensional array of the current type
+    /// Create a general array (`ARRAY`) of the current type, named as the runtime names it:
+    /// `T[*]` at rank 1, which is not the vector [`array()`](Self::array) makes, `T[,]` at 2
     ///
     /// ## Arguments
     /// * 'rank' - The dimensions for the array
     ///
     /// # Errors
-    /// Returns an error if no current type is set or if the multi-dimensional array type cannot be created.
+    /// Returns an error if the rank is zero, if no current type is set or if the array type
+    /// cannot be created.
     pub fn multi_dimensional_array(mut self, rank: u32) -> Result<Self> {
+        if rank == 0 {
+            return Err(TypeError("an array has one dimension or more".to_string()));
+        }
         if let Some(base_type) = self.current_type.take() {
-            let dimension_part = if rank <= 1 {
-                "[]".to_string()
-            } else {
-                format!("[{}]", ",".repeat((rank as usize).saturating_sub(1)))
-            };
-
-            let name = format!("{}{}", base_type.name, dimension_part);
+            let name = format!("{}[{}]", base_type.name, SignatureArray::rank_bounds(rank));
             let namespace = base_type.namespace.clone();
 
             let array_type = self.registry.get_or_create_type(&CompleteTypeSpec {
@@ -769,7 +773,7 @@ impl TypeBuilder {
                     dimensions: vec![],
                 },
                 namespace: namespace.clone(),
-                name,
+                name: name.into(),
                 source: self.source.clone(),
                 generic_args: None,
                 base_type: None,
@@ -793,15 +797,15 @@ impl TypeBuilder {
     /// # Errors
     /// Returns an error if the function pointer type cannot be created.
     pub fn function_pointer(mut self, signature: SignatureMethod) -> Result<Self> {
-        let name = Self::format_fnptr_name(&signature);
+        let name = TypeResolver::format_fnptr_name(&signature);
 
         let fn_ptr_type = self.registry.get_or_create_type(&CompleteTypeSpec {
             token_init: self.token_init.take(),
             flavor: CilFlavor::FnPtr {
                 signature: Box::new(signature),
             },
-            namespace: String::new(),
-            name,
+            namespace: SharedStr::default(),
+            name: name.into(),
             source: self.source.clone(),
             generic_args: None,
             base_type: None,
@@ -870,21 +874,22 @@ impl TypeBuilder {
         Ok(self)
     }
 
-    /// Create a generic instance of the current type
+    /// Create a generic instance of the current type, named as the type is and nested where it
+    /// is.
     ///
     /// ## Arguments
     /// * `arg_count`   - Argument count for the generic instance
     /// * `arg_builder` - Builder function for the arguments
     ///
     /// # Errors
-    /// Returns an error if no current type is set, if the argument builder fails,
-    /// or if the generic instance type cannot be created.
+    /// Returns an error if the argument builder fails or builds other than `arg_count`
+    /// arguments, or if the generic instance type cannot be created.
     pub fn generic_instance<F>(mut self, arg_count: usize, arg_builder: F) -> Result<Self>
     where
         F: FnOnce(Arc<TypeRegistry>) -> Result<Vec<CilTypeRc>>,
     {
         if let Some(base_type) = self.current_type.take() {
-            let name = Self::format_generic_name(&base_type.name, arg_count);
+            let name = base_type.name.clone();
             let namespace = base_type.namespace.clone();
             let generic_type = self.registry.get_or_create_type(&CompleteTypeSpec {
                 token_init: self.token_init.take(),
@@ -898,6 +903,13 @@ impl TypeBuilder {
             })?;
 
             let args = arg_builder(self.registry.clone())?;
+            if args.len() != arg_count {
+                return Err(malformed_error!(
+                    "Generic instance of {} takes {arg_count} arguments, {} were built",
+                    base_type.name,
+                    args.len()
+                ));
+            }
             if !args.is_empty() {
                 // For type-level generic instances, create MethodSpec instances that wrap the resolved types
                 for (index, arg) in args.iter().enumerate() {
@@ -922,7 +934,7 @@ impl TypeBuilder {
                         instantiation: SignatureMethodSpec {
                             generic_args: vec![],
                         },
-                        custom_attributes: LazyList::new(),
+                        custom_attributes: Default::default(),
                         generic_args: {
                             let type_ref_list = Arc::new(boxcar::Vec::with_capacity(1));
                             type_ref_list.push(arg.clone().into());
@@ -932,71 +944,12 @@ impl TypeBuilder {
                     generic_type.generic_args.push(method_spec);
                 }
             }
-
-            generic_type
-                .base
-                .set(base_type.into())
-                .map_err(|_| malformed_error!("Generic type base already set"))?;
+            if let Some(enclosing) = base_type.enclosing_type.get() {
+                let _ = generic_type.set_enclosing_type(enclosing);
+            }
             self.current_type = Some(generic_type);
         }
         Ok(self)
-    }
-
-    /// Formats a type name with generic arity marker.
-    ///
-    /// If the name doesn't already contain a backtick (`), appends the generic arity
-    /// in the format `Name`N` where N is the number of type arguments.
-    ///
-    /// # Arguments
-    /// * `base_name` - The original type name
-    /// * `arg_count` - The number of generic type arguments
-    ///
-    /// # Returns
-    /// The name with generic arity marker, or the original name if already present.
-    ///
-    /// # Examples
-    /// - `"List"` with 1 arg becomes `"List`1"`
-    /// - `"Dictionary"` with 2 args becomes `"Dictionary`2"`
-    /// - `"List`1"` with 1 arg stays `"List`1"`
-    fn format_generic_name(base_name: &str, arg_count: usize) -> String {
-        if base_name.contains('`') {
-            base_name.to_string()
-        } else {
-            format!("{base_name}`{arg_count}")
-        }
-    }
-
-    /// Formats a stable name for function pointer types based on signature characteristics.
-    ///
-    /// Generates a deterministic name based on the function signature's calling convention,
-    /// parameter count, and return type rather than relying on unstable pointer addresses.
-    /// This produces reproducible names across runs and platforms.
-    ///
-    /// # Arguments
-    /// * `signature` - The method signature to derive the name from
-    ///
-    /// # Returns
-    /// A deterministic string like `FnPtr_stdcall_2_void` representing the signature.
-    fn format_fnptr_name(signature: &SignatureMethod) -> String {
-        let calling_convention = if signature.stdcall {
-            "stdcall"
-        } else if signature.cdecl {
-            "cdecl"
-        } else if signature.thiscall {
-            "thiscall"
-        } else if signature.fastcall {
-            "fastcall"
-        } else {
-            "default"
-        };
-
-        let param_count = signature.params.len();
-        let return_info = format!("{:?}", signature.return_type.base).replace(' ', "");
-
-        // Truncate return_info to avoid extremely long names
-        let return_short = truncate_chars(&return_info, 16);
-
-        format!("FnPtr_{calling_convention}_{param_count}_{return_short}")
     }
 
     /// Finalizes the type construction and returns the built type.
@@ -1062,7 +1015,7 @@ mod tests {
     use crate::{
         metadata::{
             identity::AssemblyIdentity,
-            signatures::{SignatureMethod, SignatureParameter, TypeSignature},
+            signatures::{SignatureMethod, SignatureParameter, SignatureSzArray, TypeSignature},
             tables::{GenericParam, GenericParamAttributes},
             token::Token,
             typesystem::{CilFlavor, CilPrimitiveKind, TypeRegistry, TypeSource},
@@ -1146,6 +1099,42 @@ mod tests {
         } else {
             panic!("Expected Array flavor");
         };
+
+        // A rank-1 general array is not the vector: its own name and its own flavor (a token
+        // tells nothing, the registry mints one per type it creates).
+        let build = |general: bool| {
+            let builder = TypeBuilder::new(registry.clone())
+                .primitive(CilPrimitiveKind::I4)
+                .unwrap();
+            if general {
+                builder.multi_dimensional_array(1)
+            } else {
+                builder.array()
+            }
+            .unwrap()
+            .build()
+            .unwrap()
+        };
+        let (general, vector) = (build(true), build(false));
+        assert_eq!(general.name, "Int32[*]");
+        assert_eq!(vector.name, "Int32[]");
+        assert_ne!(*general.flavor(), *vector.flavor());
+
+        // The builder's vector is the resolver's: one name, one flavor.
+        let resolved = TypeResolver::new(registry.clone())
+            .resolve(&TypeSignature::SzArray(SignatureSzArray {
+                modifiers: Vec::new(),
+                base: Box::new(TypeSignature::I4),
+            }))
+            .unwrap();
+        assert_eq!(resolved.name, vector.name);
+        assert_eq!(*resolved.flavor(), *vector.flavor());
+
+        assert!(TypeBuilder::new(registry)
+            .primitive(CilPrimitiveKind::I4)
+            .unwrap()
+            .multi_dimensional_array(0)
+            .is_err());
     }
 
     #[test]
@@ -1212,11 +1201,11 @@ mod tests {
             number: 0,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "T".to_string(),
-            constraints: Arc::new(boxcar::Vec::new()),
+            name: "T".into(),
+            constraints: Default::default(),
             rid: 0,
             offset: 0,
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         });
 
         list_type.generic_params.push(generic_param);
@@ -1315,6 +1304,7 @@ mod tests {
             stdcall: true,
             thiscall: false,
             fastcall: false,
+            unmanaged: false,
             param_count_generic: 0,
             param_count: 0,
             varargs: Vec::new(),
@@ -1381,8 +1371,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(in_attr_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Runtime.InteropServices".to_string(),
-                name: "InAttribute".to_string(),
+                namespace: "System.Runtime.InteropServices".into(),
+                name: "InAttribute".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1399,9 +1389,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(int_type.modifiers.count(), 1);
-        assert!(int_type.modifiers[0].required);
+        assert!(int_type.modifiers.get(0).unwrap().required);
         assert_eq!(
-            int_type.modifiers[0].modifier.name().unwrap(),
+            int_type.modifiers.get(0).unwrap().modifier.name().unwrap(),
             "InAttribute"
         );
 
@@ -1414,7 +1404,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(string_type.modifiers.count(), 1);
-        assert!(!string_type.modifiers[0].required);
+        assert!(!string_type.modifiers.get(0).unwrap().required);
     }
 
     #[test]
@@ -1427,8 +1417,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(base_token),
                 flavor: CilFlavor::Class,
-                namespace: "System".to_string(),
-                name: "Exception".to_string(),
+                namespace: "System".into(),
+                name: "Exception".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1512,8 +1502,8 @@ mod tests {
             .get_or_create_type(&CompleteTypeSpec {
                 token_init: Some(dict_token),
                 flavor: CilFlavor::Class,
-                namespace: "System.Collections.Generic".to_string(),
-                name: "Dictionary`2".to_string(),
+                namespace: "System.Collections.Generic".into(),
+                name: "Dictionary`2".into(),
                 source: TypeSource::Unknown,
                 generic_args: None,
                 base_type: None,
@@ -1526,11 +1516,11 @@ mod tests {
             number: 0,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "TKey".to_string(),
-            constraints: Arc::new(boxcar::Vec::new()),
+            name: "TKey".into(),
+            constraints: Default::default(),
             rid: 0,
             offset: 0,
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         });
 
         let value_param = Arc::new(GenericParam {
@@ -1538,11 +1528,11 @@ mod tests {
             number: 1,
             flags: GenericParamAttributes::ZERO,
             owner: OnceLock::new(),
-            name: "TValue".to_string(),
-            constraints: Arc::new(boxcar::Vec::new()),
+            name: "TValue".into(),
+            constraints: Default::default(),
             rid: 1,
             offset: 1,
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         });
 
         dict_type.generic_params.push(key_param);

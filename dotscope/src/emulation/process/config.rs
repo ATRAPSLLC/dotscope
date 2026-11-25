@@ -840,7 +840,9 @@ impl TracingConfig {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::emulation::{EmulationConfig, TracingConfig};
+    ///
     /// let tracing = TracingConfig::full_trace("emulation.trace");
     /// let config = EmulationConfig {
     ///     tracing,

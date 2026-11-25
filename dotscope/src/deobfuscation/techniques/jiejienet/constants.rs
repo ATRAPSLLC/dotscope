@@ -232,13 +232,12 @@ mod tests {
             jiejienet::constants::{ConstantsFindings, JiejieNetConstants},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive_controlflow_no_rename() {
-        let asm =
-            load_sample("tests/samples/packers/jiejie/source/jiejie_controlflow_no_rename.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_controlflow_no_rename.exe");
         let technique = JiejieNetConstants;
         let detection = technique.detect(&asm);
 
@@ -258,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_detect_positive_renamed() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/jiejie_default.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_default.exe");
         let technique = JiejieNetConstants;
         let detection = technique.detect(&asm);
 
@@ -270,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_strings_only() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/jiejie_strings_only.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_strings_only.exe");
         let technique = JiejieNetConstants;
         let detection = technique.detect(&asm);
 
@@ -282,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_original() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/original.exe");
+        let asm = load_sample("packers/jiejie/source/original.exe");
         let technique = JiejieNetConstants;
         let detection = technique.detect(&asm);
 

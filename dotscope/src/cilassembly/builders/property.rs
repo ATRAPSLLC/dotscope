@@ -781,16 +781,16 @@ impl Default for PropertyBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::{cilassemblyview::CilAssemblyView, signatures::TypeSignature, tables::TableId},
+        testkit::fixture,
     };
 
     fn get_test_assembly() -> Result<CilAssembly> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path)?;
         Ok(CilAssembly::new(view))
     }

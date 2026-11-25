@@ -7,7 +7,7 @@
 //! protections (string decryption, CFF, anti-tamper, NecroBit, resource
 //! encryption).
 //!
-//! See [`private-impl.md`] for the full structural analysis. Quick summary:
+//! What identifies the containers and makes them safe to remove:
 //!
 //! - The GUID suffix is the **structural NR signal** — no production
 //!   compiler emits a `<PrivateImplementationDetails>` with a GUID suffix.
@@ -35,7 +35,6 @@
 //! regenerator's metadata validator rejects the output — a loud failure,
 //! not silent corruption.
 //!
-//! [`private-impl.md`]: ../../../../docs/research/netreactor/private-impl.md
 //! [`expand_type_tokens`]: crate::cilassembly::expand_type_tokens
 //! [`netreactor.licensecheck`]: super::licensecheck
 
@@ -123,25 +122,11 @@ impl Technique for NetReactorPrivateImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::validation::ValidationConfig;
-
-    fn try_load_sample(name: &str) -> Option<CilObject> {
-        let path = format!("tests/samples/packers/netreactor/7.5.0/{name}");
-        if !std::path::Path::new(&path).exists() {
-            eprintln!("Skipping test: sample not found at {path}");
-            return None;
-        }
-        Some(
-            CilObject::from_path_with_validation(&path, ValidationConfig::analysis())
-                .unwrap_or_else(|e| panic!("Failed to load {name}: {e}")),
-        )
-    }
+    use crate::testkit::load_sample;
 
     #[test]
     fn test_detect_positive_obfuscation() {
-        let Some(assembly) = try_load_sample("reactor_obfuscation.exe") else {
-            return;
-        };
+        let assembly = load_sample("packers/netreactor/7.5.0/reactor_obfuscation.exe");
         let detection = NetReactorPrivateImpl.detect(&assembly);
         assert!(
             detection.is_detected(),
@@ -158,9 +143,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_baseline() {
-        let Some(assembly) = try_load_sample("original.exe") else {
-            return;
-        };
+        let assembly = load_sample("packers/netreactor/7.5.0/original.exe");
         let detection = NetReactorPrivateImpl.detect(&assembly);
         assert!(
             !detection.is_detected(),

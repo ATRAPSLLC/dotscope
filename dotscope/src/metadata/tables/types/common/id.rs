@@ -557,33 +557,7 @@ impl TableId {
     /// ```
     #[must_use]
     pub fn has_cross_references(&self) -> bool {
-        matches!(
-            self,
-            TableId::TypeRef
-                | TableId::TypeDef
-                | TableId::MethodDef
-                | TableId::InterfaceImpl
-                | TableId::MemberRef
-                | TableId::Constant
-                | TableId::CustomAttribute
-                | TableId::FieldMarshal
-                | TableId::DeclSecurity
-                | TableId::ClassLayout
-                | TableId::FieldLayout
-                | TableId::EventMap
-                | TableId::Event
-                | TableId::PropertyMap
-                | TableId::MethodSemantics
-                | TableId::MethodImpl
-                | TableId::ImplMap
-                | TableId::FieldRVA
-                | TableId::ExportedType
-                | TableId::ManifestResource
-                | TableId::NestedClass
-                | TableId::GenericParam
-                | TableId::MethodSpec
-                | TableId::GenericParamConstraint
-        )
+        !self.references().is_empty()
     }
 
     /// Returns the set of tables that this table references.
@@ -675,7 +649,9 @@ impl TableId {
             TableId::MethodImpl => &[TableId::TypeDef, TableId::MethodDef, TableId::MemberRef],
             TableId::ImplMap => &[TableId::Field, TableId::MethodDef, TableId::ModuleRef],
             TableId::ExportedType => &[TableId::File, TableId::AssemblyRef, TableId::ExportedType],
-            TableId::ManifestResource => &[TableId::File, TableId::AssemblyRef],
+            TableId::ManifestResource => {
+                &[TableId::File, TableId::AssemblyRef, TableId::ExportedType]
+            }
             TableId::GenericParam => &[TableId::TypeDef, TableId::MethodDef],
             TableId::MethodSpec => &[TableId::MethodDef, TableId::MemberRef],
             TableId::GenericParamConstraint => &[
@@ -683,6 +659,51 @@ impl TableId {
                 TableId::TypeDef,
                 TableId::TypeRef,
                 TableId::TypeSpec,
+            ],
+            TableId::FieldPtr => &[TableId::Field],
+            TableId::MethodPtr => &[TableId::MethodDef],
+            TableId::ParamPtr => &[TableId::Param],
+            TableId::EventPtr => &[TableId::Event],
+            TableId::PropertyPtr => &[TableId::Property],
+            TableId::AssemblyRefProcessor | TableId::AssemblyRefOS => &[TableId::AssemblyRef],
+            TableId::MethodDebugInformation => &[TableId::Document],
+            TableId::LocalScope => &[
+                TableId::MethodDef,
+                TableId::ImportScope,
+                TableId::LocalVariable,
+                TableId::LocalConstant,
+            ],
+            TableId::ImportScope => &[TableId::ImportScope],
+            TableId::StateMachineMethod => &[TableId::MethodDef],
+            TableId::CustomDebugInformation => &[
+                // HasCustomDebugInformation: HasCustomAttribute's tables and the PDB's own
+                TableId::MethodDef,
+                TableId::Field,
+                TableId::TypeRef,
+                TableId::TypeDef,
+                TableId::Param,
+                TableId::InterfaceImpl,
+                TableId::MemberRef,
+                TableId::Module,
+                TableId::DeclSecurity,
+                TableId::Property,
+                TableId::Event,
+                TableId::StandAloneSig,
+                TableId::ModuleRef,
+                TableId::TypeSpec,
+                TableId::Assembly,
+                TableId::AssemblyRef,
+                TableId::File,
+                TableId::ExportedType,
+                TableId::ManifestResource,
+                TableId::GenericParam,
+                TableId::GenericParamConstraint,
+                TableId::MethodSpec,
+                TableId::Document,
+                TableId::LocalScope,
+                TableId::LocalVariable,
+                TableId::LocalConstant,
+                TableId::ImportScope,
             ],
             // Tables without cross-table references
             _ => &[],
@@ -699,13 +720,21 @@ impl TableId {
 /// # Usage Examples
 ///
 /// For table row size calculation:
-/// ```rust,ignore
-/// use crate::metadata::tables::dispatch_table_type;
-/// dispatch_table_type!(table_id, |RawType| RawType::row_size(table_info))
+/// ```
+/// use dotscope::dispatch_table_type;
+/// use dotscope::metadata::tables::{TableId, TableRow};
+/// use dotscope::CilObject;
+///
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// let table_info = &assembly.tables().expect("a tables stream").info;
+/// let table_id = TableId::TypeDef;
+/// let row_size = dispatch_table_type!(table_id, |RawType| RawType::row_size(table_info));
+/// assert!(row_size > 0);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// For table writing operations:
-/// ```rust,ignore
+/// ```text
 /// use crate::metadata::tables::dispatch_table_type;
 /// dispatch_table_type!(table_id, |RawType| {
 ///     if let Some(table) = self.tables_header.table::<RawType>() {
@@ -717,7 +746,7 @@ impl TableId {
 /// ```
 ///
 /// For generic table operations:
-/// ```rust,ignore
+/// ```text
 /// use crate::metadata::tables::dispatch_table_type;
 /// dispatch_table_type!(table_id, |RawType| {
 ///     // Any operation that needs to work with the concrete Raw type

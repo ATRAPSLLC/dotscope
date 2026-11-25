@@ -314,429 +314,416 @@ impl ClassLayoutBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
+        testkit::fixture,
     };
 
     #[test]
     fn test_class_layout_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a basic class layout
-            let type_rid = 1; // TypeDef RID 1
+        // Create a basic class layout
+        let type_rid = 1; // TypeDef RID 1
 
-            let layout_ref = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .packing_size(4)
-                .class_size(0)
-                .build(&mut assembly)
-                .unwrap();
+        let layout_ref = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .packing_size(4)
+            .class_size(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
     }
 
     #[test]
     fn test_class_layout_builder_different_packings() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Test various valid packing sizes (powers of 2)
-            let type1_rid = 1; // TypeDef RID 1
-            let type2_rid = 2; // TypeDef RID 2
-            let type3_rid = 3; // TypeDef RID 3
-            let type4_rid = 4; // TypeDef RID 4
+        // Test various valid packing sizes (powers of 2)
+        let type1_rid = 1; // TypeDef RID 1
+        let type2_rid = 2; // TypeDef RID 2
+        let type3_rid = 3; // TypeDef RID 3
+        let type4_rid = 4; // TypeDef RID 4
 
-            // Packing 1 (byte packing)
-            let layout1_ref = ClassLayoutBuilder::new()
-                .parent(type1_rid)
-                .packing_size(1)
-                .class_size(0)
-                .build(&mut assembly)
-                .unwrap();
+        // Packing 1 (byte packing)
+        let layout1_ref = ClassLayoutBuilder::new()
+            .parent(type1_rid)
+            .packing_size(1)
+            .class_size(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Packing 8 (standard 64-bit alignment)
-            let layout2_ref = ClassLayoutBuilder::new()
-                .parent(type2_rid)
-                .packing_size(8)
-                .class_size(0)
-                .build(&mut assembly)
-                .unwrap();
+        // Packing 8 (standard 64-bit alignment)
+        let layout2_ref = ClassLayoutBuilder::new()
+            .parent(type2_rid)
+            .packing_size(8)
+            .class_size(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Packing 16 (SIMD alignment)
-            let layout3_ref = ClassLayoutBuilder::new()
-                .parent(type3_rid)
-                .packing_size(16)
-                .class_size(0)
-                .build(&mut assembly)
-                .unwrap();
+        // Packing 16 (SIMD alignment)
+        let layout3_ref = ClassLayoutBuilder::new()
+            .parent(type3_rid)
+            .packing_size(16)
+            .class_size(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Packing 64 (cache line alignment)
-            let layout4_ref = ClassLayoutBuilder::new()
-                .parent(type4_rid)
-                .packing_size(64)
-                .class_size(0)
-                .build(&mut assembly)
-                .unwrap();
+        // Packing 64 (cache line alignment)
+        let layout4_ref = ClassLayoutBuilder::new()
+            .parent(type4_rid)
+            .packing_size(64)
+            .class_size(0)
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed with ClassLayout table kind
-            assert_eq!(
-                layout1_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                layout2_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                layout3_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                layout4_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
+        // All should succeed with ClassLayout table kind
+        assert_eq!(
+            layout1_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            layout2_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            layout3_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            layout4_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
 
-            // All should be different references
-            assert!(!std::sync::Arc::ptr_eq(&layout1_ref, &layout2_ref));
-            assert!(!std::sync::Arc::ptr_eq(&layout1_ref, &layout3_ref));
-            assert!(!std::sync::Arc::ptr_eq(&layout1_ref, &layout4_ref));
-        }
+        // All should be different references
+        assert!(!std::sync::Arc::ptr_eq(&layout1_ref, &layout2_ref));
+        assert!(!std::sync::Arc::ptr_eq(&layout1_ref, &layout3_ref));
+        assert!(!std::sync::Arc::ptr_eq(&layout1_ref, &layout4_ref));
     }
 
     #[test]
     fn test_class_layout_builder_default_packing() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let type_rid = 1; // TypeDef RID 1
+        let type_rid = 1; // TypeDef RID 1
 
-            // Packing 0 (default alignment)
-            let layout_ref = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .packing_size(0) // Default packing
-                .class_size(0) // Automatic size
-                .build(&mut assembly)
-                .unwrap();
+        // Packing 0 (default alignment)
+        let layout_ref = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .packing_size(0) // Default packing
+            .class_size(0) // Automatic size
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
     }
 
     #[test]
     fn test_class_layout_builder_explicit_sizes() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Test various explicit sizes
-            let type1_rid = 1; // TypeDef RID 1
-            let type2_rid = 2; // TypeDef RID 2
-            let type3_rid = 3; // TypeDef RID 3
+        // Test various explicit sizes
+        let type1_rid = 1; // TypeDef RID 1
+        let type2_rid = 2; // TypeDef RID 2
+        let type3_rid = 3; // TypeDef RID 3
 
-            // Small structure (16 bytes)
-            let layout1_ref = ClassLayoutBuilder::new()
-                .parent(type1_rid)
-                .packing_size(4)
+        // Small structure (16 bytes)
+        let layout1_ref = ClassLayoutBuilder::new()
+            .parent(type1_rid)
+            .packing_size(4)
+            .class_size(16)
+            .build(&mut assembly)
+            .unwrap();
+
+        // Medium structure (256 bytes)
+        let layout2_ref = ClassLayoutBuilder::new()
+            .parent(type2_rid)
+            .packing_size(8)
+            .class_size(256)
+            .build(&mut assembly)
+            .unwrap();
+
+        // Large structure (64KB)
+        let layout3_ref = ClassLayoutBuilder::new()
+            .parent(type3_rid)
+            .packing_size(16)
+            .class_size(65536)
+            .build(&mut assembly)
+            .unwrap();
+
+        // All should succeed
+        assert_eq!(
+            layout1_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            layout2_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            layout3_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+    }
+
+    #[test]
+    fn test_class_layout_builder_missing_packing_size() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        let type_rid = 1; // TypeDef RID 1
+
+        let result = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .class_size(16)
+            // Missing packing_size
+            .build(&mut assembly);
+
+        // Should fail because packing size is required
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_layout_builder_missing_class_size() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        let type_rid = 1; // TypeDef RID 1
+
+        let result = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .packing_size(4)
+            // Missing class_size
+            .build(&mut assembly);
+
+        // Should fail because class size is required
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_layout_builder_missing_parent() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        let result = ClassLayoutBuilder::new()
+            .packing_size(4)
+            .class_size(16)
+            // Missing parent
+            .build(&mut assembly);
+
+        // Should fail because parent is required
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_layout_builder_invalid_packing_size() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        let type_rid = 1; // TypeDef RID 1
+
+        // Test non-power-of-2 packing size
+        let result = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .packing_size(3) // Not a power of 2
+            .class_size(16)
+            .build(&mut assembly);
+
+        // Should fail because packing size is not a power of 2
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_layout_builder_excessive_packing_size() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        let type_rid = 1; // TypeDef RID 1
+
+        let result = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .packing_size(256) // Exceeds maximum of 128
+            .class_size(16)
+            .build(&mut assembly);
+
+        // Should fail because packing size exceeds maximum
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_layout_builder_excessive_class_size() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        let type_rid = 1; // TypeDef RID 1
+
+        let result = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .packing_size(4)
+            .class_size(0x20000000) // Exceeds 256MB limit
+            .build(&mut assembly);
+
+        // Should fail because class size exceeds maximum
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_layout_builder_maximum_valid_values() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        let type_rid = 1; // TypeDef RID 1
+
+        // Test maximum valid values
+        let layout_ref = ClassLayoutBuilder::new()
+            .parent(type_rid)
+            .packing_size(128) // Maximum packing size
+            .class_size(0x10000000 - 1) // Just under 256MB limit
+            .build(&mut assembly)
+            .unwrap();
+
+        // Should succeed
+        assert_eq!(
+            layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+    }
+
+    #[test]
+    fn test_class_layout_builder_all_valid_packing_sizes() {
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
+
+        // Test all valid packing sizes (powers of 2 from 0 to 128)
+        let valid_packings = [0, 1, 2, 4, 8, 16, 32, 64, 128];
+
+        for (i, &packing) in valid_packings.iter().enumerate() {
+            let type_rid = 1 + i as u32; // Different TypeDef RID for each
+
+            let layout_ref = ClassLayoutBuilder::new()
+                .parent(type_rid)
+                .packing_size(packing)
                 .class_size(16)
-                .build(&mut assembly)
-                .unwrap();
-
-            // Medium structure (256 bytes)
-            let layout2_ref = ClassLayoutBuilder::new()
-                .parent(type2_rid)
-                .packing_size(8)
-                .class_size(256)
-                .build(&mut assembly)
-                .unwrap();
-
-            // Large structure (64KB)
-            let layout3_ref = ClassLayoutBuilder::new()
-                .parent(type3_rid)
-                .packing_size(16)
-                .class_size(65536)
                 .build(&mut assembly)
                 .unwrap();
 
             // All should succeed
             assert_eq!(
-                layout1_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                layout2_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                layout3_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_missing_packing_size() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            let type_rid = 1; // TypeDef RID 1
-
-            let result = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .class_size(16)
-                // Missing packing_size
-                .build(&mut assembly);
-
-            // Should fail because packing size is required
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_missing_class_size() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            let type_rid = 1; // TypeDef RID 1
-
-            let result = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .packing_size(4)
-                // Missing class_size
-                .build(&mut assembly);
-
-            // Should fail because class size is required
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_missing_parent() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            let result = ClassLayoutBuilder::new()
-                .packing_size(4)
-                .class_size(16)
-                // Missing parent
-                .build(&mut assembly);
-
-            // Should fail because parent is required
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_invalid_packing_size() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            let type_rid = 1; // TypeDef RID 1
-
-            // Test non-power-of-2 packing size
-            let result = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .packing_size(3) // Not a power of 2
-                .class_size(16)
-                .build(&mut assembly);
-
-            // Should fail because packing size is not a power of 2
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_excessive_packing_size() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            let type_rid = 1; // TypeDef RID 1
-
-            let result = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .packing_size(256) // Exceeds maximum of 128
-                .class_size(16)
-                .build(&mut assembly);
-
-            // Should fail because packing size exceeds maximum
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_excessive_class_size() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            let type_rid = 1; // TypeDef RID 1
-
-            let result = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .packing_size(4)
-                .class_size(0x20000000) // Exceeds 256MB limit
-                .build(&mut assembly);
-
-            // Should fail because class size exceeds maximum
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_maximum_valid_values() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            let type_rid = 1; // TypeDef RID 1
-
-            // Test maximum valid values
-            let layout_ref = ClassLayoutBuilder::new()
-                .parent(type_rid)
-                .packing_size(128) // Maximum packing size
-                .class_size(0x10000000 - 1) // Just under 256MB limit
-                .build(&mut assembly)
-                .unwrap();
-
-            // Should succeed
-            assert_eq!(
                 layout_ref.kind(),
                 ChangeRefKind::TableRow(TableId::ClassLayout)
             );
-        }
-    }
-
-    #[test]
-    fn test_class_layout_builder_all_valid_packing_sizes() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
-
-            // Test all valid packing sizes (powers of 2 from 0 to 128)
-            let valid_packings = [0, 1, 2, 4, 8, 16, 32, 64, 128];
-
-            for (i, &packing) in valid_packings.iter().enumerate() {
-                let type_rid = 1 + i as u32; // Different TypeDef RID for each
-
-                let layout_ref = ClassLayoutBuilder::new()
-                    .parent(type_rid)
-                    .packing_size(packing)
-                    .class_size(16)
-                    .build(&mut assembly)
-                    .unwrap();
-
-                // All should succeed
-                assert_eq!(
-                    layout_ref.kind(),
-                    ChangeRefKind::TableRow(TableId::ClassLayout)
-                );
-            }
         }
     }
 
     #[test]
     fn test_class_layout_builder_realistic_scenarios() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // P/Invoke struct with byte packing
-            let pinvoke_type_rid = 1; // TypeDef RID 1
-            let pinvoke_layout_ref = ClassLayoutBuilder::new()
-                .parent(pinvoke_type_rid)
-                .packing_size(1) // Byte packing for exact native matching
-                .class_size(32) // Fixed size to match native struct
-                .build(&mut assembly)
-                .unwrap();
+        // P/Invoke struct with byte packing
+        let pinvoke_type_rid = 1; // TypeDef RID 1
+        let pinvoke_layout_ref = ClassLayoutBuilder::new()
+            .parent(pinvoke_type_rid)
+            .packing_size(1) // Byte packing for exact native matching
+            .class_size(32) // Fixed size to match native struct
+            .build(&mut assembly)
+            .unwrap();
 
-            // Performance-critical type with cache line alignment
-            let perf_type_rid = 2; // TypeDef RID 2
-            let perf_layout_ref = ClassLayoutBuilder::new()
-                .parent(perf_type_rid)
-                .packing_size(64) // Cache line alignment
-                .class_size(128) // Two cache lines
-                .build(&mut assembly)
-                .unwrap();
+        // Performance-critical type with cache line alignment
+        let perf_type_rid = 2; // TypeDef RID 2
+        let perf_layout_ref = ClassLayoutBuilder::new()
+            .parent(perf_type_rid)
+            .packing_size(64) // Cache line alignment
+            .class_size(128) // Two cache lines
+            .build(&mut assembly)
+            .unwrap();
 
-            // SIMD mathematics structure
-            let simd_type_rid = 3; // TypeDef RID 3
-            let simd_layout_ref = ClassLayoutBuilder::new()
-                .parent(simd_type_rid)
-                .packing_size(16) // SSE/SIMD alignment
-                .class_size(64) // 4x float4 vectors
-                .build(&mut assembly)
-                .unwrap();
+        // SIMD mathematics structure
+        let simd_type_rid = 3; // TypeDef RID 3
+        let simd_layout_ref = ClassLayoutBuilder::new()
+            .parent(simd_type_rid)
+            .packing_size(16) // SSE/SIMD alignment
+            .class_size(64) // 4x float4 vectors
+            .build(&mut assembly)
+            .unwrap();
 
-            // Standard managed type with default layout
-            let managed_type_rid = 4; // TypeDef RID 4
-            let managed_layout_ref = ClassLayoutBuilder::new()
-                .parent(managed_type_rid)
-                .packing_size(0) // Default runtime alignment
-                .class_size(0) // Automatic size calculation
-                .build(&mut assembly)
-                .unwrap();
+        // Standard managed type with default layout
+        let managed_type_rid = 4; // TypeDef RID 4
+        let managed_layout_ref = ClassLayoutBuilder::new()
+            .parent(managed_type_rid)
+            .packing_size(0) // Default runtime alignment
+            .class_size(0) // Automatic size calculation
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed
-            assert_eq!(
-                pinvoke_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                perf_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                simd_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
-            assert_eq!(
-                managed_layout_ref.kind(),
-                ChangeRefKind::TableRow(TableId::ClassLayout)
-            );
+        // All should succeed
+        assert_eq!(
+            pinvoke_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            perf_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            simd_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
+        assert_eq!(
+            managed_layout_ref.kind(),
+            ChangeRefKind::TableRow(TableId::ClassLayout)
+        );
 
-            // All should be different references
-            assert!(!std::sync::Arc::ptr_eq(
-                &pinvoke_layout_ref,
-                &perf_layout_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &pinvoke_layout_ref,
-                &simd_layout_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &pinvoke_layout_ref,
-                &managed_layout_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(&perf_layout_ref, &simd_layout_ref));
-            assert!(!std::sync::Arc::ptr_eq(
-                &perf_layout_ref,
-                &managed_layout_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &simd_layout_ref,
-                &managed_layout_ref
-            ));
-        }
+        // All should be different references
+        assert!(!std::sync::Arc::ptr_eq(
+            &pinvoke_layout_ref,
+            &perf_layout_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &pinvoke_layout_ref,
+            &simd_layout_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &pinvoke_layout_ref,
+            &managed_layout_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(&perf_layout_ref, &simd_layout_ref));
+        assert!(!std::sync::Arc::ptr_eq(
+            &perf_layout_ref,
+            &managed_layout_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &simd_layout_ref,
+            &managed_layout_ref
+        ));
     }
 }

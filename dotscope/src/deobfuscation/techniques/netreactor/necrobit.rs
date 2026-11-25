@@ -30,7 +30,7 @@
 //! resolved `VirtualProtect`. Variant B's writes land in `.text`, which is mapped
 //! read-only, and the return value also steers the init's control flow — a call
 //! that answers without applying the protection sends it down a path that stores
-//! nothing. `docs/research/netreactor/necrobit.md` covers the requirements.
+//! nothing.
 
 use std::{
     any::Any,
@@ -43,8 +43,7 @@ use crate::{
     compiler::{EventKind, EventLog},
     deobfuscation::techniques::{
         netreactor::{helpers, hooks},
-        Detection, Detections, Evidence, Technique, TechniqueCapability, TechniqueCategory,
-        WorkingAssembly,
+        Detection, Evidence, Technique, TechniqueCapability, TechniqueCategory, WorkingAssembly,
     },
     emulation::{EmValue, EmulationOutcome, EmulationProcess, HeapObject, ProcessBuilder},
     error::Error,
@@ -182,7 +181,7 @@ impl Technique for NetReactorNecroBit {
         let (purely_injected_cctors, modified_cctors) = if let Some(ref fan_in_result) = fan_in {
             let classification = helpers::classify_injected_cctors(
                 assembly,
-                fan_in_result.target_token,
+                &fan_in_result.initializers,
                 &fan_in_result.calling_cctors,
             );
             (classification.purely_injected, classification.modified)
@@ -253,14 +252,21 @@ impl Technique for NetReactorNecroBit {
         if let Some(rt_token) = runtime_type_token {
             detection.cleanup_mut().add_type(rt_token);
         }
+        // The initializers every protected type's `.cctor` calls decrypt the
+        // bodies at run time, which this deobfuscation has already done: the
+        // calls go with them, from the `.cctor`s that also hold the program's
+        // own initialization.
+        for &initializer in fan_in.iter().flat_map(|f| &f.initializers) {
+            detection.cleanup_mut().add_protection_method(initializer);
+        }
         for &cctor_token in &purely_injected_cctors {
             detection.cleanup_mut().add_method(cctor_token);
         }
         for &trial_token in &trial_check_tokens {
-            detection.cleanup_mut().add_method(trial_token);
+            detection.cleanup_mut().add_protection_method(trial_token);
         }
         if let Some(patcher_token) = body_patcher {
-            detection.cleanup_mut().add_method(patcher_token);
+            detection.cleanup_mut().add_protection_method(patcher_token);
         }
 
         detection
@@ -269,8 +275,7 @@ impl Technique for NetReactorNecroBit {
     fn byte_transform(
         &self,
         assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
 
@@ -539,6 +544,10 @@ impl Technique for NetReactorNecroBit {
     }
 }
 
+/// The bytes of a NecroBit blob its shape is read from: the 24-byte header, at most 500
+/// group entries of 8 bytes and the method count (`24 + 500 * 8 + 4`), rounded up.
+const NECROBIT_HEADER_PREFIX: usize = 4096;
+
 /// Returns whether the byte slice has the shape of a NecroBit decrypted data
 /// blob (24-byte header beginning with a MethodDef token, followed by either
 /// variant A group entries + per-method IL records or variant B per-entry
@@ -553,13 +562,18 @@ impl Technique for NetReactorNecroBit {
 /// address-space path ([`extract_bodies_from_image`]); this predicate just
 /// validates the heap blob's overall shape so we don't pick a random byte
 /// array as the decrypted blob.
-fn is_necrobit_data_array(data: &[u8]) -> bool {
-    if data.len() < 28 {
+///
+/// `header` is the blob's first bytes, at least [`NECROBIT_HEADER_PREFIX`] of
+/// them when the blob has that many, and `len` its whole length: the shape is
+/// read from the header and the length alone, so a candidate array is checked
+/// without copying it.
+fn is_necrobit_data_array(header: &[u8], len: usize) -> bool {
+    if len < 28 {
         return false;
     }
 
     let read_u32 = |off: usize| -> Option<u32> {
-        let slice = data.get(off..off.checked_add(4)?)?;
+        let slice = header.get(off..off.checked_add(4)?)?;
         let arr: [u8; 4] = slice.try_into().ok()?;
         Some(u32::from_le_bytes(arr))
     };
@@ -587,7 +601,7 @@ fn is_necrobit_data_array(data: &[u8]) -> bool {
         let Some(header_end_plus_4) = header_end.checked_add(4) else {
             return false;
         };
-        if header_end_plus_4 > data.len() {
+        if header_end_plus_4 > len {
             return false;
         }
         let Some(method_count) = read_u32(header_end) else {
@@ -603,20 +617,17 @@ fn is_necrobit_data_array(data: &[u8]) -> bool {
         else {
             return false;
         };
-        let Some(rhs) = method_count
-            .checked_mul(8)
-            .and_then(|n| data.len().checked_add(n))
-        else {
+        let Some(rhs) = method_count.checked_mul(8).and_then(|n| len.checked_add(n)) else {
             return false;
         };
         lhs <= rhs
     } else if group_count == 0 {
         // Variant B: complete method bodies start at offset 24.
         // Validate by checking if the first entry has a valid method body header.
-        if data.len() < 36 {
+        if len < 36 {
             return false;
         }
-        let Some(&body_header_byte) = data.get(32) else {
+        let Some(&body_header_byte) = header.get(32) else {
             return false;
         }; // offset 24 + 8 (RVA + v2)
         let is_fat = body_header_byte & 0x03 == 0x03;
@@ -635,26 +646,42 @@ fn is_necrobit_data_array(data: &[u8]) -> bool {
 /// variant B's authoritative bodies are in the address space, not the heap,
 /// and the heap blob is at best incomplete.
 fn find_variant_a_blob(process: &EmulationProcess) -> Option<Vec<u8>> {
-    let heap = process.address_space().managed_heap();
-    let mut best: Option<Vec<u8>> = None;
-    for (_href, obj) in heap.iter().ok()? {
-        let HeapObject::Array { elements, .. } = &obj else {
-            continue;
-        };
-        if elements.len() < 500 {
-            continue;
-        }
-        let bytes: Vec<u8> = elements
+    // A byte array's elements are its bytes, each an `I32`; anything else is not a blob
+    let bytes_of = |elements: &[EmValue]| -> Option<Vec<u8>> {
+        elements
             .iter()
-            .filter_map(|e| match e {
+            .map(|e| match e {
                 EmValue::I32(v) => Some((v & 0xFF) as u8),
                 _ => None,
             })
-            .collect();
-        if !is_necrobit_data_array(&bytes) {
+            .collect()
+    };
+    let heap = process.address_space().managed_heap();
+    let mut best: Option<Vec<u8>> = None;
+    for (_href, obj) in heap.iter().ok()? {
+        let HeapObject::Array { elements, .. } = &*obj else {
+            continue;
+        };
+        if elements.len() < 500
+            || best
+                .as_ref()
+                .is_some_and(|prev| elements.len() <= prev.len())
+        {
             continue;
         }
-        let Some(gc_slice) = bytes.get(16..20) else {
+        // Check the shape from the header before copying the array: copying every
+        // large array the decryptor left on the heap cost a copy of each one
+        let Some(header) = bytes_of(
+            elements
+                .get(..elements.len().min(NECROBIT_HEADER_PREFIX))
+                .unwrap_or_default(),
+        ) else {
+            continue;
+        };
+        if !is_necrobit_data_array(&header, elements.len()) {
+            continue;
+        }
+        let Some(gc_slice) = header.get(16..20) else {
             continue;
         };
         let Ok(gc_arr) = <[u8; 4]>::try_from(gc_slice) else {
@@ -664,7 +691,7 @@ fn find_variant_a_blob(process: &EmulationProcess) -> Option<Vec<u8>> {
         if group_count == 0 {
             continue; // variant B — wrong path
         }
-        if best.as_ref().is_none_or(|prev| bytes.len() > prev.len()) {
+        if let Some(bytes) = bytes_of(elements) {
             best = Some(bytes);
         }
     }
@@ -813,6 +840,7 @@ fn parse_variant_a_blob(data: &[u8], assembly: &CilObject) -> Result<Vec<(Token,
                 is_init_local,
                 is_exception_data: !exception_handlers.is_empty(),
                 exception_handlers,
+                exception_format: None,
             };
 
             let mut buf = Vec::with_capacity(12_usize.saturating_add(il_size).saturating_add(64));
@@ -837,6 +865,7 @@ fn parse_variant_a_blob(data: &[u8], assembly: &CilObject) -> Result<Vec<(Token,
                 is_init_local: false,
                 is_exception_data: false,
                 exception_handlers: Vec::new(),
+                exception_format: None,
             };
             let mut buf = Vec::with_capacity(1_usize.saturating_add(il_size));
             new_body
@@ -905,11 +934,7 @@ fn resolve_fat_header_metadata(
 /// Returns an empty `Vec` for tiny bodies, fat bodies without MoreSects, or
 /// any parse failure (callers treat that as "no EH").
 fn read_on_disk_exception_handlers(assembly: &CilObject, method_rva: u32) -> Vec<ExceptionHandler> {
-    let file = assembly.file();
-    let Some(offset) = file.rva_to_offset(method_rva as usize).ok() else {
-        return Vec::new();
-    };
-    let Some(body_data) = file.data().get(offset..) else {
+    let Ok(body_data) = assembly.file().section_bounded(method_rva as usize) else {
         return Vec::new();
     };
     MethodBody::from_raw(body_data)
@@ -917,6 +942,10 @@ fn read_on_disk_exception_handlers(assembly: &CilObject, method_rva: u32) -> Vec
         .map(|b| b.exception_handlers)
         .unwrap_or_default()
 }
+
+/// The first window a stub's body is read through; it doubles while the body runs past it.
+/// Most bodies, header and code, fit in it.
+const INITIAL_BODY_WINDOW: usize = 256;
 
 /// Extracts method bodies from the PE image in the address space.
 ///
@@ -959,17 +988,29 @@ fn extract_bodies_from_image(
             continue;
         }
 
-        let buffer = match addr_space.read(addr, available) {
-            Ok(b) => b,
-            Err(_) => {
+        // Read the body through a window that doubles until the whole body is in it: reading
+        // everything from the RVA to the end of the image for each stub copied the image once
+        // per method. A body that does not parse in a window may only be cut short by it; one
+        // that does not parse with the rest of the image in the window is malformed.
+        let mut window = available.min(INITIAL_BODY_WINDOW);
+        let parsed = loop {
+            let buffer = match addr_space.read(addr, window) {
+                Ok(b) => b,
+                Err(_) => break Err(true),
+            };
+            match MethodBody::from(&buffer) {
+                Ok(body) if body.size() <= buffer.len() => break Ok((body, buffer)),
+                _ if window < available => window = window.saturating_mul(2).min(available),
+                _ => break Err(false),
+            }
+        };
+        let (body, buffer) = match parsed {
+            Ok(parsed) => parsed,
+            Err(true) => {
                 read_failures = read_failures.saturating_add(1);
                 continue;
             }
-        };
-
-        let body = match MethodBody::from(&buffer) {
-            Ok(b) => b,
-            Err(_) => {
+            Err(false) => {
                 parse_failures = parse_failures.saturating_add(1);
                 continue;
             }
@@ -1014,28 +1055,24 @@ fn extract_bodies_from_image(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use super::*;
     use crate::{
-        deobfuscation::techniques::{Detections, Technique, WorkingAssembly},
+        deobfuscation::techniques::{Technique, WorkingAssembly},
         metadata::validation::ValidationConfig,
+        testkit::fixture,
         CilObject,
     };
 
     fn load_sample(name: &str) -> CilObject {
-        let path = format!("tests/samples/packers/netreactor/7.5.0/{name}");
+        let path = fixture(&format!("packers/netreactor/7.5.0/{name}"));
         CilObject::from_path_with_validation(&path, ValidationConfig::analysis())
             .unwrap_or_else(|e| panic!("Failed to load {name}: {e}"))
     }
 
     #[test]
     fn test_detect_positive() {
-        let path = "tests/samples/packers/netreactor/7.5.0/reactor_necrobit.exe";
-        if !Path::new(path).exists() {
-            eprintln!("Skipping test: sample not found at {path}");
-            return;
-        }
+        let _path = fixture("packers/netreactor/7.5.0/reactor_necrobit.exe");
 
         let assembly = load_sample("reactor_necrobit.exe");
         let technique = NetReactorNecroBit;
@@ -1085,7 +1122,7 @@ mod tests {
     fn restore_stub_bodies(sample: &str) -> (usize, usize) {
         let assembly = load_sample(sample);
         let technique = NetReactorNecroBit;
-        let detection = technique.detect(&assembly);
+        let mut detection = technique.detect(&assembly);
         assert!(detection.is_detected(), "{sample}: should detect NecroBit");
 
         let stub_count = detection
@@ -1094,8 +1131,7 @@ mod tests {
             .unwrap_or(0);
 
         let mut working = WorkingAssembly::new(assembly);
-        let detections = Detections::new();
-        let events = match technique.byte_transform(&mut working, &detection, &detections) {
+        let events = match technique.byte_transform(&mut working, &mut detection) {
             Some(Ok(events)) => events,
             Some(Err(e)) => panic!("{sample}: byte_transform returned error: {e}"),
             None => panic!("{sample}: byte_transform returned None (skipped)"),
@@ -1111,11 +1147,6 @@ mod tests {
     /// Variant A: bodies live in a structured blob on the managed heap.
     #[test]
     fn restores_every_stub_in_a_necrobit_only_binary() {
-        if !Path::new("tests/samples/packers/netreactor/7.5.0/reactor_necrobit.exe").exists() {
-            eprintln!("Skipping test: sample not found");
-            return;
-        }
-
         let (restored, stubs) = restore_stub_bodies("reactor_necrobit.exe");
         assert!(stubs > 0, "the sample must actually have stubs");
         assert_eq!(
@@ -1131,11 +1162,6 @@ mod tests {
     /// the transform returned `Ok`.
     #[test]
     fn restores_every_stub_in_a_full_protection_binary() {
-        if !Path::new("tests/samples/packers/netreactor/7.5.0/reactor_full.exe").exists() {
-            eprintln!("Skipping test: sample not found");
-            return;
-        }
-
         let (restored, stubs) = restore_stub_bodies("reactor_full.exe");
         assert!(stubs > 0, "the sample must actually have stubs");
         assert_eq!(
@@ -1146,11 +1172,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let path = "tests/samples/packers/netreactor/7.5.0/original.exe";
-        if !Path::new(path).exists() {
-            eprintln!("Skipping test: sample not found at {path}");
-            return;
-        }
+        let _path = fixture("packers/netreactor/7.5.0/original.exe");
 
         let assembly = load_sample("original.exe");
         let technique = NetReactorNecroBit;
@@ -1159,6 +1181,32 @@ mod tests {
         assert!(
             !detection.is_detected(),
             "NetReactorNecroBit should not detect NecroBit in original.exe"
+        );
+    }
+
+    /// The blob's shape is read from its header and its length alone, so the heap scan
+    /// checks a candidate array without copying it: a variant-A header (one group, two
+    /// methods) is accepted once the length holds the records it promises, and refused while
+    /// it does not.
+    #[test]
+    fn a_blob_is_recognised_from_its_header_and_length() {
+        let mut header = Vec::new();
+        header.extend_from_slice(&0x0600_0001u32.to_le_bytes()); // first token
+        header.extend_from_slice(&[0; 12]);
+        header.extend_from_slice(&1u32.to_le_bytes()); // group_count
+        header.extend_from_slice(&[0; 4]);
+        header.extend_from_slice(&[0; 8]); // the group entry
+        header.extend_from_slice(&2u32.to_le_bytes()); // method_count
+
+        // 24 + 8 + 4 header bytes, then 2 records of at least 12 - 8 bytes each
+        assert!(is_necrobit_data_array(&header, 10_000));
+        assert!(
+            !is_necrobit_data_array(&header, 30),
+            "shorter than its header"
+        );
+        assert!(
+            !is_necrobit_data_array(&header[..20], 10_000),
+            "header cut short"
         );
     }
 }

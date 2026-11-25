@@ -9,7 +9,7 @@
 //!
 //! - [`LocalConstantRaw`]: Raw table structure with unresolved heap indices
 //! - [`LocalConstant`]: Owned variant with resolved references and constant information
-//! - [`LocalConstantLoader`]: Internal loader for processing `LocalConstant` table data
+//! - [`LocalConstantLoader`](crate::metadata::loader::tables::LocalConstantLoader): Internal loader for processing `LocalConstant` table data
 //! - Type aliases for efficient collections and reference management
 //!
 //! # `LocalConstant` Table Structure
@@ -23,7 +23,7 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
+//! ```no_run
 //! # use dotscope::metadata::tables::LocalConstant;
 //! # fn example(local_constant: &LocalConstant) {
 //! // Display constant information
@@ -34,9 +34,9 @@
 //!     println!("Anonymous or compiler-generated constant");
 //! }
 //!
-//! // Analyze signature data
-//! if !local_constant.signature.is_empty() {
-//!     println!("Constant has {} bytes of signature data", local_constant.signature.len());
+//! // Analyze the signature: its custom modifiers, then the type and value
+//! if !local_constant.signature.modifiers.is_empty() {
+//!     println!("Constant has {} custom modifiers", local_constant.signature.modifiers.len());
 //! }
 //! # }
 //! ```
@@ -51,14 +51,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

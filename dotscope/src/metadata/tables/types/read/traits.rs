@@ -24,7 +24,7 @@
 //!
 //! ## Related Modules
 //!
-//! - [`crate::metadata::tables::types::write::traits`] - Corresponding write traits
+//! - [`RowWritable`](crate::metadata::tables::types::RowWritable) - Corresponding write trait
 //! - [`crate::metadata::tables::types::read::table`] - Table-level read operations
 //! - [`crate::metadata::tables::types::read::data`] - Low-level data deserialization
 

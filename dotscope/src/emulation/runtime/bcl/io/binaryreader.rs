@@ -35,10 +35,11 @@
 
 use crate::{
     emulation::{
+        engine::synthetic_exception,
         runtime::{
             bcl::{
-                io::stream::{stream_close_pre, stream_dispose_pre},
-                limits::{checked_len, MAX_HOOK_BUFFER},
+                io::stream::stream_dispose_pre,
+                limits::{buffer_range, checked_len, MAX_HOOK_BUFFER},
             },
             hook::{Hook, HookContext, HookManager, PreHookResult},
         },
@@ -193,7 +194,7 @@ pub fn register(manager: &HookManager) -> Result<()> {
     manager.register(
         Hook::new("System.IO.BinaryReader.Close")
             .match_name("System.IO", "BinaryReader", "Close")
-            .pre(stream_close_pre),
+            .pre(stream_dispose_pre),
     )?;
 
     manager.register(
@@ -565,13 +566,11 @@ fn binary_reader_read_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
         }
         // Read(byte[], int, int) — buffer read
         3 => {
-            #[allow(clippy::cast_sign_loss)]
+            // `BinaryReader` throws `ArgumentException` for a range past the buffer's end
             let (buffer_ref, offset, count) =
-                match (ctx.args.first(), ctx.args.get(1), ctx.args.get(2)) {
-                    (Some(EmValue::ObjectRef(b)), Some(EmValue::I32(o)), Some(EmValue::I32(c))) => {
-                        (*b, *o as usize, *c as usize)
-                    }
-                    _ => return PreHookResult::Bypass(Some(EmValue::I32(0))),
+                match buffer_range(ctx, thread, synthetic_exception::ARGUMENT_EXCEPTION) {
+                    Ok(range) => range,
+                    Err(result) => return result,
                 };
 
             let Some(bytes) = try_hook!(thread.heap().stream_read(stream_ref, count)) else {
@@ -1160,7 +1159,7 @@ mod tests {
             EmValue, HeapRef,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     /// Helper to create a BinaryReader backed by a stream with the given data.

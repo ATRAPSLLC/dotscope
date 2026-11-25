@@ -297,60 +297,55 @@ impl Default for NativeImportsBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::cilassembly::CilAssembly;
+    use crate::{cilassembly::CilAssembly, testkit::fixture};
 
     #[test]
     fn test_native_imports_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = NativeImportsBuilder::new()
-                .add_dll("kernel32.dll")
-                .and_then(|b| b.add_function("kernel32.dll", "GetCurrentProcessId"))
-                .and_then(|b| b.add_function("kernel32.dll", "ExitProcess"))
-                .and_then(|b| b.build(&mut assembly));
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = NativeImportsBuilder::new()
+            .add_dll("kernel32.dll")
+            .and_then(|b| b.add_function("kernel32.dll", "GetCurrentProcessId"))
+            .and_then(|b| b.add_function("kernel32.dll", "ExitProcess"))
+            .and_then(|b| b.build(&mut assembly));
 
-            assert!(result.is_ok());
-        }
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_native_imports_builder_with_ordinals() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = NativeImportsBuilder::new()
-                .add_dll("user32.dll")
-                .and_then(|b| b.add_function_by_ordinal("user32.dll", 120))
-                .and_then(|b| b.add_function("user32.dll", "GetWindowTextW"))
-                .and_then(|b| b.build(&mut assembly));
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = NativeImportsBuilder::new()
+            .add_dll("user32.dll")
+            .and_then(|b| b.add_function_by_ordinal("user32.dll", 120))
+            .and_then(|b| b.add_function("user32.dll", "GetWindowTextW"))
+            .and_then(|b| b.build(&mut assembly));
 
-            assert!(result.is_ok());
-        }
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_native_imports_builder_auto_dll_addition() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = NativeImportsBuilder::new()
-                .add_function("kernel32.dll", "GetCurrentProcessId")
-                .and_then(|b| b.add_function_by_ordinal("user32.dll", 120))
-                .and_then(|b| b.build(&mut assembly));
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = NativeImportsBuilder::new()
+            .add_function("kernel32.dll", "GetCurrentProcessId")
+            .and_then(|b| b.add_function_by_ordinal("user32.dll", 120))
+            .and_then(|b| b.build(&mut assembly));
 
-            assert!(result.is_ok());
-        }
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_native_imports_builder_empty() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = NativeImportsBuilder::new().build(&mut assembly);
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = NativeImportsBuilder::new().build(&mut assembly);
 
-            assert!(result.is_ok());
-        }
+        assert!(result.is_ok());
     }
 
     #[test]

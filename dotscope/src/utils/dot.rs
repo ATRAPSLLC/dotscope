@@ -18,12 +18,7 @@
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::escape_dot;
-///
-/// let escaped = escape_dot("Method<T>");
-/// assert_eq!(escaped, "Method\\<T\\>");
-/// ```
+/// The `examples::escape_dot_example` test in this module runs this example.
 #[must_use]
 pub fn escape_dot(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -70,5 +65,18 @@ mod tests {
             escape_dot("Method<T>(\"arg\")"),
             "Method\\<T\\>(\\\"arg\\\")"
         );
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn escape_dot_example() -> Result<()> {
+        let escaped = escape_dot("Method<T>");
+        assert_eq!(escaped, "Method\\<T\\>");
+        Ok(())
     }
 }

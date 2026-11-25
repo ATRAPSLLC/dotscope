@@ -34,14 +34,14 @@ use std::collections::BTreeMap;
 
 use crate::{
     analysis::{
-        CilTarget, DefSite, MethodRef, ReturnInfo, SsaFunction, SsaInstruction, SsaOp, SsaType,
-        SsaVarId, VariableOrigin,
+        Callee, CilTarget, DefSite, MethodRef, ReturnInfo, SsaFunction, SsaInstruction, SsaOp,
+        SsaType, SsaVarId, VariableOrigin,
     },
     compiler::{
-        pass::{PassCapability, SsaPass},
+        pass::{ModificationScope, PassCapability, SsaPass},
         CompilerContext, EventKind, EventLog,
     },
-    metadata::{tables::MemberRefSignature, token::Token, typesystem::CilTypeReference},
+    metadata::{tables::TableId, token::Token},
     CilObject,
 };
 
@@ -181,7 +181,7 @@ impl<'a> InliningContext<'a> {
                 }
 
                 // Check purity - only inline pure or read-only methods
-                if !callee_ssa.purity().can_inline() {
+                if !callee_ssa.purity(|_| None).can_inline() {
                     return false;
                 }
 
@@ -211,7 +211,7 @@ impl<'a> InliningContext<'a> {
     fn has_recursive_call(&self, method_token: Token, ssa: &SsaFunction) -> bool {
         for block in ssa.blocks() {
             for instr in block.instructions() {
-                if let SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } = instr.op() {
+                if let Some(method) = instr.op().as_call().and_then(|call| call.callee.method()) {
                     if method.token() == method_token {
                         return true;
                     }
@@ -228,10 +228,10 @@ impl<'a> InliningContext<'a> {
 
     /// Resolves a token to its MethodDef equivalent.
     ///
-    /// This is necessary because:
-    /// - SSA forms are stored under MethodDef tokens
-    /// - Call instructions may use MemberRef tokens even for internal methods
-    /// - We need to match MemberRef -> MethodDef to look up the callee's SSA
+    /// SSA forms are stored under MethodDef tokens, but call instructions may
+    /// name an internal method through a MemberRef. The resolution matches the
+    /// reference's signature, so an overloaded name is never inlined as the
+    /// wrong overload.
     ///
     /// # Arguments
     ///
@@ -241,40 +241,13 @@ impl<'a> InliningContext<'a> {
     ///
     /// The resolved MethodDef token, or the original token if resolution fails.
     fn resolve_to_method_def(&self, token: Token) -> Token {
-        let table_id = token.table();
-
-        // Already a MethodDef - return as-is
-        if table_id == 0x06 {
+        if !token.is_table(TableId::MemberRef) {
             return token;
         }
-
-        // MemberRef - try to resolve to MethodDef
-        if table_id == 0x0A {
-            let refs = self.assembly.refs_members();
-            if let Some(member_ref_entry) = refs.get(&token) {
-                let member_ref = member_ref_entry.value();
-
-                // Only handle method signatures, not fields
-                let MemberRefSignature::Method(ref _method_sig) = member_ref.signature else {
-                    return token;
-                };
-
-                // Check if declared by a TypeDef (internal type)
-                if let CilTypeReference::TypeDef(type_ref) = &member_ref.declaredby {
-                    if let Some(type_info) = type_ref.upgrade() {
-                        if let Some(method) = type_info
-                            .query_methods()
-                            .name(&member_ref.name)
-                            .find_first()
-                        {
-                            return method.token;
-                        }
-                    }
-                }
-            }
-        }
-
-        token
+        self.assembly
+            .resolver()
+            .resolve_memberref_method(token)
+            .unwrap_or(token)
     }
 
     /// Finds all inlinable call sites in the method.
@@ -289,9 +262,12 @@ impl<'a> InliningContext<'a> {
         let mut candidates = Vec::new();
 
         for (block_idx, instr_idx, instr) in self.caller_ssa.iter_instructions() {
-            let raw_callee_token = match instr.op() {
-                SsaOp::Call { method, .. } => method.token(),
-                SsaOp::CallVirt { method, .. } => {
+            let Some(call) = instr.op().as_call() else {
+                continue;
+            };
+            let raw_callee_token = match &call.callee {
+                Callee::Direct(method) => method.token(),
+                Callee::Virtual(method) => {
                     let token = method.token();
                     // Check if this is actually polymorphic
                     if self
@@ -304,7 +280,10 @@ impl<'a> InliningContext<'a> {
                     }
                     token
                 }
-                _ => continue,
+                // A constrained call's receiver is the address of the value,
+                // which the named body does not take: the runtime boxes it,
+                // dereferences it or calls the constraint type's own method.
+                Callee::Constrained { .. } | Callee::Indirect { .. } => continue,
             };
 
             // Resolve MemberRef tokens to MethodDef tokens for SSA lookup
@@ -371,7 +350,8 @@ impl<'a> InliningContext<'a> {
     /// This method handles different return patterns optimally:
     /// - Constant returns: Replace call with constant assignment
     /// - Pass-through returns: Replace call with copy from argument
-    /// - Void returns: Replace call with Nop
+    /// - Void returns: Replace a call expecting no value with Nop, when the
+    ///   callee returns at all
     /// - Pure computation: Perform full block inlining
     ///
     /// # Arguments
@@ -394,15 +374,32 @@ impl<'a> InliningContext<'a> {
         callee_token: Token,
     ) -> bool {
         // Extract call information
-        let (dest, args) = match call_op {
-            SsaOp::Call { dest, args, .. } | SsaOp::CallVirt { dest, args, .. } => {
-                (*dest, args.clone())
-            }
-            _ => return false,
+        let Some((dest, args)) = call_op
+            .as_named_call()
+            .map(|call| (call.dest, call.args.clone()))
+        else {
+            return false;
         };
 
-        // For very simple cases, we can do a simpler inline
-        match callee_ssa.return_info() {
+        // The shortcuts below replace the call with its result, or delete it,
+        // without the callee's body. That drops whatever the body does besides
+        // compute the result - which purity rules out for writes, but not for a
+        // division by zero, a null dereference or an overflow check, each of
+        // which throws. A body that may throw is inlined whole instead, so the
+        // throw stays where the call was.
+        let body_may_throw = callee_ssa.blocks().iter().any(|block| {
+            block
+                .instructions()
+                .iter()
+                .any(|instr| instr.may_throw() && !matches!(instr.op(), SsaOp::Return { .. }))
+        });
+        let return_info = if body_may_throw {
+            ReturnInfo::Unknown
+        } else {
+            callee_ssa.return_info()
+        };
+
+        match return_info {
             ReturnInfo::Constant(value) => {
                 if let Some(dest_var) = dest {
                     if let Some(block) = self.caller_ssa.block_mut(call_block_idx) {
@@ -452,6 +449,16 @@ impl<'a> InliningContext<'a> {
                 }
             }
             ReturnInfo::Void => {
+                // Removing the call is right only for a call expecting no
+                // value from a callee that comes back. A callee with no
+                // `Return` never does, and a value the call defines would be
+                // left with no definition.
+                let returns = callee_ssa
+                    .iter_instructions()
+                    .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Return { .. }));
+                if dest.is_some() || !returns {
+                    return false;
+                }
                 if let Some(block) = self.caller_ssa.block_mut(call_block_idx) {
                     if let Some(instr) = block.instructions_mut().get_mut(call_instr_idx) {
                         instr.set_op(SsaOp::Nop);
@@ -519,6 +526,28 @@ impl<'a> InliningContext<'a> {
             return false;
         };
 
+        // The body is spliced into the middle of the caller's block, so it must
+        // fall through to a `Return` and nowhere else. And it must not name the
+        // callee's frame: a `ldarg`, `ldloc` or the address of either refers to
+        // a slot by number, and in the caller that number is a different slot.
+        let ends_in_return = matches!(
+            callee_block.instructions().last().map(SsaInstruction::op),
+            Some(SsaOp::Return { .. })
+        );
+        let names_callee_frame = callee_block.instructions().iter().any(|instr| {
+            matches!(
+                instr.op(),
+                SsaOp::LoadArg { .. }
+                    | SsaOp::LoadLocal { .. }
+                    | SsaOp::LoadArgAddr { .. }
+                    | SsaOp::LoadLocalAddr { .. }
+                    | SsaOp::RuntimeValue { .. }
+            )
+        });
+        if !ends_in_return || names_callee_frame || callee_ssa.has_exception_handlers() {
+            return false;
+        }
+
         // Build variable remapping
         let mut var_remap: BTreeMap<SsaVarId, SsaVarId> = BTreeMap::new();
 
@@ -540,12 +569,24 @@ impl<'a> InliningContext<'a> {
 
         for instr in callee_block.instructions() {
             let op = instr.op();
-            if let SsaOp::Return { value } = op {
+            if let SsaOp::Return { value, .. } = op {
                 return_value = *value;
             } else {
-                let remapped_op = Self::remap_op(op, &mut var_remap, callee_ssa, self.caller_ssa);
+                let Some(remapped_op) =
+                    Self::remap_op(op, &mut var_remap, callee_ssa, self.caller_ssa)
+                else {
+                    return false;
+                };
                 inlined_ops.push(remapped_op);
             }
+        }
+        if return_value.is_some_and(|value| !var_remap.contains_key(&value)) {
+            return false;
+        }
+        // The call's result is defined by the copy of the returned value; with
+        // nothing returned it would have no definition at all.
+        if dest.is_some() && return_value.is_none() {
+            return false;
         }
 
         // Modify the caller
@@ -612,8 +653,12 @@ impl<'a> InliningContext<'a> {
 
     /// Remaps variables in an SSA operation using the given mapping.
     ///
-    /// Creates fresh variables in the caller for any callee variables not
-    /// already in the mapping (i.e., variables defined within the callee).
+    /// Creates fresh variables in the caller for the variables the operation
+    /// defines, then rewrites every operand at once. At once is the point: the
+    /// callee's numbering and the caller's overlap, so rewriting one operand at
+    /// a time lets a later rewrite catch an operand an earlier one produced -
+    /// a call passing `(v1, v0)` to a callee computing `v0 + v1` would come out
+    /// as `v0 + v0`.
     ///
     /// # Arguments
     ///
@@ -624,30 +669,26 @@ impl<'a> InliningContext<'a> {
     ///
     /// # Returns
     ///
-    /// A cloned operation with all variables remapped to caller variables.
+    /// The operation in the caller's variables, or `None` when it reads a callee
+    /// variable nothing maps: one the callee neither receives as a parameter nor
+    /// defines before this point, which has no counterpart in the caller.
     fn remap_op(
         op: &SsaOp,
         var_remap: &mut BTreeMap<SsaVarId, SsaVarId>,
         callee_ssa: &SsaFunction,
         caller_ssa: &mut SsaFunction,
-    ) -> SsaOp {
-        let mut cloned = op.clone();
+    ) -> Option<SsaOp> {
+        if op.uses().iter().any(|used| !var_remap.contains_key(used)) {
+            return None;
+        }
 
-        // Remap every definition, not just the primary destination: an operation
-        // with secondary or flag outputs defines those too, and a callee variable
-        // left unremapped would collide with the caller's numbering.
+        // Every definition, not just the primary destination: an operation
+        // with secondary or flag outputs defines those too.
         for def in op.defs() {
-            let new_def = Self::get_or_create_var(def, var_remap, callee_ssa, caller_ssa);
-            cloned.replace_def(def, new_def);
+            Self::get_or_create_var(def, var_remap, callee_ssa, caller_ssa);
         }
 
-        // Remap uses
-        for used in op.uses() {
-            let new_var = var_remap.get(&used).copied().unwrap_or(used);
-            cloned.replace_uses(used, new_var);
-        }
-
-        cloned
+        Some(op.remap_variables(|var| var_remap.get(&var).copied()))
     }
 
     /// Gets the remapped variable or creates a new one in the caller.
@@ -729,6 +770,12 @@ impl SsaPass<CilTarget, CompilerContext> for InliningPass {
         "Inlines small, pure methods at their call sites"
     }
 
+    /// Only single-block callees are spliced, into the middle of the calling
+    /// block, so no edge changes.
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::InstructionsOnly
+    }
+
     fn reads_peer_ssa(&self) -> bool {
         true
     }
@@ -780,14 +827,15 @@ mod tests {
 
     use crate::{
         analysis::{
-            CallGraph, ConstValue, MethodRef, SsaFunctionBuilder, SsaOp, SsaType, SsaVarId,
+            CallGraph, Callee, ConstValue, MethodRef, ReturnInfo, SsaFunction, SsaFunctionBuilder,
+            SsaOp, SsaType, SsaVarId,
         },
         compiler::{
             passes::inlining::{InliningContext, InliningPass},
             CompilerContext, SsaPass,
         },
         metadata::token::Token,
-        test::helpers::test_assembly_arc,
+        testkit::helpers::test_assembly_arc,
         CilObject,
     };
 
@@ -835,7 +883,11 @@ mod tests {
             let ssa = SsaFunctionBuilder::new(0, 0)
                 .build_with(|f| {
                     f.block(0, |b| {
-                        let dest = b.call(MethodRef::new(callee_token), &[], SsaType::I32);
+                        let dest = b.call(
+                            Callee::Direct(MethodRef::new(callee_token)),
+                            &[],
+                            SsaType::I32,
+                        );
                         dest_out = dest;
                         b.ret_val(dest);
                     });
@@ -875,6 +927,254 @@ mod tests {
         let _ = callee_v0;
     }
 
+    /// Inlines `callee` at the single call in block 0 of `caller`.
+    fn inline_first_call(
+        callee_ssa: &SsaFunction,
+        caller_ssa: &mut SsaFunction,
+        call_instr_idx: usize,
+    ) -> bool {
+        let callee_token = Token::new(0x06000002);
+        let ctx = test_context();
+        ctx.set_ssa(callee_token, callee_ssa.clone());
+        let call_op = caller_ssa.block(0).unwrap().instructions()[call_instr_idx]
+            .op()
+            .clone();
+        let pass = InliningPass::new(20);
+        let assembly = test_assembly();
+        let mut inline_ctx =
+            InliningContext::new(&pass, caller_ssa, Token::new(0x06000001), &ctx, &assembly);
+        inline_ctx.inline_call(callee_ssa, 0, call_instr_idx, &call_op, callee_token)
+    }
+
+    /// A callee with no `Return` never comes back, so its call is not removed
+    /// as a void one: not when the call expects a value, which would then have
+    /// no definition, and not when it expects none, which would let the
+    /// caller run past a call that never returns.
+    #[test]
+    fn a_callee_that_never_returns_is_not_removed() {
+        // Callee: `for (;;) {}`, which the return classification reads as void.
+        let callee_ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| b.jump(0));
+            })
+            .unwrap();
+        assert!(matches!(callee_ssa.return_info(), ReturnInfo::Void));
+
+        for expects_value in [true, false] {
+            let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
+                .build_with(|f| {
+                    f.block(0, |b| {
+                        let callee = || Callee::Direct(MethodRef::new(Token::new(0x06000002)));
+                        if expects_value {
+                            let result = b.call(callee(), &[], SsaType::I32);
+                            b.ret_val(result);
+                        } else {
+                            b.call_void(callee(), &[]);
+                            b.ret();
+                        }
+                    });
+                })
+                .unwrap();
+            assert!(
+                !inline_first_call(&callee_ssa, &mut caller_ssa, 0),
+                "the call is kept (expects a value: {expects_value})"
+            );
+            assert!(matches!(
+                caller_ssa.block(0).unwrap().instructions()[0].op(),
+                SsaOp::Call(_)
+            ));
+        }
+    }
+
+    /// A void callee's call that nonetheless expects a value is not removed:
+    /// the value would have no definition.
+    #[test]
+    fn a_void_callee_called_for_a_value_is_not_removed() {
+        let callee_ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| b.ret());
+            })
+            .unwrap();
+        let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    let result = b.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[],
+                        SsaType::I32,
+                    );
+                    b.ret_val(result);
+                });
+            })
+            .unwrap();
+        assert!(!inline_first_call(&callee_ssa, &mut caller_ssa, 0));
+        assert!(caller_ssa.block(0).unwrap().instructions()[0]
+            .op()
+            .as_call()
+            .is_some_and(|call| call.dest.is_some()));
+    }
+
+    /// A body that may throw is inlined whole, and when it returns nothing
+    /// the call expecting a value is kept: the value would have no definition.
+    #[test]
+    fn a_whole_body_returning_nothing_is_not_inlined_for_a_value() {
+        let callee_ssa = SsaFunctionBuilder::new(2, 0)
+            .build_with(|f| {
+                let (a, b) = (f.arg(0, SsaType::I32), f.arg(1, SsaType::I32));
+                f.block(0, |blk| {
+                    let _ = blk.div(a, b);
+                    blk.ret();
+                });
+            })
+            .unwrap();
+        let mut caller_ssa = SsaFunctionBuilder::new(2, 0)
+            .build_with(|f| {
+                let (x, y) = (f.arg(0, SsaType::I32), f.arg(1, SsaType::I32));
+                f.block(0, |blk| {
+                    let result = blk.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[x, y],
+                        SsaType::I32,
+                    );
+                    blk.ret_val(result);
+                });
+            })
+            .unwrap();
+        assert!(!inline_first_call(&callee_ssa, &mut caller_ssa, 0));
+        assert!(caller_ssa.block(0).unwrap().instructions()[0]
+            .op()
+            .as_call()
+            .is_some_and(|call| call.dest.is_some()));
+    }
+
+    #[test]
+    fn an_inlined_body_reads_the_arguments_in_the_order_they_were_passed() {
+        // Callee `(a, b) => a - b`, whose parameters are v0 and v1.
+        let callee_ssa = SsaFunctionBuilder::new(2, 0)
+            .build_with(|f| {
+                let (a, b) = (f.arg(0, SsaType::I32), f.arg(1, SsaType::I32));
+                f.block(0, |blk| {
+                    let diff = blk.sub(a, b);
+                    blk.ret_val(diff);
+                });
+            })
+            .unwrap();
+
+        // Caller `(x, y) => callee(y, x)`: its own v0 and v1, passed crosswise.
+        let mut params = (SsaVarId::from_index(0), SsaVarId::from_index(0));
+        let mut caller_ssa = SsaFunctionBuilder::new(2, 0)
+            .build_with(|f| {
+                let (x, y) = (f.arg(0, SsaType::I32), f.arg(1, SsaType::I32));
+                params = (x, y);
+                f.block(0, |blk| {
+                    let r = blk.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[y, x],
+                        SsaType::I32,
+                    );
+                    blk.ret_val(r);
+                });
+            })
+            .unwrap();
+
+        assert!(inline_first_call(&callee_ssa, &mut caller_ssa, 0));
+
+        let (x, y) = params;
+        let sub = caller_ssa
+            .block(0)
+            .unwrap()
+            .instructions()
+            .iter()
+            .find_map(|instr| match instr.op() {
+                SsaOp::Sub { left, right, .. } => Some((*left, *right)),
+                _ => None,
+            })
+            .expect("the callee's subtraction is inlined");
+        assert_eq!(sub, (y, x), "callee(y, x) computes y - x");
+    }
+
+    #[test]
+    fn a_callee_that_may_throw_is_not_replaced_by_its_constant_result() {
+        // Callee `(a) => { _ = 10 / a; return 5; }`: always 5, but it throws for 0.
+        let callee_ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let a = f.arg(0, SsaType::I32);
+                f.block(0, |blk| {
+                    let ten = blk.const_i32(10);
+                    let _quotient = blk.div(ten, a);
+                    let five = blk.const_i32(5);
+                    blk.ret_val(five);
+                });
+            })
+            .unwrap();
+        assert!(
+            matches!(callee_ssa.return_info(), ReturnInfo::Constant(_)),
+            "the shortcut this guards against must be the one on offer"
+        );
+
+        let mut caller_ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let x = f.arg(0, SsaType::I32);
+                f.block(0, |blk| {
+                    let r = blk.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[x],
+                        SsaType::I32,
+                    );
+                    blk.ret_val(r);
+                });
+            })
+            .unwrap();
+
+        assert!(inline_first_call(&callee_ssa, &mut caller_ssa, 0));
+        assert!(
+            caller_ssa
+                .block(0)
+                .unwrap()
+                .instructions()
+                .iter()
+                .any(|instr| matches!(instr.op(), SsaOp::Div { .. })),
+            "the division that may throw must survive the inline"
+        );
+    }
+
+    #[test]
+    fn a_callee_reading_its_own_frame_slot_is_not_inlined() {
+        let callee_ssa = SsaFunctionBuilder::new(1, 0)
+            .build_with(|f| {
+                let loaded = f.var();
+                f.block(0, |blk| {
+                    blk.op_typed(
+                        SsaOp::LoadArg {
+                            dest: loaded,
+                            arg_index: 0,
+                        },
+                        SsaType::I32,
+                    );
+                    blk.ret_val(loaded);
+                });
+            })
+            .unwrap();
+        let mut caller_ssa = SsaFunctionBuilder::new(2, 0)
+            .build_with(|f| {
+                let y = f.arg(1, SsaType::I32);
+                f.block(0, |blk| {
+                    let r = blk.call(
+                        Callee::Direct(MethodRef::new(Token::new(0x06000002))),
+                        &[y],
+                        SsaType::I32,
+                    );
+                    blk.ret_val(r);
+                });
+            })
+            .unwrap();
+
+        assert!(
+            !inline_first_call(&callee_ssa, &mut caller_ssa, 0),
+            "`ldarg.0` in the callee is not the caller's argument 0"
+        );
+    }
+
     #[test]
     fn test_inline_void_pure() {
         // Callee: void method that does nothing impure
@@ -890,7 +1190,7 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(callee_token), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(callee_token)), &[]);
                     b.ret();
                 });
             })
@@ -999,7 +1299,11 @@ mod tests {
             .build_with(|f| {
                 f.block(0, |b| {
                     let v0 = b.const_i32(5);
-                    let v1 = b.call(MethodRef::new(callee_token), &[v0], SsaType::I32);
+                    let v1 = b.call(
+                        Callee::Direct(MethodRef::new(callee_token)),
+                        &[v0],
+                        SsaType::I32,
+                    );
                     b.ret_val(v1);
                 });
             })

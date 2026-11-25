@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::{
     metadata::{
         tables::{
-            EventList, EventMap, EventMapEntry, EventMapEntryRc, EventPtrMap, MetadataTable,
+            EventList, EventMap, EventMapEntry, EventMapEntryRc, EventPtrMap, MemberRanges,
             TableId, TableInfoRef, TableRow,
         },
         token::Token,
@@ -105,13 +105,19 @@ impl EventMapRaw {
     ///
     /// - **Start**: `self.event_list` (inclusive)
     /// - **End**: Next `EventMap` entry's `event_list` (exclusive) or end of Event table
-    /// - **`EventPtr` Indirection**: Handles `EventPtr` table if present for level of indirection
+    /// - **Normalization**: `ranges` holds the runs of the whole table, clamped to the Event
+    ///   table and made non-overlapping (see [`MemberRanges`]), so a hostile column cannot make
+    ///   a run longer than the table or two maps share events
+    /// - **`EventPtr` Indirection**: Positions go through `event_ptr` when `ranges` says the
+    ///   `EventPtr` table has rows
     ///
     /// # Arguments
     ///
     /// * `events` - Event table for resolving event references
     /// * `event_ptr` - `EventPtr` table for indirection resolution (if present)
-    /// * `map` - `EventMap` table for determining range boundaries
+    /// * `ranges` - The normalized `EventList` runs of the whole `EventMap` table
+    ///   ([`TablesHeader::member_ranges`](crate::metadata::streams::TablesHeader::member_ranges)
+    ///   with [`MemberList::EventMapEvents`](crate::metadata::tables::MemberList::EventMapEvents))
     ///
     /// # Returns
     ///
@@ -119,78 +125,18 @@ impl EventMapRaw {
     ///
     /// # Errors
     ///
-    /// - Range calculation fails due to invalid next row lookup
-    /// - Event token resolution fails
-    /// - `EventPtr` indirection resolution fails
-    /// - Event lookup in the Event table fails
+    /// - A position in the run names an `EventPtr` row that is not loaded
+    /// - A position (or its `EventPtr` entry) names an event that is not loaded
     fn resolve_event_list(
         &self,
         events: &EventMap,
         event_ptr: &EventPtrMap,
-        map: &MetadataTable<EventMapRaw>,
+        ranges: &MemberRanges,
     ) -> Result<EventList> {
-        if self.event_list == 0 || events.is_empty() {
-            return Ok(Arc::new(boxcar::Vec::new()));
+        let event_list = EventList::new();
+        for event in ranges.members(self.rid, event_ptr, |ptr| ptr.event, events) {
+            _ = event_list.push(event?);
         }
-
-        let next_row_id = self
-            .rid
-            .checked_add(1)
-            .ok_or_else(|| malformed_error!("EventMap rid overflow: {}", self.rid))?;
-        let start = self.event_list as usize;
-        let end = if next_row_id > map.row_count {
-            events.len().saturating_add(1)
-        } else {
-            match map.get(next_row_id)? {
-                Some(next_row) => next_row.event_list as usize,
-                None => {
-                    return Err(malformed_error!(
-                        "Failed to resolve event_end from next row - {}",
-                        next_row_id
-                    ))
-                }
-            }
-        };
-
-        if start > events.len() || end > events.len().saturating_add(1) || end < start {
-            return Ok(Arc::new(boxcar::Vec::new()));
-        }
-
-        let event_list = Arc::new(boxcar::Vec::with_capacity(end.saturating_sub(start)));
-        for counter in start..end {
-            let event_rid = u32::try_from(counter)
-                .map_err(|_| malformed_error!("Event row index out of range: {}", counter))?;
-            let actual_event_token = if event_ptr.is_empty() {
-                Token::from_parts(TableId::Event, event_rid)
-            } else {
-                // Built from the TableId enum rather than a hand-written prefix so the table
-                // id cannot drift from the value `EventPtrReader` keys rows under.
-                let event_ptr_token = Token::from_parts(TableId::EventPtr, event_rid);
-
-                match event_ptr.get(&event_ptr_token) {
-                    Some(event_ptr_entry) => {
-                        Token::from_parts(TableId::Event, event_ptr_entry.value().event)
-                    }
-                    None => {
-                        return Err(malformed_error!(
-                            "Failed to resolve EventPtr - {}",
-                            event_ptr_token.value()
-                        ))
-                    }
-                }
-            };
-
-            match events.get(&actual_event_token) {
-                Some(event) => _ = event_list.push(event.value().clone()),
-                None => {
-                    return Err(malformed_error!(
-                        "Failed to resolve event - {}",
-                        actual_event_token.value()
-                    ))
-                }
-            }
-        }
-
         Ok(event_list)
     }
 
@@ -206,7 +152,8 @@ impl EventMapRaw {
     /// * `types` - The type registry for resolving the parent type reference
     /// * `events` - The Event table for resolving event references in the range
     /// * `event_ptr` - The `EventPtr` table for indirection resolution (if present)
-    /// * `map` - The `EventMap` table for determining event range boundaries
+    /// * `ranges` - The normalized `EventList` runs of the whole `EventMap` table (see
+    ///   [`MemberRanges`])
     ///
     /// # Returns
     ///
@@ -224,7 +171,7 @@ impl EventMapRaw {
         types: &TypeRegistry,
         events: &EventMap,
         event_ptr: &EventPtrMap,
-        map: &MetadataTable<EventMapRaw>,
+        ranges: &MemberRanges,
     ) -> Result<EventMapEntryRc> {
         let parent = match types.get(&Token::new(self.parent | 0x0200_0000)) {
             Some(parent_type) => parent_type.into(),
@@ -241,7 +188,7 @@ impl EventMapRaw {
             token: self.token,
             offset: self.offset,
             parent,
-            events: self.resolve_event_list(events, event_ptr, map)?,
+            events: self.resolve_event_list(events, event_ptr, ranges)?,
         }))
     }
 
@@ -257,7 +204,8 @@ impl EventMapRaw {
     /// * `types` - The type registry containing all parsed `TypeDef` entries
     /// * `events` - The Event table containing all parsed Event entries
     /// * `event_ptr` - The `EventPtr` table for indirection resolution (if present)
-    /// * `map` - The `EventMap` table for determining event range boundaries
+    /// * `ranges` - The normalized `EventList` runs of the whole `EventMap` table (see
+    ///   [`MemberRanges`])
     ///
     /// # Returns
     ///
@@ -276,13 +224,9 @@ impl EventMapRaw {
         types: &TypeRegistry,
         events: &EventMap,
         event_ptr: &EventPtrMap,
-        map: &MetadataTable<EventMapRaw>,
+        ranges: &MemberRanges,
     ) -> Result<()> {
-        let event_list = self.resolve_event_list(events, event_ptr, map)?;
-
-        if event_list.is_empty() && (self.event_list != 0 && !events.is_empty()) {
-            return Err(malformed_error!("Invalid event list"));
-        }
+        let event_list = self.resolve_event_list(events, event_ptr, ranges)?;
 
         match types.get(&Token::new(self.parent | 0x0200_0000)) {
             Some(event_parent) => {

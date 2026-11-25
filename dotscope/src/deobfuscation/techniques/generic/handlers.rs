@@ -20,7 +20,7 @@ use std::any::Any;
 use crate::{
     compiler::{EventKind, EventLog},
     deobfuscation::techniques::{
-        Detection, Detections, Evidence, Technique, TechniqueCategory, WorkingAssembly,
+        Detection, Evidence, Technique, TechniqueCapability, TechniqueCategory, WorkingAssembly,
     },
     metadata::{
         method::{MethodBody, MethodImplCodeType},
@@ -53,6 +53,10 @@ impl Technique for GenericHandlers {
         TechniqueCategory::Metadata
     }
 
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![TechniqueCapability::ByteTransform]
+    }
+
     fn detect(&self, assembly: &CilObject) -> Detection {
         let Some(tables) = assembly.tables() else {
             return Detection::new_empty();
@@ -77,23 +81,19 @@ impl Technique for GenericHandlers {
             }
 
             let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
-            if code_type.contains(MethodImplCodeType::NATIVE)
-                || code_type.contains(MethodImplCodeType::RUNTIME)
-            {
+            if matches!(
+                code_type,
+                MethodImplCodeType::NATIVE | MethodImplCodeType::RUNTIME
+            ) {
                 continue;
             }
 
-            let Ok(offset) = file.rva_to_offset(row.rva as usize) else {
+            let Ok(body_data) = file.section_bounded(row.rva as usize) else {
                 continue;
             };
-            let available = file.data().len().saturating_sub(offset);
-            if available == 0 {
+            if body_data.is_empty() {
                 continue;
             }
-
-            let Some(body_data) = file.data().get(offset..offset.saturating_add(available)) else {
-                continue;
-            };
 
             if let Ok((_, filtered)) = MethodBody::from_lenient(body_data) {
                 if filtered > 0 {
@@ -122,8 +122,7 @@ impl Technique for GenericHandlers {
     fn byte_transform(
         &self,
         assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
 
@@ -159,7 +158,7 @@ impl Technique for GenericHandlers {
 
 #[cfg(test)]
 mod tests {
-    use crate::{deobfuscation::techniques::Technique, test::helpers::load_sample};
+    use crate::{deobfuscation::techniques::Technique, testkit::helpers::load_sample};
 
     /// Verify detection runs without error on a protected sample.
     ///
@@ -168,14 +167,14 @@ mod tests {
     /// without panicking.
     #[test]
     fn test_detect_no_panic_on_obfuscated() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_normal.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/mkaring_normal.exe");
         let technique = super::GenericHandlers;
         let _detection = technique.detect(&asm);
     }
 
     #[test]
     fn test_detect_negative() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
         let technique = super::GenericHandlers;
         let detection = technique.detect(&asm);
         assert!(!detection.is_detected());

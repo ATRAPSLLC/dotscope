@@ -40,6 +40,7 @@
 mod base;
 mod builder;
 mod encoder;
+mod fullname;
 mod hash;
 mod primitives;
 mod registry;
@@ -58,6 +59,7 @@ pub use base::{
 };
 pub use builder::TypeBuilder;
 pub use encoder::TypeSignatureEncoder;
+pub use fullname::FullName;
 pub use hash::TypeSignatureHash;
 pub use primitives::{CilPrimitive, CilPrimitiveData, CilPrimitiveKind};
 pub use registry::{CompleteTypeSpec, TypeRegistry, TypeSource};
@@ -69,13 +71,15 @@ use crate::{
         method::{MethodRc, MethodRefList},
         query::{FieldQuery, MethodQuery},
         security::Security,
+        signatures::TypeSignature,
+        streams::SharedStr,
         tables::{
             EventList, FieldAttributes, FieldList, FieldRc, GenericParamList, InterfaceEntryList,
             MethodSpec, MethodSpecList, PropertyList, TableId, TypeAttributes,
         },
         token::Token,
     },
-    utils::LazyList,
+    utils::{LazyList, RowList},
     Error, Result,
 };
 
@@ -93,7 +97,7 @@ pub type CilTypeRc = Arc<CilType>;
 
 /// Maximum number of ancestors [`CilType::base_chain`] will yield before stopping.
 ///
-/// Real inheritance chains are shallow — the deepest in the .NET base class library is well
+/// Real inheritance chains are shallow - the deepest in the .NET base class library is well
 /// under 20. This bound exists solely to terminate walks over malformed metadata, and is set
 /// high enough that no legitimate assembly can reach it. It matches the limit already applied
 /// to the virtual-dispatch walks in the emulation engine.
@@ -160,10 +164,13 @@ pub struct CilType {
     /// Computed type flavor - lazily determined from context and inheritance chain
     flavor: OnceLock<CilFlavor>,
     /// Type namespace (empty for global types and some special cases like `<Module>`)
-    pub namespace: String,
+    pub namespace: SharedStr,
     /// Type name (class name, interface name, etc.)
-    pub name: String,
-    /// External type reference for imported types (from `AssemblyRef`, `File`, `ModuleRef`)
+    pub name: SharedStr,
+    /// The scope the type belongs to: for a type reference where it resolves (`AssemblyRef`,
+    /// `File`, `ModuleRef`, an enclosing `TypeRef`); for a type definition its own assembly.
+    /// Set for both, so it does not tell an imported type from a defined one: the token's
+    /// table does.
     external: OnceLock<CilTypeReference>,
     /// Base type reference - the type this type inherits from (for classes) or extends (for interfaces)
     base: OnceLock<CilTypeRef>,
@@ -180,9 +187,9 @@ pub struct CilType {
     /// All interfaces this type implements (from `InterfaceImpl` table)
     pub interfaces: InterfaceEntryList,
     /// All method overwrites this type implements (explicit interface implementations)
-    pub overwrites: Arc<boxcar::Vec<CilTypeReference>>,
+    pub overwrites: RowList<CilTypeReference>,
     /// Nested types contained within this type (inner classes, delegates, etc.)
-    pub nested_types: CilTypeRefList,
+    pub nested_types: RowList<CilTypeRef>,
     /// Generic parameters for this type definition (e.g., T, U in Class<T, U>)
     pub generic_params: GenericParamList,
     /// Generic arguments for instantiated generic types (actual types substituted for parameters)
@@ -195,14 +202,17 @@ pub struct CilType {
     pub class_size: OnceLock<u32>,
     /// `TypeSpec` specifiers providing additional type information for complex types
     pub spec: OnceLock<CilFlavor>,
-    /// Type modifiers from `TypeSpec` (required/optional modifiers, pinned types, etc.)
-    pub modifiers: Arc<boxcar::Vec<CilModifier>>,
-    /// Security declarations and permissions associated with this type
-    pub security: OnceLock<Security>,
+    /// Type modifiers from `TypeSpec` (required/optional modifiers, pinned types, etc.),
+    /// allocated on the first push
+    pub modifiers: LazyList<CilModifier>,
+    /// The type's declarative security, a `DeclSecurity` row each, in table order: a type may
+    /// demand permissions under several actions (a link demand and an inheritance demand,
+    /// say).
+    pub security: RowList<Security>,
     /// Enclosing type for nested types - used for reverse lookup to build hierarchical names
     pub enclosing_type: OnceLock<CilTypeRef>,
-    /// Cached full name to avoid expensive recomputation.
-    fullname: RwLock<Option<Arc<str>>>,
+    /// Cached full name, cleared when this type or an enclosing type is nested.
+    fullname: RwLock<Option<FullName>>,
     // vtable
     // security
     // default_constructor: Option<MethodRef>
@@ -240,11 +250,10 @@ impl CilType {
     /// ```rust,no_run
     /// use dotscope::metadata::{
     ///     method::MethodRefList,
-    ///     tables::TypeAttributes,
+    ///     tables::{FieldList, TypeAttributes},
     ///     typesystem::{CilType, CilFlavor},
     ///     token::Token,
     /// };
-    /// use std::sync::Arc;
     ///
     /// let cil_type = CilType::new(
     ///     Token::new(0x02000001), // TypeDef token
@@ -253,7 +262,7 @@ impl CilType {
     ///     None, // Not an external type
     ///     None, // No base type specified yet
     ///     TypeAttributes::new(0x00100001), // TypeAttributes flags
-    ///     Arc::new(boxcar::Vec::new()), // Empty fields list
+    ///     FieldList::new(), // Empty fields list, allocated on first push
     ///     MethodRefList::new(), // Empty methods list, allocated on first push
     ///     Some(CilFlavor::Class), // Explicit class flavor
     /// );
@@ -261,8 +270,8 @@ impl CilType {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: Token,
-        namespace: String,
-        name: String,
+        namespace: impl Into<SharedStr>,
+        name: impl Into<SharedStr>,
         external: Option<CilTypeReference>,
         base: Option<CilTypeRef>,
         flags: TypeAttributes,
@@ -287,27 +296,27 @@ impl CilType {
 
         CilType {
             token,
-            namespace,
-            name,
+            namespace: namespace.into(),
+            name: name.into(),
             external: external_lock,
             base: base_lock,
             flags,
             flavor: flavor_lock,
             fields,
             methods,
-            properties: Arc::new(boxcar::Vec::new()),
-            events: Arc::new(boxcar::Vec::new()),
-            interfaces: Arc::new(boxcar::Vec::new()),
-            overwrites: Arc::new(boxcar::Vec::new()),
-            nested_types: Arc::new(boxcar::Vec::new()),
-            generic_params: LazyList::new(),
+            properties: LazyList::new(),
+            events: LazyList::new(),
+            interfaces: Default::default(),
+            overwrites: Default::default(),
+            nested_types: Default::default(),
+            generic_params: Default::default(),
             generic_args: LazyList::new(),
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
             packing_size: OnceLock::new(),
             class_size: OnceLock::new(),
             spec: OnceLock::new(),
-            modifiers: Arc::new(boxcar::Vec::new()),
-            security: OnceLock::new(),
+            modifiers: LazyList::new(),
+            security: RowList::new(),
             enclosing_type: OnceLock::new(),
             fullname: RwLock::new(None),
         }
@@ -338,13 +347,13 @@ impl CilType {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use dotscope::metadata::typesystem::{CilType, CilTypeRef};
     /// use std::sync::{Arc, Weak};
     ///
     /// # fn example(cil_type: &CilType, base_type: Arc<CilType>) {
     /// let base_ref = CilTypeRef::new(&base_type);
-    /// match cil_type.set_base(base_ref) {
+    /// match cil_type.set_base(&base_ref) {
     ///     Ok(()) => println!("Base type set successfully"),
     ///     Err(_) => println!("Base type was already set"),
     /// }
@@ -438,7 +447,7 @@ impl CilType {
 
     /// Iterates the type's inheritance chain, from the immediate base type towards the root.
     ///
-    /// The starting type itself is **not** yielded — the first item is `self.base()`.
+    /// The starting type itself is **not** yielded - the first item is `self.base()`.
     ///
     /// # Why this exists
     ///
@@ -448,7 +457,7 @@ impl CilType {
     /// [`ValidationConfig::analysis`](crate::metadata::validation::ValidationConfig::analysis)
     /// because that preset reports circular inheritance as a diagnostic rather than refusing the
     /// file. A hand-written `while let Some(t) = t.base()` loop over such a graph never
-    /// terminates, and the recursive equivalent exhausts the native stack — an abort that no
+    /// terminates, and the recursive equivalent exhausts the native stack - an abort that no
     /// caller can catch and that no emulation budget can interrupt.
     ///
     /// This iterator is the only sanctioned way to walk a base chain. It is bounded twice over:
@@ -465,7 +474,7 @@ impl CilType {
     /// // Safe against attacker-supplied inheritance cycles.
     /// let derives_from_exception = cil_type
     ///     .base_chain()
-    ///     .any(|ancestor| &*ancestor.fullname() == "System.Exception");
+    ///     .any(|ancestor| ancestor.fullname() == "System.Exception");
     /// # }
     /// ```
     #[must_use]
@@ -504,11 +513,10 @@ impl CilType {
     pub fn set_enclosing_type(&self, enclosing_type: &CilTypeRef) -> Result<()> {
         match self.enclosing_type.set(enclosing_type.clone()) {
             Ok(()) => {
-                // Invalidate the cached fullname so it will be recomputed
-                // with the enclosing type prefix on next access.
-                if let Ok(mut guard) = self.fullname.write() {
-                    *guard = None;
-                }
+                // Invalidate the cached full names so they are recomputed with the enclosing
+                // type's prefix on next access: this type's, and those of the types nested in
+                // it, which may have been computed before it was nested itself.
+                self.clear_fullnames();
                 Ok(())
             }
             Err(_) => {
@@ -617,14 +625,17 @@ impl CilType {
         }
     }
 
-    /// Gets the external type reference for this type, if it exists.
+    /// The scope this type belongs to.
     ///
-    /// Returns the external reference that indicates where this type is defined,
-    /// or `None` if this is a type defined in the current assembly or if no
-    /// external reference has been set.
+    /// For a type reference, where it resolves (`AssemblyRef`, `File`, `ModuleRef`, or the
+    /// `TypeRef` enclosing a nested reference); for a type definition, the assembly that
+    /// defines it, when the module has an Assembly row. It is therefore set for defined
+    /// types too and does not tell an imported type from a defined one: the token's table
+    /// does (`TypeDef` defines, `TypeRef` imports).
     ///
     /// ## Returns
-    /// Returns the external reference if it has been set, or `None` if it's still pending resolution.
+    /// The scope, or `None` when none was recorded (a netmodule's type definitions, or a
+    /// reference whose scope is still pending resolution).
     pub fn external(&self) -> Option<&CilTypeReference> {
         self.external.get()
     }
@@ -661,6 +672,29 @@ impl CilType {
         self.flavor.get_or_init(|| self.compute_flavor())
     }
 
+    /// Records that this type is a value type, from a fact its own flavor
+    /// computation cannot see yet.
+    ///
+    /// A type referenced from another assembly has no definition here to
+    /// compute its kind from, and the heuristics then take it for a class:
+    /// `System.DateTime`, `System.RuntimeTypeHandle` and every other imported
+    /// struct would read as reference types. The signatures that use the type
+    /// are required to say which it is. A type defined here derives from
+    /// `System.ValueType` or `System.Enum` directly, as ECMA-335 requires, but
+    /// its base is linked only after loaders that may already ask for its
+    /// flavor have run, and a flavor computed then is a class forever. A
+    /// primitive keeps its own flavor. Has no effect once the flavor has been
+    /// computed.
+    pub fn mark_value_type(&self) {
+        let computed = self.compute_flavor();
+        let flavor = if computed.is_value_type() {
+            computed
+        } else {
+            CilFlavor::ValueType
+        };
+        let _ = self.flavor.set(flavor);
+    }
+
     /// Compute the type flavor based on flags, inheritance chain, and intelligent heuristics.
     ///
     /// This method implements the core type classification logic, determining whether a type
@@ -670,7 +704,8 @@ impl CilType {
     /// 1. **ECMA-335 Interface flag** - Types with the Interface attribute are always interfaces
     /// 2. **System primitive types** - Well-known System namespace types get direct classification
     /// 3. **Inheritance chain analysis** - Types inheriting from ValueType, Enum, etc.
-    /// 4. **Attribute-based heuristics** - Layout flags, sealed/abstract combinations
+    /// 4. **Attribute-based heuristics** - Layout flags, sealed/abstract combinations, for a
+    ///    type with no definition here (a defined type's base decides, ECMA-335 II.13)
     /// 5. **Default** - Unclassified types default to Class
     ///
     /// # Returns
@@ -701,8 +736,10 @@ impl CilType {
                 "IntPtr" => return CilFlavor::I,
                 "UIntPtr" => return CilFlavor::U,
                 // Decimal is a special value type (not a primitive flavor)
-                // Special value types (base types themselves)
-                "Decimal" | "ValueType" | "Enum" => return CilFlavor::ValueType,
+                "Decimal" => return CilFlavor::ValueType,
+                // The bases of value types are classes themselves (ECMA-335 II.13): a
+                // `System.Enum` or `System.ValueType` is a reference to a boxed value
+                "ValueType" | "Enum" => return CilFlavor::Class,
                 // Well-known reference types
                 "Object" => return CilFlavor::Object,
                 "String" => return CilFlavor::String,
@@ -718,9 +755,16 @@ impl CilType {
             return inherited_flavor;
         }
 
-        // 4. Intelligent attribute-based classification
-        if let Some(attribute_flavor) = self.classify_by_attributes() {
-            return attribute_flavor;
+        // 4. Attribute-based guesses, for a type with no definition here to decide from. A
+        // type defined here is a value type exactly when it extends System.ValueType or
+        // System.Enum (ECMA-335 II.13), which its loader records before anything can ask
+        // (`mark_value_type`); guessing from its flags would make a sealed class with
+        // sequential layout, common in interop code, a value type whenever its base is not
+        // linked yet.
+        if !self.token.is_table(TableId::TypeDef) {
+            if let Some(attribute_flavor) = self.classify_by_attributes() {
+                return attribute_flavor;
+            }
         }
 
         // 5. Default classification for reference types
@@ -742,14 +786,14 @@ impl CilType {
             let base_fullname = base_type.fullname();
 
             // Direct well-known base types
-            if &*base_fullname == wellknown::names::VALUE_TYPE
-                || &*base_fullname == wellknown::names::ENUM
+            if base_fullname == wellknown::names::VALUE_TYPE
+                || base_fullname == wellknown::names::ENUM
             {
                 return Some(CilFlavor::ValueType);
             }
 
-            if &*base_fullname == wellknown::names::DELEGATE
-                || &*base_fullname == wellknown::names::MULTICAST_DELEGATE
+            if base_fullname == wellknown::names::DELEGATE
+                || base_fullname == wellknown::names::MULTICAST_DELEGATE
             {
                 return Some(CilFlavor::Class); // Delegates are reference types but special classes
             }
@@ -968,10 +1012,15 @@ impl CilType {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let types = assembly.types();
+    /// # let entry = types.iter().next().expect("the sample has types");
+    /// # let cil_type = entry.value();
     /// if cil_type.is_public() {
     ///     println!("Type {} is publicly accessible", cil_type.name);
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_public(&self) -> bool {
         self.flags.is_public()
@@ -1025,7 +1074,23 @@ impl CilType {
     #[must_use]
     pub fn is_enum(&self) -> bool {
         self.base()
-            .is_some_and(|b| &*b.fullname() == wellknown::names::ENUM)
+            .is_some_and(|b| b.fullname() == wellknown::names::ENUM)
+    }
+
+    /// Returns an enum's underlying type: the type of its one instance field
+    /// (ECMA-335 II.14.3), whatever the field is named. Compilers name it
+    /// `value__`; a renaming obfuscator need not keep that.
+    ///
+    /// Read off the type as it stands, without checking that it is an enum: a
+    /// type known by a reference may not show its base, and a caller asks this
+    /// of a type it has found to be one ([`Self::is_enum`], or the registry's
+    /// view of its inheritance). `None` for a type with no instance field.
+    #[must_use]
+    pub fn enum_underlying(&self) -> Option<&TypeSignature> {
+        self.fields
+            .iter()
+            .find(|(_, field)| !field.flags.is_static())
+            .map(|(_, field)| &field.signature.base)
     }
 
     /// Returns true if this type is a delegate (inherits from `System.Delegate` or `System.MulticastDelegate`).
@@ -1041,10 +1106,17 @@ impl CilType {
     ///
     /// This handles the weak-ref upgrade boilerplate automatically,
     /// replacing the common pattern:
-    /// ```rust,ignore
+    /// ```
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let types = assembly.types();
+    /// # let entry = types.iter().next().expect("the sample has types");
+    /// # let type_info = entry.value();
     /// for (_, method_ref) in type_info.methods.iter() {
-    ///     if let Some(method) = method_ref.upgrade() { ... }
+    ///     if let Some(method) = method_ref.upgrade() {
+    ///         println!("{}", method.name);
+    ///     }
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn query_methods(&self) -> MethodQuery<'_> {
         MethodQuery::from_type(&self.methods)
@@ -1053,9 +1125,14 @@ impl CilType {
     /// Returns a composable query over fields defined in this type.
     ///
     /// This provides a fluent API mirroring [`query_methods()`](Self::query_methods):
-    /// ```rust,ignore
+    /// ```
+    /// # let assembly = dotscope::CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// # let types = assembly.types();
+    /// # let entry = types.iter().next().expect("the sample has types");
+    /// # let type_info = entry.value();
     /// let static_fields = type_info.query_fields().static_fields().find_all();
     /// let value_field = type_info.query_fields().instance_fields().name("value__").find_first();
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn query_fields(&self) -> FieldQuery<'_> {
         FieldQuery::from_type(&self.fields)
@@ -1159,107 +1236,116 @@ impl CilType {
             .collect()
     }
 
-    /// Returns the full name (Namespace.Name) of the type.
+    /// Get the full name (namespace + name) of this type.
     ///
     /// Combines the namespace and name to create a fully qualified type name,
     /// which is useful for type lookup and identification. For nested types,
     /// uses "/" separators as per .NET runtime convention.
     ///
     /// # Returns
-    /// A string containing the full name in the format:
+    /// The [`FullName`], which displays and compares as:
     /// - `"Namespace.Name"` for top-level types
     /// - `"Namespace.Outer/Inner"` for nested types
     ///
+    /// A type with an empty name is named `<unnamed_TTTTTTTT>` after its token. A chain of
+    /// enclosing types that comes back to a type already in it ends at the last type before
+    /// the repeat, which counts as the outermost.
+    ///
     /// # Caching
-    /// The result is cached after first computation for performance.
-    pub fn fullname(&self) -> Arc<str> {
-        if let Ok(guard) = self.fullname.read() {
-            if let Some(cached) = guard.as_ref() {
-                return Arc::clone(cached);
-            }
+    /// The result is cached after first computation, and the names of the enclosing types
+    /// along with it when the chain has no cycle. A `FullName` joins its text only when it is
+    /// shown or read as a `str`.
+    pub fn fullname(&self) -> FullName {
+        if let Some(cached) = self.cached_fullname() {
+            return cached;
         }
 
-        let fullname: Arc<str> = Arc::from(self.compute_fullname());
+        // The enclosing types, innermost first, up to the outermost one, one whose name is
+        // cached, or a type the chain has already passed (a cycle)
+        let mut enclosing_types: Vec<CilTypeRc> = Vec::new();
+        let mut visited = HashSet::from([self.token]);
+        let mut cached_scope = None;
+        let mut cyclic = false;
+        let mut current = self.enclosing_type();
+        while let Some(enclosing) = current {
+            if !visited.insert(enclosing.token) {
+                cyclic = true;
+                break;
+            }
+            if let Some(cached) = enclosing.cached_fullname() {
+                cached_scope = Some(cached);
+                break;
+            }
+            current = enclosing.enclosing_type();
+            enclosing_types.push(enclosing);
+        }
+
+        let mut scope = cached_scope;
+        for enclosing in enclosing_types.iter().rev() {
+            let name = Self::scoped_name(scope, enclosing);
+            if !cyclic {
+                enclosing.store_fullname(&name);
+            }
+            scope = Some(name);
+        }
+        let name = Self::scoped_name(scope, self);
+        self.store_fullname(&name);
+        name
+    }
+
+    /// The full name of `ty` within `scope`: nested in it, or top-level without one.
+    fn scoped_name(scope: Option<FullName>, ty: &CilType) -> FullName {
+        let name = if ty.name.is_empty() {
+            SharedStr::from(format!("<unnamed_{:08X}>", ty.token.value()))
+        } else {
+            ty.name.clone()
+        };
+        match scope {
+            Some(enclosing) => FullName::nested(enclosing, name),
+            None => FullName::top_level(ty.namespace.clone(), name),
+        }
+    }
+
+    /// The cached full name, if computed since this type or an enclosing type was nested.
+    fn cached_fullname(&self) -> Option<FullName> {
+        self.fullname
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    /// Caches `name` as this type's full name.
+    fn store_fullname(&self, name: &FullName) {
         if let Ok(mut guard) = self.fullname.write() {
-            *guard = Some(Arc::clone(&fullname));
+            *guard = Some(name.clone());
         }
-        fullname
     }
 
-    /// Computes the full name by traversing the enclosing type hierarchy.
-    ///
-    /// This is the core implementation separated from caching logic for clarity.
-    fn compute_fullname(&self) -> String {
-        let (path_components, outermost_namespace) = self.collect_type_path();
-
-        if path_components.len() > 1 {
-            // This is a nested type - use "/" separators like .NET runtime.
-            // The namespace comes from the outermost enclosing type, not self,
-            // because nested types in ECMA-335 typically have an empty namespace field.
-            let nested_path = path_components.join("/");
-            if outermost_namespace.is_empty() {
-                nested_path
-            } else {
-                format!("{outermost_namespace}.{nested_path}")
+    /// Clears the cached full names of this type and of every type nested in it, at any
+    /// depth (each once, so a cyclic nesting ends).
+    fn clear_fullnames(&self) {
+        let mut visited = HashSet::from([self.token]);
+        if let Ok(mut guard) = self.fullname.write() {
+            *guard = None;
+        }
+        let mut pending: Vec<CilTypeRc> = self
+            .nested_types
+            .into_iter()
+            .filter_map(|(_, nested)| nested.upgrade())
+            .collect();
+        while let Some(nested) = pending.pop() {
+            if !visited.insert(nested.token) {
+                continue;
             }
-        } else {
-            // This is a top-level type - use traditional "." separator
-            self.format_toplevel_fullname()
-        }
-    }
-
-    /// Collects the type path from innermost (self) to outermost enclosing type.
-    ///
-    /// Returns the path components in outermost-to-innermost order and the
-    /// outermost enclosing type's namespace (which is the namespace that applies
-    /// to the entire nested type chain in ECMA-335 metadata).
-    fn collect_type_path(&self) -> (Vec<String>, String) {
-        let mut path_components = Vec::new();
-
-        path_components.push(self.safe_type_name());
-
-        let mut outermost_namespace = self.namespace.clone();
-        let mut visited_tokens = HashSet::new();
-        visited_tokens.insert(self.token);
-
-        let mut current_type = self.enclosing_type();
-        while let Some(enclosing) = current_type {
-            if visited_tokens.contains(&enclosing.token) {
-                break; // Cycle detected
+            if let Ok(mut guard) = nested.fullname.write() {
+                *guard = None;
             }
-            visited_tokens.insert(enclosing.token);
-
-            outermost_namespace = enclosing.namespace.clone();
-            path_components.push(Self::safe_name_for(&enclosing.name, enclosing.token));
-            current_type = enclosing.enclosing_type();
-        }
-
-        // Reverse to get outermost-to-innermost order
-        path_components.reverse();
-        (path_components, outermost_namespace)
-    }
-
-    /// Returns a safe type name, using a placeholder for empty names.
-    fn safe_type_name(&self) -> String {
-        Self::safe_name_for(&self.name, self.token)
-    }
-
-    /// Returns a safe name string, using a token-based placeholder if empty.
-    fn safe_name_for(name: &str, token: Token) -> String {
-        if name.is_empty() {
-            format!("<unnamed_{:08X}>", token.value())
-        } else {
-            name.to_string()
-        }
-    }
-
-    /// Formats the full name for a top-level type using "." separator.
-    fn format_toplevel_fullname(&self) -> String {
-        let type_name = self.safe_type_name();
-        if self.namespace.is_empty() {
-            type_name
-        } else {
-            format!("{}.{}", self.namespace, type_name)
+            pending.extend(
+                nested
+                    .nested_types
+                    .into_iter()
+                    .filter_map(|(_, inner)| inner.upgrade()),
+            );
         }
     }
 
@@ -1530,18 +1616,14 @@ impl CilType {
     /// Two types have equivalent generic parameters if they have the same number
     /// of parameters and each corresponding parameter has the same name and number.
     fn generic_params_equivalent(&self, other: &CilType) -> bool {
-        let count = self.generic_params.count();
-        if count != other.generic_params.count() {
+        if self.generic_params.count() != other.generic_params.count() {
             return false;
         }
 
-        (0..count).all(
-            |i| match (self.generic_params.get(i), other.generic_params.get(i)) {
-                (Some(p1), Some(p2)) => p1.name == p2.name && p1.number == p2.number,
-                (None, None) => true,
-                _ => false,
-            },
-        )
+        self.generic_params
+            .iter()
+            .zip(other.generic_params.iter())
+            .all(|((_, p1), (_, p2))| p1.name == p2.name && p1.number == p2.number)
     }
 
     /// Compare base types for equivalence
@@ -1667,7 +1749,19 @@ impl fmt::Display for CilType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::builders::CilTypeBuilder;
+    use crate::testkit::builders::CilTypeBuilder;
+
+    /// A type defined here is a value type only by its base (ECMA-335 II.13). A sealed class
+    /// with sequential layout, as interop code declares one, stays a class while its base is
+    /// not linked yet, instead of being guessed a value type from its flags.
+    #[test]
+    fn a_sealed_sequential_type_definition_is_not_guessed_a_value_type() {
+        let defined = CilTypeBuilder::simple_class("Mono.Unix.Native", "SockaddrIn")
+            .with_flags(TypeAttributes::SEALED | TypeAttributes::SEQUENTIAL_LAYOUT)
+            .with_computed_flavor()
+            .build();
+        assert_eq!(*defined.flavor(), CilFlavor::Class);
+    }
 
     /// Builds a type with a distinct token so the visited set can tell instances apart.
     fn typ(rid: u32, name: &str) -> CilTypeRc {
@@ -1768,5 +1862,41 @@ mod tests {
         b.set_base(&CilTypeRef::new(&a)).expect("set_base b -> a");
 
         assert!(!a.implements_interface(&iface));
+    }
+
+    /// Nests `inner` in `outer` as the NestedClass loader does.
+    fn nest(outer: &CilTypeRc, inner: &CilTypeRc) {
+        outer
+            .nested_types
+            .push_row(inner.token, inner.clone().into());
+        inner.set_enclosing_type(&outer.clone().into()).unwrap();
+    }
+
+    /// A nested type's full name follows its enclosing types nested after it was computed:
+    /// nesting a type clears the cached names of the types nested in it too.
+    #[test]
+    fn a_full_name_follows_an_enclosing_type_nested_later() {
+        let (outer, middle, inner) = (typ(1, "A"), typ(2, "B"), typ(3, "C"));
+        nest(&middle, &inner);
+        assert_eq!(inner.fullname(), "Test.B/C");
+        assert_eq!(middle.fullname(), "Test.B");
+
+        nest(&outer, &middle);
+        assert_eq!(middle.fullname(), "Test.A/B");
+        assert_eq!(inner.fullname(), "Test.A/B/C");
+        assert_eq!(inner.fullname().to_string(), "Test.A/B/C");
+    }
+
+    /// A deep chain of nested types names each type once: computing the innermost name
+    /// caches every enclosing type's along the way.
+    #[test]
+    fn a_deep_nesting_chain_names_each_type_once() {
+        let types: Vec<CilTypeRc> = (1..=2000).map(|rid| typ(rid, "N")).collect();
+        for pair in types.windows(2) {
+            nest(&pair[0], &pair[1]);
+        }
+        let innermost = types.last().unwrap().fullname();
+        assert_eq!(innermost.len(), "Test.".len() + 2000 * 2 - 1);
+        assert!(types.iter().all(|ty| ty.fullname.read().unwrap().is_some()));
     }
 }

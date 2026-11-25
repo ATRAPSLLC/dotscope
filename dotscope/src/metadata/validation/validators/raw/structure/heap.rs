@@ -147,9 +147,7 @@ impl RawHeapValidator {
     /// - String entries contain invalid UTF-8 sequences
     /// - String entries are not properly null-terminated
     fn validate_string_heap(assembly_view: &CilAssemblyView) -> Result<()> {
-        let streams = assembly_view.streams();
-
-        let strings_stream = streams.iter().find(|s| s.name == "#Strings");
+        let strings_stream = assembly_view.metadata_root().stream("#Strings");
         if let Some(stream) = strings_stream {
             if stream.size > 0x7FFF_FFFF {
                 return Err(malformed_error!(
@@ -200,14 +198,23 @@ impl RawHeapValidator {
     /// - String is not properly null-terminated (ECMA-335 requirement)
     /// - String heap iteration fails due to corruption
     fn validate_string_heap_content(assembly_view: &CilAssemblyView) -> Result<()> {
+        // The raw entries, not the decoded strings: decoding is what fails on invalid UTF-8.
         if let Some(strings) = assembly_view.strings() {
-            for (offset, string_data) in strings.iter() {
-                if std::str::from_utf8(string_data.as_bytes()).is_err() {
+            let data = strings.data();
+            if data.last().is_some_and(|last| *last != 0) {
+                return Err(malformed_error!(
+                    "String heap's last entry is not NUL-terminated"
+                ));
+            }
+            let mut offset = 0usize;
+            for entry in data.split(|byte| *byte == 0) {
+                if std::str::from_utf8(entry).is_err() {
                     return Err(malformed_error!(
                         "String heap contains invalid UTF-8 sequence at offset {}",
                         offset
                     ));
                 }
+                offset = offset.saturating_add(entry.len()).saturating_add(1);
             }
         }
 
@@ -237,9 +244,7 @@ impl RawHeapValidator {
     /// - Blob heap offset exceeds maximum allowed value
     /// - Blob entries have invalid size encoding or data corruption
     fn validate_blob_heap(assembly_view: &CilAssemblyView) -> Result<()> {
-        let streams = assembly_view.streams();
-
-        let blob_stream = streams.iter().find(|s| s.name == "#Blob");
+        let blob_stream = assembly_view.metadata_root().stream("#Blob");
 
         if let Some(stream) = blob_stream {
             if stream.size > 0x7FFF_FFFF {
@@ -336,8 +341,7 @@ impl RawHeapValidator {
     /// - GUID heap offset exceeds maximum allowed value
     /// - GUID entries are malformed or contain invalid data
     fn validate_guid_heap(assembly_view: &CilAssemblyView) -> Result<()> {
-        let streams = assembly_view.streams();
-        let guid_stream = streams.iter().find(|s| s.name == "#GUID");
+        let guid_stream = assembly_view.metadata_root().stream("#GUID");
 
         if let Some(stream) = guid_stream {
             if stream.size > 0x7FFF_FFFF {
@@ -435,18 +439,10 @@ impl RawHeapValidator {
                         ));
                     }
                 }
-
-                // Prevent excessive iteration in case of heap corruption
-                if guid_count > 65536 {
-                    return Err(malformed_error!(
-                        "GUID heap contains excessive number of entries (>65536), possible corruption"
-                    ));
-                }
             }
 
             // Verify count consistency with heap size
-            let streams = assembly_view.streams();
-            if let Some(guid_stream) = streams.iter().find(|s| s.name == "#GUID") {
+            if let Some(guid_stream) = assembly_view.metadata_root().stream("#GUID") {
                 let expected_count = (guid_stream.size / 16) as usize;
                 if guid_count != expected_count {
                     return Err(malformed_error!(
@@ -485,9 +481,7 @@ impl RawHeapValidator {
     /// - UserString heap offset exceeds maximum allowed value
     /// - UserString entries have invalid UTF-16 encoding or length prefixes
     fn validate_userstring_heap(assembly_view: &CilAssemblyView) -> Result<()> {
-        let streams = assembly_view.streams();
-
-        let us_stream = streams.iter().find(|s| s.name == "#US");
+        let us_stream = assembly_view.metadata_root().stream("#US");
 
         if let Some(stream) = us_stream {
             if stream.size > 0x7FFF_FFFF {
@@ -539,7 +533,7 @@ impl RawHeapValidator {
     /// - User string heap iteration fails due to corruption
     fn validate_userstring_heap_content(assembly_view: &CilAssemblyView) -> Result<()> {
         if let Some(userstrings) = assembly_view.userstrings() {
-            for (offset, userstring_data) in userstrings.iter().take(1000) {
+            for (offset, userstring_data) in userstrings.iter() {
                 let utf16_chars = userstring_data.as_slice();
                 if utf16_chars.len() > 0x1FFF_FFFF {
                     return Err(malformed_error!(
@@ -629,11 +623,11 @@ mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::raw_structure_heap::*, get_testfile_wb, validator_test,
             TestAssembly,
         },
-        Error, Result,
+        Result,
     };
 
     #[test]
@@ -647,7 +641,6 @@ mod tests {
         validator_test(
             raw_heap_validator_file_factory,
             "RawHeapValidator",
-            "Parse",
             config,
             |context| validator.validate_raw(context),
         )
@@ -658,17 +651,14 @@ mod tests {
         let validator = RawHeapValidator::new();
 
         fn clean_only_factory() -> Result<Vec<TestAssembly>> {
-            let Some(clean_testfile) = get_testfile_wb() else {
-                return Err(Error::Other("WindowsBase.dll not available".to_string()));
-            };
-            Ok(vec![TestAssembly::new(&clean_testfile, true)])
+            let clean_testfile = get_testfile_wb();
+            Ok(vec![TestAssembly::new(&clean_testfile)])
         }
 
         // Test disabled configuration
         let result_disabled = validator_test(
             clean_only_factory,
             "RawHeapValidator",
-            "Parse",
             ValidationConfig {
                 enable_structural_validation: false,
                 ..Default::default()
@@ -691,7 +681,6 @@ mod tests {
         let result_enabled = validator_test(
             clean_only_factory,
             "RawHeapValidator",
-            "Parse",
             ValidationConfig {
                 enable_structural_validation: true,
                 ..Default::default()

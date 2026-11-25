@@ -1,91 +1,68 @@
-//! ConfuserEx invalid metadata detection and repair.
+//! ConfuserEx invalid metadata detection.
 //!
-//! ConfuserEx's InvalidMetadata protection adds corrupted rows to metadata
-//! tables with the characteristic marker value `0x7fff7fff`. This breaks
-//! disassemblers and analysis tools that expect valid indices. The protection
-//! also injects non-empty ENC tables and duplicate stream headers.
-//!
-//! # How ConfuserEx Invalid Metadata Works
-//!
-//! ConfuserEx **adds new invalid rows** to metadata tables (it doesn't modify
-//! existing valid rows). This means we can safely remove the invalid rows
-//! entirely. Specifically, ConfuserEx adds:
-//! - Module row with `name = 0x7fff7fff`
-//! - Assembly row with `name = 0x7fff7fff`
-//! - DeclSecurity row with `action = 0x7fff`
-//! - Random ENCLog/ENCMap entries
-//! - Duplicate stream headers (#GUID, #Strings, #Blob, #Schema)
-//!
-//! This technique supersedes [`GenericMetadata`](super::super::generic::GenericMetadata)
-//! with ConfuserEx-specific knowledge: it recognises the exact marker value,
-//! patches all affected table types (Module, Assembly, DeclSecurity), removes
-//! ENC table entries, and flags duplicate stream headers for removal during
-//! regeneration.
+//! ConfuserEx's InvalidMetadata protection adds junk to the metadata to break disassemblers
+//! and analysis tools; the CLR ignores all of it. It adds (it does not modify existing rows):
+//! - a second Module row and a second Assembly row, their names `0x7fff7fff`;
+//! - a DeclSecurity row with action `0x7fff` whose parent's coded-index tag names no table
+//!   (the CLR reads it as a null parent);
+//! - ENCLog and ENCMap rows, meaningless outside an edit-and-continue delta;
+//! - repeated `#GUID`, `#Strings` and `#Blob` headers after the real ones, and a `#Schema`
+//!   header, which makes the CLR read the first header of each name (see
+//!   [`crate::metadata::root::Root::stream`]).
 //!
 //! # Detection
 //!
-//! Scans Module, Assembly, and DeclSecurity tables for fields containing the
-//! `0x7fff7fff` / `0x7fff` marker. Also checks for non-empty ENCLog/ENCMap
-//! tables and duplicate metadata stream headers.
+//! The rows above, by their `0x7fff` markers, non-empty ENC tables, and stream headers the
+//! runtime does not read.
 //!
-//! # Transform
+//! # Repair
 //!
-//! We remove rows that have invalid values:
-//! 1. **Module/Assembly tables**: Remove rows with out-of-bounds string indices
-//! 2. **DeclSecurity table**: Remove rows with invalid action values
-//! 3. **ENC tables**: Remove all rows (not needed at runtime)
-//!
-//! Patches invalid fields in-place via `WorkingAssembly::write_le()`. ENC
-//! tables and duplicate streams are handled during assembly regeneration.
+//! The junk is removed when the assembly is regenerated: the deobfuscation cleanup's
+//! metadata repairs (`deobfuscation::repairs`) remove the extra Module and Assembly rows, the
+//! DeclSecurity rows with a null parent and the ENC rows, and the writer emits only the
+//! streams the runtime reads. This technique detects the protection and requests that
+//! regeneration.
 
 use std::any::Any;
 
 use crate::{
     compiler::{EventKind, EventLog},
     deobfuscation::techniques::{
-        Detection, Detections, Evidence, Technique, TechniqueCategory, WorkingAssembly,
+        Detection, Evidence, Technique, TechniqueCapability, TechniqueCategory, WorkingAssembly,
     },
-    metadata::tables::{
-        AssemblyRaw, DeclSecurityRaw, EncLogRaw, EncMapRaw, ModuleRaw, TableId, TypeRefRaw,
-    },
+    metadata::tables::{AssemblyRaw, DeclSecurityRaw, EncLogRaw, EncMapRaw, ModuleRaw},
     CilObject, Result,
 };
 
-/// ConfuserEx-specific marker value for invalid metadata indices.
+/// ConfuserEx's marker value for invalid metadata indices, at four bytes.
 const CONFUSEREX_MARKER: u32 = 0x7fff_7fff;
 
-/// ConfuserEx-specific marker value for 16-bit fields.
+/// ConfuserEx's marker value at two bytes (a two-byte index column holds its low half).
 const CONFUSEREX_MARKER_16: u16 = 0x7fff;
 
 /// Findings from ConfuserEx metadata scanning.
 #[derive(Debug)]
 pub struct CxMetadataFindings {
-    /// Total number of invalid metadata entries detected.
+    /// Rows ConfuserEx added: marked Module and Assembly rows after the first, and
+    /// DeclSecurity rows with the marker action and a null parent.
     pub invalid_entries: usize,
-    /// Non-empty ENC table indices (ENCLog = 0x1E, ENCMap = 0x1F).
+    /// Non-empty ENC tables (ENCLog = 0x1E, ENCMap = 0x1F).
     pub enc_tables: Vec<u8>,
-    /// Whether duplicate metadata stream headers were found.
+    /// Whether the stream directory holds headers the runtime does not read, or `#Schema`.
     pub has_duplicate_streams: bool,
-    /// Byte-level patches to apply (offset, size, corrected value).
-    pub patches: Vec<CxMetadataPatch>,
 }
 
-/// A single byte-level metadata patch.
-#[derive(Debug, Clone)]
-pub struct CxMetadataPatch {
-    /// File offset to write to.
-    pub offset: usize,
-    /// Size of the field (2 or 4 bytes).
-    pub size: u8,
-    /// Corrected value to write.
-    pub corrected: u32,
+/// Whether a name index carries ConfuserEx's marker or points past the `#Strings` heap.
+fn is_marked_name(name: u32, strings_size: usize) -> bool {
+    name == CONFUSEREX_MARKER
+        || name == u32::from(CONFUSEREX_MARKER_16)
+        || name as usize >= strings_size
 }
 
-/// Detects and repairs ConfuserEx invalid metadata markers.
+/// Detects ConfuserEx's invalid metadata protection.
 ///
-/// Supersedes the generic metadata technique with ConfuserEx-specific
-/// knowledge of the `0x7fff7fff` marker pattern, ENC tables, and duplicate
-/// stream headers.
+/// Supersedes the generic metadata technique with ConfuserEx-specific knowledge of the
+/// `0x7fff` markers, ENC tables, and repeated stream headers.
 pub struct ConfuserExMetadata;
 
 impl Technique for ConfuserExMetadata {
@@ -101,6 +78,10 @@ impl Technique for ConfuserExMetadata {
         TechniqueCategory::Metadata
     }
 
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![TechniqueCapability::ByteTransform]
+    }
+
     fn supersedes(&self) -> &[&'static str] {
         &["generic.metadata"]
     }
@@ -109,134 +90,75 @@ impl Technique for ConfuserExMetadata {
         let Some(tables) = assembly.tables() else {
             return Detection::new_empty();
         };
-        let strings = assembly.strings();
-        let strings_size = strings.as_ref().map(|s| s.data().len()).unwrap_or(0);
+        let strings_size = assembly.strings().map_or(0, |s| s.data().len());
 
-        let mut findings = CxMetadataFindings {
-            invalid_entries: 0,
-            enc_tables: Vec::new(),
-            has_duplicate_streams: false,
-            patches: Vec::new(),
-        };
-        let mut evidence = Vec::new();
-
-        // Check Module table for invalid name indices (0x7fff7fff marker).
-        if let Some(module_table) = tables.table::<ModuleRaw>() {
-            for row in module_table {
-                let row = match row {
-                    Ok(row) => row,
-                    Err(e) => {
-                        log::warn!("skipping unreadable metadata row: {e}");
-                        continue;
-                    }
-                };
-                if row.name == CONFUSEREX_MARKER || row.name as usize >= strings_size {
-                    findings.invalid_entries = findings.invalid_entries.saturating_add(1);
-                    // Skip rows where the file offset would overflow when adding the
-                    // name field offset within the Module row.
-                    if let Some(name_offset) = row.offset.checked_add(2) {
-                        findings.patches.push(CxMetadataPatch {
-                            offset: name_offset,
-                            size: if strings_size > 0xFFFF { 4 } else { 2 },
-                            corrected: 0,
-                        });
-                    }
-                }
-            }
+        let mut invalid_entries = 0usize;
+        if let Some(modules) = tables.table::<ModuleRaw>() {
+            invalid_entries = invalid_entries.saturating_add(
+                modules
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|row| row.rid > 1 && is_marked_name(row.name, strings_size))
+                    .count(),
+            );
+        }
+        if let Some(assemblies) = tables.table::<AssemblyRaw>() {
+            invalid_entries = invalid_entries.saturating_add(
+                assemblies
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|row| row.rid > 1 && is_marked_name(row.name, strings_size))
+                    .count(),
+            );
+        }
+        if let Some(declsecurity) = tables.table::<DeclSecurityRaw>() {
+            invalid_entries = invalid_entries.saturating_add(
+                declsecurity
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|row| row.action == CONFUSEREX_MARKER_16 && row.parent.row == 0)
+                    .count(),
+            );
         }
 
-        // Check Assembly table for invalid name indices.
-        if let Some(assembly_table) = tables.table::<AssemblyRaw>() {
-            for row in assembly_table {
-                let row = match row {
-                    Ok(row) => row,
-                    Err(e) => {
-                        log::warn!("skipping unreadable metadata row: {e}");
-                        continue;
-                    }
-                };
-                if row.name == CONFUSEREX_MARKER || row.name as usize >= strings_size {
-                    findings.invalid_entries = findings.invalid_entries.saturating_add(1);
-                }
-            }
+        let mut enc_tables = Vec::new();
+        if tables.table::<EncLogRaw>().is_some_and(|t| t.row_count > 0) {
+            enc_tables.push(0x1E);
+        }
+        if tables.table::<EncMapRaw>().is_some_and(|t| t.row_count > 0) {
+            enc_tables.push(0x1F);
         }
 
-        // Check DeclSecurity for invalid action values.
-        if let Some(declsec_table) = tables.table::<DeclSecurityRaw>() {
-            for row in declsec_table {
-                let row = match row {
-                    Ok(row) => row,
-                    Err(e) => {
-                        log::warn!("skipping unreadable metadata row: {e}");
-                        continue;
-                    }
-                };
-                if row.action == CONFUSEREX_MARKER_16 || row.action > 0x000E {
-                    findings.invalid_entries = findings.invalid_entries.saturating_add(1);
-                }
-            }
-        }
+        let root = assembly.metadata_root();
+        let has_duplicate_streams = root.unread_streams().next().is_some()
+            || root.stream_headers.iter().any(|s| s.name == "#Schema");
 
-        // Check TypeRef resolution scopes for invalid indices.
-        if let Some(typeref_table) = tables.table::<TypeRefRaw>() {
-            for row in typeref_table {
-                let row = match row {
-                    Ok(row) => row,
-                    Err(e) => {
-                        log::warn!("skipping unreadable metadata row: {e}");
-                        continue;
-                    }
-                };
-                if row.resolution_scope.tag == TableId::Module && row.resolution_scope.row == 0 {
-                    findings.invalid_entries = findings.invalid_entries.saturating_add(1);
-                }
-            }
-        }
-
-        // Check for non-empty ENC tables (ConfuserEx injects garbage entries).
-        if let Some(enclog) = tables.table::<EncLogRaw>() {
-            if enclog.row_count > 0 {
-                findings.enc_tables.push(0x1E);
-            }
-        }
-        if let Some(encmap) = tables.table::<EncMapRaw>() {
-            if encmap.row_count > 0 {
-                findings.enc_tables.push(0x1F);
-            }
-        }
-
-        // Check for duplicate stream headers in the metadata root.
-        // ConfuserEx sometimes adds duplicate #GUID, #Strings, #Blob headers
-        // to confuse parsers.
-        findings.has_duplicate_streams = check_duplicate_streams(assembly);
-
-        // Build evidence and decide if detected.
-        let has_marker_pattern = findings.invalid_entries > 0;
-        let has_enc = !findings.enc_tables.is_empty();
-        let has_dups = findings.has_duplicate_streams;
-
-        if !has_marker_pattern && !has_enc && !has_dups {
+        if invalid_entries == 0 && enc_tables.is_empty() && !has_duplicate_streams {
             return Detection::new_empty();
         }
 
-        if has_marker_pattern {
+        let mut evidence = Vec::new();
+        if invalid_entries > 0 {
             evidence.push(Evidence::MetadataPattern(format!(
-                "{} invalid metadata entries with 0x7fff marker",
-                findings.invalid_entries,
+                "{invalid_entries} invalid metadata rows with the 0x7fff marker"
             )));
         }
-        if has_enc {
+        if !enc_tables.is_empty() {
             evidence.push(Evidence::MetadataPattern(format!(
-                "Non-empty ENC tables: {:?}",
-                findings.enc_tables,
+                "Non-empty ENC tables: {enc_tables:?}"
             )));
         }
-        if has_dups {
+        if has_duplicate_streams {
             evidence.push(Evidence::MetadataPattern(
-                "Duplicate metadata stream headers".to_string(),
+                "Stream headers the runtime does not read".to_string(),
             ));
         }
 
+        let findings = CxMetadataFindings {
+            invalid_entries,
+            enc_tables,
+            has_duplicate_streams,
+        };
         Detection::new_detected(
             evidence,
             Some(Box::new(findings) as Box<dyn Any + Send + Sync>),
@@ -245,52 +167,16 @@ impl Technique for ConfuserExMetadata {
 
     fn byte_transform(
         &self,
-        assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        _assembly: &mut WorkingAssembly,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
-
-        let Some(findings) = detection.findings::<CxMetadataFindings>() else {
-            return Some(Ok(events));
-        };
-
-        let mut patched = 0usize;
-
-        for patch in &findings.patches {
-            match patch.size {
-                2 => match assembly.write_le::<u16>(patch.offset, patch.corrected as u16) {
-                    Ok(_) => patched = patched.saturating_add(1),
-                    Err(e) => return Some(Err(e)),
-                },
-                4 => match assembly.write_le::<u32>(patch.offset, patch.corrected) {
-                    Ok(_) => patched = patched.saturating_add(1),
-                    Err(e) => return Some(Err(e)),
-                },
-                _ => {}
-            }
-        }
-
-        if patched > 0 {
+        if let Some(findings) = detection.findings::<CxMetadataFindings>() {
             events.record(EventKind::ArtifactRemoved).message(format!(
-                "Patched {} ConfuserEx invalid metadata entries (0x7fff marker)",
-                patched,
+                "ConfuserEx invalid metadata ({} rows, ENC tables {:?}, repeated streams: {}) is removed on regeneration",
+                findings.invalid_entries, findings.enc_tables, findings.has_duplicate_streams,
             ));
         }
-
-        if !findings.enc_tables.is_empty() {
-            events.record(EventKind::ArtifactRemoved).message(format!(
-                "ENC tables {:?} will be cleared on regeneration",
-                findings.enc_tables,
-            ));
-        }
-
-        if findings.has_duplicate_streams {
-            events
-                .record(EventKind::ArtifactRemoved)
-                .message("Duplicate stream headers will be removed on regeneration");
-        }
-
         Some(Ok(events))
     }
 
@@ -299,124 +185,19 @@ impl Technique for ConfuserExMetadata {
     }
 }
 
-/// Checks whether the assembly has duplicate metadata stream headers.
-///
-/// ConfuserEx sometimes adds extra copies of #GUID, #Strings, or #Blob
-/// stream headers to confuse metadata parsers.
-fn check_duplicate_streams(assembly: &CilObject) -> bool {
-    let file = assembly.file();
-    let data = file.data();
-
-    // Find the metadata root via the CLI header.
-    let metadata_rva = assembly.cor20header().meta_data_rva as usize;
-    let Ok(metadata_offset) = file.rva_to_offset(metadata_rva) else {
-        return false;
-    };
-
-    // Parse stream count from metadata root header.
-    // Metadata root layout: signature(4) + major(2) + minor(2) + reserved(4) + version_len(4)
-    let header_base = metadata_offset;
-    let Some(header_end) = header_base.checked_add(16) else {
-        return false;
-    };
-    if header_end > data.len() {
-        return false;
-    }
-
-    let Some(version_len_start) = header_base.checked_add(12) else {
-        return false;
-    };
-    let Some(version_bytes) = data.get(version_len_start..header_end) else {
-        return false;
-    };
-    let version_len = u32::from_le_bytes(version_bytes.try_into().unwrap_or_default()) as usize;
-    // Align version length to 4 bytes
-    let aligned_len = match version_len.checked_add(3) {
-        Some(v) => v & !3,
-        None => return false,
-    };
-    let Some(flags_offset) = header_end.checked_add(aligned_len) else {
-        return false;
-    };
-
-    let Some(streams_end) = flags_offset.checked_add(4) else {
-        return false;
-    };
-    if streams_end > data.len() {
-        return false;
-    }
-
-    // flags(2) + streams(2)
-    let Some(stream_count_start) = flags_offset.checked_add(2) else {
-        return false;
-    };
-    let Some(stream_count_bytes) = data.get(stream_count_start..streams_end) else {
-        return false;
-    };
-    let stream_count =
-        u16::from_le_bytes(stream_count_bytes.try_into().unwrap_or_default()) as usize;
-
-    // Walk stream headers and check for duplicate names.
-    let mut seen_names = std::collections::HashSet::new();
-    let mut pos = streams_end;
-
-    for _ in 0..stream_count {
-        let Some(after_header) = pos.checked_add(8) else {
-            break;
-        };
-        if after_header > data.len() {
-            break;
-        }
-        // offset(4) + size(4) + name (null-terminated, 4-byte aligned)
-        pos = after_header;
-
-        // Read stream name
-        let name_start = pos;
-        while let Some(&byte) = data.get(pos) {
-            if byte == 0 {
-                break;
-            }
-            let Some(next) = pos.checked_add(1) else {
-                return false;
-            };
-            pos = next;
-        }
-        if pos >= data.len() {
-            break;
-        }
-        let name_bytes = match data.get(name_start..pos) {
-            Some(b) => b,
-            None => break,
-        };
-        let name = std::str::from_utf8(name_bytes).unwrap_or("");
-        pos = match pos.checked_add(1) {
-            Some(v) => v,
-            None => break,
-        };
-        // Align to 4 bytes
-        pos = match pos.checked_add(3) {
-            Some(v) => v & !3,
-            None => break,
-        };
-
-        if !name.is_empty() && !seen_names.insert(name.to_string()) {
-            return true;
-        }
-    }
-
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{
-        deobfuscation::techniques::{confuserex::metadata::ConfuserExMetadata, Technique},
-        test::helpers::load_sample,
+        deobfuscation::techniques::{
+            confuserex::metadata::{ConfuserExMetadata, CxMetadataFindings},
+            Technique,
+        },
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_negative_original() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = ConfuserExMetadata;
         let detection = technique.detect(&assembly);
@@ -430,7 +211,7 @@ mod tests {
     #[test]
     fn test_detect_negative_normal() {
         // Normal preset does not include InvalidMetadata protection.
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_normal.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_normal.exe");
 
         let technique = ConfuserExMetadata;
         let detection = technique.detect(&assembly);
@@ -457,28 +238,28 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_on_maximum() {
-        // Maximum preset: check if metadata markers are present.
-        // InvalidMetadata is separate from the standard presets,
-        // so this may or may not detect depending on the sample.
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_maximum.exe");
+    fn test_detect_negative_maximum() {
+        // The Maximum preset does not include the InvalidMetadata protection.
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_maximum.exe");
+        assert!(!ConfuserExMetadata.detect(&assembly).is_detected());
+    }
 
-        let technique = ConfuserExMetadata;
-        let detection = technique.detect(&assembly);
-
-        // If detected, verify findings structure
-        if detection.is_detected() {
-            assert!(!detection.evidence().is_empty());
+    #[test]
+    fn test_detect_invalidmetadata() {
+        for sample in [
+            "packers/confuserex/1.6.0/mkaring_invalidmetadata.exe",
+            "packers/confuserex/1.6.0/mkaring_invalidmetadata_antitamper.exe",
+        ] {
+            let assembly = load_sample(sample);
+            let detection = ConfuserExMetadata.detect(&assembly);
+            assert!(detection.is_detected(), "{sample}: not detected");
             let findings = detection
-                .findings::<super::CxMetadataFindings>()
-                .expect("Should have CxMetadataFindings");
-
-            assert!(
-                findings.invalid_entries > 0
-                    || !findings.enc_tables.is_empty()
-                    || findings.has_duplicate_streams,
-                "At least one indicator should be present"
-            );
+                .findings::<CxMetadataFindings>()
+                .expect("findings");
+            // A second Module row, a second Assembly row and the DeclSecurity row.
+            assert_eq!(findings.invalid_entries, 3, "{sample}: {findings:?}");
+            assert_eq!(findings.enc_tables, vec![0x1E, 0x1F], "{sample}");
+            assert!(findings.has_duplicate_streams, "{sample}");
         }
     }
 }

@@ -159,7 +159,7 @@ fn insert_sorted(bucket: &mut Vec<HookEntry>, entry: HookEntry) {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::emulation::{HookManager, Hook, HookPriority, PreHookResult, EmValue};
 ///
 /// let manager = HookManager::new();
@@ -180,6 +180,7 @@ fn insert_sorted(bucket: &mut Vec<HookEntry>, entry: HookEntry) {
 /// )?;
 ///
 /// // When "Decrypt" is called, "high-priority" matches first
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct HookManager {
     /// Full match index: namespace → type → method → entries.
@@ -235,9 +236,12 @@ impl HookManager {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use dotscope::emulation::{Hook, HookManager};
+    ///
     /// let manager = HookManager::new();
     /// manager.register(Hook::new("my-hook").match_method_name("Test"))?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn register(&self, hook: Hook) -> Result<()> {
         let route = extract_route(&hook);
@@ -349,23 +353,46 @@ impl HookManager {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::emulation::{HookContext, HookOutcome};
+    /// ```
+    /// use dotscope::emulation::{EmValue, HookContext, HookManager, HookOutcome};
+    /// use dotscope::metadata::{token::Token, typesystem::PointerSize};
+    /// # use std::sync::{Arc, RwLock};
+    /// # use dotscope::emulation::{
+    /// #     AddressSpace, CaptureContext, EmulationConfig, EmulationThread, RuntimeState,
+    /// #     SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+    /// # };
+    /// # let address_space = Arc::new(AddressSpace::new());
+    /// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+    /// # let context = Arc::new(ThreadContext::new(
+    /// #     address_space,
+    /// #     Arc::new(RwLock::new(RuntimeState::new())),
+    /// #     Arc::new(CaptureContext::new()),
+    /// #     Arc::new(EmulationConfig::default()),
+    /// #     None,
+    /// #     fake_objects,
+    /// #     Arc::new(VirtualFs::new()),
+    /// # ));
+    /// # let mut thread = EmulationThread::new(ThreadId::MAIN, context);
     ///
+    /// let manager = HookManager::new();
     /// let context = HookContext::new(
-    ///     method_token,
+    ///     Token::new(0x0A00_0001),
     ///     "System", "String", "Concat",
+    ///     PointerSize::Bit64,
     /// );
     ///
-    /// let outcome = manager.execute(&context, &mut thread, |thread| {
+    /// let outcome = manager.execute(&context, &mut thread, |_thread| {
     ///     // Execute the original method
-    ///     Some(EmValue::String(...))
+    ///     Some(EmValue::Null)
     /// })?;
     ///
     /// match outcome {
     ///     HookOutcome::NoMatch => { /* execute normally */ }
     ///     HookOutcome::Handled(value) => { /* use value */ }
+    ///     HookOutcome::ReflectionInvoke { .. } => { /* redirect to the invoked method */ }
+    ///     HookOutcome::ThrewException { .. } => { /* raise the CLR exception */ }
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn execute<F>(
         &self,
@@ -554,7 +581,7 @@ mod tests {
     use crate::{
         emulation::HookPriority,
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     #[test]

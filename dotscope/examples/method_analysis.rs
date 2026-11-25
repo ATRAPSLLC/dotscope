@@ -25,7 +25,7 @@
 
 use std::{env, path::Path};
 
-use dotscope::prelude::*;
+use dotscope::{metadata::method::ExceptionHandlerKind, prelude::*};
 
 // Helper functions to format implementation attributes
 fn format_impl_code_type(code_type: &MethodImplCodeType) -> String {
@@ -158,45 +158,45 @@ fn find_suitable_method(assembly: &CilObject) -> Result<MethodRc> {
 
 /// Perform exhaustive analysis of the selected method
 fn analyze_method_completely(_assembly: &CilObject, method: MethodRc) -> Result<()> {
-    // === Basic Method Information ===
+    // Basic Method Information
     print_method_basic_info(&method);
 
-    // === Method Flags and Attributes ===
+    // Method Flags and Attributes
     print_method_flags(&method);
 
-    // === Method Signature Analysis ===
+    // Method Signature Analysis
     print_method_signature(&method);
 
-    // === Parameters Analysis ===
+    // Parameters Analysis
     print_method_parameters(&method);
 
-    // === Local Variables Analysis ===
+    // Local Variables Analysis
     print_local_variables(&method);
 
-    // === Generic Information ===
+    // Generic Information
     print_generic_information(&method);
 
-    // === Method Body Analysis ===
+    // Method Body Analysis
     if let Some(body) = method.body.get() {
         print_method_body_details(&method, body);
 
-        // === IL Instructions Analysis ===
+        // IL Instructions Analysis
         print_il_instructions(&method, body)?;
 
-        // === Exception Handlers ===
+        // Exception Handlers
         print_exception_handlers(body);
     } else {
         println!("\n❌ NO METHOD BODY");
         println!("   This method is abstract, extern, or P/Invoke");
     }
 
-    // === P/Invoke Information ===
+    // P/Invoke Information
     print_pinvoke_info(&method);
 
-    // === Security Information ===
+    // Security Information
     print_security_info(&method);
 
-    // === Additional Metadata ===
+    // Additional Metadata
     print_additional_metadata(&method);
 
     Ok(())
@@ -308,7 +308,7 @@ fn print_method_parameters(method: &Method) {
             println!("   Parameter [{i}]:");
             println!(
                 "     Name: {}",
-                param.name.as_ref().unwrap_or(&"<unnamed>".to_string())
+                param.name.as_deref().unwrap_or("<unnamed>")
             );
             println!("     Sequence: {}", param.sequence);
             println!("     Flags: 0x{:04X}", param.flags);
@@ -323,29 +323,6 @@ fn print_method_parameters(method: &Method) {
     for (i, param) in method.signature.params.iter().enumerate() {
         println!("   Parameter [{i}] from signature:");
         print_signature_parameter(param, "     ");
-    }
-
-    // VarArg parameters
-    let vararg_count = method.varargs.count();
-    if vararg_count > 0 {
-        println!("\n   VarArg Parameters:");
-        for (i, vararg) in method.varargs.iter() {
-            println!("   VarArg [{i}]:");
-            println!("     Type: <VarArg Type>"); // CilTypeRef display would need more complex handling
-            println!("     By Reference: {}", vararg.by_ref);
-            if vararg.modifiers.is_empty() {
-                println!("     Custom Modifiers: None");
-            } else {
-                println!(
-                    "     Custom Modifiers: {} modifier(s)",
-                    vararg.modifiers.count()
-                );
-                for (j, modifier) in vararg.modifiers.iter() {
-                    let token_value = modifier.token().map_or(0, |t| t.value());
-                    println!("       [{j}]: Token 0x{token_value:08X}");
-                }
-            }
-        }
     }
 }
 
@@ -467,16 +444,16 @@ fn print_il_instructions(method: &Method, body: &MethodBody) -> Result<()> {
         return Ok(());
     }
 
-    // === Basic Statistics ===
+    // Basic Statistics
     print_basic_il_statistics(method, body);
 
-    // === Basic Block Analysis ===
+    // Basic Block Analysis
     print_basic_block_analysis(method);
 
-    // === Instruction Stream Analysis ===
+    // Instruction Stream Analysis
     print_instruction_stream_analysis(method)?;
 
-    // === Control Flow Analysis ===
+    // Control Flow Analysis
     print_control_flow_analysis(method);
 
     Ok(())
@@ -750,14 +727,11 @@ fn print_exception_handlers(body: &MethodBody) {
             println!("       Offset: 0x{:04X}", handler.handler_offset);
             println!("       Length: {} bytes", handler.handler_length);
 
-            // Handle different exception handler types based on flag bits
-            if handler.flags.bits() & 0x01 != 0 {
-                println!("     Type: Finally/Fault handler");
-            } else {
-                println!("     Type: Catch handler");
-                if let Some(_handler_type) = &handler.handler {
-                    println!("     Exception Type: <exception type>");
-                }
+            // The handler's kind (ECMA-335 II.25.4.6): 0x0 catch, 0x1 filter, 0x2 finally,
+            // 0x4 fault
+            println!("     Type: {:?} handler", handler.flags.kind());
+            if handler.flags.kind() == ExceptionHandlerKind::Catch && handler.handler.is_some() {
+                println!("     Exception Type: <exception type>");
             }
         }
     }
@@ -783,10 +757,11 @@ fn print_security_info(method: &Method) {
     println!("\n🔒 SECURITY INFORMATION");
     println!("{}", "-".repeat(50));
 
-    if method.security.get().is_some() {
-        println!("   Security attributes present");
-    } else {
+    if method.security.is_empty() {
         println!("   No security attributes");
+    }
+    for (_, security) in method.security.iter() {
+        println!("   {}: {}", security.action, security.permission_set);
     }
 }
 
@@ -814,7 +789,6 @@ fn print_additional_metadata(method: &Method) {
         "     Parameters List Size: {}",
         method.params.iter().count()
     );
-    println!("     VarArgs Size: {}", method.varargs.iter().count());
     println!(
         "     Local Variables Size: {}",
         method.local_vars.iter().count()

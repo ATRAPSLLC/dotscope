@@ -69,8 +69,10 @@ fn enum_to_i64(value: &EmValue, thread: &EmulationThread) -> Option<i64> {
         EmValue::NativeInt(v) => Some(*v),
         EmValue::NativeUInt(v) => Some(*v as i64),
         EmValue::ObjectRef(href) => {
-            if let Ok(HeapObject::BoxedValue { value, .. }) = thread.heap().get(*href) {
-                match *value {
+            if let Ok(HeapObject::BoxedValue { value, .. }) =
+                thread.heap().get_shared(*href).as_deref()
+            {
+                match **value {
                     EmValue::I32(v) => Some(i64::from(v)),
                     EmValue::I64(v) => Some(v),
                     _ => None,
@@ -163,8 +165,9 @@ fn enum_is_defined_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 
 /// Hook for `Enum.GetUnderlyingType(Type)`.
 ///
-/// Reads the enum's `value__` instance field to determine the actual underlying
-/// type. Falls back to `System.Int32` if metadata is unavailable.
+/// Reads the enum's underlying type from its one instance field
+/// ([`CilType::enum_underlying`](crate::metadata::typesystem::CilType::enum_underlying)).
+/// Falls back to `System.Int32` if metadata is unavailable.
 fn enum_get_underlying_type_pre(
     ctx: &HookContext<'_>,
     thread: &mut EmulationThread,
@@ -172,33 +175,22 @@ fn enum_get_underlying_type_pre(
     if let Some(EmValue::ObjectRef(type_ref)) = ctx.args.first() {
         if let Some(type_token) = try_hook!(thread.heap().get_reflection_type_token(*type_ref)) {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(cil_type) = asm.types().resolve(&type_token) {
-                    // Find the special "value__" instance field (non-static, non-literal)
-                    for (_, field) in cil_type.fields.iter() {
-                        if !field.flags.is_static() && !field.flags.is_literal() {
-                            if let Some(sig) = asm.types().get_field_signature(&field.token) {
-                                let underlying_token = TypeResolver::new(asm.types())
-                                    .resolve(&sig)
-                                    .map(|t| t.token)
-                                    .unwrap_or_else(|_| CilPrimitiveKind::I4.token());
-                                match thread
-                                    .heap_mut()
-                                    .alloc_reflection_type(underlying_token, None)
-                                {
-                                    Ok(href) => {
-                                        return PreHookResult::Bypass(Some(EmValue::ObjectRef(
-                                            href,
-                                        )))
-                                    }
-                                    Err(e) => {
-                                        return PreHookResult::Error(format!(
-                                            "heap allocation failed: {e}"
-                                        ))
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if let Some(underlying) = asm
+                    .types()
+                    .resolve(&type_token)
+                    .and_then(|cil_type| cil_type.enum_underlying().cloned())
+                {
+                    let underlying_token = TypeResolver::new(asm.types())
+                        .resolve(&underlying)
+                        .map(|t| t.token)
+                        .unwrap_or_else(|_| CilPrimitiveKind::I4.token());
+                    return match thread
+                        .heap_mut()
+                        .alloc_reflection_type(underlying_token, None)
+                    {
+                        Ok(href) => PreHookResult::Bypass(Some(EmValue::ObjectRef(href))),
+                        Err(e) => PreHookResult::Error(format!("heap allocation failed: {e}")),
+                    };
                 }
             }
         }
@@ -217,7 +209,7 @@ mod tests {
     use crate::{
         emulation::runtime::hook::HookManager,
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     fn ctx<'a>(method: &'a str, this: Option<&'a EmValue>, args: &'a [EmValue]) -> HookContext<'a> {

@@ -26,16 +26,17 @@
 // On 32-bit targets this could truncate, but RVAs in .NET are always 32-bit.
 #![allow(clippy::cast_possible_truncation)]
 
+use std::num::NonZeroU8;
+
 use crate::{
     analysis::ssa::{
-        conv_op_for_target,
-        ops::{BreakpointOp, CmpKind, SsaOp},
+        ops::{AccessQualifiers, BreakpointOp, CallData, Callee, CilPrefix, CmpKind, SsaOp},
         types::{FieldRef, MethodRef, SigRef, SsaType, TypeRef},
         value::ConstValue,
         SsaVarId,
     },
     assembly::{Immediate, Instruction, Operand},
-    metadata::{cilobject::CilObject, token::Token},
+    metadata::cilobject::CilObject,
     Error, Result,
 };
 
@@ -51,7 +52,8 @@ use crate::{
 ///
 /// # Returns
 ///
-/// The decomposed `SsaOp`.
+/// The decomposed operation, or the prefix the instruction states on the
+/// operation of the instruction after it.
 ///
 /// # Errors
 ///
@@ -62,13 +64,28 @@ pub fn decompose_instruction(
     def: Option<SsaVarId>,
     successors: &[usize],
     assembly: Option<&CilObject>,
-) -> Result<SsaOp> {
-    // Handle FE-prefixed instructions
+) -> Result<Decomposed> {
     if instr.prefix == 0xFE {
-        return decompose_fe_instruction(instr, uses, def);
+        return match instr.opcode {
+            0x12 | 0x13 | 0x14 | 0x16 | 0x1E => decompose_prefix(instr).map(Decomposed::Prefix),
+            // no.: the instruction after it *may* skip the checks it names (ECMA-335
+            // III.2.2). Lifted as nothing, the checks stay, which is a run it allows.
+            0x19 => Ok(Decomposed::Op(SsaOp::Nop)),
+            _ => decompose_fe_instruction(instr, uses, def).map(Decomposed::Op),
+        };
     }
 
-    decompose_standard_instruction(instr, uses, def, successors, assembly)
+    decompose_standard_instruction(instr, uses, def, successors, assembly).map(Decomposed::Op)
+}
+
+/// What one CIL instruction decomposes to.
+#[derive(Debug, Clone)]
+pub enum Decomposed {
+    /// The instruction's operation.
+    Op(SsaOp),
+    /// A prefix, which the instruction after it states on its operation
+    /// ([`CilPrefix::apply`]).
+    Prefix(CilPrefix),
 }
 
 /// Decomposes a standard (non-prefixed) CIL instruction.
@@ -189,7 +206,7 @@ fn decompose_standard_instruction(
             def.and_then(|dest| {
                 extract_f32(&instr.operand).map(|v| SsaOp::Const {
                     dest,
-                    value: ConstValue::F32(v),
+                    value: ConstValue::from(v),
                 })
             })
         }
@@ -198,7 +215,7 @@ fn decompose_standard_instruction(
             def.and_then(|dest| {
                 extract_f64(&instr.operand).map(|v| SsaOp::Const {
                     dest,
-                    value: ConstValue::F64(v),
+                    value: ConstValue::from(v),
                 })
             })
         }
@@ -368,142 +385,140 @@ fn decompose_standard_instruction(
         }),
         0x67 => unary_op(uses, def, |dest, operand| {
             // conv.i1
-            conv_op_for_target(dest, operand, SsaType::I8, false, false)
+            SsaOp::conversion_between(dest, operand, SsaType::I8, None, false, false)
         }),
         0x68 => unary_op(uses, def, |dest, operand| {
             // conv.i2
-            conv_op_for_target(dest, operand, SsaType::I16, false, false)
+            SsaOp::conversion_between(dest, operand, SsaType::I16, None, false, false)
         }),
         0x69 => unary_op(uses, def, |dest, operand| {
             // conv.i4
-            conv_op_for_target(dest, operand, SsaType::I32, false, false)
+            SsaOp::conversion_between(dest, operand, SsaType::I32, None, false, false)
         }),
         0x6A => unary_op(uses, def, |dest, operand| {
             // conv.i8
-            conv_op_for_target(dest, operand, SsaType::I64, false, false)
+            SsaOp::conversion_between(dest, operand, SsaType::I64, None, false, false)
         }),
         0x6B => unary_op(uses, def, |dest, operand| {
             // conv.r4
-            conv_op_for_target(dest, operand, SsaType::F32, false, false)
+            SsaOp::conversion_between(dest, operand, SsaType::F32, None, false, false)
         }),
         0x6C => unary_op(uses, def, |dest, operand| {
             // conv.r8
-            conv_op_for_target(dest, operand, SsaType::F64, false, false)
+            SsaOp::conversion_between(dest, operand, SsaType::F64, None, false, false)
         }),
         0xD1 => unary_op(uses, def, |dest, operand| {
             // conv.u2
-            conv_op_for_target(dest, operand, SsaType::U16, true, false)
+            SsaOp::conversion_between(dest, operand, SsaType::U16, None, true, false)
         }),
         0xD2 => unary_op(uses, def, |dest, operand| {
             // conv.u1
-            conv_op_for_target(dest, operand, SsaType::U8, true, false)
+            SsaOp::conversion_between(dest, operand, SsaType::U8, None, true, false)
         }),
         0x6D => unary_op(uses, def, |dest, operand| {
             // conv.u4
-            conv_op_for_target(dest, operand, SsaType::U32, true, false)
+            SsaOp::conversion_between(dest, operand, SsaType::U32, None, true, false)
         }),
         0x6E => unary_op(uses, def, |dest, operand| {
             // conv.u8
-            conv_op_for_target(dest, operand, SsaType::U64, true, false)
+            SsaOp::conversion_between(dest, operand, SsaType::U64, None, true, false)
         }),
         0xD3 => unary_op(uses, def, |dest, operand| {
             // conv.i
-            conv_op_for_target(dest, operand, SsaType::NativeInt, false, false)
+            SsaOp::conversion_between(dest, operand, SsaType::NativeInt, None, false, false)
         }),
         0xE0 => unary_op(uses, def, |dest, operand| {
             // conv.u
-            conv_op_for_target(dest, operand, SsaType::NativeUInt, true, false)
+            SsaOp::conversion_between(dest, operand, SsaType::NativeUInt, None, true, false)
         }),
         0x76 => unary_op(uses, def, |dest, operand| {
             // conv.r.un
-            conv_op_for_target(dest, operand, SsaType::F64, true, false)
+            SsaOp::conversion_between(dest, operand, SsaType::F64, None, true, false)
         }),
 
         // Overflow-checking conversions
         0xB3 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i1
-            conv_op_for_target(dest, operand, SsaType::I8, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I8, None, false, true)
         }),
         0x82 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i1.un
-            conv_op_for_target(dest, operand, SsaType::I8, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I8, None, true, true)
         }),
         0xB5 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i2
-            conv_op_for_target(dest, operand, SsaType::I16, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I16, None, false, true)
         }),
         0x83 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i2.un
-            conv_op_for_target(dest, operand, SsaType::I16, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I16, None, true, true)
         }),
         0xB7 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i4
-            conv_op_for_target(dest, operand, SsaType::I32, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I32, None, false, true)
         }),
         0x84 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i4.un
-            conv_op_for_target(dest, operand, SsaType::I32, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I32, None, true, true)
         }),
         0xB9 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i8
-            conv_op_for_target(dest, operand, SsaType::I64, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I64, None, false, true)
         }),
         0x85 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i8.un
-            conv_op_for_target(dest, operand, SsaType::I64, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::I64, None, true, true)
         }),
         0xD4 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i
-            conv_op_for_target(dest, operand, SsaType::NativeInt, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::NativeInt, None, false, true)
         }),
         0x8A => unary_op(uses, def, |dest, operand| {
             // conv.ovf.i.un
-            conv_op_for_target(dest, operand, SsaType::NativeInt, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::NativeInt, None, true, true)
         }),
         0xB4 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u1
-            conv_op_for_target(dest, operand, SsaType::U8, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U8, None, false, true)
         }),
         0x86 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u1.un
-            conv_op_for_target(dest, operand, SsaType::U8, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U8, None, true, true)
         }),
         0xB6 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u2
-            conv_op_for_target(dest, operand, SsaType::U16, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U16, None, false, true)
         }),
         0x87 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u2.un
-            conv_op_for_target(dest, operand, SsaType::U16, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U16, None, true, true)
         }),
         0xB8 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u4
-            conv_op_for_target(dest, operand, SsaType::U32, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U32, None, false, true)
         }),
         0x88 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u4.un
-            conv_op_for_target(dest, operand, SsaType::U32, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U32, None, true, true)
         }),
         0xBA => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u8
-            conv_op_for_target(dest, operand, SsaType::U64, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U64, None, false, true)
         }),
         0x89 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u8.un
-            conv_op_for_target(dest, operand, SsaType::U64, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::U64, None, true, true)
         }),
         0xD5 => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u
-            conv_op_for_target(dest, operand, SsaType::NativeUInt, false, true)
+            SsaOp::conversion_between(dest, operand, SsaType::NativeUInt, None, false, true)
         }),
         0x8B => unary_op(uses, def, |dest, operand| {
             // conv.ovf.u.un
-            conv_op_for_target(dest, operand, SsaType::NativeUInt, true, true)
+            SsaOp::conversion_between(dest, operand, SsaType::NativeUInt, None, true, true)
         }),
-        0x2A => Some(SsaOp::Return {
-            // ret
-            value: uses.first().copied(),
-        }),
+        // ret
+        0x2A => Some(SsaOp::returns(uses.first().copied())),
         // Unconditional branches
         0x2B | 0x38 => {
             // br.s, br
@@ -612,12 +627,10 @@ fn decompose_standard_instruction(
             successors.first().map(|&target| SsaOp::Leave { target })
         }
 
-        // =====================================================================
         // Load/Store arguments and locals
-        // =====================================================================
         // ldarg and ldloc produce a LoadArg/LoadLocal op with the new stack
         // variable allocated by the simulator as dest. This makes them visible
-        // to SSA analysis and enables correct data flow through rebuild_ssa.
+        // to SSA analysis and lets SSA construction track data flow through them.
         0x02 => def.map(|dest| SsaOp::LoadArg { dest, arg_index: 0 }), // ldarg.0
         0x03 => def.map(|dest| SsaOp::LoadArg { dest, arg_index: 1 }), // ldarg.1
         0x04 => def.map(|dest| SsaOp::LoadArg { dest, arg_index: 2 }), // ldarg.2
@@ -680,9 +693,7 @@ fn decompose_standard_instruction(
             })
         }
 
-        // =====================================================================
         // Object operations
-        // =====================================================================
         0x6F => {
             // callvirt
             call_op(instr, uses, def, true)
@@ -704,12 +715,7 @@ fn decompose_standard_instruction(
                 } else {
                     (SsaVarId::from_index(0), vec![])
                 };
-                Some(SsaOp::CallIndirect {
-                    dest: def,
-                    fptr,
-                    signature,
-                    args,
-                })
+                Some(CallData::new(def, Callee::Indirect { fptr, signature }, args).into())
             } else {
                 None
             }
@@ -814,9 +820,7 @@ fn decompose_standard_instruction(
             }
         }
 
-        // =====================================================================
         // Field operations
-        // =====================================================================
         0x7B => {
             // ldfld
             if let (Some(field), Some(&object), Some(dest)) =
@@ -826,6 +830,7 @@ fn decompose_standard_instruction(
                     dest,
                     object,
                     field,
+                    access: AccessQualifiers::FLAT,
                 })
             } else {
                 None
@@ -842,6 +847,7 @@ fn decompose_standard_instruction(
                     object: *object,
                     field,
                     value: *value,
+                    access: AccessQualifiers::FLAT,
                 })
             } else {
                 None
@@ -864,7 +870,11 @@ fn decompose_standard_instruction(
         0x7E => {
             // ldsfld
             if let (Some(field), Some(dest)) = (extract_field_token(&instr.operand), def) {
-                Some(SsaOp::LoadStaticField { dest, field })
+                Some(SsaOp::LoadStaticField {
+                    dest,
+                    field,
+                    access: AccessQualifiers::FLAT,
+                })
             } else {
                 None
             }
@@ -873,7 +883,11 @@ fn decompose_standard_instruction(
             // stsfld
             if let (Some(field), Some(&value)) = (extract_field_token(&instr.operand), uses.first())
             {
-                Some(SsaOp::StoreStaticField { field, value })
+                Some(SsaOp::StoreStaticField {
+                    field,
+                    value,
+                    access: AccessQualifiers::FLAT,
+                })
             } else {
                 None
             }
@@ -887,9 +901,7 @@ fn decompose_standard_instruction(
             }
         }
 
-        // =====================================================================
         // Array operations
-        // =====================================================================
         0x8E => {
             // ldlen
             if let (Some(&array), Some(dest)) = (uses.first(), def) {
@@ -911,6 +923,7 @@ fn decompose_standard_instruction(
                     array,
                     index,
                     elem_type,
+                    readonly: false,
                 })
             } else {
                 None
@@ -948,9 +961,7 @@ fn decompose_standard_instruction(
         0xA2 => stelem_typed(uses, SsaType::Object), // stelem.ref
         0x9B => stelem_typed(uses, SsaType::NativeInt), // stelem.i
 
-        // =====================================================================
         // Indirect access (ldind/stind)
-        // =====================================================================
         0x46 => ldind_typed(uses, def, SsaType::I8), // ldind.i1
         0x47 => ldind_typed(uses, def, SsaType::U8), // ldind.u1
         0x48 => ldind_typed(uses, def, SsaType::I16), // ldind.i2
@@ -972,18 +983,17 @@ fn decompose_standard_instruction(
         0x51 => stind_typed(uses, SsaType::Object), // stind.ref
         0xDF => stind_typed(uses, SsaType::NativeInt), // stind.i
 
-        // =====================================================================
         // Object memory operations
-        // =====================================================================
         0x71 => {
             // ldobj
-            if let (Some(&src_addr), Some(dest)) = (uses.first(), def) {
-                let value_type = extract_type_token(&instr.operand)
-                    .unwrap_or_else(|| TypeRef::new(Token::new(0)));
+            if let (Some(&src_addr), Some(dest), Some(value_type)) =
+                (uses.first(), def, extract_type_token(&instr.operand))
+            {
                 Some(SsaOp::LoadObj {
                     dest,
                     src_addr,
                     value_type,
+                    access: AccessQualifiers::FLAT,
                 })
             } else {
                 None
@@ -991,13 +1001,16 @@ fn decompose_standard_instruction(
         }
         0x81 => {
             // stobj
-            if let (Some(&dest_addr), Some(&value)) = (uses.first(), uses.get(1)) {
-                let value_type = extract_type_token(&instr.operand)
-                    .unwrap_or_else(|| TypeRef::new(Token::new(0)));
+            if let (Some(&dest_addr), Some(&value), Some(value_type)) = (
+                uses.first(),
+                uses.get(1),
+                extract_type_token(&instr.operand),
+            ) {
                 Some(SsaOp::StoreObj {
                     dest_addr,
                     value,
                     value_type,
+                    access: AccessQualifiers::FLAT,
                 })
             } else {
                 None
@@ -1005,9 +1018,11 @@ fn decompose_standard_instruction(
         }
         0x70 => {
             // cpobj
-            if let (Some(&dest_addr), Some(&src_addr)) = (uses.first(), uses.get(1)) {
-                let value_type = extract_type_token(&instr.operand)
-                    .unwrap_or_else(|| TypeRef::new(Token::new(0)));
+            if let (Some(&dest_addr), Some(&src_addr), Some(value_type)) = (
+                uses.first(),
+                uses.get(1),
+                extract_type_token(&instr.operand),
+            ) {
                 Some(SsaOp::CopyObj {
                     dest_addr,
                     src_addr,
@@ -1018,9 +1033,7 @@ fn decompose_standard_instruction(
             }
         }
 
-        // =====================================================================
         // Exception handling
-        // =====================================================================
         0x7A => {
             // throw
             uses.first().map(|&exception| SsaOp::Throw { exception })
@@ -1029,9 +1042,7 @@ fn decompose_standard_instruction(
         // endfinally is DC
         0xDC => Some(SsaOp::EndFinally), // endfinally
 
-        // =====================================================================
         // Misc
-        // =====================================================================
         0x00 => Some(SsaOp::Nop), // nop
         // CIL `break` is a debugger breakpoint, the same operation MIPS
         // spells `break`.
@@ -1062,6 +1073,36 @@ fn decompose_standard_instruction(
             }
         }
 
+        0xC2 => {
+            // refanyval
+            if let (Some(value_type), Some(&typed_ref), Some(dest)) =
+                (extract_type_token(&instr.operand), uses.first(), def)
+            {
+                Some(SsaOp::TypedRefValue {
+                    dest,
+                    typed_ref,
+                    value_type,
+                })
+            } else {
+                None
+            }
+        }
+
+        0xC6 => {
+            // mkrefany
+            if let (Some(value_type), Some(&address), Some(dest)) =
+                (extract_type_token(&instr.operand), uses.first(), def)
+            {
+                Some(SsaOp::MakeTypedRef {
+                    dest,
+                    address,
+                    value_type,
+                })
+            } else {
+                None
+            }
+        }
+
         // Default: unknown opcode
         _ => {
             return Err(Error::SsaError(format!(
@@ -1079,6 +1120,28 @@ fn decompose_standard_instruction(
     })
 }
 
+/// Decomposes a prefix instruction (ECMA-335 III.2).
+fn decompose_prefix(instr: &Instruction) -> Result<CilPrefix> {
+    let prefix = match instr.opcode {
+        // unaligned. carries the alignment, which is 1, 2 or 4 bytes
+        0x12 => extract_u8(&instr.operand)
+            .and_then(NonZeroU8::new)
+            .filter(|bytes| bytes.is_power_of_two() && bytes.get() <= 4)
+            .map(CilPrefix::Unaligned),
+        0x13 => Some(CilPrefix::Volatile),
+        0x14 => Some(CilPrefix::Tail),
+        0x16 => extract_type_token(&instr.operand).map(CilPrefix::Constrained),
+        0x1E => Some(CilPrefix::Readonly),
+        _ => None,
+    };
+    prefix.ok_or_else(|| {
+        Error::SsaError(format!(
+            "Malformed prefix {} (0xFE 0x{:02X}) at RVA 0x{:08X}: operand {:?}",
+            instr.mnemonic, instr.opcode, instr.rva, instr.operand
+        ))
+    })
+}
+
 /// Decomposes FE-prefixed instructions.
 fn decompose_fe_instruction(
     instr: &Instruction,
@@ -1087,10 +1150,20 @@ fn decompose_fe_instruction(
 ) -> Result<SsaOp> {
     let result = match instr.opcode {
         // Comparison operations
+        0x00 => def.map(|dest| SsaOp::ArgList { dest }), // arglist
+        0x1D => {
+            // refanytype
+            if let (Some(&typed_ref), Some(dest)) = (uses.first(), def) {
+                Some(SsaOp::TypedRefType { dest, typed_ref })
+            } else {
+                None
+            }
+        }
         0x01 => binary_op(uses, def, |dest, left, right| SsaOp::Ceq {
             dest,
             left,
             right,
+            signaling: false,
         }), // ceq
         0x02 => binary_op(uses, def, |dest, left, right| SsaOp::Cgt {
             // cgt
@@ -1098,6 +1171,7 @@ fn decompose_fe_instruction(
             left,
             right,
             unsigned: false,
+            signaling: false,
         }),
         0x03 => binary_op(uses, def, |dest, left, right| SsaOp::Cgt {
             // cgt.un
@@ -1105,6 +1179,7 @@ fn decompose_fe_instruction(
             left,
             right,
             unsigned: true,
+            signaling: false,
         }),
         0x04 => binary_op(uses, def, |dest, left, right| SsaOp::Clt {
             // clt
@@ -1112,6 +1187,7 @@ fn decompose_fe_instruction(
             left,
             right,
             unsigned: false,
+            signaling: false,
         }),
         0x05 => binary_op(uses, def, |dest, left, right| SsaOp::Clt {
             // clt.un
@@ -1119,13 +1195,18 @@ fn decompose_fe_instruction(
             left,
             right,
             unsigned: true,
+            signaling: false,
         }),
 
         // Function pointers
         0x06 => {
             // ldftn
             if let (Some(method), Some(dest)) = (extract_method_token(&instr.operand), def) {
-                Some(SsaOp::LoadFunctionPtr { dest, method })
+                Some(SsaOp::LoadFunctionPtr {
+                    dest,
+                    method,
+                    constraint: None,
+                })
             } else {
                 None
             }
@@ -1190,9 +1271,9 @@ fn decompose_fe_instruction(
         // Memory operations
         0x15 => {
             // initobj
-            if let Some(&dest_addr) = uses.first() {
-                let value_type = extract_type_token(&instr.operand)
-                    .unwrap_or_else(|| TypeRef::new(Token::new(0)));
+            if let (Some(&dest_addr), Some(value_type)) =
+                (uses.first(), extract_type_token(&instr.operand))
+            {
                 Some(SsaOp::InitObj {
                     dest_addr,
                     value_type,
@@ -1210,8 +1291,13 @@ fn decompose_fe_instruction(
                     dest_addr,
                     src_addr,
                     size,
-                    // CIL `cpblk` is always forward (no direction flag).
-                    reverse: false,
+                    // CIL `cpblk` counts bytes rather than wider elements.
+                    element_bytes: 1,
+                    // CIL `cpblk` walks upward: it reads no direction flag.
+                    backward: None,
+                    // CIL memory is one flat space.
+                    dest_access: AccessQualifiers::FLAT,
+                    src_access: AccessQualifiers::FLAT,
                 })
             } else {
                 None
@@ -1226,8 +1312,10 @@ fn decompose_fe_instruction(
                     dest_addr,
                     value,
                     size,
-                    // CIL `initblk` is always forward (no direction flag).
-                    reverse: false,
+                    // CIL `initblk` walks upward: it reads no direction flag.
+                    backward: None,
+                    // CIL memory is one flat space.
+                    access: AccessQualifiers::FLAT,
                 })
             } else {
                 None
@@ -1245,7 +1333,13 @@ fn decompose_fe_instruction(
         0x0F => {
             // localloc
             if let (Some(&size), Some(dest)) = (uses.first(), def) {
-                Some(SsaOp::LocalAlloc { dest, size })
+                // Whether the bytes are zeroed is the method's `localsinit`,
+                // which the converter states (`TypeProvider::locals_zero_initialized`).
+                Some(SsaOp::LocalAlloc {
+                    dest,
+                    size,
+                    zeroed: false,
+                })
             } else {
                 None
             }
@@ -1260,18 +1354,6 @@ fn decompose_fe_instruction(
                 None
             }
         }
-
-        // Prefix instructions
-        0x12 => {
-            // unaligned. - carries alignment operand (1, 2, or 4)
-            let alignment = extract_u8(&instr.operand).unwrap_or(1);
-            Some(SsaOp::Unaligned { alignment })
-        }
-        0x13 => Some(SsaOp::Volatile),   // volatile.
-        0x14 => Some(SsaOp::TailPrefix), // tail.
-        0x16 => extract_type_token(&instr.operand)
-            .map(|constraint_type| SsaOp::Constrained { constraint_type }), // constrained.
-        0x1E => Some(SsaOp::Readonly),   // readonly.
 
         // Default: unknown FE-prefixed opcode
         _ => {
@@ -1353,19 +1435,12 @@ fn call_op(
     is_virtual: bool,
 ) -> Option<SsaOp> {
     extract_method_token(&instr.operand).map(|method| {
-        if is_virtual {
-            SsaOp::CallVirt {
-                dest: def,
-                method,
-                args: uses.to_vec(),
-            }
+        let callee = if is_virtual {
+            Callee::Virtual(method)
         } else {
-            SsaOp::Call {
-                dest: def,
-                method,
-                args: uses.to_vec(),
-            }
-        }
+            Callee::Direct(method)
+        };
+        CallData::new(def, callee, uses.to_vec()).into()
     })
 }
 
@@ -1419,7 +1494,7 @@ fn ldind_typed(uses: &[SsaVarId], def: Option<SsaVarId>, value_type: SsaType) ->
             addr,
             value_type,
             // CIL `ldind` has no segment/address-space qualifier.
-            address_space: None,
+            access: AccessQualifiers::FLAT,
         })
     } else {
         None
@@ -1433,7 +1508,7 @@ fn stind_typed(uses: &[SsaVarId], value_type: SsaType) -> Option<SsaOp> {
             value,
             value_type,
             // CIL `stind` has no segment/address-space qualifier.
-            address_space: None,
+            access: AccessQualifiers::FLAT,
         })
     } else {
         None
@@ -1554,7 +1629,10 @@ fn type_ref_to_ssa(type_ref: TypeRef, assembly: Option<&CilObject>) -> SsaType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembly::{FlowType, InstructionCategory, StackBehavior};
+    use crate::{
+        assembly::{FlowType, InstructionCategory, StackBehavior},
+        metadata::token::Token,
+    };
 
     fn make_instruction(
         opcode: u8,
@@ -1583,6 +1661,138 @@ mod tests {
         }
     }
 
+    /// Decomposes `instr` into the operation it is; a prefix is none.
+    fn decompose_op(
+        instr: &Instruction,
+        uses: &[SsaVarId],
+        def: Option<SsaVarId>,
+        successors: &[usize],
+        assembly: Option<&CilObject>,
+    ) -> Result<SsaOp> {
+        match decompose_instruction(instr, uses, def, successors, assembly)? {
+            Decomposed::Op(op) => Ok(op),
+            Decomposed::Prefix(prefix) => {
+                Err(Error::SsaError(format!("{prefix:?} is no operation")))
+            }
+        }
+    }
+
+    /// Each prefix decomposes to the prefix it states on the next
+    /// instruction, `unaligned.` with its alignment and `constrained.` with
+    /// its type; none is an operation of its own.
+    #[test]
+    fn a_prefix_decomposes_to_what_it_states() {
+        let token = Token::new(0x0200_0003);
+        let prefix = |opcode, mnemonic, operand| {
+            let instr = make_instruction(opcode, 0xFE, mnemonic, operand, 0, 0);
+            match decompose_instruction(&instr, &[], None, &[], None) {
+                Ok(Decomposed::Prefix(prefix)) => Ok(prefix),
+                Ok(Decomposed::Op(op)) => Err(format!("{mnemonic} lifted to {op}")),
+                Err(error) => Err(format!("{mnemonic}: {error}")),
+            }
+        };
+        let two = NonZeroU8::new(2).unwrap();
+        assert_eq!(
+            prefix(0x12, "unaligned.", Operand::Immediate(Immediate::UInt8(2))),
+            Ok(CilPrefix::Unaligned(two))
+        );
+        assert_eq!(
+            prefix(0x13, "volatile.", Operand::None),
+            Ok(CilPrefix::Volatile)
+        );
+        assert_eq!(prefix(0x14, "tail.", Operand::None), Ok(CilPrefix::Tail));
+        assert_eq!(
+            prefix(0x16, "constrained.", Operand::Token(token)),
+            Ok(CilPrefix::Constrained(TypeRef::new(token)))
+        );
+        assert_eq!(
+            prefix(0x1E, "readonly.", Operand::None),
+            Ok(CilPrefix::Readonly)
+        );
+    }
+
+    /// `no.` only allows the next instruction to skip checks, so it lifts to nothing and the
+    /// checks stay: a run the prefix allows.
+    #[test]
+    fn the_no_prefix_lifts_to_nothing() {
+        let instr = make_instruction(
+            0x19,
+            0xFE,
+            "no.",
+            Operand::Immediate(Immediate::UInt8(0x04)),
+            0,
+            0,
+        );
+        assert!(matches!(
+            decompose_instruction(&instr, &[], None, &[], None),
+            Ok(Decomposed::Op(SsaOp::Nop))
+        ));
+    }
+
+    /// `unaligned.` states an alignment of 1, 2 or 4 bytes (ECMA-335
+    /// III.2.5); any other, or none, is malformed IL rather than an alignment
+    /// of one byte.
+    #[test]
+    fn an_unaligned_prefix_states_a_valid_alignment() {
+        for operand in [
+            Operand::Immediate(Immediate::UInt8(0)),
+            Operand::Immediate(Immediate::UInt8(3)),
+            Operand::Immediate(Immediate::UInt8(8)),
+            Operand::None,
+        ] {
+            let instr = make_instruction(0x12, 0xFE, "unaligned.", operand.clone(), 0, 0);
+            assert!(
+                decompose_instruction(&instr, &[], None, &[], None).is_err(),
+                "{operand:?}"
+            );
+        }
+    }
+
+    /// The object operations name the type they move or clear; without the
+    /// token the instruction is malformed, not an operation on the nil type.
+    #[test]
+    fn an_object_operation_needs_its_type() {
+        let (v0, v1) = (SsaVarId::from_index(0), SsaVarId::from_index(1));
+        let cases = [
+            (
+                make_instruction(0x71, 0, "ldobj", Operand::None, 1, 1),
+                vec![v0],
+                Some(v1),
+            ),
+            (
+                make_instruction(0x81, 0, "stobj", Operand::None, 2, 0),
+                vec![v0, v1],
+                None,
+            ),
+            (
+                make_instruction(0x70, 0, "cpobj", Operand::None, 2, 0),
+                vec![v0, v1],
+                None,
+            ),
+            (
+                make_instruction(0x15, 0xFE, "initobj", Operand::None, 1, 0),
+                vec![v0],
+                None,
+            ),
+        ];
+        for (instr, uses, def) in cases {
+            assert!(
+                decompose_op(&instr, &uses, def, &[], None).is_err(),
+                "{} without a type token",
+                instr.mnemonic
+            );
+            let typed = Instruction {
+                operand: Operand::Token(Token::new(0x0200_0003)),
+                ..instr
+            };
+            assert!(
+                decompose_op(&typed, &uses, def, &[], None).is_ok(),
+                "{}",
+                typed.mnemonic
+            );
+        }
+    }
+
     #[test]
     fn test_decompose_add() {
         let instr = make_instruction(0x58, 0, "add", Operand::None, 2, 1);
@@ -1592,7 +1802,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_ok());
 
         if let Ok(SsaOp::Add {
@@ -1617,7 +1827,7 @@ mod tests {
         let uses = vec![];
         let def = Some(v0);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_ok());
 
         if let Ok(SsaOp::Const { dest, value }) = op {
@@ -1642,7 +1852,7 @@ mod tests {
         let uses = vec![];
         let def = Some(v0);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_ok());
 
         if let Ok(SsaOp::Const { dest, value }) = op {
@@ -1660,10 +1870,10 @@ mod tests {
         let uses = vec![v];
         let def = None;
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_ok());
 
-        if let Ok(SsaOp::Return { value }) = op {
+        if let Ok(SsaOp::Return { value, .. }) = op {
             assert_eq!(value, Some(v));
         } else {
             panic!("Expected SsaOp::Return");
@@ -1676,10 +1886,10 @@ mod tests {
         let uses = vec![];
         let def = None;
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_ok());
 
-        if let Ok(SsaOp::Return { value }) = op {
+        if let Ok(SsaOp::Return { value, .. }) = op {
             assert_eq!(value, None);
         } else {
             panic!("Expected SsaOp::Return");
@@ -1695,10 +1905,13 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_ok());
 
-        if let Ok(SsaOp::Ceq { dest, left, right }) = op {
+        if let Ok(SsaOp::Ceq {
+            dest, left, right, ..
+        }) = op
+        {
             assert_eq!(dest, v2);
             assert_eq!(left, v0);
             assert_eq!(right, v1);
@@ -1707,13 +1920,58 @@ mod tests {
         }
     }
 
+    /// The vararg handle and the three typed-reference operations decompose to
+    /// their own operations, with the type token, the value each takes, and
+    /// the value each defines; they used to be rejected as unknown opcodes.
+    #[test]
+    fn test_decompose_arglist_and_typed_references() {
+        let v0 = SsaVarId::from_index(0);
+        let v1 = SsaVarId::from_index(1);
+        let token = Token::new(0x0100_0005);
+
+        let arglist = make_instruction(0x00, 0xFE, "arglist", Operand::None, 0, 1);
+        assert_eq!(
+            decompose_op(&arglist, &[], Some(v1), &[], None).unwrap(),
+            SsaOp::ArgList { dest: v1 }
+        );
+
+        let mkrefany = make_instruction(0xC6, 0, "mkrefany", Operand::Token(token), 1, 1);
+        assert_eq!(
+            decompose_op(&mkrefany, &[v0], Some(v1), &[], None).unwrap(),
+            SsaOp::MakeTypedRef {
+                dest: v1,
+                address: v0,
+                value_type: TypeRef::new(token),
+            }
+        );
+
+        let refanyval = make_instruction(0xC2, 0, "refanyval", Operand::Token(token), 1, 1);
+        assert_eq!(
+            decompose_op(&refanyval, &[v0], Some(v1), &[], None).unwrap(),
+            SsaOp::TypedRefValue {
+                dest: v1,
+                typed_ref: v0,
+                value_type: TypeRef::new(token),
+            }
+        );
+
+        let refanytype = make_instruction(0x1D, 0xFE, "refanytype", Operand::None, 1, 1);
+        assert_eq!(
+            decompose_op(&refanytype, &[v0], Some(v1), &[], None).unwrap(),
+            SsaOp::TypedRefType {
+                dest: v1,
+                typed_ref: v0,
+            }
+        );
+    }
+
     #[test]
     fn test_decompose_nop() {
         let instr = make_instruction(0x00, 0, "nop", Operand::None, 0, 0);
         let uses = vec![];
         let def = None;
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert_eq!(op.unwrap(), SsaOp::Nop);
     }
 
@@ -1725,7 +1983,7 @@ mod tests {
         let uses = vec![v0];
         let def = Some(v1);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None).unwrap();
+        let op = decompose_op(&instr, &uses, def, &[], None).unwrap();
 
         if let SsaOp::IntConv {
             dest,
@@ -1754,7 +2012,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::Sub { .. })));
     }
 
@@ -1767,7 +2025,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::Mul { .. })));
     }
 
@@ -1780,7 +2038,7 @@ mod tests {
         let v2 = SsaVarId::from_index(2);
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Div { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -1797,7 +2055,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Div { unsigned, .. }) = op {
             assert!(unsigned);
         } else {
@@ -1814,7 +2072,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Rem { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -1831,7 +2089,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Rem { unsigned, .. }) = op {
             assert!(unsigned);
         } else {
@@ -1847,7 +2105,7 @@ mod tests {
         let uses = vec![v0];
         let def = Some(v1);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::Neg { flags: None, .. })));
     }
 
@@ -1860,7 +2118,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::AddOvf { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -1877,7 +2135,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::AddOvf { unsigned, .. }) = op {
             assert!(unsigned);
         } else {
@@ -1894,7 +2152,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::MulOvf { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -1911,7 +2169,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::SubOvf { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -1928,7 +2186,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::And { .. })));
     }
 
@@ -1941,7 +2199,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::Or { .. })));
     }
 
@@ -1954,7 +2212,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::Xor { .. })));
     }
 
@@ -1966,7 +2224,7 @@ mod tests {
         let uses = vec![v0];
         let def = Some(v1);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::Not { flags: None, .. })));
     }
 
@@ -1979,7 +2237,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(matches!(op, Ok(SsaOp::Shl { .. })));
     }
 
@@ -1992,7 +2250,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Shr { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -2009,7 +2267,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Shr { unsigned, .. }) = op {
             assert!(unsigned);
         } else {
@@ -2024,7 +2282,7 @@ mod tests {
         let uses = vec![];
         let def = Some(v0);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
             assert_eq!(value, ConstValue::Null);
         } else {
@@ -2039,7 +2297,7 @@ mod tests {
         let uses = vec![];
         let def = Some(v0);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
             assert_eq!(value, ConstValue::I32(-1));
         } else {
@@ -2062,7 +2320,7 @@ mod tests {
         ] {
             let instr = make_instruction(opcode, 0, "ldc.i4.N", Operand::None, 0, 1);
             let v0 = SsaVarId::from_index(0);
-            let op = decompose_instruction(&instr, &[], Some(v0), &[], None);
+            let op = decompose_op(&instr, &[], Some(v0), &[], None);
             if let Ok(SsaOp::Const { value, .. }) = op {
                 assert_eq!(value, ConstValue::I32(expected_value));
             } else {
@@ -2082,7 +2340,7 @@ mod tests {
             1,
         );
         let v0 = SsaVarId::from_index(0);
-        let op = decompose_instruction(&instr, &[], Some(v0), &[], None);
+        let op = decompose_op(&instr, &[], Some(v0), &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
             assert_eq!(value, ConstValue::I32(0x12345678));
         } else {
@@ -2101,7 +2359,7 @@ mod tests {
             1,
         );
         let v0 = SsaVarId::from_index(0);
-        let op = decompose_instruction(&instr, &[], Some(v0), &[], None);
+        let op = decompose_op(&instr, &[], Some(v0), &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
             assert_eq!(value, ConstValue::I64(0x123456789ABCDEF0));
         } else {
@@ -2120,9 +2378,9 @@ mod tests {
             1,
         );
         let v0 = SsaVarId::from_index(0);
-        let op = decompose_instruction(&instr, &[], Some(v0), &[], None);
+        let op = decompose_op(&instr, &[], Some(v0), &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
-            assert_eq!(value, ConstValue::F32(std::f32::consts::PI));
+            assert_eq!(value, ConstValue::from(std::f32::consts::PI));
         } else {
             panic!("Expected SsaOp::Const");
         }
@@ -2139,9 +2397,9 @@ mod tests {
             1,
         );
         let v0 = SsaVarId::from_index(0);
-        let op = decompose_instruction(&instr, &[], Some(v0), &[], None);
+        let op = decompose_op(&instr, &[], Some(v0), &[], None);
         if let Ok(SsaOp::Const { value, .. }) = op {
-            assert_eq!(value, ConstValue::F64(std::f64::consts::E));
+            assert_eq!(value, ConstValue::from(std::f64::consts::E));
         } else {
             panic!("Expected SsaOp::Const");
         }
@@ -2155,7 +2413,7 @@ mod tests {
         let uses = vec![v0];
         let def = Some(v1);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Copy { dest, src }) = op {
             assert_eq!(dest, v1);
             assert_eq!(src, v0);
@@ -2171,7 +2429,7 @@ mod tests {
         let uses = vec![v0];
         let def = None;
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Pop { value }) = op {
             assert_eq!(value, v0);
         } else {
@@ -2184,7 +2442,7 @@ mod tests {
         let instr = make_instruction(0x38, 0, "br", Operand::None, 0, 0);
         let successors = vec![5];
 
-        let op = decompose_instruction(&instr, &[], None, &successors, None);
+        let op = decompose_op(&instr, &[], None, &successors, None);
         if let Ok(SsaOp::Jump { target }) = op {
             assert_eq!(target, 5);
         } else {
@@ -2197,7 +2455,7 @@ mod tests {
         let instr = make_instruction(0x2B, 0, "br.s", Operand::None, 0, 0);
         let successors = vec![3];
 
-        let op = decompose_instruction(&instr, &[], None, &successors, None);
+        let op = decompose_op(&instr, &[], None, &successors, None);
         if let Ok(SsaOp::Jump { target }) = op {
             assert_eq!(target, 3);
         } else {
@@ -2212,7 +2470,7 @@ mod tests {
         let uses = vec![v0];
         let successors = vec![5, 2]; // branch target, fallthrough
 
-        let op = decompose_instruction(&instr, &uses, None, &successors, None);
+        let op = decompose_op(&instr, &uses, None, &successors, None);
         if let Ok(SsaOp::Branch {
             condition,
             true_target,
@@ -2234,7 +2492,7 @@ mod tests {
         let uses = vec![v0];
         let successors = vec![5, 2]; // branch target, fallthrough
 
-        let op = decompose_instruction(&instr, &uses, None, &successors, None);
+        let op = decompose_op(&instr, &uses, None, &successors, None);
         if let Ok(SsaOp::Branch {
             condition,
             true_target,
@@ -2256,7 +2514,7 @@ mod tests {
         let uses = vec![v0];
         let successors = vec![10, 20, 30, 5]; // case targets, then default
 
-        let op = decompose_instruction(&instr, &uses, None, &successors, None);
+        let op = decompose_op(&instr, &uses, None, &successors, None);
         if let Ok(SsaOp::Switch {
             value,
             targets,
@@ -2280,7 +2538,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Cgt { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -2297,7 +2555,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Cgt { unsigned, .. }) = op {
             assert!(unsigned);
         } else {
@@ -2314,7 +2572,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Clt { unsigned, .. }) = op {
             assert!(!unsigned);
         } else {
@@ -2331,7 +2589,7 @@ mod tests {
         let uses = vec![v0, v1];
         let def = Some(v2);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         if let Ok(SsaOp::Clt { unsigned, .. }) = op {
             assert!(unsigned);
         } else {
@@ -2360,7 +2618,7 @@ mod tests {
             let instr = make_instruction(opcode, 0, "conv.*", Operand::None, 1, 1);
             let v0 = SsaVarId::from_index(0);
             let v1 = SsaVarId::from_index(1);
-            let op = decompose_instruction(&instr, &[v0], Some(v1), &[], None);
+            let op = decompose_op(&instr, &[v0], Some(v1), &[], None);
 
             // conv.i*/u* lower to `IntConv`, conv.r* to `IntToFloat` (which
             // carries no overflow-check); extract the shared fields from either.
@@ -2410,7 +2668,7 @@ mod tests {
             let instr = make_instruction(opcode, 0, "conv.ovf.*", Operand::None, 1, 1);
             let v0 = SsaVarId::from_index(0);
             let v1 = SsaVarId::from_index(1);
-            let op = decompose_instruction(&instr, &[v0], Some(v1), &[], None);
+            let op = decompose_op(&instr, &[v0], Some(v1), &[], None);
 
             // All conv.ovf.* opcodes target an integer, so they lower to `IntConv`.
             if let Ok(SsaOp::IntConv {
@@ -2444,7 +2702,7 @@ mod tests {
         let v0 = SsaVarId::from_index(0);
         let uses = vec![v0];
 
-        let op = decompose_instruction(&instr, &uses, None, &[], None);
+        let op = decompose_op(&instr, &uses, None, &[], None);
         if let Ok(SsaOp::Throw { exception }) = op {
             assert_eq!(exception, v0);
         } else {
@@ -2455,21 +2713,21 @@ mod tests {
     #[test]
     fn test_decompose_endfinally() {
         let instr = make_instruction(0xDC, 0, "endfinally", Operand::None, 0, 0);
-        let op = decompose_instruction(&instr, &[], None, &[], None);
+        let op = decompose_op(&instr, &[], None, &[], None);
         assert_eq!(op.unwrap(), SsaOp::EndFinally);
     }
 
     #[test]
     fn test_decompose_rethrow() {
         let instr = make_instruction(0x1A, 0xFE, "rethrow", Operand::None, 0, 0);
-        let op = decompose_instruction(&instr, &[], None, &[], None);
+        let op = decompose_op(&instr, &[], None, &[], None);
         assert_eq!(op.unwrap(), SsaOp::Rethrow);
     }
 
     #[test]
     fn test_decompose_break() {
         let instr = make_instruction(0x01, 0, "break", Operand::None, 0, 0);
-        let op = decompose_instruction(&instr, &[], None, &[], None);
+        let op = decompose_op(&instr, &[], None, &[], None);
         assert_eq!(op.unwrap(), SsaOp::Break(BreakpointOp::Breakpoint));
     }
 
@@ -2478,7 +2736,7 @@ mod tests {
         let instr = make_instruction(0xDE, 0, "leave", Operand::None, 0, 0);
         let successors = vec![10];
 
-        let op = decompose_instruction(&instr, &[], None, &successors, None);
+        let op = decompose_op(&instr, &[], None, &successors, None);
         if let Ok(SsaOp::Leave { target }) = op {
             assert_eq!(target, 10);
         } else {
@@ -2494,8 +2752,8 @@ mod tests {
         let uses = vec![v0];
         let def = Some(v1);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
-        if let Ok(SsaOp::LocalAlloc { dest, size }) = op {
+        let op = decompose_op(&instr, &uses, def, &[], None);
+        if let Ok(SsaOp::LocalAlloc { dest, size, .. }) = op {
             assert_eq!(dest, v1);
             assert_eq!(size, v0);
         } else {
@@ -2512,7 +2770,7 @@ mod tests {
         let uses = vec![v0]; // Only one operand
         let def = Some(v1);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_err());
     }
 
@@ -2524,7 +2782,7 @@ mod tests {
         let uses = vec![]; // No operand
         let def = Some(v0);
 
-        let op = decompose_instruction(&instr, &uses, def, &[], None);
+        let op = decompose_op(&instr, &uses, def, &[], None);
         assert!(op.is_err());
     }
 
@@ -2532,7 +2790,7 @@ mod tests {
     fn test_decompose_const_missing_def() {
         // Constant load with no def should return None
         let instr = make_instruction(0x16, 0, "ldc.i4.0", Operand::None, 0, 1);
-        let op = decompose_instruction(&instr, &[], None, &[], None);
+        let op = decompose_op(&instr, &[], None, &[], None);
         assert!(op.is_err());
     }
 
@@ -2540,7 +2798,7 @@ mod tests {
     fn test_decompose_unknown_opcode() {
         // Unknown opcode should return None
         let instr = make_instruction(0xFF, 0, "unknown", Operand::None, 0, 0);
-        let op = decompose_instruction(&instr, &[], None, &[], None);
+        let op = decompose_op(&instr, &[], None, &[], None);
         assert!(op.is_err());
     }
 }

@@ -34,9 +34,10 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! use dotscope::metadata::tables::{MetadataTable, RowReadable, TableInfoRef, TableRow};
+//! ```no_run
+//! use dotscope::metadata::tables::{MetadataTable, RowReadable, TableId, TableInfoRef, TableRow};
 //! use dotscope::Result;
+//! use rayon::prelude::*;
 //!
 //! # struct ExampleRow { id: u32 }
 //! # impl TableRow for ExampleRow {
@@ -45,6 +46,7 @@
 //! #     }
 //! # }
 //! # impl RowReadable for ExampleRow {
+//! #     const TABLE_ID: TableId = TableId::Module;
 //! #     fn row_read(_: &[u8], offset: &mut usize, rid: u32, _: &TableInfoRef) -> Result<Self> {
 //! #         *offset += 4;
 //! #         Ok(ExampleRow { id: rid })
@@ -56,18 +58,19 @@
 //!
 //! // Sequential iteration over all rows
 //! for row in &table {
-//!     println!("Processing row ID: {}", row.id);
+//!     println!("Processing row ID: {}", row?.id);
 //! }
 //!
 //! // Parallel processing with error propagation
 //! table.par_iter().try_for_each(|row| {
 //!     // Each row processed in parallel threads
-//!     process_row_data(&row)?;
-//!     Ok(())
+//!     process_row_data(&row?)?;
+//!     Ok::<(), dotscope::Error>(())
 //! })?;
 //! # Ok(())
 //! # }
 //! # fn process_row_data(_: &ExampleRow) -> Result<()> { Ok(()) }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Error Handling

@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    assembly::Operand, deobfuscation::utils::find_methods_calling_apis, metadata::token::Token,
+    assembly::{BasicBlock, FlowType, Instruction, Operand},
+    deobfuscation::utils::find_methods_calling_apis,
+    metadata::{method::Method, token::Token},
     CilObject,
 };
 
@@ -108,9 +110,15 @@ pub fn scan_stub_methods(assembly: &CilObject) -> StubScanResult {
 /// Result of .cctor fan-in analysis.
 #[derive(Debug)]
 pub struct CctorFanInResult {
-    /// Token of the method called by the most type .cctors.
+    /// Token of the method called by the most type .cctors, the lowest token
+    /// among equals.
     pub target_token: Token,
-    /// Tokens of all .cctors that call the target method.
+    /// Every runtime initializer the .cctors call: each method of the target's
+    /// declaring type that is called from at least [`MIN_CCTOR_FAN_IN`]
+    /// .cctors, in token order. .NET Reactor injects more than one call into a
+    /// protected type's .cctor, and all of them go when the runtime does.
+    pub initializers: Vec<Token>,
+    /// Tokens of all .cctors that call any of the initializers, in token order.
     pub calling_cctors: Vec<Token>,
     /// Number of local variables in the target method.
     pub target_local_count: usize,
@@ -118,11 +126,12 @@ pub struct CctorFanInResult {
     pub target_instruction_count: usize,
 }
 
-/// Finds the method with the highest .cctor fan-in.
+/// Finds the runtime initializers the most type .cctors call.
 ///
 /// NecroBit injects .cctors into every type, all calling the same
-/// initialization method. No legitimate program has 5+ types whose .cctors
-/// all call the same single target.
+/// initialization methods. No legitimate program has 5+ types whose .cctors
+/// all call the same single target. The result names the target with the
+/// highest fan-in and every other method of its type called as widely.
 ///
 /// Returns `None` if no target has fan-in >= [`MIN_CCTOR_FAN_IN`].
 pub fn find_cctor_fan_in_target(assembly: &CilObject) -> Option<CctorFanInResult> {
@@ -158,14 +167,49 @@ pub fn find_cctor_fan_in_target(assembly: &CilObject) -> Option<CctorFanInResult
         }
     }
 
-    // Find the target with the maximum fan-in
-    let (target_token, calling_cctors) = call_target_to_cctors
-        .into_iter()
-        .max_by_key(|(_, cctors)| cctors.len())?;
+    // The target with the most calling .cctors, the lowest token among
+    // equals: two initializers can be called from exactly the same .cctors,
+    // and the map's own order would pick one at random.
+    let (target_token, target_cctors) = call_target_to_cctors
+        .iter()
+        .max_by_key(|(token, cctors)| (cctors.len(), std::cmp::Reverse(token.value())))?;
+    let target_token = *target_token;
 
-    if calling_cctors.len() < MIN_CCTOR_FAN_IN {
+    if target_cctors.len() < MIN_CCTOR_FAN_IN {
         return None;
     }
+
+    // Every other method of the target's type that the .cctors call as often
+    // is an initializer of the same runtime.
+    let runtime_type = assembly
+        .method(&target_token)
+        .ok()
+        .and_then(|m| m.declaring_type_rc())
+        .map(|t| t.token);
+    let mut initializers: Vec<Token> = call_target_to_cctors
+        .iter()
+        .filter(|(token, cctors)| {
+            cctors.len() >= MIN_CCTOR_FAN_IN
+                && (**token == target_token
+                    || runtime_type.is_some()
+                        && assembly
+                            .method(token)
+                            .ok()
+                            .and_then(|m| m.declaring_type_rc())
+                            .map(|t| t.token)
+                            == runtime_type)
+        })
+        .map(|(token, _)| *token)
+        .collect();
+    initializers.sort();
+    let mut calling_cctors: Vec<Token> = initializers
+        .iter()
+        .filter_map(|token| call_target_to_cctors.get(token))
+        .flatten()
+        .copied()
+        .collect();
+    calling_cctors.sort();
+    calling_cctors.dedup();
 
     // Extract structural properties of the target method
     let (target_local_count, target_instruction_count) = assembly
@@ -176,6 +220,7 @@ pub fn find_cctor_fan_in_target(assembly: &CilObject) -> Option<CctorFanInResult
 
     Some(CctorFanInResult {
         target_token,
+        initializers,
         calling_cctors,
         target_local_count,
         target_instruction_count,
@@ -305,8 +350,7 @@ pub fn find_body_patcher(assembly: &CilObject) -> Option<Token> {
 
 /// A `<PrivateImplementationDetails>{GUID}` container injected by NR.
 ///
-/// See `docs/research/netreactor/private-impl.md` for the full structure.
-/// Briefly: a sealed type whose name is `<PrivateImplementationDetails>`
+/// The container is a sealed type whose name is `<PrivateImplementationDetails>`
 /// followed by a GUID-shaped suffix, holding SHA-256-named static fields
 /// pointing at PE-mapped raw bytes consumed by NR's runtime decryptors.
 #[derive(Debug)]
@@ -609,21 +653,103 @@ enum AccessorKind {
     Method,
 }
 
+/// The instructions a call to `method` executes, in order, along the path
+/// from its entry: `nop`s are dropped and unconditional branches followed
+/// rather than yielded.
+///
+/// .NET Reactor pads protected helpers with a `br` over junk bytes, so the
+/// instructions a body executes are not the ones laid out in it. The walk
+/// ends after the first instruction that does not simply continue (a `ret`,
+/// a conditional branch, a switch, a throw), which it yields last: a body is
+/// one straight path exactly when that instruction is a `ret`. A loop or a
+/// jump out of the body ends it without that.
+///
+/// Walks the decoded blocks in place; nothing is copied or indexed.
+pub fn executed_path(method: &Method) -> ExecutedPath<'_> {
+    ExecutedPath {
+        blocks: method.blocks.get().map_or(&[], Vec::as_slice),
+        block: 0,
+        index: 0,
+        hops: 0,
+        done: false,
+    }
+}
+
+/// Iterator returned by [`executed_path`].
+pub struct ExecutedPath<'a> {
+    blocks: &'a [BasicBlock],
+    block: usize,
+    index: usize,
+    /// Blocks entered so far; a straight path enters each at most once.
+    hops: usize,
+    done: bool,
+}
+
+impl ExecutedPath<'_> {
+    /// Continues in `next`, the block control reaches from the current one.
+    fn enter(&mut self, next: Option<usize>) {
+        self.hops = self.hops.saturating_add(1);
+        match next {
+            Some(block) if self.hops <= self.blocks.len() => {
+                self.block = block;
+                self.index = 0;
+            }
+            _ => self.done = true,
+        }
+    }
+}
+
+impl<'a> Iterator for ExecutedPath<'a> {
+    type Item = &'a Instruction;
+
+    fn next(&mut self) -> Option<&'a Instruction> {
+        while !self.done {
+            let Some(block) = self.blocks.get(self.block) else {
+                self.done = true;
+                break;
+            };
+            let Some(instruction) = block.instructions.get(self.index) else {
+                // Off the end of a block that falls through to the next.
+                self.enter(block.successors.first().copied());
+                continue;
+            };
+            self.index = self.index.saturating_add(1);
+            match instruction.flow_type {
+                FlowType::UnconditionalBranch => {
+                    self.enter(block.successors.first().copied());
+                }
+                FlowType::Sequential | FlowType::Call | FlowType::CallIndirect => {
+                    if instruction.mnemonic != "nop" {
+                        return Some(instruction);
+                    }
+                }
+                _ => {
+                    self.done = true;
+                    return Some(instruction);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Returns the accessor kind if `method_token`'s body matches the NR
 /// metadata-token resolver shape; otherwise `None`.
 ///
-/// Body shape (4 instructions):
+/// Body shape (4 instructions, in execution order - see [`executed_path`]):
 /// `ldsflda <static_field>` → `ldarg.0` → `call instance ModuleHandle::Get*FromMetadataToken` → `ret`.
 fn classify_token_accessor_body(assembly: &CilObject, method_token: Token) -> Option<AccessorKind> {
     let method = assembly.method(&method_token).ok()?;
-    let instrs: Vec<_> = method.instructions().collect();
-    if instrs.len() != 4 {
+    let mut path = executed_path(&method);
+    let (Some(i0), Some(i1), Some(i2), Some(i3), None) = (
+        path.next(),
+        path.next(),
+        path.next(),
+        path.next(),
+        path.next(),
+    ) else {
         return None;
-    }
-    let i0 = instrs.first()?;
-    let i1 = instrs.get(1)?;
-    let i2 = instrs.get(2)?;
-    let i3 = instrs.get(3)?;
+    };
     if i0.mnemonic != "ldsflda"
         || i1.mnemonic != "ldarg.0"
         || i2.mnemonic != "call"
@@ -656,7 +782,7 @@ fn classify_token_accessor_body(assembly: &CilObject, method_token: Token) -> Op
 /// manifest-resource token that is only reachable through the scanned
 /// methods — once those methods are cleaned up, the resource's data
 /// payload is dead weight. This is the structural signal used by
-/// [`netreactor.antitamp`] to mark the NR anti-tamper encrypted resource
+/// [`netreactor.antitamp`](crate::deobfuscation::techniques::netreactor::NetReactorAntiTamp) to mark the NR anti-tamper encrypted resource
 /// for removal.
 ///
 /// The `assembly::Operand::Token` branch is *not* checked here — NR's
@@ -714,14 +840,15 @@ pub struct InjectedCctorClassification {
     pub modified: Vec<Token>,
 }
 
-/// Classifies .cctors that call the init method as purely-injected or modified.
+/// Classifies .cctors that call the runtime's initializers as purely-injected
+/// or modified.
 ///
 /// A purely-injected .cctor has a very small body (<=5 instructions) whose only
-/// `call` target is the init method. A modified .cctor has additional code after
-/// the init call (the original .cctor body was preserved).
+/// `call` targets are initializers. A modified .cctor has additional code after
+/// the init calls (the original .cctor body was preserved).
 pub fn classify_injected_cctors(
     assembly: &CilObject,
-    init_token: Token,
+    initializers: &[Token],
     calling_cctors: &[Token],
 ) -> InjectedCctorClassification {
     let mut purely_injected = Vec::new();
@@ -744,8 +871,8 @@ pub fn classify_injected_cctors(
 
         // A purely-injected .cctor:
         // - Has a small body (<=5 instructions)
-        // - Its only call target is the init method
-        let only_calls_init = call_targets.iter().all(|&t| t == init_token);
+        // - Its only call targets are initializers
+        let only_calls_init = call_targets.iter().all(|t| initializers.contains(t));
 
         if instr_count <= 5 && only_calls_init {
             purely_injected.push(cctor_token);

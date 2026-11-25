@@ -16,9 +16,9 @@ use crate::{
     metadata::{
         method::Method,
         signatures::{parse_type_spec_signature, SignatureParameter, TypeSignature},
-        tables::TypeSpecRaw,
+        tables::{TableId, TypeSpecRaw},
         token::Token,
-        typesystem::{CilPrimitive, CilPrimitiveData, CilType, CilTypeReference},
+        typesystem::{ArrayDimensions, CilPrimitive, CilPrimitiveData, CilType, CilTypeReference},
     },
     CilObject,
 };
@@ -275,7 +275,7 @@ const ILASM_KEYWORDS: &[&str] = &[
 ];
 
 /// Write `depth` levels of indentation (2 spaces per level).
-pub(super) fn write_indent(w: &mut dyn Write, depth: usize) -> io::Result<()> {
+pub fn write_indent(w: &mut dyn Write, depth: usize) -> io::Result<()> {
     for _ in 0..depth {
         write!(w, "  ")?;
     }
@@ -287,7 +287,7 @@ pub(super) fn write_indent(w: &mut dyn Write, depth: usize) -> io::Result<()> {
 /// ILAsm identifiers that contain characters outside the normal `[A-Za-z0-9_$@?.]`
 /// set (such as `<`, `>`, `-`, `=`) must be wrapped in single quotes.
 /// Returns the identifier unchanged if no quoting is needed.
-pub(super) fn quote_identifier(name: &str) -> String {
+pub fn quote_identifier(name: &str) -> String {
     // For nested type paths (contains '/'), quote each component individually
     // so the '/' separator stays outside quotes: 'Outer'/'Inner'
     if name.contains('/') {
@@ -310,15 +310,121 @@ fn quote_single(name: &str) -> String {
         || name.contains('`')
         || name.starts_with(|c: char| c.is_ascii_digit())
         || ILASM_RESERVED.contains(name);
-    if needs_quoting {
-        format!("'{name}'")
+    if needs_quoting
+        || name
+            .chars()
+            .any(|c| c == '\'' || c == '\\' || c.is_control())
+    {
+        quoted_name(name)
     } else {
         name.to_string()
     }
 }
 
+/// `name` as a single-quoted ILAsm name (`SQSTRING`), whatever it holds: an assembly, module,
+/// file or resource name, or an identifier [`quote_identifier`] decides to quote.
+///
+/// The characters the quoting would end or misread are escaped (see [`push_escaped`]): a name
+/// with a `'` in it was written as two names and the rest, and a `\` read as an escape.
+pub fn quoted_name(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len().saturating_add(2));
+    quoted.push('\'');
+    push_escaped(&mut quoted, name, '\'');
+    quoted.push('\'');
+    quoted
+}
+
+/// `text` as a double-quoted ILAsm string (`QSTRING`): a string constant, a P/Invoke module
+/// or entry point name, a culture, or a user string that is valid UTF-16.
+///
+/// One escaper for every string the output quotes: they were written unescaped, so a `"`
+/// ended the string early and a control character went out raw.
+pub fn quoted_string(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len().saturating_add(2));
+    quoted.push('"');
+    push_escaped(&mut quoted, text, '"');
+    quoted.push('"');
+    quoted
+}
+
+/// Appends `text` to `out` escaped for an ILAsm string quoted by `quote`: the quote and `\`
+/// by a backslash, the usual control characters by their C escapes, and any other control
+/// character as a three-digit octal escape, the form ILAsm reads for any byte. Other
+/// characters, ASCII or not, go out as they are.
+fn push_escaped(out: &mut String, text: &str, quote: char) {
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_control() => {
+                out.push_str(&format!("\\{:03o}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// A user string as `ldstr` takes it: a quoted string ([`quoted_string`]) when its UTF-16
+/// code units are valid UTF-16, and otherwise `bytearray (...)` of the code units little
+/// endian, the form ILAsm reads for any string. A string with a lone surrogate (which
+/// obfuscators produce) was decoded lossily, and the output assembled to another string.
+pub fn user_string_literal(units: &[u16]) -> String {
+    match String::from_utf16(units) {
+        Ok(text) => quoted_string(&text),
+        Err(_) => {
+            let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            format!("bytearray ({})", hex_bytes(&bytes))
+        }
+    }
+}
+
+/// The decimal ILAsm literal of a float Rust's `Debug` wrote (the shortest decimal that reads
+/// back as the same value), with a decimal point: ILAsm reads a number without one, `1e300`
+/// or `5`, as an integer.
+fn with_decimal_point(mut decimal: String) -> String {
+    if !decimal.contains('.') {
+        match decimal.find('e') {
+            Some(exponent) => decimal.insert_str(exponent, ".0"),
+            None => decimal.push_str(".0"),
+        }
+    }
+    decimal
+}
+
+/// `value` as an ILAsm decimal literal, or `None` when it has none: an infinity, a NaN or
+/// negative zero, which ILAsm writes as their bits. A decimal is the shortest that reads back
+/// as the same value, so a value no fixed precision reaches still round-trips.
+fn decimal_f32(value: f32) -> Option<String> {
+    (value.is_finite() && !(value == 0.0 && value.is_sign_negative()))
+        .then(|| with_decimal_point(format!("{value:?}")))
+}
+
+/// [`decimal_f32`] for a `float64`.
+fn decimal_f64(value: f64) -> Option<String> {
+    (value.is_finite() && !(value == 0.0 && value.is_sign_negative()))
+        .then(|| with_decimal_point(format!("{value:?}")))
+}
+
+/// The operand of `ldc.r4`: a decimal literal, or `float32(0x...)`, the value's bits, for an
+/// infinity, a NaN or negative zero. `inf`, `NaN` and `-0` are no ILAsm, and a large value
+/// written out in full has hundreds of digits.
+pub fn ldc_r4_operand(value: f32) -> String {
+    decimal_f32(value).unwrap_or_else(|| format!("float32(0x{:08X})", value.to_bits()))
+}
+
+/// The operand of `ldc.r8`, as [`ldc_r4_operand`] writes `ldc.r4`'s.
+pub fn ldc_r8_operand(value: f64) -> String {
+    decimal_f64(value).unwrap_or_else(|| format!("float64(0x{:016X})", value.to_bits()))
+}
+
 /// Format a byte slice as a hex string: `XX XX XX`.
-pub(super) fn hex_bytes(bytes: &[u8]) -> String {
+pub fn hex_bytes(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|b| format!("{b:02X}"))
@@ -333,7 +439,7 @@ pub(super) fn hex_bytes(bytes: &[u8]) -> String {
 /// accessor directives. Includes the `instance` prefix when the method has
 /// a `this` parameter, the return type, declaring type, method name, and
 /// the full parameter type list from the method signature.
-pub(super) fn format_method_ref(method: &Method, asm: &CilObject) -> String {
+pub fn format_method_ref(method: &Method, asm: &CilObject) -> String {
     let declaring_type = method
         .declaring_type_fullname()
         .map(|n| quote_identifier(&n));
@@ -347,7 +453,7 @@ pub(super) fn format_method_ref(method: &Method, asm: &CilObject) -> String {
     )
 }
 
-/// Build an assembly-scoped name for a type with TypeSpec fallback resolution.
+/// Build an assembly-scoped name for a type, as an ILAsm `typeSpec` names it.
 ///
 /// For types defined in an external assembly, returns a name like
 /// `[mscorlib]System.Object` with the assembly reference prefix.
@@ -356,44 +462,15 @@ pub(super) fn format_method_ref(method: &Method, asm: &CilObject) -> String {
 /// the assembly reference (nested TypeRefs have their parent TypeRef as
 /// resolution scope, not the assembly ref directly).
 ///
-/// Handles TypeSpec entries that represent generic instances of nested types.
-/// These TypeSpecs lack enclosing type info (they were created during type
-/// resolution before the NestedClass table established nesting relationships).
-/// This function searches for the corresponding TypeDef to get the proper
-/// nested name.
-pub(super) fn assembly_scoped_name(cil_type: &CilType, asm: &CilObject) -> String {
-    // For TypeSpec entries without enclosing type, try to find the TypeDef with proper nesting
-    if cil_type.token.table() == 0x1B && cil_type.enclosing_type().is_none() {
-        // Strip arity suffix (e.g. "`2") for comparison — TypeSpec CilTypes may have
-        // an arity suffix added by the type system that the TypeDef metadata name lacks
-        // (e.g. compiler-generated types like `<GetEnumerator>d__13`).
-        let base_name = strip_arity(&cil_type.name);
-        for entry in asm.types().iter() {
-            let td = entry.value();
-            if td.token.table() == 0x02
-                && strip_arity(&td.name) == base_name
-                && td.namespace == cil_type.namespace
-                && td.enclosing_type().is_some()
-            {
-                return format_assembly_scoped(td);
-            }
+/// A TypeSpec entry is written from its signature, which states what the type is: a generic
+/// instance as `class Name<args>`, an array or pointer by its element type.
+pub fn assembly_scoped_name(cil_type: &CilType, asm: &CilObject) -> String {
+    if cil_type.token.is_table(TableId::TypeSpec) {
+        if let Some(formatted) = format_typespec_from_blob(asm, &cil_type.token) {
+            return formatted;
         }
     }
     format_assembly_scoped(cil_type)
-}
-
-/// Strip a trailing generic arity suffix (`` `N ``) from a type name.
-fn strip_arity(name: &str) -> &str {
-    if let Some(pos) = name.rfind('`') {
-        if let Some(rest) = name.get(pos.saturating_add(1)..) {
-            if rest.chars().all(|c| c.is_ascii_digit()) {
-                if let Some(prefix) = name.get(..pos) {
-                    return prefix;
-                }
-            }
-        }
-    }
-    name
 }
 
 /// Format an assembly-scoped name without TypeSpec resolution (internal helper).
@@ -411,7 +488,7 @@ fn format_assembly_scoped(cil_type: &CilType) -> String {
 fn find_assembly_ref(cil_type: &CilType) -> Option<String> {
     // Check direct external reference (resolution scope)
     match cil_type.external() {
-        Some(CilTypeReference::AssemblyRef(aref)) => return Some(aref.name.clone()),
+        Some(CilTypeReference::AssemblyRef(aref)) => return Some(aref.name.to_string()),
         // For nested TypeRefs, the resolution scope points to the parent TypeRef.
         // Walk up that chain to find the assembly ref.
         Some(CilTypeReference::TypeRef(parent_ref) | CilTypeReference::TypeDef(parent_ref)) => {
@@ -440,7 +517,7 @@ fn find_assembly_ref(cil_type: &CilType) -> Option<String> {
 /// this function resolves `Class(token)` and `ValueType(token)` to assembly-scoped names
 /// like `class [mscorlib]System.Object`. Recursively resolves composite types (arrays,
 /// pointers, generics, modifiers).
-pub(super) fn format_type_sig(sig: &TypeSignature, asm: &CilObject) -> String {
+pub fn format_type_sig(sig: &TypeSignature, asm: &CilObject) -> String {
     match sig {
         TypeSignature::Class(token) => {
             let name = asm
@@ -462,7 +539,11 @@ pub(super) fn format_type_sig(sig: &TypeSignature, asm: &CilObject) -> String {
             format!("{}[]", format_type_sig(&inner.base, asm))
         }
         TypeSignature::Array(arr) => {
-            format!("{}[{}]", format_type_sig(&arr.base, asm), arr.rank)
+            format!(
+                "{}[{}]",
+                format_type_sig(&arr.base, asm),
+                array_bounds(arr.rank, &arr.dimensions)
+            )
         }
         TypeSignature::Ptr(ptr) => {
             format!("{}*", format_type_sig(&ptr.base, asm))
@@ -485,29 +566,24 @@ pub(super) fn format_type_sig(sig: &TypeSignature, asm: &CilObject) -> String {
         TypeSignature::Pinned(inner) => {
             format!("pinned {}", format_type_sig(inner, asm))
         }
-        TypeSignature::ModifiedRequired(modifiers) => {
-            let mut parts = Vec::new();
+        // ILAsm writes a modifier after the type it modifies: `int32 modreq(IsVolatile)`
+        TypeSignature::ModifiedRequired(modifiers, base)
+        | TypeSignature::ModifiedOptional(modifiers, base) => {
+            let kind = if matches!(sig, TypeSignature::ModifiedRequired(..)) {
+                "modreq"
+            } else {
+                "modopt"
+            };
+            let mut result = format_type_sig(base, asm);
             for m in modifiers {
                 let mod_name = asm
                     .types()
                     .get(&m.modifier_type)
                     .map(|t| assembly_scoped_name(&t, asm))
                     .unwrap_or_else(|| format!("{:08X}", m.modifier_type.value()));
-                parts.push(format!("modreq({mod_name})"));
+                result.push_str(&format!(" {kind}({mod_name})"));
             }
-            parts.join(" ")
-        }
-        TypeSignature::ModifiedOptional(modifiers) => {
-            let mut parts = Vec::new();
-            for m in modifiers {
-                let mod_name = asm
-                    .types()
-                    .get(&m.modifier_type)
-                    .map(|t| assembly_scoped_name(&t, asm))
-                    .unwrap_or_else(|| format!("{:08X}", m.modifier_type.value()));
-                parts.push(format!("modopt({mod_name})"));
-            }
-            parts.join(" ")
+            result
         }
         // ILAsm primitive type names (differ from C#-style Display output)
         TypeSignature::Void => "void".to_string(),
@@ -533,10 +609,50 @@ pub(super) fn format_type_sig(sig: &TypeSignature, asm: &CilObject) -> String {
     }
 }
 
+/// The bounds of a general array (`ELEMENT_TYPE_ARRAY`) as ILAsm writes them between its
+/// brackets, one per dimension: `lo...hi` for a lower bound and a size, `lo...` for a lower
+/// bound alone, the size alone, or nothing; a rank-one array with no bounds is `...`, since `[]`
+/// is the single-dimensional array. It rendered as `[rank]`, which ILAsm reads as a
+/// single-dimensional array of that size, its bounds lost.
+fn array_bounds(rank: u32, dimensions: &[ArrayDimensions]) -> String {
+    let bounds: Vec<String> = (0..rank as usize)
+        .map(|dimension| match dimensions.get(dimension) {
+            None
+            | Some(ArrayDimensions {
+                size: None,
+                lower_bound: None,
+            }) => String::new(),
+            Some(ArrayDimensions {
+                size: Some(size),
+                lower_bound: None,
+            }) => size.to_string(),
+            Some(ArrayDimensions {
+                size: None,
+                lower_bound: Some(lower),
+            }) => format!("{lower}..."),
+            Some(ArrayDimensions {
+                size: Some(size),
+                lower_bound: Some(lower),
+            }) => {
+                // An i32 bound and a u32 size cannot overflow an i64
+                let upper = i64::from(*lower)
+                    .saturating_add(i64::from(*size))
+                    .saturating_sub(1);
+                format!("{lower}...{upper}")
+            }
+        })
+        .collect();
+    if rank == 1 && bounds.first().is_some_and(String::is_empty) {
+        "...".to_string()
+    } else {
+        bounds.join(",")
+    }
+}
+
 /// Format a signature parameter with resolved type names.
 ///
 /// Handles `by_ref` prefix and delegates to [`format_type_sig`] for the base type.
-pub(super) fn format_sig_param(param: &SignatureParameter, asm: &CilObject) -> String {
+pub fn format_sig_param(param: &SignatureParameter, asm: &CilObject) -> String {
     let base = format_type_sig(&param.base, asm);
     if param.by_ref {
         format!("{base}&")
@@ -549,7 +665,7 @@ pub(super) fn format_sig_param(param: &SignatureParameter, asm: &CilObject) -> S
 ///
 /// All method-reference-building functions delegate here with their specific
 /// `declaring_type` string (assembly-scoped, quoted, etc.).
-pub(super) fn format_method_call_sig(
+pub fn format_method_call_sig(
     has_this: bool,
     return_type: &SignatureParameter,
     declaring_type: Option<&str>,
@@ -595,7 +711,7 @@ pub(super) fn format_method_call_sig(
 /// Returns `None` if the TypeSpec blob cannot be accessed or parsed.
 /// When successful, uses `format_type_sig` which correctly handles generic
 /// parameter positional notation (`!0`, `!!0`) in composite types.
-pub(super) fn format_typespec_from_blob(asm: &CilObject, token: &Token) -> Option<String> {
+pub fn format_typespec_from_blob(asm: &CilObject, token: &Token) -> Option<String> {
     let tables = asm.tables()?;
     let table = tables.table::<TypeSpecRaw>()?;
     let row = table.get(token.row()).ok().flatten()?;
@@ -610,7 +726,7 @@ pub(super) fn format_typespec_from_blob(asm: &CilObject, token: &Token) -> Optio
 /// Produces strings like `int32(0x00000064)`, `bool(true)`, `"hello"`.
 /// ILDasm uses hex format for all integer constants. ILAsm requires the type
 /// prefix for all constant values except strings and nullref.
-pub(super) fn format_constant(value: &CilPrimitive) -> String {
+pub fn format_constant(value: &CilPrimitive) -> String {
     match &value.data {
         CilPrimitiveData::None => "nullref".to_string(),
         CilPrimitiveData::Boolean(v) => format!("bool({v})"),
@@ -623,29 +739,19 @@ pub(super) fn format_constant(value: &CilPrimitive) -> String {
         CilPrimitiveData::U4(v) => format!("uint32(0x{v:08X})"),
         CilPrimitiveData::I8(v) => format!("int64(0x{:X})", *v as u64),
         CilPrimitiveData::U8(v) => format!("uint64(0x{v:X})"),
-        CilPrimitiveData::R4(v) => {
-            // ILDasm uses the decimal representation if it round-trips exactly,
-            // otherwise falls back to hex representation of the raw bits.
-            let formatted = format!("{v:.8}");
-            let round_tripped: f32 = formatted.parse().unwrap_or(f32::NAN);
-            if round_tripped.to_bits() == v.to_bits() {
-                format!("float32({formatted})")
-            } else {
-                format!("float32(0x{:08X})", v.to_bits())
-            }
-        }
-        CilPrimitiveData::R8(v) => {
-            let formatted = format!("{v:.17}");
-            let round_tripped: f64 = formatted.parse().unwrap_or(f64::NAN);
-            if round_tripped.to_bits() == v.to_bits() {
-                format!("float64({formatted})")
-            } else {
-                format!("float64(0x{:016X})", v.to_bits())
-            }
-        }
+        // The shortest decimal that reads back as the value, or its bits for an infinity, a
+        // NaN and negative zero, which have no ILAsm decimal
+        CilPrimitiveData::R4(v) => match decimal_f32(*v) {
+            Some(decimal) => format!("float32({decimal})"),
+            None => format!("float32(0x{:08X})", v.to_bits()),
+        },
+        CilPrimitiveData::R8(v) => match decimal_f64(*v) {
+            Some(decimal) => format!("float64({decimal})"),
+            None => format!("float64(0x{:016X})", v.to_bits()),
+        },
         CilPrimitiveData::I(v) => format!("int32(0x{:08X})", *v as u32),
         CilPrimitiveData::U(v) => format!("uint32(0x{:08X})", *v as u32),
-        CilPrimitiveData::String(v) => format!("\"{v}\""),
+        CilPrimitiveData::String(v) => quoted_string(v),
         CilPrimitiveData::Bytes(v) => {
             let mut result = String::from("bytearray (");
             for (i, byte) in v.iter().enumerate() {
@@ -661,7 +767,7 @@ pub(super) fn format_constant(value: &CilPrimitive) -> String {
 }
 
 /// Find which PE section contains a given RVA.
-pub(super) fn find_section_for_rva(sections: &[SectionTable], rva: u32) -> Option<&SectionTable> {
+pub fn find_section_for_rva(sections: &[SectionTable], rva: u32) -> Option<&SectionTable> {
     sections.iter().find(|s| {
         let end = s.virtual_address.saturating_add(s.virtual_size);
         rva >= s.virtual_address && rva < end
@@ -675,7 +781,7 @@ pub(super) fn find_section_for_rva(sections: &[SectionTable], rva: u32) -> Optio
 ///     01 00 0B 48 65 6C 6C 6F 20 57 6F 72 6C 64 00 00
 ///     01 02 03 )
 /// ```
-pub(super) fn write_blob_hex(w: &mut dyn Write, indent: &str, data: &[u8]) -> io::Result<()> {
+pub fn write_blob_hex(w: &mut dyn Write, indent: &str, data: &[u8]) -> io::Result<()> {
     write!(w, "{indent}    ")?;
     for (i, byte) in data.iter().enumerate() {
         if i > 0 && i % 16 == 0 {
@@ -693,13 +799,107 @@ pub(super) fn write_blob_hex(w: &mut dyn Write, indent: &str, data: &[u8]) -> io
 /// - `("D_", "")` for `.data` section (standard initialized data)
 /// - `("T_", " tls")` for `.tls` section (thread-local storage)
 /// - `("I_", " cil")` for `.text` section (CIL-embedded data)
-pub(super) fn data_label_for_rva(
-    sections: &[SectionTable],
-    rva: u32,
-) -> (&'static str, &'static str) {
+pub fn data_label_for_rva(sections: &[SectionTable], rva: u32) -> (&'static str, &'static str) {
     match find_section_for_rva(sections, rva) {
         Some(s) if s.name.starts_with(".tls") => ("T_", " tls"),
         Some(s) if s.name.starts_with(".text") => ("I_", " cil"),
         _ => ("D_", ""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One escaper for every quoted string: the quote and `\` are escaped, control characters
+    /// by their C escapes or in octal, and other text, ASCII or not, goes out as it is.
+    #[test]
+    fn a_quoted_string_escapes_what_ends_or_breaks_it() {
+        assert_eq!(quoted_string(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quoted_string(r"C:\dir"), r#""C:\\dir""#);
+        assert_eq!(quoted_string("a\nb\tc"), r#""a\nb\tc""#);
+        assert_eq!(quoted_string("\u{1}x\u{7f}"), r#""\001x\177""#);
+        assert_eq!(quoted_string("é"), "\"é\"");
+        assert_eq!(quoted_name("O'Brien"), r"'O\'Brien'");
+    }
+
+    /// An identifier holding a quote or backslash is quoted with them escaped: it was written
+    /// as is, the quote ending the name.
+    #[test]
+    fn an_identifier_with_a_quote_is_quoted_and_escaped() {
+        assert_eq!(quote_identifier("plain"), "plain");
+        assert_eq!(quote_identifier("it's"), r"'it\'s'");
+        assert_eq!(quote_identifier("<Module>"), "'<Module>'");
+    }
+
+    /// A user string with a lone surrogate, which no UTF-8 text holds, goes out as its code
+    /// units: decoded lossily it assembled to another string.
+    #[test]
+    fn a_user_string_that_is_not_utf16_is_a_bytearray() {
+        assert_eq!(user_string_literal(&[0x68, 0x69]), "\"hi\"");
+        assert_eq!(
+            user_string_literal(&[0x61, 0xD800]),
+            "bytearray (61 00 00 D8)"
+        );
+    }
+
+    /// A float's decimal is the shortest that reads back as the same value, always with a
+    /// decimal point; an infinity, a NaN and negative zero are written as their bits.
+    #[test]
+    fn floats_are_written_as_ilasm_reads_them() {
+        assert_eq!(ldc_r8_operand(1.5), "1.5");
+        assert_eq!(ldc_r8_operand(5.0), "5.0");
+        assert_eq!(ldc_r8_operand(1e300), "1.0e300");
+        assert_eq!(ldc_r8_operand(f64::INFINITY), "float64(0x7FF0000000000000)");
+        assert_eq!(ldc_r8_operand(-0.0), "float64(0x8000000000000000)");
+        assert_eq!(ldc_r4_operand(f32::NEG_INFINITY), "float32(0xFF800000)");
+        assert!(ldc_r4_operand(f32::NAN).starts_with("float32(0x"));
+
+        for value in [
+            0.1f64,
+            1e-7,
+            123_456_789.123,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324,
+        ] {
+            let decimal = ldc_r8_operand(value);
+            assert!(decimal.contains('.'), "{decimal}");
+            assert_eq!(decimal.parse::<f64>().unwrap().to_bits(), value.to_bits());
+        }
+        for value in [0.1f32, 3.4e38, 1e-45] {
+            let decimal = ldc_r4_operand(value);
+            assert!(decimal.contains('.'), "{decimal}");
+            assert_eq!(decimal.parse::<f32>().unwrap().to_bits(), value.to_bits());
+        }
+    }
+
+    /// A float constant is `float32(...)`/`float64(...)` around the same literal; a string
+    /// constant is quoted and escaped.
+    #[test]
+    fn constants_are_written_as_ilasm_reads_them() {
+        assert_eq!(format_constant(&CilPrimitive::r8(2.5)), "float64(2.5)");
+        assert_eq!(
+            format_constant(&CilPrimitive::r4(f32::INFINITY)),
+            "float32(0x7F800000)"
+        );
+        assert_eq!(format_constant(&CilPrimitive::string("a\"b")), r#""a\"b""#);
+    }
+
+    /// A general array is written with its bounds: `lo...hi` for a lower bound and a size,
+    /// `lo...` for a lower bound alone, the size alone, nothing for neither, and `...` for an
+    /// unbounded rank-one array (`[]` is the single-dimensional one). It was `[rank]`.
+    #[test]
+    fn a_general_array_is_written_with_its_bounds() {
+        let dim = |size, lower_bound| ArrayDimensions { size, lower_bound };
+        assert_eq!(array_bounds(2, &[]), ",");
+        assert_eq!(
+            array_bounds(2, &[dim(None, Some(0)), dim(None, Some(0))]),
+            "0...,0..."
+        );
+        assert_eq!(array_bounds(1, &[dim(Some(5), Some(1))]), "1...5");
+        assert_eq!(array_bounds(1, &[dim(Some(5), None)]), "5");
+        assert_eq!(array_bounds(1, &[]), "...");
+        assert_eq!(array_bounds(3, &[dim(Some(2), Some(-1))]), "-1...0,,");
     }
 }

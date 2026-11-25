@@ -1,10 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-#[cfg(feature = "smart-rename")]
-use dotscope::deobfuscation::SmartRenameConfig;
-use dotscope::deobfuscation::{
-    CleanupConfig, DeobfuscationEngine, DeobfuscationResult, EngineConfig,
+use dotscope::{
+    analysis::Budget,
+    deobfuscation::{CleanupConfig, DeobfuscationEngine, DeobfuscationResult, EngineConfig},
 };
 use log::info;
 use serde::Serialize;
@@ -68,8 +67,6 @@ pub struct DeobfuscateOptions<'a> {
     pub aggressive: bool,
     pub detailed: bool,
     pub report: Option<&'a Path>,
-    #[cfg(feature = "smart-rename")]
-    pub rename_ai: Option<&'a Path>,
     pub global: &'a GlobalOptions,
 }
 
@@ -231,21 +228,13 @@ fn build_config(opts: &DeobfuscateOptions) -> EngineConfig {
     };
 
     if let Some(iters) = opts.max_iterations {
-        config.iterations.max_ssa_iterations = iters;
+        config.budget = config.budget.with_limit(Budget::PipelineRounds, iters);
     }
     if let Some(instrs) = opts.max_instructions {
-        config.emulation.max_instructions = instrs;
+        config.emulation.limits.max_instructions = instrs;
     }
     if opts.no_cleanup {
         config.cleanup = CleanupConfig::disabled();
-    }
-
-    #[cfg(feature = "smart-rename")]
-    if let Some(model_path) = opts.rename_ai {
-        config.cleanup.smart_rename = Some(SmartRenameConfig {
-            model_path: model_path.to_path_buf(),
-            ..SmartRenameConfig::default()
-        });
     }
 
     config

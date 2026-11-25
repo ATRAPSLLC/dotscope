@@ -38,7 +38,7 @@ pub fn run(path: &Path, opts: &GlobalOptions) -> anyhow::Result<()> {
             let exported = entry.value();
             let fullname = match &exported.namespace {
                 Some(ns) if !ns.is_empty() => format!("{ns}.{}", exported.name),
-                _ => exported.name.clone(),
+                _ => exported.name.to_string(),
             };
             CilExport {
                 token: exported.token.to_string(),

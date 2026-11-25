@@ -43,7 +43,7 @@
 //! All values are controlled by [`EnvironmentConfig`] in [`EmulationConfig`]. The defaults
 //! simulate a Windows 10 x64 environment suitable for most deobfuscation scenarios.
 //!
-//! [`EnvironmentConfig`]: crate::emulation::process::config::EnvironmentConfig
+//! [`EnvironmentConfig`]: crate::emulation::EnvironmentConfig
 //! [`EmulationConfig`]: crate::emulation::EmulationConfig
 
 use crate::{
@@ -404,7 +404,7 @@ mod tests {
     use crate::{
         emulation::runtime::hook::{HookContext, HookManager, PreHookResult},
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     #[test]

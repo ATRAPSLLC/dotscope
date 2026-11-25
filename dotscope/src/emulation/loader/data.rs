@@ -16,9 +16,10 @@
 //!
 //! # Usage
 //!
-//! ```ignore
-//! use dotscope::emulation::memory::{AddressSpace, MemoryProtection};
-//! use dotscope::emulation::loader::DataLoader;
+//! ```
+//! use dotscope::emulation::AddressSpace;
+//! use dotscope::emulation::MemoryProtection;
+//! use dotscope::emulation::DataLoader;
 //!
 //! let address_space = AddressSpace::new();
 //!
@@ -26,7 +27,7 @@
 //! let info = DataLoader::map_readonly(
 //!     &address_space,
 //!     0x10000,
-//!     vec![0x01, 0x02, 0x03],
+//!     &[0x01, 0x02, 0x03],
 //!     "constants",
 //! )?;
 //!
@@ -34,15 +35,16 @@
 //! let info = DataLoader::map_readwrite(
 //!     &address_space,
 //!     0x20000,
-//!     vec![0u8; 0x1000],
+//!     &[0u8; 0x1000],
 //!     "buffer",
 //! )?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Memory Protection
 //!
 //! The loader supports all standard memory protection combinations through
-//! [`MemoryProtection`](crate::emulation::memory::MemoryProtection) flags:
+//! [`MemoryProtection`] flags:
 //!
 //! - `READ` - Memory can be read
 //! - `WRITE` - Memory can be written
@@ -72,7 +74,7 @@ pub struct MappedRegionInfo {
     /// Base address where the region was mapped in virtual memory.
     ///
     /// This is the starting address that can be used to read from or write to
-    /// the mapped data through the [`AddressSpace`](crate::emulation::memory::AddressSpace).
+    /// the mapped data through the [`AddressSpace`].
     pub base_address: u64,
 
     /// Size of the mapped region in bytes.
@@ -91,7 +93,7 @@ pub struct MappedRegionInfo {
     /// Memory protection flags for this region.
     ///
     /// Defines what operations are permitted on this memory region.
-    /// See [`MemoryProtection`](crate::emulation::memory::MemoryProtection) for
+    /// See [`MemoryProtection`] for
     /// available flags (READ, WRITE, EXECUTE).
     pub protection: MemoryProtection,
 }
@@ -100,7 +102,7 @@ pub struct MappedRegionInfo {
 ///
 /// `DataLoader` provides static methods to map raw byte data into the emulation
 /// address space. It is a stateless utility struct - all methods are associated
-/// functions that operate directly on an [`AddressSpace`](crate::emulation::memory::AddressSpace).
+/// functions that operate directly on an [`AddressSpace`].
 ///
 /// # Design
 ///
@@ -145,7 +147,9 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     /// let info = DataLoader::map_at(
     ///     &address_space,
     ///     0x10000,
@@ -154,6 +158,7 @@ impl DataLoader {
     ///     MemoryProtection::READ | MemoryProtection::EXECUTE,
     /// )?;
     /// assert_eq!(info.base_address, 0x10000);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn map_at(
         address_space: &AddressSpace,
@@ -203,7 +208,9 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     /// let info = DataLoader::map(
     ///     &address_space,
     ///     &vec![0u8; 0x1000],
@@ -211,6 +218,7 @@ impl DataLoader {
     ///     MemoryProtection::READ | MemoryProtection::WRITE,
     /// )?;
     /// println!("Buffer mapped at: 0x{:X}", info.base_address);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn map(
         address_space: &AddressSpace,
@@ -362,15 +370,18 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
     /// use std::path::Path;
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     ///
     /// let info = DataLoader::map_file(
     ///     &address_space,
-    ///     Path::new("/path/to/data.bin"),
+    ///     Path::new("tests/samples/crafted_2.exe"),
     ///     0x50000,
     ///     MemoryProtection::READ,
     /// )?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn map_file(
         address_space: &AddressSpace,
@@ -414,7 +425,9 @@ impl DataLoader {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// # use dotscope::emulation::{AddressSpace, DataLoader, MemoryProtection};
+    /// # let address_space = AddressSpace::new();
     /// // Create a 1MB stack region
     /// let stack_info = DataLoader::map_zeroed(
     ///     &address_space,
@@ -423,6 +436,7 @@ impl DataLoader {
     ///     "stack",
     ///     MemoryProtection::READ | MemoryProtection::WRITE,
     /// )?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn map_zeroed(
         address_space: &AddressSpace,

@@ -441,12 +441,13 @@ impl ManifestResourceBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// # use dotscope::prelude::*;
     /// let builder = ManifestResourceBuilder::new()
     ///     .name("AppResources")
-    ///     .add_string_resource("AppTitle", "My Application")
-    ///     .add_string_resource("Version", "1.0.0");
+    ///     .add_string_resource("AppTitle", "My Application")?
+    ///     .add_string_resource("Version", "1.0.0")?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     ///
     /// # Errors
@@ -625,7 +626,7 @@ impl ManifestResourceBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// # use dotscope::prelude::*;
     /// # use std::path::Path;
     /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
@@ -637,7 +638,7 @@ impl ManifestResourceBuilder {
     ///     .offset(0x1000)
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created ManifestResource with token: {}", resource_token);
+    /// println!("Created ManifestResource with token: {:?}", resource_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {
@@ -713,7 +714,7 @@ mod tests {
     use crate::{
         cilassembly::ChangeRefKind,
         metadata::tables::{ManifestResourceAttributes, TableId},
-        test::factories::table::assemblyref::get_test_assembly,
+        testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

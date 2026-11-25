@@ -47,7 +47,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use log::debug;
 
 use crate::{
-    analysis::{CilTarget, ConstValue, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, ConstValue, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     assembly::{Immediate, Operand},
     cilassembly::GeneratorConfig,
     compiler::{CompilerContext, EventKind, EventLog, PassPhase, SsaPass},
@@ -55,7 +55,7 @@ use crate::{
         context::AnalysisContext,
         passes::jiejienet::{ResourceRestorationPass, ResourceTarget},
         techniques::{
-            Detection, Detections, Evidence, Technique, TechniqueCategory, WorkingAssembly,
+            Detection, Evidence, Technique, TechniqueCapability, TechniqueCategory, WorkingAssembly,
         },
         utils::get_field_data_size,
     },
@@ -113,6 +113,13 @@ impl Technique for JiejieNetResources {
 
     fn category(&self) -> TechniqueCategory {
         TechniqueCategory::Value
+    }
+
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![
+            TechniqueCapability::ByteTransform,
+            TechniqueCapability::SsaPass,
+        ]
     }
 
     fn detect(&self, _assembly: &CilObject) -> Detection {
@@ -204,8 +211,7 @@ impl Technique for JiejieNetResources {
     fn byte_transform(
         &self,
         assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
 
@@ -634,12 +640,10 @@ fn extract_resource_entries_ssa(ssa: &SsaFunction, assembly: &CilObject) -> Vec<
         let mut resource_name: Option<String> = None;
 
         for instr in block.instructions() {
-            let (method_token, args) = match instr.op() {
-                SsaOp::CallVirt { method, args, .. } | SsaOp::Call { method, args, .. } => {
-                    (method.token(), args)
-                }
-                _ => continue,
+            let Some((method_token, call)) = instr.op().method_call() else {
+                continue;
             };
+            let args = &call.args;
 
             if !is_string_equals(assembly, method_token) {
                 continue;
@@ -663,9 +667,8 @@ fn extract_resource_entries_ssa(ssa: &SsaFunction, assembly: &CilObject) -> Vec<
             continue;
         };
         for instr in successor.instructions() {
-            let method_token = match instr.op() {
-                SsaOp::Call { method, .. } => method.token(),
-                _ => continue,
+            let Some((method_token, _)) = instr.op().method_call() else {
+                continue;
             };
 
             if let Ok(called_method) = assembly.method(&method_token) {
@@ -802,9 +805,9 @@ fn extract_and_decrypt_resource(
             ))
         })?;
 
-    let file = assembly.file();
-    let offset = file.rva_to_offset(rva_entry.rva as usize)?;
-    let raw_data = file.data_slice(offset, data_size)?;
+    let raw_data = assembly
+        .file()
+        .rva_slice(rva_entry.rva as usize, data_size)?;
 
     if raw_data.len() < 4 {
         return Err(Error::Deobfuscation(format!(
@@ -866,13 +869,13 @@ mod tests {
             },
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_returns_empty() {
         // detect() returns empty — all detection is SSA-based
-        let asm = load_sample("tests/samples/packers/jiejie/source/jiejie_resources_only.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_resources_only.exe");
         let technique = JiejieNetResources;
         let detection = technique.detect(&asm);
 
@@ -881,7 +884,7 @@ mod tests {
 
     #[test]
     fn test_structural_detection() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/jiejie_resources_only.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_resources_only.exe");
         let structure = detect_resource_structure(&asm);
 
         assert!(structure.is_some(), "Should find resource structure");
@@ -900,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_xor_key_extraction() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/jiejie_resources_only.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_resources_only.exe");
         let structure = detect_resource_structure(&asm).expect("Should find structure");
 
         let xor_key = extract_xor_key_from_stream(&asm, structure.stream_type);
@@ -909,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_controlflow_only() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/jiejie_controlflow_only.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_controlflow_only.exe");
         let structure = detect_resource_structure(&asm);
 
         assert!(
@@ -920,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_original() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/original.exe");
+        let asm = load_sample("packers/jiejie/source/original.exe");
         let structure = detect_resource_structure(&asm);
 
         assert!(structure.is_none(), "Should not detect in original");

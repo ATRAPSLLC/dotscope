@@ -41,7 +41,7 @@
 //!
 //! let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
 //!
-//! # fn get_custom_attribute_data() -> (u32, std::sync::Arc<boxcar::Vec<dotscope::metadata::tables::ParamRc>>) { todo!() }
+//! # fn get_custom_attribute_data() -> (u32, dotscope::metadata::tables::ParamList) { todo!() }
 //! let (blob_index, constructor_params) = get_custom_attribute_data();
 //!
 //! if let Some(blob_heap) = assembly.blob() {
@@ -58,7 +58,7 @@
 //! ```rust,no_run
 //! use dotscope::metadata::customattributes::{parse_custom_attribute_data, CustomAttributeArgument};
 //!
-//! # fn get_constructor_params() -> std::sync::Arc<boxcar::Vec<dotscope::metadata::tables::ParamRc>> { todo!() }
+//! # fn get_constructor_params() -> dotscope::metadata::tables::ParamList { todo!() }
 //! let constructor_params = get_constructor_params();
 //!
 //! // Example: Simple custom attribute with string argument
@@ -73,7 +73,7 @@
 //!
 //! // Access parsed arguments
 //! match &result.fixed_args[0] {
-//!     CustomAttributeArgument::String(s) => println!("String argument: '{}'", s),
+//!     CustomAttributeArgument::String(s) => println!("String argument: {:?}", s),
 //!     _ => println!("Unexpected argument type"),
 //! }
 //!
@@ -116,17 +116,18 @@
 //! - **Memory Safety**: Comprehensive bounds checking and nesting depth limiting
 //! - **Error Handling**: Detailed error messages for debugging malformed data
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     file::parser::Parser,
     metadata::{
         customattributes::types::{
             CustomAttributeArgument, CustomAttributeNamedArgument, CustomAttributeValue,
-            NAMED_ARG_TYPE, SERIALIZATION_TYPE,
+            FieldOrPropType, NAMED_ARG_TYPE, SERIALIZATION_TYPE,
         },
         streams::Blob,
-        tables::ParamRc,
+        tables::ParamList,
+        texthash::TextHash,
         typesystem::{CilFlavor, CilTypeRef, CilTypeReference, TypeRegistry},
     },
     utils::EnumUtils,
@@ -134,50 +135,16 @@ use crate::{
     Result,
 };
 
-/// Maximum nesting depth for custom attribute parsing.
-///
-/// This limit prevents stack overflow and excessive memory usage when parsing
-/// deeply nested custom attribute structures. The iterative implementation
-/// uses explicit stack allocation which is tracked against this limit.
-///
-/// The limit is set generously to accommodate legitimate complex custom attributes
-/// while still protecting against malformed or malicious metadata.
-const MAX_NESTING_DEPTH: usize = 1000;
-
-/// Maximum **native** recursion depth for nested attribute arguments.
-///
-/// Separate from [`MAX_NESTING_DEPTH`], which bounds a heap work stack where
-/// 1000 entries are cheap. This bounds real stack frames, where they are not.
+/// Maximum native recursion depth for nested arguments: arrays of boxed values of arrays.
 const MAX_ARGUMENT_RECURSION: usize = 64;
 
-/// Maximum number of named arguments in a custom attribute.
-///
-/// Custom attributes can have named properties/fields, but excessive counts indicate
-/// malformed data. 1024 is far beyond any reasonable use case.
-const MAX_NAMED_ARGS: u16 = 1024;
+/// The underlying type sizes an enum can have, `int`'s first as the usual one.
+const ENUM_SIZES: [usize; 4] = [4, 1, 2, 8];
 
-/// Maximum array length in custom attribute arguments.
-///
-/// # Rationale
-///
-/// This limit (65536 = 2^16 elements) serves two purposes:
-///
-/// 1. **Memory Safety**: Prevents allocation bombs where malformed metadata claims
-///    astronomical array sizes (e.g., 2^31 elements × 8 bytes = 16GB allocation).
-///    With this limit, the maximum allocation is ~512KB for 64-bit elements.
-///
-/// 2. **Practical Sufficiency**: Real-world custom attributes rarely contain large
-///    arrays. Even data-heavy attributes like `[Guid]` or permission sets typically
-///    use fixed-size data, not variable-length arrays of this magnitude.
-///
-/// # Value Choice
-///
-/// The value 65536 (2^16) was chosen because:
-/// - It's large enough for any legitimate use case encountered in practice
-/// - It keeps maximum allocation bounded to reasonable memory
-/// - It matches the maximum value representable by a u16, which is often used
-///   as an array length type in .NET metadata
-const MAX_ATTRIBUTE_ARRAY_LENGTH: i32 = 65536;
+/// How many decodings [`CustomAttributeParser::parse_custom_attribute`] tries for a blob
+/// whose enums it cannot size. Each consumes at most the blob, and real blobs name one or two
+/// such enums, which need at most 16.
+const MAX_ENUM_SIZE_ATTEMPTS: usize = 256;
 
 /// Parse custom attribute blob data from the blob heap using constructor parameter information.
 ///
@@ -209,7 +176,7 @@ const MAX_ATTRIBUTE_ARRAY_LENGTH: i32 = 65536;
 ///
 /// let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
 ///
-/// # fn get_custom_attribute_data() -> (u32, std::sync::Arc<boxcar::Vec<dotscope::metadata::tables::ParamRc>>) { todo!() }
+/// # fn get_custom_attribute_data() -> (u32, dotscope::metadata::tables::ParamList) { todo!() }
 /// let (blob_index, constructor_params) = get_custom_attribute_data();
 ///
 /// if let Some(blob_heap) = assembly.blob() {
@@ -227,7 +194,7 @@ const MAX_ATTRIBUTE_ARRAY_LENGTH: i32 = 65536;
 pub fn parse_custom_attribute_blob(
     blob: &Blob,
     index: u32,
-    params: &Arc<boxcar::Vec<ParamRc>>,
+    params: &ParamList,
 ) -> Result<CustomAttributeValue> {
     if index == 0 {
         return Ok(CustomAttributeValue {
@@ -273,7 +240,7 @@ pub fn parse_custom_attribute_blob(
 /// ```rust,no_run
 /// use dotscope::metadata::customattributes::{parse_custom_attribute_data, CustomAttributeArgument};
 ///
-/// # fn get_constructor_params() -> std::sync::Arc<boxcar::Vec<dotscope::metadata::tables::ParamRc>> { todo!() }
+/// # fn get_constructor_params() -> dotscope::metadata::tables::ParamList { todo!() }
 /// let constructor_params = get_constructor_params();
 ///
 /// // Example: Simple custom attribute with string argument
@@ -288,7 +255,7 @@ pub fn parse_custom_attribute_blob(
 ///
 /// // Access parsed arguments
 /// match &result.fixed_args[0] {
-///     CustomAttributeArgument::String(s) => println!("String argument: '{}'", s),
+///     CustomAttributeArgument::String(s) => println!("String argument: {:?}", s),
 ///     _ => println!("Unexpected argument type"),
 /// }
 ///
@@ -301,7 +268,7 @@ pub fn parse_custom_attribute_blob(
 /// This function is thread-safe and can be called concurrently from multiple threads.
 pub fn parse_custom_attribute_data(
     data: &[u8],
-    params: &Arc<boxcar::Vec<ParamRc>>,
+    params: &ParamList,
 ) -> Result<CustomAttributeValue> {
     let mut parser = CustomAttributeParser::new(data);
     parser.parse_custom_attribute(params)
@@ -339,7 +306,7 @@ pub fn parse_custom_attribute_data(
 /// This function is thread-safe and can be called concurrently from multiple threads.
 pub fn parse_custom_attribute_data_with_registry(
     data: &[u8],
-    params: &Arc<boxcar::Vec<ParamRc>>,
+    params: &ParamList,
     type_registry: &Arc<TypeRegistry>,
 ) -> Result<CustomAttributeValue> {
     let mut parser = CustomAttributeParser::with_registry(data, type_registry.clone());
@@ -370,7 +337,7 @@ pub fn parse_custom_attribute_data_with_registry(
 pub fn parse_custom_attribute_blob_with_registry(
     blob: &Blob,
     index: u32,
-    params: &Arc<boxcar::Vec<ParamRc>>,
+    params: &ParamList,
     type_registry: &Arc<TypeRegistry>,
 ) -> Result<CustomAttributeValue> {
     let data = blob.get(index as usize)?;
@@ -378,16 +345,12 @@ pub fn parse_custom_attribute_blob_with_registry(
     parser.parse_custom_attribute(params)
 }
 
-/// Custom attribute parser implementing ECMA-335 II.23.3 specification.
+/// Custom attribute parser implementing ECMA-335 II.23.3.
 ///
-/// This parser uses an iterative stack-based approach with depth limiting to handle
-/// arbitrarily nested custom attribute structures without risk of stack overflow.
-/// It provides a structured approach to parsing the complex binary format of .NET
-/// custom attributes.
-///
-/// The parser handles both fixed arguments (based on constructor parameters) and named
-/// arguments (with embedded type information) while maintaining compatibility with
-/// real-world .NET assemblies through graceful degradation strategies.
+/// A fixed argument is decoded by its constructor parameter's type, a named argument and a
+/// boxed value by the type the blob names before it ([`FieldOrPropType`]); one decoder,
+/// driven by that type, reads every value. The blob does not say how wide an enum is, so an
+/// enum no loaded assembly defines takes the size under which the whole blob decodes exactly.
 ///
 /// # Thread Safety
 ///
@@ -399,12 +362,14 @@ pub struct CustomAttributeParser<'a> {
     /// Optional TypeRegistry for cross-assembly type resolution
     type_registry: Option<Arc<TypeRegistry>>,
     /// Current native-recursion depth, for stack-overflow prevention.
-    ///
-    /// `parse_fixed_argument` recurses into itself for array elements. The
-    /// `MAX_NESTING_DEPTH` defined in this file bounds a *heap* work stack
-    /// elsewhere and was never consulted here, so the recursion was unbounded
-    /// over an attacker-supplied attribute blob.
     depth: usize,
+    /// The underlying type sizes of the enums a constructor parameter resolved, by name.
+    known_enum_sizes: HashMap<TextHash, usize>,
+    /// The underlying type sizes the current decoding assumes for enums no loaded assembly
+    /// defines, by name.
+    enum_sizes: HashMap<String, usize>,
+    /// The enums of that kind the decodings met, in the order they met them.
+    unknown_enums: Vec<String>,
 }
 
 impl<'a> CustomAttributeParser<'a> {
@@ -415,25 +380,21 @@ impl<'a> CustomAttributeParser<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::metadata::customattributes::parser::CustomAttributeParser;
-    ///
-    /// let blob_data = &[0x01, 0x00, 0x00, 0x00]; // Minimal custom attribute
-    /// let parser = CustomAttributeParser::new(blob_data);
-    /// ```
+    /// The `examples::new_example` test in this module runs this example.
     #[must_use]
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             parser: Parser::new(data),
             type_registry: None,
             depth: 0,
+            known_enum_sizes: HashMap::new(),
+            enum_sizes: HashMap::new(),
+            unknown_enums: Vec::new(),
         }
     }
 
-    /// Creates a new custom attribute parser with cross-assembly type resolution support.
-    ///
-    /// This enhanced constructor enables cross-assembly type resolution for proper handling
-    /// of external enum types that would otherwise fail with heuristic approaches.
+    /// Creates a new custom attribute parser with cross-assembly type resolution support,
+    /// which sizes the enums the registry can resolve.
     ///
     /// # Arguments
     /// * `data` - Raw bytes of the custom attribute blob to parse
@@ -441,35 +402,17 @@ impl<'a> CustomAttributeParser<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::metadata::customattributes::parser::CustomAttributeParser;
-    /// use std::sync::Arc;
-    ///
-    /// let blob_data = &[0x01, 0x00, 0x00, 0x00]; // Minimal custom attribute
-    /// let test_identity = AssemblyIdentity::parse("TestAssembly, Version=1.0.0.0").unwrap();
-    /// let type_registry = Arc::new(TypeRegistry::new(test_identity).unwrap());
-    /// let parser = CustomAttributeParser::with_registry(blob_data, type_registry);
-    /// ```
+    /// The `examples::with_registry_example` test in this module runs this example.
     #[must_use]
     pub fn with_registry(data: &'a [u8], type_registry: Arc<TypeRegistry>) -> Self {
         Self {
-            parser: Parser::new(data),
             type_registry: Some(type_registry),
-            depth: 0,
+            ..Self::new(data)
         }
     }
 
-    /// Parse a complete custom attribute blob according to ECMA-335 II.23.3.
-    ///
-    /// This method handles the full custom attribute parsing workflow:
-    /// 1. Validates the standard prolog (0x0001)
-    /// 2. Parses fixed arguments using constructor parameter types
-    /// 3. Parses named arguments using embedded type information
-    ///
-    /// The parser implements type-aware parsing for fixed arguments when constructor
-    /// parameter information is available, and falls back to heuristic parsing when
-    /// type resolution fails. Named arguments are always parsed using their embedded
-    /// serialization type tags.
+    /// Parse a complete custom attribute blob according to ECMA-335 II.23.3: the prolog
+    /// `0x0001`, a fixed argument per constructor parameter, then the named arguments.
     ///
     /// # Arguments
     /// * `params` - Constructor method parameters for fixed argument type resolution
@@ -478,32 +421,98 @@ impl<'a> CustomAttributeParser<'a> {
     /// A complete [`crate::metadata::customattributes::CustomAttributeValue`] with all parsed data.
     ///
     /// # Errors
-    /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] for various format violations:
-    /// - Invalid prolog (not 0x0001)
-    /// - Insufficient data for declared arguments
-    /// - Invalid serialization types in named arguments
-    /// - Nesting depth limit exceeded during parsing
+    /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] for format
+    /// violations: a prolog other than 0x0001, a parameter type no attribute argument can
+    /// have, data that ends early, or a type tag the grammar does not define; and
+    /// [`crate::Error::DepthLimitExceeded`] for nesting past the parser's bound.
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::metadata::customattributes::parser::CustomAttributeParser;
+    /// The `examples::parse_custom_attribute_example` test in this module runs this example.
+    pub fn parse_custom_attribute(&mut self, params: &ParamList) -> Result<CustomAttributeValue> {
+        let types = self.parameter_types(params)?;
+        self.settle(|parser| parser.decode(&types))
+    }
+
+    /// Decodes `count` named arguments from the start of the data: the properties of a
+    /// permission in a binary permission set, which follow the custom attribute named argument
+    /// grammar (ECMA-335 II.23.3). Their enums are sized as a blob's are, by the sizing under
+    /// which the arguments end where the data does.
     ///
-    /// # fn get_constructor_params() -> std::sync::Arc<boxcar::Vec<dotscope::metadata::tables::ParamRc>> { todo!() }
-    /// let blob_data = &[0x01, 0x00, 0x00, 0x00]; // Simple custom attribute
-    /// let mut parser = CustomAttributeParser::new(blob_data);
-    /// let params = get_constructor_params();
+    /// # Errors
     ///
-    /// let custom_attr = parser.parse_custom_attribute(&params)?;
-    /// println!("Parsed {} fixed args and {} named args",
-    ///          custom_attr.fixed_args.len(), custom_attr.named_args.len());
-    /// # Ok::<(), dotscope::Error>(())
-    /// ```
-    pub fn parse_custom_attribute(
+    /// When the arguments do not decode.
+    pub fn parse_named_arguments(
         &mut self,
-        params: &Arc<boxcar::Vec<ParamRc>>,
-    ) -> Result<CustomAttributeValue> {
-        // Check for the standard prolog (0x0001)
+        count: usize,
+    ) -> Result<Vec<CustomAttributeNamedArgument>> {
+        self.settle(|parser| {
+            parser.parser.seek(0)?;
+            parser.depth = 0;
+            (0..count)
+                .map(|_| parser.parse_named_argument())
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    /// Runs `decode` from the start of the data, and when it meets enums it cannot size and
+    /// does not end exactly at the data's end, again under each other sizing of them, bounded,
+    /// until a decoding does. The blob does not say how wide an enum is, and no loaded
+    /// assembly defines these: only their true sizes end the data where its last value ends.
+    /// Without such a decoding, the first one's result stands.
+    fn settle<T>(&mut self, mut decode: impl FnMut(&mut Self) -> Result<T>) -> Result<T> {
+        self.unknown_enums.clear();
+        self.enum_sizes.clear();
+        let first = decode(self);
+        if self.unknown_enums.is_empty() || (first.is_ok() && !self.parser.has_more_data()) {
+            return first;
+        }
+
+        let mut attempts = 1usize;
+        let mut enums = self.unknown_enums.len();
+        let mut assignment: usize = 1;
+        while attempts < MAX_ENUM_SIZE_ATTEMPTS {
+            let combinations = u32::try_from(enums)
+                .ok()
+                .and_then(|count| ENUM_SIZES.len().checked_pow(count))
+                .unwrap_or(usize::MAX);
+            if assignment >= combinations {
+                break;
+            }
+            let mut digits = assignment;
+            self.enum_sizes.clear();
+            for name in &self.unknown_enums {
+                let size = digits
+                    .checked_rem(ENUM_SIZES.len())
+                    .and_then(|digit| ENUM_SIZES.get(digit))
+                    .copied()
+                    .unwrap_or(4);
+                self.enum_sizes.insert(name.clone(), size);
+                digits = digits.checked_div(ENUM_SIZES.len()).unwrap_or_default();
+            }
+            attempts = attempts.saturating_add(1);
+            assignment = assignment.saturating_add(1);
+
+            let decoded = decode(self);
+            if decoded.is_ok() && !self.parser.has_more_data() {
+                return decoded;
+            }
+            // A decoding that read further met enums the earlier ones did not reach: start
+            // over with those in the count.
+            if self.unknown_enums.len() > enums {
+                enums = self.unknown_enums.len();
+                assignment = 1;
+            }
+        }
+        first
+    }
+
+    /// One decoding of the blob from its start, the fixed arguments by `types`, under the enum
+    /// sizes [`Self::enum_sizes`] assumes.
+    fn decode(&mut self, types: &[FieldOrPropType]) -> Result<CustomAttributeValue> {
+        self.parser.seek(0)?;
+        self.depth = 0;
+
         let prolog = self.parser.read_le::<u16>()?;
         if prolog != 0x0001 {
             return Err(malformed_error!(
@@ -511,34 +520,22 @@ impl<'a> CustomAttributeParser<'a> {
             ));
         }
 
-        // Parse fixed arguments based on constructor parameter types
-        let fixed_args = self.parse_fixed_arguments(params)?;
+        let mut fixed_args = Vec::with_capacity(types.len());
+        for argument_type in types {
+            fixed_args.push(self.decode_value(argument_type)?);
+        }
 
-        // Parse named arguments using explicit type tags
-        let named_args = if self.parser.has_more_data()
-            && self.parser.len() >= self.parser.pos().saturating_add(2)
-        {
-            let num_named = self.parser.read_le::<u16>()?;
-            if num_named > MAX_NAMED_ARGS {
-                return Err(malformed_error!(
-                    "Custom attribute has too many named arguments: {} (max: {})",
-                    num_named,
-                    MAX_NAMED_ARGS
-                ));
+        // NumNamed follows the fixed arguments; a blob that ends without it has none
+        let mut named_args = Vec::new();
+        if self.parser.has_more_data() {
+            let count = self.parser.read_le::<u16>()?;
+            // Each named argument takes several bytes, so what is left bounds the count
+            let remaining = self.parser.len().saturating_sub(self.parser.pos());
+            named_args.reserve(usize::from(count).min(remaining));
+            for _ in 0..count {
+                named_args.push(self.parse_named_argument()?);
             }
-
-            let mut args = Vec::with_capacity(num_named as usize);
-            for _ in 0..num_named {
-                if let Some(arg) = self.parse_named_argument()? {
-                    args.push(arg);
-                } else {
-                    break;
-                }
-            }
-            args
-        } else {
-            vec![]
-        };
+        }
 
         Ok(CustomAttributeValue {
             fixed_args,
@@ -548,906 +545,357 @@ impl<'a> CustomAttributeParser<'a> {
         })
     }
 
-    /// Parse fixed arguments based on constructor parameter types.
-    ///
-    /// Extracts constructor parameters (excluding return parameter at sequence 0),
-    /// sorts them by sequence number, and parses each argument using its type information.
-    /// This ensures proper argument order matching the constructor signature.
-    ///
-    /// # Arguments
-    /// * `params` - Constructor method parameters with type and sequence information
-    ///
-    /// # Returns
-    /// Vector of parsed arguments in constructor parameter order
+    /// The type each constructor parameter, in order, gives its fixed argument.
     ///
     /// # Errors
-    /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] if:
-    /// - Constructor has parameters but no resolved types
-    /// - Insufficient blob data for declared parameters
-    /// - Parameter type parsing fails
-    fn parse_fixed_arguments(
-        &mut self,
-        params: &Arc<boxcar::Vec<ParamRc>>,
-    ) -> Result<Vec<CustomAttributeArgument>> {
-        // Create sorted list of constructor parameters (excluding return parameter)
-        let mut sorted_params: Vec<_> = params
+    ///
+    /// When a parameter's type is unresolved or no attribute argument can have it.
+    fn parameter_types(&mut self, params: &ParamList) -> Result<Vec<FieldOrPropType>> {
+        let mut parameters: Vec<_> = params
             .iter()
             .filter(|(_, param)| param.sequence > 0)
             .map(|(_, param)| param)
             .collect();
-        sorted_params.sort_by_key(|param| param.sequence);
-
-        let resolved_param_types: Vec<_> = sorted_params
-            .iter()
-            .filter_map(|param| param.base.get())
-            .collect();
-
-        if resolved_param_types.is_empty() && !sorted_params.is_empty() {
-            return Err(malformed_error!(
-                "Constructor has {} parameters but no resolved types",
-                sorted_params.len()
-            ));
-        }
-
-        let mut fixed_args = Vec::new();
-        for param_type in resolved_param_types {
-            if !self.parser.has_more_data() {
-                return Err(malformed_error!(
-                    "Not enough data for remaining constructor parameters"
-                ));
-            }
-
-            if let Some(arg) = self.parse_fixed_argument(param_type)? {
-                fixed_args.push(arg);
-            } else {
-                return Err(malformed_error!(
-                    "Unsupported parameter type in custom attribute constructor"
-                ));
-            }
-        }
-
-        Ok(fixed_args)
+        parameters.sort_by_key(|param| param.sequence);
+        parameters
+            .into_iter()
+            .map(|param| match param.base.get() {
+                Some(base) => self.argument_type(base),
+                None => Err(malformed_error!(
+                    "Constructor parameter {} has no resolved type",
+                    param.sequence
+                )),
+            })
+            .collect()
     }
 
-    /// Parse an enum value based on its underlying type size.
-    ///
-    /// This method handles all enum parsing logic in one place, reading the appropriate
-    /// number of bytes based on the enum's underlying type and creating the correct
-    /// CustomAttributeArgument variant.
-    ///
-    /// # Arguments
-    /// * `type_name` - Full name of the enum type
-    /// * `underlying_type_size` - Size in bytes of the enum's underlying type
-    ///
-    /// # Returns
-    /// * `Ok(Some(CustomAttributeArgument))` - Successfully parsed enum value
-    /// * `Err(Error)` - If parsing fails or invalid underlying type size
-    fn parse_enum(
-        &mut self,
-        type_name: String,
-        underlying_type_size: usize,
-    ) -> Result<Option<CustomAttributeArgument>> {
-        match underlying_type_size {
-            0 => Err(malformed_error!(
-                "Cannot determine enum underlying type size for '{}' - enum fields not loaded yet.",
-                type_name
-            )),
-            1 => {
-                let enum_value = self.parser.read_le::<u8>()?;
-                Ok(Some(CustomAttributeArgument::Enum(
-                    type_name,
-                    Box::new(CustomAttributeArgument::U1(enum_value)),
-                )))
-            }
-            2 => {
-                let enum_value = self.parser.read_le::<u16>()?;
-                Ok(Some(CustomAttributeArgument::Enum(
-                    type_name,
-                    Box::new(CustomAttributeArgument::U2(enum_value)),
-                )))
-            }
-            4 => {
-                let enum_value = self.parser.read_le::<i32>()?;
-                Ok(Some(CustomAttributeArgument::Enum(
-                    type_name,
-                    Box::new(CustomAttributeArgument::I4(enum_value)),
-                )))
-            }
-            8 => {
-                let enum_value = self.parser.read_le::<i64>()?;
-                Ok(Some(CustomAttributeArgument::Enum(
-                    type_name,
-                    Box::new(CustomAttributeArgument::I8(enum_value)),
-                )))
-            }
-            _ => Err(malformed_error!(
-                "Invalid enum underlying type size {} for enum '{}'. Expected 1, 2, 4, or 8 bytes.",
-                underlying_type_size,
-                type_name
-            )),
-        }
-    }
-
-    /// Parse a single fixed argument based on constructor parameter type.
-    ///
-    /// Uses [`crate::metadata::typesystem::CilFlavor`] to determine the correct parsing
-    /// strategy for each parameter type. Handles primitive types, strings, arrays,
-    /// and complex types including System.Type, System.Object, and enum types.
-    ///
-    /// # Type Handling
-    /// - **Primitives**: Direct binary reading (bool, int, float, etc.)
-    /// - **String**: Compressed length + UTF-8 data or null marker (0xFF)
-    /// - **Class Types**: Special handling for System.Type, System.String, System.Object
-    /// - **`ValueType`**: Treated as enum with i32 underlying type
-    /// - **Arrays**: Single-dimensional arrays with element type parsing
-    /// - **Enum**: Heuristic detection with graceful fallback to Type parsing
-    ///
-    /// # Arguments
-    /// * `cil_type` - Constructor parameter type information for parsing guidance
-    ///
-    /// # Returns
-    /// Parsed argument if successful, None if type is unsupported
+    /// The [`FieldOrPropType`] a parameter of type `cil_type` gives its argument: a
+    /// primitive, `string`, `System.Type`, `object`, an enum, or a single-dimensional array of
+    /// one of these (ECMA-335 II.23.3).
     ///
     /// # Errors
-    /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] for invalid data or unsupported types
-    fn parse_fixed_argument(
-        &mut self,
-        cil_type: &CilTypeRef,
-    ) -> Result<Option<CustomAttributeArgument>> {
-        self.depth = self.depth.saturating_add(1);
-        if self.depth >= MAX_ARGUMENT_RECURSION {
-            self.depth = self.depth.saturating_sub(1);
-            return Err(DepthLimitExceeded(MAX_ARGUMENT_RECURSION));
-        }
-        let result = self.parse_fixed_argument_inner(cil_type);
-        self.depth = self.depth.saturating_sub(1);
-        result
-    }
-
-    /// Inner implementation of [`parse_fixed_argument`]; depth handled by caller.
-    fn parse_fixed_argument_inner(
-        &mut self,
-        cil_type: &CilTypeRef,
-    ) -> Result<Option<CustomAttributeArgument>> {
+    ///
+    /// For any other type, such as a native integer, a class, or a multi-dimensional array.
+    fn argument_type(&mut self, cil_type: &CilTypeRef) -> Result<FieldOrPropType> {
         let Some(type_ref) = cil_type.upgrade() else {
             return Err(malformed_error!("Type reference has been dropped"));
         };
-
         let flavor = type_ref.flavor();
-
-        if !self.parser.has_more_data() {
-            return Err(malformed_error!(
-                "Not enough data for fixed argument type {:?} (pos={}, len={})",
-                flavor,
-                self.parser.pos(),
-                self.parser.len()
-            ));
-        }
-
-        match flavor {
-            // Primitive types - stored directly without type tags
-            CilFlavor::Boolean => Ok(Some(CustomAttributeArgument::Bool(
-                self.parser.read_le::<u8>()? != 0,
-            ))),
-            CilFlavor::Char => {
-                let val = self.parser.read_le::<u16>()?;
-                let character = char::from_u32(u32::from(val)).unwrap_or('\u{FFFD}');
-                Ok(Some(CustomAttributeArgument::Char(character)))
-            }
-            CilFlavor::I1 => Ok(Some(CustomAttributeArgument::I1(
-                self.parser.read_le::<i8>()?,
-            ))),
-            CilFlavor::U1 => Ok(Some(CustomAttributeArgument::U1(
-                self.parser.read_le::<u8>()?,
-            ))),
-            CilFlavor::I2 => Ok(Some(CustomAttributeArgument::I2(
-                self.parser.read_le::<i16>()?,
-            ))),
-            CilFlavor::U2 => Ok(Some(CustomAttributeArgument::U2(
-                self.parser.read_le::<u16>()?,
-            ))),
-            CilFlavor::I4 => Ok(Some(CustomAttributeArgument::I4(
-                self.parser.read_le::<i32>()?,
-            ))),
-            CilFlavor::U4 => Ok(Some(CustomAttributeArgument::U4(
-                self.parser.read_le::<u32>()?,
-            ))),
-            CilFlavor::I8 => Ok(Some(CustomAttributeArgument::I8(
-                self.parser.read_le::<i64>()?,
-            ))),
-            CilFlavor::U8 => Ok(Some(CustomAttributeArgument::U8(
-                self.parser.read_le::<u64>()?,
-            ))),
-            CilFlavor::R4 => Ok(Some(CustomAttributeArgument::R4(
-                self.parser.read_le::<f32>()?,
-            ))),
-            CilFlavor::R8 => Ok(Some(CustomAttributeArgument::R8(
-                self.parser.read_le::<f64>()?,
-            ))),
-            CilFlavor::I => {
-                // Native integers: size depends on target platform
-                // On 64-bit: read i64, isize is i64 - no truncation
-                // On 32-bit: read i32, isize is i32 - no truncation
-                // Note: Cross-platform parsing (32-bit assembly on 64-bit host) is not supported
-                if cfg!(target_pointer_width = "64") {
-                    let val = self.parser.read_le::<i64>()?;
-                    #[allow(clippy::cast_possible_truncation)] // Safe: i64 == isize on 64-bit
-                    Ok(Some(CustomAttributeArgument::I(val as isize)))
-                } else {
-                    let val = self.parser.read_le::<i32>()?;
-                    Ok(Some(CustomAttributeArgument::I(val as isize)))
-                }
-            }
-            CilFlavor::U => {
-                // Native integers: size depends on target platform
-                // On 64-bit: read u64, usize is u64 - no truncation
-                // On 32-bit: read u32, usize is u32 - no truncation
-                // Note: Cross-platform parsing (32-bit assembly on 64-bit host) is not supported
-                if cfg!(target_pointer_width = "64") {
-                    let val = self.parser.read_le::<u64>()?;
-                    #[allow(clippy::cast_possible_truncation)] // Safe: u64 == usize on 64-bit
-                    Ok(Some(CustomAttributeArgument::U(val as usize)))
-                } else {
-                    let val = self.parser.read_le::<u32>()?;
-                    Ok(Some(CustomAttributeArgument::U(val as usize)))
-                }
-            }
-            CilFlavor::String => {
-                if self.parser.peek_byte()? == 0xFF {
-                    let _ = self.parser.read_le::<u8>()?; // consume null marker
-                    Ok(Some(CustomAttributeArgument::String(String::new())))
-                } else {
-                    let s = self
-                        .parse_string()
-                        .map_err(|e| malformed_error!("Failed to parse String parameter: {}", e))?;
-                    Ok(Some(CustomAttributeArgument::String(s)))
-                }
-            }
-            CilFlavor::Class => {
-                // For Class types in fixed arguments, we need to check what specific class it is
-                // According to .NET runtime: only System.Type, System.String, and System.Object are supported
-                // BUT: Enum types can also appear as Class and should be handled as ValueType/Enum
-                let type_name = type_ref.fullname();
-
-                if &*type_name == "System.Type" {
-                    // System.Type is stored as a string (type name)
-                    if self.parser.peek_byte()? == 0xFF {
-                        let _ = self.parser.read_le::<u8>()?; // consume null marker
-                        Ok(Some(CustomAttributeArgument::Type(String::new())))
-                    } else {
-                        let s = self.parse_string().map_err(|e| {
-                            malformed_error!("Failed to parse System.Type parameter: {}", e)
-                        })?;
-                        Ok(Some(CustomAttributeArgument::Type(s)))
-                    }
-                } else if &*type_name == "System.String" {
-                    // System.String is stored as a string
-                    if self.parser.peek_byte()? == 0xFF {
-                        let _ = self.parser.read_le::<u8>()?; // consume null marker
-                        Ok(Some(CustomAttributeArgument::String(String::new())))
-                    } else {
-                        let s = self.parse_string().map_err(|e| {
-                            malformed_error!("Failed to parse System.String parameter: {}", e)
-                        })?;
-                        Ok(Some(CustomAttributeArgument::String(s)))
-                    }
-                } else if &*type_name == "System.Object" {
-                    // System.Object is stored as a tagged object - read type tag first
-                    let type_tag = self.parser.read_le::<u8>()?;
-                    let value = self.parse_argument_by_type_tag(type_tag)?;
-                    Ok(Some(value))
-                } else {
-                    // Class types that are actually enums (external enum references)
-                    // use the same multi-stage fallback strategy as ValueType enums.
-                    //
-                    // Stage 1: Direct type resolution via TypeRegistry
-                    if let Some(registry) = &self.type_registry {
-                        if let Some(resolved_type) = registry.resolve_type_global(&type_name) {
-                            if EnumUtils::is_enum_type(&resolved_type, Some(registry)) {
-                                let underlying_type_size =
-                                    EnumUtils::get_enum_underlying_type_size(&resolved_type);
-                                return self
-                                    .parse_enum(type_name.to_string(), underlying_type_size);
-                            }
-                        }
-                    }
-
-                    // Stage 2: Heuristic enum detection as fallback
-                    let is_enum = if let Some(registry) = &self.type_registry {
-                        EnumUtils::is_enum_type_by_name(&type_name, registry)
-                    } else {
-                        EnumUtils::is_enum_type(&type_ref, None)
-                    };
-
-                    if is_enum {
-                        let underlying_type_size = if let Some(registry) = &self.type_registry {
-                            EnumUtils::get_enum_underlying_type_size_by_name(&type_name, registry)
-                        } else {
-                            EnumUtils::get_enum_underlying_type_size(&type_ref)
-                        };
-
-                        return self.parse_enum(type_name.to_string(), underlying_type_size);
-                    }
-
-                    // Stage 3: Fallback for unresolvable external types
-                    // TypeRef types (external references) often have CilFlavor::Class even
-                    // when they're actually enums, because we lack the type definition to
-                    // determine inheritance. For custom attributes, external types that
-                    // aren't System.Type/String/Object are typically enums. Assume int32
-                    // underlying type (the most common) to allow parsing to continue.
-                    self.parse_enum(type_name.to_string(), 4)
-                }
-            }
-            CilFlavor::ValueType => {
-                // ValueType enum resolution uses a multi-stage fallback strategy:
-                //
-                // Stage 1: Direct type resolution via TypeRegistry
-                //   - Look up the type by full name in the registry
-                //   - If found and it's an enum, use its defined underlying type size
-                //   - This is the most accurate method when the type is fully loaded
-                //
-                // Stage 2: Heuristic enum detection (fallback)
-                //   - Use EnumUtils to detect enums by name patterns or inheritance
-                //   - Infer underlying type size from available metadata
-                //   - Used when the type definition isn't directly available
-                //
-                // Stage 3: Error (no resolution possible)
-                //   - If neither stage succeeds, the type cannot be parsed
-                //   - Indicates missing assembly dependencies
-                let type_name = type_ref.fullname();
-
-                // Stage 1: Try direct type resolution via TypeRegistry
-                if let Some(registry) = &self.type_registry {
-                    if let Some(resolved_type) = registry.resolve_type_global(&type_name) {
-                        if EnumUtils::is_enum_type(&resolved_type, Some(registry)) {
-                            let underlying_type_size =
-                                EnumUtils::get_enum_underlying_type_size(&resolved_type);
-                            return self.parse_enum(type_name.to_string(), underlying_type_size);
-                        }
-                    }
-                }
-
-                // Stage 2: Heuristic enum detection as fallback
-                let is_enum = if let Some(registry) = &self.type_registry {
-                    EnumUtils::is_enum_type_by_name(&type_name, registry)
-                } else {
-                    EnumUtils::is_enum_type(&type_ref, None)
+        Ok(match flavor {
+            CilFlavor::Boolean => FieldOrPropType::Bool,
+            CilFlavor::Char => FieldOrPropType::Char,
+            CilFlavor::I1 => FieldOrPropType::I1,
+            CilFlavor::U1 => FieldOrPropType::U1,
+            CilFlavor::I2 => FieldOrPropType::I2,
+            CilFlavor::U2 => FieldOrPropType::U2,
+            CilFlavor::I4 => FieldOrPropType::I4,
+            CilFlavor::U4 => FieldOrPropType::U4,
+            CilFlavor::I8 => FieldOrPropType::I8,
+            CilFlavor::U8 => FieldOrPropType::U8,
+            CilFlavor::R4 => FieldOrPropType::R4,
+            CilFlavor::R8 => FieldOrPropType::R8,
+            CilFlavor::String => FieldOrPropType::String,
+            CilFlavor::Object => FieldOrPropType::Boxed,
+            CilFlavor::Array { rank: 1, .. } => {
+                let Some(element) = type_ref.base() else {
+                    return Err(malformed_error!("Array parameter has no element type"));
                 };
-
-                if is_enum {
-                    let underlying_type_size = if let Some(registry) = &self.type_registry {
-                        EnumUtils::get_enum_underlying_type_size_by_name(&type_name, registry)
-                    } else {
-                        EnumUtils::get_enum_underlying_type_size(&type_ref)
-                    };
-
-                    self.parse_enum(type_name.to_string(), underlying_type_size)
-                } else {
-                    // Stage 3: No resolution possible - missing dependencies
-                    Err(malformed_error!(
-                            "Cannot resolve ValueType '{}' - type not found in TypeRegistry. This indicates the assembly containing this type is not loaded yet.",
-                            type_name
-                        ))
+                if self.depth >= MAX_ARGUMENT_RECURSION {
+                    return Err(DepthLimitExceeded(MAX_ARGUMENT_RECURSION));
                 }
+                self.depth = self.depth.saturating_add(1);
+                let element = self.argument_type(&element.into());
+                self.depth = self.depth.saturating_sub(1);
+                FieldOrPropType::SzArray(Box::new(element?))
             }
-            CilFlavor::Array { rank, .. } => {
-                if *rank == 1 {
-                    let array_length = self.parser.read_le::<i32>()?;
-                    if array_length == -1 {
-                        Ok(Some(CustomAttributeArgument::Array(vec![]))) // null array
-                    } else if array_length < 0 {
-                        Err(malformed_error!("Invalid array length: {}", array_length))
-                    } else if array_length > MAX_ATTRIBUTE_ARRAY_LENGTH {
-                        Err(malformed_error!(
-                            "Custom attribute array too large: {} (max: {})",
-                            array_length,
-                            MAX_ATTRIBUTE_ARRAY_LENGTH
-                        ))
-                    } else {
-                        // Try to get the base element type from the array type
-                        if let Some(base_type) = type_ref.base() {
-                            let base_type_ref = base_type.into();
-                            // Safe: array_length was validated as positive and <= MAX_ATTRIBUTE_ARRAY_LENGTH
-                            #[allow(clippy::cast_sign_loss)]
-                            let mut elements = Vec::with_capacity(array_length as usize);
-
-                            for _ in 0..array_length {
-                                if let Some(element) = self.parse_fixed_argument(&base_type_ref)? {
-                                    elements.push(element);
-                                } else {
-                                    return Err(malformed_error!("Failed to parse array element"));
-                                }
-                            }
-
-                            Ok(Some(CustomAttributeArgument::Array(elements)))
-                        } else {
-                            Err(malformed_error!(
-                                "Array type has no base element type information for fixed arguments"
-                            ))
+            CilFlavor::Class | CilFlavor::ValueType => {
+                let name = type_ref.fullname();
+                if name == "System.Type" {
+                    FieldOrPropType::Type
+                } else if name == "System.String" {
+                    FieldOrPropType::String
+                } else if name == "System.Object" {
+                    FieldOrPropType::Boxed
+                } else {
+                    {
+                        // The only other types an argument can have are enums (II.23.3). One
+                        // defined here, or in an assembly the registry has, is sized by its
+                        // definition; an imported one the blob sizes.
+                        let defined = self
+                            .type_registry
+                            .as_ref()
+                            .and_then(|registry| registry.get_by_full_name(&name, true))
+                            .filter(|resolved| {
+                                EnumUtils::is_enum_type(resolved, self.type_registry.as_ref())
+                            });
+                        if let Some(resolved) = defined {
+                            let size = EnumUtils::get_enum_underlying_type_size(&resolved);
+                            self.known_enum_sizes.insert(name.text_hash(), size);
+                        } else if EnumUtils::is_enum_type(&type_ref, None) {
+                            let size = EnumUtils::get_enum_underlying_type_size(&type_ref);
+                            self.known_enum_sizes.insert(name.text_hash(), size);
+                        } else if type_ref.token.table() != 0x01 && !type_ref.is_typeref() {
+                            return Err(malformed_error!(
+                                "Constructor parameter type '{}' is neither an enum nor a type a custom attribute argument can have",
+                                name
+                            ));
                         }
+                        FieldOrPropType::Enum(name.to_string())
                     }
-                } else {
-                    Err(malformed_error!(
-                        "Multi-dimensional arrays not supported in custom attributes"
-                    ))
                 }
             }
-            CilFlavor::Void => Ok(Some(CustomAttributeArgument::Void)),
-            CilFlavor::Object => {
-                // System.Object in CustomAttribute is stored as a tagged object - read type tag first
-                let type_tag = self.parser.read_le::<u8>()?;
-                let value = self.parse_argument_by_type_tag(type_tag)?;
-                Ok(Some(value))
+            other => {
+                return Err(malformed_error!(
+                    "No custom attribute argument can have type {:?} (ECMA-335 II.23.3)",
+                    other
+                ))
             }
-            _ => Err(malformed_error!(
-                "Unsupported type flavor in custom attribute: {:?}",
-                flavor
-            )),
-        }
+        })
     }
 
-    /// Parse a named argument (field or property) with explicit type tags.
-    ///
-    /// Named arguments start with a field/property indicator (0x53/0x54), followed by
-    /// a [`crate::metadata::customattributes::types::SERIALIZATION_TYPE`] tag, name length,
-    /// name string, and the argument value. This follows ECMA-335 II.23.3 exactly.
-    ///
-    /// # Format
-    /// 1. Field/Property indicator: 0x53 (FIELD) or 0x54 (PROPERTY)
-    /// 2. Type tag: `CorSerializationType` enumeration value
-    /// 3. Name: Compressed length + UTF-8 string
-    /// 4. Value: Type-specific binary data
-    ///
-    /// # Returns
-    /// Parsed named argument with name, type, and value, or None if no more data
+    /// Reads a `FieldOrPropType`: a serialization tag, with an enum's type name or an array's
+    /// element type after it.
     ///
     /// # Errors
-    /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] for invalid format or unsupported types
-    fn parse_named_argument(&mut self) -> Result<Option<CustomAttributeNamedArgument>> {
-        if !self.parser.has_more_data() {
-            return Ok(None);
-        }
-
-        // Read field/property indicator per ECMA-335 §II.23.3
-        let field_or_prop = self.parser.read_le::<u8>()?;
-        let is_field = match field_or_prop {
-            NAMED_ARG_TYPE::FIELD => true,
-            NAMED_ARG_TYPE::PROPERTY => false,
-            0x00 => {
-                // 0x00 can appear as padding or end-of-data marker in some custom attributes
-                // This is sometimes used as a null terminator in malformed or legacy attributes
-                return Ok(None);
+    ///
+    /// For a tag the grammar does not define, or nesting past [`MAX_ARGUMENT_RECURSION`].
+    fn read_field_or_prop_type(&mut self) -> Result<FieldOrPropType> {
+        let tag = self.parser.read_le::<u8>()?;
+        Ok(match tag {
+            SERIALIZATION_TYPE::BOOLEAN => FieldOrPropType::Bool,
+            SERIALIZATION_TYPE::CHAR => FieldOrPropType::Char,
+            SERIALIZATION_TYPE::I1 => FieldOrPropType::I1,
+            SERIALIZATION_TYPE::U1 => FieldOrPropType::U1,
+            SERIALIZATION_TYPE::I2 => FieldOrPropType::I2,
+            SERIALIZATION_TYPE::U2 => FieldOrPropType::U2,
+            SERIALIZATION_TYPE::I4 => FieldOrPropType::I4,
+            SERIALIZATION_TYPE::U4 => FieldOrPropType::U4,
+            SERIALIZATION_TYPE::I8 => FieldOrPropType::I8,
+            SERIALIZATION_TYPE::U8 => FieldOrPropType::U8,
+            SERIALIZATION_TYPE::R4 => FieldOrPropType::R4,
+            SERIALIZATION_TYPE::R8 => FieldOrPropType::R8,
+            SERIALIZATION_TYPE::STRING => FieldOrPropType::String,
+            SERIALIZATION_TYPE::TYPE => FieldOrPropType::Type,
+            SERIALIZATION_TYPE::TAGGED_OBJECT => FieldOrPropType::Boxed,
+            SERIALIZATION_TYPE::ENUM => match self.read_ser_string()? {
+                Some(name) => FieldOrPropType::Enum(name),
+                None => return Err(malformed_error!("An enum type has a null name")),
+            },
+            SERIALIZATION_TYPE::SZARRAY => {
+                if self.depth >= MAX_ARGUMENT_RECURSION {
+                    return Err(DepthLimitExceeded(MAX_ARGUMENT_RECURSION));
+                }
+                self.depth = self.depth.saturating_add(1);
+                let element = self.read_field_or_prop_type();
+                self.depth = self.depth.saturating_sub(1);
+                FieldOrPropType::SzArray(Box::new(element?))
             }
             _ => {
                 return Err(malformed_error!(
+                    "Unsupported serialization type tag: 0x{:02X}",
+                    tag
+                ))
+            }
+        })
+    }
+
+    /// Reads a value of type `argument_type` (II.23.3 `Elem`, or a boxed value's tag and
+    /// value).
+    ///
+    /// # Errors
+    ///
+    /// When the data ends early, an array's length runs past the blob, or nesting passes
+    /// [`MAX_ARGUMENT_RECURSION`].
+    fn decode_value(&mut self, argument_type: &FieldOrPropType) -> Result<CustomAttributeArgument> {
+        if self.depth >= MAX_ARGUMENT_RECURSION {
+            return Err(DepthLimitExceeded(MAX_ARGUMENT_RECURSION));
+        }
+        self.depth = self.depth.saturating_add(1);
+        let value = self.decode_value_at(argument_type);
+        self.depth = self.depth.saturating_sub(1);
+        value
+    }
+
+    fn decode_value_at(
+        &mut self,
+        argument_type: &FieldOrPropType,
+    ) -> Result<CustomAttributeArgument> {
+        let p = &mut self.parser;
+        Ok(match argument_type {
+            FieldOrPropType::Bool => CustomAttributeArgument::Bool(p.read_le::<u8>()? != 0),
+            FieldOrPropType::Char => CustomAttributeArgument::Char(p.read_le::<u16>()?),
+            FieldOrPropType::I1 => CustomAttributeArgument::I1(p.read_le::<i8>()?),
+            FieldOrPropType::U1 => CustomAttributeArgument::U1(p.read_le::<u8>()?),
+            FieldOrPropType::I2 => CustomAttributeArgument::I2(p.read_le::<i16>()?),
+            FieldOrPropType::U2 => CustomAttributeArgument::U2(p.read_le::<u16>()?),
+            FieldOrPropType::I4 => CustomAttributeArgument::I4(p.read_le::<i32>()?),
+            FieldOrPropType::U4 => CustomAttributeArgument::U4(p.read_le::<u32>()?),
+            FieldOrPropType::I8 => CustomAttributeArgument::I8(p.read_le::<i64>()?),
+            FieldOrPropType::U8 => CustomAttributeArgument::U8(p.read_le::<u64>()?),
+            FieldOrPropType::R4 => CustomAttributeArgument::R4(p.read_le::<f32>()?),
+            FieldOrPropType::R8 => CustomAttributeArgument::R8(p.read_le::<f64>()?),
+            FieldOrPropType::String => CustomAttributeArgument::String(self.read_ser_string()?),
+            FieldOrPropType::Type => CustomAttributeArgument::Type(self.read_ser_string()?),
+            FieldOrPropType::Boxed => {
+                let held = self.read_field_or_prop_type()?;
+                if held == FieldOrPropType::Boxed {
+                    return Err(malformed_error!("A boxed value cannot hold a boxed value"));
+                }
+                CustomAttributeArgument::Boxed(Box::new(self.decode_value(&held)?))
+            }
+            FieldOrPropType::Enum(name) => {
+                let size = self.enum_underlying_size(name);
+                self.parse_enum(name.clone(), size)?
+            }
+            FieldOrPropType::SzArray(element) => {
+                // NumElem: a little-endian uint32, 0xFFFFFFFF for the null array
+                let count = self.parser.read_le::<u32>()?;
+                if count == u32::MAX {
+                    return Ok(CustomAttributeArgument::Array((**element).clone(), None));
+                }
+                // Every element takes at least a byte, so a count past what is left is no
+                // array this blob can hold
+                let remaining = self.parser.len().saturating_sub(self.parser.pos());
+                let count = usize::try_from(count).unwrap_or(usize::MAX);
+                if count > remaining {
+                    return Err(malformed_error!(
+                        "Custom attribute array of {} elements, with {} bytes left",
+                        count,
+                        remaining
+                    ));
+                }
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    items.push(self.decode_value(element)?);
+                }
+                CustomAttributeArgument::Array((**element).clone(), Some(items))
+            }
+        })
+    }
+
+    /// The size of the named enum's underlying type: the constructor parameter's or the
+    /// registry's when either defines the enum, otherwise [`Self::assumed_enum_size`].
+    fn enum_underlying_size(&mut self, type_name: &str) -> usize {
+        if let Some(&size) = self
+            .known_enum_sizes
+            .get(&TextHash::of(type_name.as_bytes()))
+        {
+            return size;
+        }
+        if let Some(registry) = &self.type_registry {
+            if let Some(resolved) = registry.resolve_type_global(type_name) {
+                if EnumUtils::is_enum_type(&resolved, Some(registry)) {
+                    return EnumUtils::get_enum_underlying_type_size(&resolved);
+                }
+            }
+        }
+        self.assumed_enum_size(type_name)
+    }
+
+    /// The underlying type size the current decoding assumes for an enum no loaded assembly
+    /// defines: `int`'s, the usual one, unless [`Self::parse_custom_attribute`] is trying
+    /// another. The enum is recorded so that it can.
+    fn assumed_enum_size(&mut self, type_name: &str) -> usize {
+        if let Some(&size) = self.enum_sizes.get(type_name) {
+            return size;
+        }
+        self.unknown_enums.push(type_name.to_string());
+        self.enum_sizes.insert(type_name.to_string(), 4);
+        4
+    }
+
+    /// An enum value of the named enum, read as its underlying type of `size` bytes.
+    ///
+    /// # Errors
+    ///
+    /// When the size is not 1, 2, 4 or 8 (an enum whose fields are not loaded reports 0).
+    fn parse_enum(&mut self, type_name: String, size: usize) -> Result<CustomAttributeArgument> {
+        let value = match size {
+            1 => CustomAttributeArgument::U1(self.parser.read_le::<u8>()?),
+            2 => CustomAttributeArgument::U2(self.parser.read_le::<u16>()?),
+            4 => CustomAttributeArgument::I4(self.parser.read_le::<i32>()?),
+            8 => CustomAttributeArgument::I8(self.parser.read_le::<i64>()?),
+            0 => {
+                return Err(malformed_error!(
+                "Cannot determine enum underlying type size for '{}' - enum fields not loaded yet.",
+                type_name
+            ))
+            }
+            _ => {
+                return Err(malformed_error!(
+                "Invalid enum underlying type size {} for enum '{}'. Expected 1, 2, 4, or 8 bytes.",
+                size,
+                type_name
+            ))
+            }
+        };
+        Ok(CustomAttributeArgument::Enum(type_name, Box::new(value)))
+    }
+
+    /// Parse a named argument: FIELD (0x53) or PROPERTY (0x54), its `FieldOrPropType`, its
+    /// name, then its value (ECMA-335 II.23.3).
+    ///
+    /// # Errors
+    /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] for a marker
+    /// other than FIELD or PROPERTY, a type tag the grammar does not define, or a null or
+    /// truncated name.
+    fn parse_named_argument(&mut self) -> Result<CustomAttributeNamedArgument> {
+        let is_field = match self.parser.read_le::<u8>()? {
+            NAMED_ARG_TYPE::FIELD => true,
+            NAMED_ARG_TYPE::PROPERTY => false,
+            other => {
+                return Err(malformed_error!(
                     "Invalid field/property indicator: 0x{:02X} (expected 0x{:02X} for FIELD or 0x{:02X} for PROPERTY)",
-                    field_or_prop,
+                    other,
                     NAMED_ARG_TYPE::FIELD,
                     NAMED_ARG_TYPE::PROPERTY
                 ))
             }
         };
-
-        // Read type information
-        let type_info = self.parser.read_le::<u8>()?;
-        let arg_type = match type_info {
-            SERIALIZATION_TYPE::BOOLEAN => "Boolean".to_string(),
-            SERIALIZATION_TYPE::CHAR => "Char".to_string(),
-            SERIALIZATION_TYPE::I1 => "I1".to_string(),
-            SERIALIZATION_TYPE::U1 => "U1".to_string(),
-            SERIALIZATION_TYPE::I2 => "I2".to_string(),
-            SERIALIZATION_TYPE::U2 => "U2".to_string(),
-            SERIALIZATION_TYPE::I4 => "I4".to_string(),
-            SERIALIZATION_TYPE::U4 => "U4".to_string(),
-            SERIALIZATION_TYPE::I8 => "I8".to_string(),
-            SERIALIZATION_TYPE::U8 => "U8".to_string(),
-            SERIALIZATION_TYPE::R4 => "R4".to_string(),
-            SERIALIZATION_TYPE::R8 => "R8".to_string(),
-            SERIALIZATION_TYPE::STRING => "String".to_string(),
-            SERIALIZATION_TYPE::TYPE => "Type".to_string(),
-            SERIALIZATION_TYPE::TAGGED_OBJECT => "TaggedObject".to_string(),
-            SERIALIZATION_TYPE::ENUM => "Enum".to_string(),
-            _ => {
-                return Err(malformed_error!(
-                    "Unsupported named argument type: 0x{:02X}",
-                    type_info
-                ))
-            }
+        // The type is complete before the name (ECMA-335 II.23.3): an enum's type name and an
+        // array's element type follow its tag.
+        let arg_type = self.read_field_or_prop_type()?;
+        let Some(name) = self.read_ser_string()? else {
+            return Err(malformed_error!("A named argument has a null name"));
         };
-
-        // Read field/property name.
-        //
-        // Each name byte consumes exactly one input byte, so a length beyond what remains in the
-        // blob can never be legitimate. Reject it before reserving, mirroring `parse_string`:
-        // `read_compressed_uint` reaches 0x1FFF_FFFF, so four attacker bytes would otherwise buy
-        // a ~512 MB reservation per row before the first read could fail.
-        let name_length = self.parser.read_compressed_uint()? as usize;
-        let available_data = self.parser.len().saturating_sub(self.parser.pos());
-        if name_length > available_data {
-            return Err(malformed_error!(
-                "Named argument name length {} exceeds {} remaining blob bytes",
-                name_length,
-                available_data
-            ));
-        }
-
-        let mut name = String::with_capacity(name_length);
-        for _ in 0..name_length {
-            name.push(char::from(self.parser.read_le::<u8>()?));
-        }
-
-        // Parse value based on type tag
-        let value = self.parse_argument_by_type_tag(type_info)?;
-
-        Ok(Some(CustomAttributeNamedArgument {
+        let value = self.decode_value(&arg_type)?;
+        Ok(CustomAttributeNamedArgument {
             is_field,
             name,
             arg_type,
             value,
-        }))
+        })
     }
 
-    /// Parse an argument based on its `CorSerializationType` tag using iterative processing.
-    ///
-    /// This method uses an explicit stack-based approach to handle deeply nested structures
-    /// without consuming call stack space. It supports complex types like arrays and tagged
-    /// objects while preventing resource exhaustion through depth limiting.
-    ///
-    /// # Supported Types
-    /// - All primitive types (bool, int, float, char)
-    /// - String and Type arguments
-    /// - Enum values with type name and underlying value
-    /// - Single-dimensional arrays (SZARRAY) - supports arbitrary nesting depth
-    /// - Tagged objects - supports arbitrary nesting depth
-    ///
-    /// # Nesting Safety
-    /// Uses explicit stack tracking with [`MAX_NESTING_DEPTH`] limit to prevent memory
-    /// exhaustion from maliciously crafted or deeply nested custom attribute data.
-    ///
-    /// # Arguments
-    /// * `type_tag` - [`crate::metadata::customattributes::types::SERIALIZATION_TYPE`] enumeration value
-    ///
-    /// # Returns
-    /// Parsed argument value according to the type tag specification
+    /// Reads a `SerString`: 0xFF for the null string, otherwise a compressed length and that
+    /// many UTF-8 bytes.
     ///
     /// # Errors
-    /// - [`crate::Error::DepthLimitExceeded`]: Maximum nesting depth exceeded
-    /// - [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`]: Invalid type tags or malformed data format
-    fn parse_argument_by_type_tag(&mut self, type_tag: u8) -> Result<CustomAttributeArgument> {
-        /// Work item for iterative parsing stack
-        enum WorkItem {
-            /// Parse a type tag and push result
-            ParseTag(u8),
-            /// Build array from N elements on stack
-            BuildArray(i32),
-            /// Take inner tagged object result
-            TaggedObject,
+    ///
+    /// When the length runs past the blob or the bytes are not UTF-8.
+    fn read_ser_string(&mut self) -> Result<Option<String>> {
+        if self.parser.peek_byte()? == 0xFF {
+            self.parser.read_le::<u8>()?;
+            return Ok(None);
         }
-
-        let mut work_stack: Vec<WorkItem> = Vec::new();
-        let mut result_stack: Vec<CustomAttributeArgument> = Vec::new();
-
-        work_stack.push(WorkItem::ParseTag(type_tag));
-
-        while let Some(work) = work_stack.pop() {
-            if work_stack.len().saturating_add(result_stack.len()) > MAX_NESTING_DEPTH {
-                return Err(DepthLimitExceeded(MAX_NESTING_DEPTH));
-            }
-
-            match work {
-                WorkItem::ParseTag(tag) => {
-                    match tag {
-                        SERIALIZATION_TYPE::BOOLEAN => {
-                            let val = self.parser.read_le::<u8>()?;
-                            result_stack.push(CustomAttributeArgument::Bool(val != 0));
-                        }
-                        SERIALIZATION_TYPE::CHAR => {
-                            let val = self.parser.read_le::<u16>()?;
-                            let character = char::from_u32(u32::from(val)).unwrap_or('\u{FFFD}');
-                            result_stack.push(CustomAttributeArgument::Char(character));
-                        }
-                        SERIALIZATION_TYPE::I1 => {
-                            result_stack
-                                .push(CustomAttributeArgument::I1(self.parser.read_le::<i8>()?));
-                        }
-                        SERIALIZATION_TYPE::U1 => {
-                            result_stack
-                                .push(CustomAttributeArgument::U1(self.parser.read_le::<u8>()?));
-                        }
-                        SERIALIZATION_TYPE::I2 => {
-                            result_stack
-                                .push(CustomAttributeArgument::I2(self.parser.read_le::<i16>()?));
-                        }
-                        SERIALIZATION_TYPE::U2 => {
-                            result_stack
-                                .push(CustomAttributeArgument::U2(self.parser.read_le::<u16>()?));
-                        }
-                        SERIALIZATION_TYPE::I4 => {
-                            result_stack
-                                .push(CustomAttributeArgument::I4(self.parser.read_le::<i32>()?));
-                        }
-                        SERIALIZATION_TYPE::U4 => {
-                            result_stack
-                                .push(CustomAttributeArgument::U4(self.parser.read_le::<u32>()?));
-                        }
-                        SERIALIZATION_TYPE::I8 => {
-                            result_stack
-                                .push(CustomAttributeArgument::I8(self.parser.read_le::<i64>()?));
-                        }
-                        SERIALIZATION_TYPE::U8 => {
-                            result_stack
-                                .push(CustomAttributeArgument::U8(self.parser.read_le::<u64>()?));
-                        }
-                        SERIALIZATION_TYPE::R4 => {
-                            result_stack
-                                .push(CustomAttributeArgument::R4(self.parser.read_le::<f32>()?));
-                        }
-                        SERIALIZATION_TYPE::R8 => {
-                            result_stack
-                                .push(CustomAttributeArgument::R8(self.parser.read_le::<f64>()?));
-                        }
-                        SERIALIZATION_TYPE::STRING => {
-                            if self.parser.peek_byte()? == 0xFF {
-                                let _ = self.parser.read_le::<u8>()?; // consume null marker
-                                result_stack.push(CustomAttributeArgument::String(String::new()));
-                            } else {
-                                let s = self.parse_string()?;
-                                result_stack.push(CustomAttributeArgument::String(s));
-                            }
-                        }
-                        SERIALIZATION_TYPE::TYPE => {
-                            if self.parser.peek_byte()? == 0xFF {
-                                let _ = self.parser.read_le::<u8>()?; // consume null marker
-                                result_stack.push(CustomAttributeArgument::Type(String::new()));
-                            } else {
-                                let s = self.parse_string()?;
-                                result_stack.push(CustomAttributeArgument::Type(s));
-                            }
-                        }
-                        SERIALIZATION_TYPE::TAGGED_OBJECT => {
-                            // Read inner type tag and schedule work
-                            let inner_type_tag = self.parser.read_le::<u8>()?;
-                            work_stack.push(WorkItem::TaggedObject);
-                            work_stack.push(WorkItem::ParseTag(inner_type_tag));
-                        }
-                        SERIALIZATION_TYPE::ENUM => {
-                            // Read enum type name, then value
-                            let type_name = self.parse_string()?;
-                            let val = self.parser.read_le::<i32>()?; // Most enums are I4-based
-                            result_stack.push(CustomAttributeArgument::Enum(
-                                type_name,
-                                Box::new(CustomAttributeArgument::I4(val)),
-                            ));
-                        }
-                        SERIALIZATION_TYPE::SZARRAY => {
-                            // Read array element type tag and length
-                            let element_type_tag = self.parser.read_le::<u8>()?;
-                            let array_length = self.parser.read_le::<i32>()?;
-
-                            if array_length == -1 {
-                                result_stack.push(CustomAttributeArgument::Array(vec![]));
-                            // null array
-                            } else if array_length < 0 {
-                                return Err(malformed_error!(
-                                    "Invalid array length: {}",
-                                    array_length
-                                ));
-                            } else if array_length > MAX_ATTRIBUTE_ARRAY_LENGTH {
-                                // Same cap the type-driven path applies. Without it this arm is
-                                // an allocation bomb: the push loop below consumes no further
-                                // input, so the blob's own length does not bound the work and
-                                // ~12 bytes can demand gigabytes of `work_stack`.
-                                return Err(malformed_error!(
-                                    "Custom attribute array too large: {} (max: {})",
-                                    array_length,
-                                    MAX_ATTRIBUTE_ARRAY_LENGTH
-                                ));
-                            } else if work_stack
-                                .len()
-                                .saturating_add(usize::try_from(array_length).unwrap_or(usize::MAX))
-                                > MAX_NESTING_DEPTH
-                            {
-                                // Bound the burst *before* it happens. The depth check at the top
-                                // of this loop is only evaluated on the next pop, i.e. after the
-                                // vector has already grown. Behaviour-preserving: any length past
-                                // the depth limit would error on that next pop regardless.
-                                return Err(DepthLimitExceeded(MAX_NESTING_DEPTH));
-                            } else {
-                                // Schedule work to build array after parsing elements
-                                work_stack.push(WorkItem::BuildArray(array_length));
-
-                                // Schedule parsing of array elements in reverse order
-                                // (so they are processed in correct order from stack)
-                                for _ in 0..array_length {
-                                    work_stack.push(WorkItem::ParseTag(element_type_tag));
-                                }
-                            }
-                        }
-                        _ => {
-                            return Err(malformed_error!(
-                                "Unsupported serialization type tag: 0x{:02X}",
-                                tag
-                            ));
-                        }
-                    }
-                }
-                WorkItem::BuildArray(count) => {
-                    // Pop N elements from result stack and build array
-                    // Safe: count was validated as non-negative when BuildArray was pushed
-                    #[allow(clippy::cast_sign_loss)]
-                    let count_usize = count as usize;
-
-                    if result_stack.len() < count_usize {
-                        return Err(malformed_error!(
-                            "Insufficient elements on stack for array of length {}",
-                            count
-                        ));
-                    }
-
-                    // Elements are on stack in correct order (last parsed = last in array)
-                    let start_idx = result_stack.len().saturating_sub(count_usize);
-                    let elements = result_stack.drain(start_idx..).collect();
-                    result_stack.push(CustomAttributeArgument::Array(elements));
-                }
-                WorkItem::TaggedObject => {
-                    // Result is already on stack from inner ParseTag, nothing to do
-                    // Tagged object is transparent - we just return the inner value
-                }
-            }
-        }
-
-        // Should have exactly one result
-        if result_stack.len() != 1 {
+        let length = self.parser.read_compressed_uint()? as usize;
+        let start = self.parser.pos();
+        let available = self.parser.len().saturating_sub(start);
+        if length > available {
             return Err(malformed_error!(
-                "Internal error: expected 1 result, got {}",
-                result_stack.len()
+                "Custom attribute string of {} bytes, with {} left",
+                length,
+                available
             ));
         }
-
-        // Safe: we just verified len() == 1, so pop() will return Some
-        result_stack
-            .pop()
-            .ok_or_else(|| malformed_error!("Internal error: result stack unexpectedly empty"))
-    }
-
-    /// Attempt to parse a string speculatively, with validation and heuristics.
-    ///
-    /// This method tries to parse a string from the current position. If parsing
-    /// succeeds and the data looks like a valid string, it returns `Some(string)`
-    /// and the parser position is advanced. If parsing fails or the data doesn't
-    /// look like a valid string, it returns `None` and the parser position is restored.
-    ///
-    /// This is useful for graceful fallback during ambiguous type parsing situations
-    /// where we need to speculatively try parsing as a string.
-    ///
-    /// # Validation Strategy
-    /// 1. Checks for null string marker (0xFF)
-    /// 2. Attempts to read compressed length
-    /// 3. Validates available data matches declared length
-    /// 4. Performs UTF-8 validation on string bytes
-    /// 5. Applies heuristics for reasonable string lengths (max 1000 chars)
-    ///
-    /// # Parser State
-    /// On success (`Some`), the parser position is advanced past the string.
-    /// On failure (`None`), the parser position is restored to its original value.
-    ///
-    /// # Returns
-    /// `Some(String)` if a valid string was parsed, `None` otherwise
-    fn try_parse_string(&mut self) -> Option<String> {
-        // Check for null string marker first
-        if self.parser.has_more_data() && self.parser.peek_byte().ok()? == 0xFF {
-            self.parser.read_le::<u8>().ok()?;
-            return Some(String::new());
-        }
-
-        self.parser
-            .transactional(|p| {
-                let length = p.read_compressed_uint()?;
-
-                // Check if we have enough data for the string
-                let remaining_data = p.len().saturating_sub(p.pos());
-                if length as usize > remaining_data {
-                    return Err(malformed_error!("not enough data"));
-                }
-
-                // Heuristic: reject unreasonably large "lengths" that are likely
-                // misinterpreted enum values. Custom attribute strings are typically
-                // short (type names, messages, etc.). The 1000 char limit is
-                // conservative but catches most false positives where an i32 enum
-                // value is misread as a compressed length.
-                if length > 1000 {
-                    return Err(malformed_error!("length too large for speculative string"));
-                }
-
-                if length == 0 {
-                    return Ok(String::new());
-                }
-
-                // Check if the bytes are valid UTF-8
-                let start = p.pos();
-                let end = start
-                    .checked_add(length as usize)
-                    .ok_or_else(|| malformed_error!("string length overflow"))?;
-                let string_bytes = p.data().get(start..end).ok_or(out_of_bounds_error!())?;
-                let s = std::str::from_utf8(string_bytes)
-                    .map_err(|_| malformed_error!("invalid UTF-8"))?;
-                let result = s.to_string();
-
-                // Advance past the string bytes
-                p.advance_by(length as usize)?;
-
-                Ok(result)
-            })
-            .ok()
-    }
-
-    /// Parse a compressed string from the blob.
-    ///
-    /// Implements ECMA-335 string parsing with support for null strings (0xFF marker)
-    /// and proper UTF-8 handling. Uses compressed unsigned integer for length encoding
-    /// as specified in the .NET metadata format.
-    ///
-    /// # Format
-    /// - **Null String**: Single 0xFF byte → returns empty `String`
-    /// - **Empty String**: Compressed uint 0 → returns empty `String`
-    /// - **Regular String**: Compressed length + UTF-8 bytes
-    ///
-    /// # Design Note
-    ///
-    /// Both null strings (0xFF) and empty strings (length 0) return an empty Rust `String`,
-    /// since Rust's `String` type cannot represent null. This means the distinction between
-    /// null and empty is lost during parsing, but this is acceptable for the Rust API.
-    ///
-    /// # Returns
-    /// Parsed string (empty `String` for both null marker and zero length)
-    ///
-    /// # Errors
-    /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::Other`] if:
-    /// - No data available for reading
-    /// - Declared length exceeds available data
-    /// - Compressed length parsing fails
-    /// - String data contains invalid UTF-8
-    fn parse_string(&mut self) -> Result<String> {
-        if !self.parser.has_more_data() {
-            return Err(malformed_error!("No data available for string"));
-        }
-
-        // Check for null string marker (0xFF) first
-        let first_byte = self.parser.peek_byte()?;
-        if first_byte == 0xFF {
-            // Null string - consume the 0xFF byte and return empty string
-            self.parser.read_le::<u8>()?;
-            return Ok(String::new());
-        }
-
-        // Not a null string, parse as normal compressed uint + data
-        let length = self.parser.read_compressed_uint()?;
-        let available_data = self.parser.len().saturating_sub(self.parser.pos());
-
-        if length == 0 {
-            Ok(String::new())
-        } else if length as usize <= available_data {
-            let mut bytes = Vec::with_capacity(length as usize);
-            for _ in 0..length {
-                bytes.push(self.parser.read_le::<u8>()?);
-            }
-            String::from_utf8(bytes).map_err(|e| {
-                malformed_error!(
-                    "Invalid UTF-8 in custom attribute string at position {}: {}",
-                    self.parser.pos().saturating_sub(length as usize),
-                    e.utf8_error()
-                )
-            })
-        } else {
-            Err(malformed_error!(
-                "String length {} exceeds available data {} (blob context: pos={}, len={}, first_byte=0x{:02X})",
-                length,
-                available_data,
-                self.parser.pos().saturating_sub(1), // subtract 1 because we already read the length
-                self.parser.len(),
-                first_byte
-            ))
-        }
+        let bytes = self.parser.read_bytes(length)?;
+        String::from_utf8(bytes.to_vec()).map(Some).map_err(|e| {
+            malformed_error!(
+                "Invalid UTF-8 in custom attribute string at position {}: {}",
+                start,
+                e
+            )
+        })
     }
 }
 
@@ -1469,11 +917,14 @@ mod tests {
             token::Token,
             typesystem::{CilFlavor, CilPrimitiveKind, CilTypeRef, TypeBuilder, TypeRegistry},
         },
-        test::factories::metadata::customattributes::{
-            create_constructor_with_params, create_constructor_with_params_and_registry,
-            create_empty_constructor, get_test_type_registry,
+        testkit::{
+            factories::metadata::customattributes::{
+                create_constructor_with_params, create_constructor_with_params_and_registry,
+                create_empty_constructor, get_test_type_registry,
+            },
+            fixture,
         },
-        utils::LazyList,
+        CilObject,
     };
 
     #[test]
@@ -1547,7 +998,7 @@ mod tests {
         let result = parse_custom_attribute_data(blob_data, &method.params).unwrap();
         assert_eq!(result.fixed_args.len(), 1);
         match &result.fixed_args[0] {
-            CustomAttributeArgument::Char(val) => assert_eq!(*val, 'A'),
+            CustomAttributeArgument::Char(val) => assert_eq!(*val, 0x41),
             _ => panic!("Expected Char argument"),
         }
     }
@@ -1641,39 +1092,14 @@ mod tests {
         }
     }
 
+    /// No custom attribute argument has a native integer type (ECMA-335 II.23.3), so a
+    /// constructor taking one has no blob to read.
     #[test]
     fn test_parse_native_integer_arguments() {
-        let method = create_constructor_with_params(vec![CilFlavor::I, CilFlavor::U]);
-
-        #[cfg(target_pointer_width = "64")]
-        let blob_data = &[
-            0x01, 0x00, // Prolog
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x80, // I: -9223372036854775808 (LE, 64-bit)
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, // U: 18446744073709551615 (LE, 64-bit)
-            0x00, 0x00, // NumNamed = 0
-        ];
-
-        #[cfg(target_pointer_width = "32")]
-        let blob_data = &[
-            0x01, 0x00, // Prolog
-            0x00, 0x00, 0x00, 0x80, // I: -2147483648 (LE, 32-bit)
-            0xFF, 0xFF, 0xFF, 0xFF, // U: 4294967295 (LE, 32-bit)
-            0x00, 0x00, // NumNamed = 0
-        ];
-
-        // Using direct API
-        let result = parse_custom_attribute_data(blob_data, &method.params).unwrap();
-        assert_eq!(result.fixed_args.len(), 2);
-
-        match &result.fixed_args[0] {
-            CustomAttributeArgument::I(_) => (), // Value depends on platform
-            _ => panic!("Expected I argument"),
-        }
-        match &result.fixed_args[1] {
-            CustomAttributeArgument::U(_) => (), // Value depends on platform
-            _ => panic!("Expected U argument"),
+        for flavor in [CilFlavor::I, CilFlavor::U] {
+            let method = create_constructor_with_params(vec![flavor]);
+            let blob_data = &[0x01, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00];
+            assert!(parse_custom_attribute_data(blob_data, &method.params).is_err());
         }
     }
 
@@ -1692,7 +1118,7 @@ mod tests {
         let result = parse_custom_attribute_data(blob_data, &method.params).unwrap();
         assert_eq!(result.fixed_args.len(), 1);
         match &result.fixed_args[0] {
-            CustomAttributeArgument::String(val) => assert_eq!(val, "Hello"),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, "Hello"),
             _ => panic!("Expected String argument"),
         }
     }
@@ -1714,8 +1140,8 @@ mod tests {
         assert_eq!(result.fixed_args.len(), 1);
         // Parser may return either Type or String depending on context
         match &result.fixed_args[0] {
-            CustomAttributeArgument::Type(val) => assert_eq!(val, "System.Int32"),
-            CustomAttributeArgument::String(val) => assert_eq!(val, "System.Int32"),
+            CustomAttributeArgument::Type(Some(val)) => assert_eq!(val, "System.Int32"),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, "System.Int32"),
             other => panic!("Expected Type or String argument, got: {other:?}"),
         }
     }
@@ -1740,8 +1166,8 @@ mod tests {
                 assert_eq!(attr.fixed_args.len(), 1);
                 // Accept either Type or String argument based on actual parser behavior
                 match &attr.fixed_args[0] {
-                    CustomAttributeArgument::Type(s) => assert_eq!(s, ""),
-                    CustomAttributeArgument::String(s) => assert_eq!(s, ""),
+                    CustomAttributeArgument::Type(Some(s)) => assert_eq!(s, ""),
+                    CustomAttributeArgument::String(Some(s)) => assert_eq!(s, ""),
                     _ => panic!("Expected empty string or type argument"),
                 }
             }
@@ -1778,22 +1204,12 @@ mod tests {
         }
     }
 
+    /// No argument has type `void`.
     #[test]
     fn test_parse_void_argument() {
         let method = create_constructor_with_params(vec![CilFlavor::Void]);
-
-        let blob_data = &[
-            0x01, 0x00, // Prolog
-            0x00, 0x00, // NumNamed = 0
-        ];
-
-        // Using direct API
-        let result = parse_custom_attribute_data(blob_data, &method.params).unwrap();
-        assert_eq!(result.fixed_args.len(), 1);
-        match &result.fixed_args[0] {
-            CustomAttributeArgument::Void => (),
-            _ => panic!("Expected Void argument"),
-        }
+        let blob_data = &[0x01, 0x00, 0x00, 0x00];
+        assert!(parse_custom_attribute_data(blob_data, &method.params).is_err());
     }
 
     #[test]
@@ -1816,7 +1232,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Array type has no base element type information"));
+            .contains("Array parameter has no element type"));
     }
 
     #[test]
@@ -1842,13 +1258,13 @@ mod tests {
             offset: 0,
             flags: ParamAttributes::ZERO,
             sequence: 1,
-            name: Some("arrayParam".to_string()),
+            name: Some("arrayParam".into()),
             default: OnceLock::new(),
             marshal: OnceLock::new(),
             modifiers: Arc::new(boxcar::Vec::new()),
             base: OnceLock::new(),
             is_by_ref: std::sync::atomic::AtomicBool::new(false),
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         });
         param.base.set(CilTypeRef::from(array_type)).ok();
         method.params.push(param);
@@ -1868,7 +1284,7 @@ mod tests {
         assert_eq!(result.fixed_args.len(), 1);
 
         match &result.fixed_args[0] {
-            CustomAttributeArgument::Array(elements) => {
+            CustomAttributeArgument::Array(FieldOrPropType::I4, Some(elements)) => {
                 assert_eq!(elements.len(), 3);
                 match &elements[0] {
                     CustomAttributeArgument::I4(val) => assert_eq!(*val, 1),
@@ -1915,7 +1331,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Multi-dimensional arrays not supported"));
+            .contains("No custom attribute argument can have type"));
     }
 
     #[test]
@@ -1949,7 +1365,7 @@ mod tests {
         let field_arg = &result.named_args[0];
         assert!(field_arg.is_field);
         assert_eq!(field_arg.name, "Value");
-        assert_eq!(field_arg.arg_type, "I4");
+        assert_eq!(field_arg.arg_type, FieldOrPropType::I4);
         match &field_arg.value {
             CustomAttributeArgument::I4(val) => assert_eq!(*val, 42),
             _ => panic!("Expected I4 value"),
@@ -1959,9 +1375,9 @@ mod tests {
         let prop_arg = &result.named_args[1];
         assert!(!prop_arg.is_field);
         assert_eq!(prop_arg.name, "Name");
-        assert_eq!(prop_arg.arg_type, "String");
+        assert_eq!(prop_arg.arg_type, FieldOrPropType::String);
         match &prop_arg.value {
-            CustomAttributeArgument::String(val) => assert_eq!(val, "Test"),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, "Test"),
             _ => panic!("Expected String value"),
         }
     }
@@ -1985,9 +1401,9 @@ mod tests {
         assert_eq!(result.named_args.len(), 1);
 
         let named_arg = &result.named_args[0];
-        assert_eq!(named_arg.arg_type, "Char");
+        assert_eq!(named_arg.arg_type, FieldOrPropType::Char);
         match &named_arg.value {
-            CustomAttributeArgument::Char(val) => assert_eq!(*val, 'Z'),
+            CustomAttributeArgument::Char(val) => assert_eq!(*val, 0x5A),
             _ => panic!("Expected Char value"),
         }
     }
@@ -2079,7 +1495,7 @@ mod tests {
             _ => panic!("Expected I4 argument"),
         }
         match &result.fixed_args[1] {
-            CustomAttributeArgument::String(val) => assert_eq!(val, "Hello"),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, "Hello"),
             _ => panic!("Expected String argument"),
         }
 
@@ -2087,7 +1503,7 @@ mod tests {
         let named_arg = &result.named_args[0];
         assert!(!named_arg.is_field);
         assert_eq!(named_arg.name, "Enabled");
-        assert_eq!(named_arg.arg_type, "Boolean");
+        assert_eq!(named_arg.arg_type, FieldOrPropType::Bool);
         match &named_arg.value {
             CustomAttributeArgument::Bool(val) => assert!(*val),
             _ => panic!("Expected Boolean value"),
@@ -2098,7 +1514,7 @@ mod tests {
     fn test_parse_utf16_edge_cases() {
         let method = create_constructor_with_params(vec![CilFlavor::Char]);
 
-        // Test invalid UTF-16 value (should be replaced with replacement character)
+        // An unpaired surrogate is a char value like any other: the code unit is kept
         let blob_data = &[
             0x01, 0x00, // Prolog
             0x00, 0xD8, // Invalid UTF-16 surrogate (0xD800)
@@ -2109,7 +1525,7 @@ mod tests {
         let result = parse_custom_attribute_data(blob_data, &method.params).unwrap();
         assert_eq!(result.fixed_args.len(), 1);
         match &result.fixed_args[0] {
-            CustomAttributeArgument::Char(val) => assert_eq!(*val, '\u{FFFD}'), // Replacement character
+            CustomAttributeArgument::Char(val) => assert_eq!(*val, 0xD800),
             _ => panic!("Expected Char argument"),
         }
     }
@@ -2129,7 +1545,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Unsupported type flavor in custom attribute"));
+            .contains("No custom attribute argument can have type"));
     }
 
     #[test]
@@ -2146,8 +1562,181 @@ mod tests {
         let result = parse_custom_attribute_data(blob_data, &method.params).unwrap();
         assert_eq!(result.fixed_args.len(), 1);
         match &result.fixed_args[0] {
-            CustomAttributeArgument::String(val) => assert_eq!(val, ""),
+            CustomAttributeArgument::String(Some(val)) => assert_eq!(val, ""),
             _ => panic!("Expected String argument"),
+        }
+    }
+
+    #[test]
+    fn test_parse_named_enum_argument_reads_the_enum_type_before_the_name() {
+        // ECMA-335 II.23.3: PROPERTY, ENUM, the enum's type name, then the
+        // property's name, then the value.
+        let method = create_empty_constructor();
+        let mut blob = vec![0x01, 0x00, 0x01, 0x00, 0x54, 0x55];
+        blob.push(4);
+        blob.extend_from_slice(b"E.Ty");
+        blob.push(4);
+        blob.extend_from_slice(b"Mode");
+        blob.extend_from_slice(&7i32.to_le_bytes());
+
+        let result = parse_custom_attribute_data(&blob, &method.params).unwrap();
+        let named = &result.named_args[0];
+        assert_eq!(named.name, "Mode");
+        match &named.value {
+            CustomAttributeArgument::Enum(type_name, value) => {
+                assert_eq!(type_name, "E.Ty");
+                assert!(matches!(**value, CustomAttributeArgument::I4(7)));
+            }
+            other => panic!("expected an enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_named_enum_no_assembly_defines_is_sized_by_the_blob() {
+        // `Mode` is an enum over `byte`: as an `int` its value would run past the blob.
+        let method = create_empty_constructor();
+        let mut blob = vec![0x01, 0x00, 0x01, 0x00, 0x54, 0x55];
+        blob.push(4);
+        blob.extend_from_slice(b"E.Ty");
+        blob.push(4);
+        blob.extend_from_slice(b"Mode");
+        blob.push(7);
+
+        let result = parse_custom_attribute_data(&blob, &method.params).unwrap();
+        match &result.named_args[0].value {
+            CustomAttributeArgument::Enum(type_name, value) => {
+                assert_eq!(type_name, "E.Ty");
+                assert!(matches!(**value, CustomAttributeArgument::U1(7)));
+            }
+            other => panic!("expected an enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enums_of_different_sizes_are_sized_together() {
+        // `A` over `short`, then `B` over `long`: only those two sizes end the blob after `B`.
+        let method = create_empty_constructor();
+        let mut blob = vec![0x01, 0x00, 0x02, 0x00];
+        for (enum_name, property, value) in [
+            (&b"E.A"[..], &b"First"[..], &3u16.to_le_bytes()[..]),
+            (&b"E.B"[..], &b"Second"[..], &(-5i64).to_le_bytes()[..]),
+        ] {
+            blob.extend_from_slice(&[0x54, 0x55, u8::try_from(enum_name.len()).unwrap()]);
+            blob.extend_from_slice(enum_name);
+            blob.push(u8::try_from(property.len()).unwrap());
+            blob.extend_from_slice(property);
+            blob.extend_from_slice(value);
+        }
+
+        let result = parse_custom_attribute_data(&blob, &method.params).unwrap();
+        let values: Vec<_> = result.named_args.iter().map(|arg| &arg.value).collect();
+        assert!(matches!(
+            values[..],
+            [
+                CustomAttributeArgument::Enum(_, ref first),
+                CustomAttributeArgument::Enum(_, ref second),
+            ] if matches!(**first, CustomAttributeArgument::U2(3))
+                && matches!(**second, CustomAttributeArgument::I8(-5))
+        ));
+    }
+
+    #[test]
+    fn a_framework_attribute_over_an_imported_byte_enum_loads() {
+        // `SecurityRulesAttribute(SecurityRuleSet)`, where `SecurityRuleSet` is mscorlib's enum
+        // over `byte`, followed by `SkipVerificationInFullTrust = true`.
+        let assembly = CilObject::from_path(fixture("mono_4.8/System.dll")).unwrap();
+        let attributes = &assembly.assembly().unwrap().custom_attributes;
+        let rules = attributes
+            .iter()
+            .map(|(_, attribute)| attribute)
+            .find(|attribute| {
+                matches!(
+                    attribute.fixed_args.first(),
+                    Some(CustomAttributeArgument::Enum(name, _))
+                        if name == "System.Security.SecurityRuleSet"
+                )
+            })
+            .expect("System.dll declares its security rules");
+
+        assert!(matches!(
+            rules.fixed_args[..],
+            [CustomAttributeArgument::Enum(_, ref value)]
+                if matches!(**value, CustomAttributeArgument::U1(1))
+        ));
+        assert_eq!(rules.named_args.len(), 1);
+        assert_eq!(rules.named_args[0].name, "SkipVerificationInFullTrust");
+        assert!(matches!(
+            rules.named_args[0].value,
+            CustomAttributeArgument::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn test_parse_named_array_argument() {
+        // FIELD, SZARRAY of I4, the name, then a length and the elements.
+        let method = create_empty_constructor();
+        let mut blob = vec![0x01, 0x00, 0x01, 0x00, 0x53, 0x1D, 0x08];
+        blob.push(6);
+        blob.extend_from_slice(b"Values");
+        blob.extend_from_slice(&2i32.to_le_bytes());
+        blob.extend_from_slice(&10i32.to_le_bytes());
+        blob.extend_from_slice(&20i32.to_le_bytes());
+
+        let result = parse_custom_attribute_data(&blob, &method.params).unwrap();
+        let named = &result.named_args[0];
+        assert_eq!(named.name, "Values");
+        assert_eq!(
+            named.arg_type,
+            FieldOrPropType::SzArray(Box::new(FieldOrPropType::I4))
+        );
+        match &named.value {
+            CustomAttributeArgument::Array(FieldOrPropType::I4, Some(values)) => {
+                assert!(matches!(
+                    values[..],
+                    [
+                        CustomAttributeArgument::I4(10),
+                        CustomAttributeArgument::I4(20)
+                    ]
+                ));
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_boxed_enum_array_reads_the_enum_type_before_the_length() {
+        // A boxed object holding an enum array: OBJECT, SZARRAY, ENUM, the
+        // enum's type name, then the length and the values.
+        let method = create_empty_constructor();
+        let mut blob = vec![0x01, 0x00, 0x01, 0x00, 0x54, 0x51];
+        blob.push(1);
+        blob.extend_from_slice(b"P");
+        blob.extend_from_slice(&[0x1D, 0x55]);
+        blob.push(4);
+        blob.extend_from_slice(b"E.Ty");
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&3i32.to_le_bytes());
+
+        let result = parse_custom_attribute_data(&blob, &method.params).unwrap();
+        assert_eq!(result.named_args[0].arg_type, FieldOrPropType::Boxed);
+        let CustomAttributeArgument::Boxed(held) = &result.named_args[0].value else {
+            panic!(
+                "expected a boxed value, got {:?}",
+                result.named_args[0].value
+            );
+        };
+        match &**held {
+            CustomAttributeArgument::Array(FieldOrPropType::Enum(element), Some(values)) => {
+                assert_eq!(element, "E.Ty");
+                match &values[..] {
+                    [CustomAttributeArgument::Enum(type_name, value)] => {
+                        assert_eq!(type_name, "E.Ty");
+                        assert!(matches!(**value, CustomAttributeArgument::I4(3)));
+                    }
+                    other => panic!("expected one enum, got {other:?}"),
+                }
+            }
+            other => panic!("expected an enum array, got {other:?}"),
         }
     }
 
@@ -2171,7 +1760,60 @@ mod tests {
         if let Err(e) = result {
             assert!(e
                 .to_string()
-                .contains("Unsupported named argument type: 0xFF"));
+                .contains("Unsupported serialization type tag: 0xFF"));
         }
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        metadata::{identity::AssemblyIdentity, typesystem::TypeRegistry},
+        Result,
+    };
+
+    /// The smallest attribute blob: the prolog and no named arguments.
+    const MINIMAL: &[u8] = &[0x01, 0x00, 0x00, 0x00];
+
+    #[test]
+    fn new_example() -> Result<()> {
+        let mut parser = CustomAttributeParser::new(MINIMAL);
+        let parsed = parser.parse_custom_attribute(&ParamList::new())?;
+        assert!(parsed.fixed_args.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn with_registry_example() -> Result<()> {
+        let test_identity = AssemblyIdentity::parse("TestAssembly, Version=1.0.0.0")?;
+        let type_registry = Arc::new(TypeRegistry::new(test_identity)?);
+        let mut parser = CustomAttributeParser::with_registry(MINIMAL, type_registry);
+        let parsed = parser.parse_custom_attribute(&ParamList::new())?;
+        assert!(parsed.named_args.is_empty());
+        Ok(())
+    }
+
+    /// A constructor without parameters, and one named argument: the field `Answer` of type
+    /// `int32` set to 42.
+    #[test]
+    fn parse_custom_attribute_example() -> Result<()> {
+        let blob_data = &[
+            0x01, 0x00, // prolog
+            0x01, 0x00, // one named argument
+            0x53, 0x08, // FIELD, int32
+            0x06, b'A', b'n', b's', b'w', b'e', b'r', // its name
+            0x2A, 0x00, 0x00, 0x00, // 42
+        ];
+        let mut parser = CustomAttributeParser::new(blob_data);
+        let params = ParamList::new();
+
+        let custom_attr = parser.parse_custom_attribute(&params)?;
+        assert!(custom_attr.fixed_args.is_empty());
+        assert_eq!(custom_attr.named_args.len(), 1);
+        assert_eq!(custom_attr.named_args[0].name, "Answer");
+        Ok(())
     }
 }

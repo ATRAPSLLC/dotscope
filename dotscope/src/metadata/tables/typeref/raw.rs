@@ -150,12 +150,12 @@ impl TypeRefRaw {
 
         Ok(Arc::new(CilType::new(
             self.token,
-            strings.get(self.type_namespace as usize)?.to_string(),
-            strings.get(self.type_name as usize)?.to_string(),
+            strings.get_shared(self.type_namespace as usize)?,
+            strings.get_shared(self.type_name as usize)?,
             resolution_scope,
             None,
             TypeAttributes::ZERO,
-            Arc::new(boxcar::Vec::new()),
+            LazyList::new(),
             LazyList::new(),
             None,
         )))

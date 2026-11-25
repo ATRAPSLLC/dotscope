@@ -16,7 +16,7 @@ use crate::{
 
 /// Extracts a reflection type token from an `EmValue` that may be an `ObjectRef`
 /// pointing to a `ReflectionType` on the heap, or `Null`.
-pub(crate) fn extract_type_token(thread: &EmulationThread, val: &EmValue) -> Option<Token> {
+pub fn extract_type_token(thread: &EmulationThread, val: &EmValue) -> Option<Token> {
     match val {
         EmValue::ObjectRef(href) => thread
             .heap()
@@ -33,7 +33,7 @@ pub(crate) fn extract_type_token(thread: &EmulationThread, val: &EmValue) -> Opt
 /// are mapped to their artificial `0xF000_XXXX` primitive tokens. This ensures that
 /// `typeof(int)` (which uses a TypeRef from `ldtoken`) compares equal to the token
 /// produced by `FieldInfo.get_FieldType` for an `int32` field.
-pub(crate) fn normalize_type_token(thread: &EmulationThread, token: Token) -> Token {
+pub fn normalize_type_token(thread: &EmulationThread, token: Token) -> Token {
     // Artificial tokens are already canonical
     if token.value() & 0xFF00_0000 == 0xF000_0000 {
         return token;
@@ -57,7 +57,7 @@ pub(crate) fn normalize_type_token(thread: &EmulationThread, token: Token) -> To
 }
 
 /// Maps a BCL type name in the `System` namespace to its artificial primitive token.
-pub(crate) fn bcl_name_to_primitive_token(name: &str) -> Option<Token> {
+pub fn bcl_name_to_primitive_token(name: &str) -> Option<Token> {
     let kind = match name {
         "Boolean" => CilPrimitiveKind::Boolean,
         "Char" => CilPrimitiveKind::Char,
@@ -107,7 +107,7 @@ fn find_method_on_type(cil_type: &CilType, name: &str) -> Option<Token> {
 /// [`CilType::base_chain`](crate::metadata::typesystem::CilType::base_chain), which bounds the
 /// walk — a hostile assembly can describe an inheritance cycle, and searching for a name that
 /// appears nowhere in it would otherwise recurse until the native stack is exhausted.
-pub(crate) fn find_method_by_name(asm: &CilObject, type_token: Token, name: &str) -> Option<Token> {
+pub fn find_method_by_name(asm: &CilObject, type_token: Token, name: &str) -> Option<Token> {
     let cil_type = asm.types().resolve(&type_token)?;
     if let Some(token) = find_method_on_type(&cil_type, name) {
         return Some(token);
@@ -120,10 +120,10 @@ pub(crate) fn find_method_by_name(asm: &CilObject, type_token: Token, name: &str
 /// Resolves a method token (MethodDef, MemberRef, or MethodSpec) to a [`MethodRc`].
 ///
 /// Tries direct MethodDef lookup first, then falls back to the assembly's
-/// [`TokenResolver`] for MemberRef -> MethodDef resolution. Returns `None`
+/// [`TokenResolver`](crate::metadata::resolver::TokenResolver) for MemberRef -> MethodDef resolution. Returns `None`
 /// for external methods that have no local MethodDef (e.g., BCL methods
 /// referenced via TypeRef).
-pub(crate) fn resolve_method_from_token(method_token: Token, asm: &CilObject) -> Option<MethodRc> {
+pub fn resolve_method_from_token(method_token: Token, asm: &CilObject) -> Option<MethodRc> {
     // Direct MethodDef lookup
     if let Some(method) = asm.methods().get(&method_token).map(|e| e.value().clone()) {
         return Some(method);
@@ -138,7 +138,7 @@ pub(crate) fn resolve_method_from_token(method_token: Token, asm: &CilObject) ->
 }
 
 /// Allocates a `Type[]` and populates it with `ReflectionType` objects for each token.
-pub(crate) fn alloc_type_array_from_tokens(
+pub fn alloc_type_array_from_tokens(
     thread: &mut EmulationThread,
     tokens: &[Token],
 ) -> PreHookResult {
@@ -166,10 +166,12 @@ pub(crate) fn alloc_type_array_from_tokens(
 ///
 /// In .NET, `FieldInfo.SetValue(obj, value)` passes the value as `object`,
 /// so primitives are boxed. This helper extracts the inner value.
-pub(crate) fn unbox_value(thread: &EmulationThread, value: &EmValue) -> EmValue {
+pub fn unbox_value(thread: &EmulationThread, value: &EmValue) -> EmValue {
     if let EmValue::ObjectRef(href) = value {
-        if let Ok(HeapObject::BoxedValue { value: inner, .. }) = thread.heap().get(*href) {
-            return *inner;
+        if let Ok(HeapObject::BoxedValue { value: inner, .. }) =
+            thread.heap().get_shared(*href).as_deref()
+        {
+            return <EmValue as Clone>::clone(&**inner);
         }
     }
     value.clone()
@@ -179,7 +181,7 @@ pub(crate) fn unbox_value(thread: &EmulationThread, value: &EmValue) -> EmValue 
 ///
 /// If the value is already an `ObjectRef` or `Null`, returns as-is.
 /// Otherwise, boxes it so it can be used as an `object` return value.
-pub(crate) fn box_value_if_needed(thread: &EmulationThread, value: EmValue) -> EmValue {
+pub fn box_value_if_needed(thread: &EmulationThread, value: EmValue) -> EmValue {
     match &value {
         EmValue::ObjectRef(_) | EmValue::Null => value,
         EmValue::I32(_) => {
@@ -209,7 +211,7 @@ pub(crate) fn box_value_if_needed(thread: &EmulationThread, value: EmValue) -> E
 ///
 /// Given the `CilTypeReference` from a `CustomAttributeValue.constructor`,
 /// finds the declaring type by looking up the method's declaring type.
-pub(crate) fn resolve_attribute_type_token(
+pub fn resolve_attribute_type_token(
     asm: &CilObject,
     constructor: &CilTypeReference,
 ) -> Option<Token> {

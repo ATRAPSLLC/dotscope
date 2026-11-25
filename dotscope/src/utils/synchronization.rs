@@ -38,42 +38,7 @@ use crate::{Error, Result};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::synchronization::FailFastBarrier;
-/// use std::sync::Arc;
-/// use std::thread;
-///
-/// let barrier = Arc::new(FailFastBarrier::new(3)?);
-/// let mut handles = vec![];
-///
-/// for i in 0..3 {
-///     let barrier_clone = Arc::clone(&barrier);
-///     let handle = thread::spawn(move || {
-///         // Simulate some work
-///         if i == 1 {
-///             // Thread 1 fails and breaks the barrier
-///             barrier_clone.break_barrier("Simulated failure");
-///             return Err("Simulated failure");
-///         }
-///
-///         // Try to wait for all threads
-///         match barrier_clone.wait() {
-///             Ok(()) => Ok("Success"),
-///             Err(_) => Err("Barrier was broken by another thread"),
-///         }
-///     });
-///     handles.push(handle);
-/// }
-///
-/// // Collect results - some will succeed, others will get barrier broken error
-/// for handle in handles {
-///     let result = handle.join().unwrap();
-///     match result {
-///         Ok(msg) => println!("Thread succeeded: {}", msg),
-///         Err(err) => println!("Thread failed: {}", err),
-///     }
-/// }
-/// ```
+/// The `examples::fail_fast_barrier_example` test in this module runs this example.
 pub struct FailFastBarrier {
     /// Number of threads that need to reach the barrier
     count: usize,
@@ -98,14 +63,7 @@ impl FailFastBarrier {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::synchronization::FailFastBarrier;
-    ///
-    /// let barrier = FailFastBarrier::new(4)?; // Wait for 4 threads
-    ///
-    /// // Zero count returns an error
-    /// assert!(FailFastBarrier::new(0).is_err());
-    /// ```
+    /// The `examples::new_example` test in this module runs this example.
     pub fn new(count: usize) -> Result<Self> {
         if count == 0 {
             return Err(Error::LockError(
@@ -139,25 +97,7 @@ impl FailFastBarrier {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::synchronization::FailFastBarrier;
-    /// use std::sync::Arc;
-    /// use std::thread;
-    ///
-    /// let barrier = Arc::new(FailFastBarrier::new(2)?);
-    /// let barrier_clone = Arc::clone(&barrier);
-    ///
-    /// let handle = thread::spawn(move || {
-    ///     match barrier_clone.wait() {
-    ///         Ok(()) => println!("All threads reached barrier"),
-    ///         Err(err) => println!("Barrier was broken: {}", err),
-    ///     }
-    /// });
-    ///
-    /// // Main thread also waits
-    /// let _ = barrier.wait();
-    /// handle.join().unwrap();
-    /// ```
+    /// The `examples::wait_example` test in this module runs this example.
     pub fn wait(&self) -> Result<()> {
         // Check if already broken
         {
@@ -221,29 +161,7 @@ impl FailFastBarrier {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::synchronization::FailFastBarrier;
-    /// use std::sync::Arc;
-    /// use std::thread;
-    ///
-    /// let barrier = Arc::new(FailFastBarrier::new(3)?);
-    ///
-    /// // Thread that will fail and break the barrier
-    /// let barrier_clone = Arc::clone(&barrier);
-    /// thread::spawn(move || {
-    ///     // Simulate work that fails
-    ///     thread::sleep(std::time::Duration::from_millis(100));
-    ///
-    ///     // Break the barrier on failure
-    ///     barrier_clone.break_barrier("Assembly failed to parse due to invalid metadata");
-    /// });
-    ///
-    /// // This will return Err(Error) when the barrier is broken
-    /// match barrier.wait() {
-    ///     Ok(()) => println!("Unexpectedly succeeded"),
-    ///     Err(err) => println!("Barrier was broken: {}", err),
-    /// }
-    /// ```
+    /// The `examples::break_barrier_example` test in this module runs this example.
     pub fn break_barrier(&self, error_message: impl Into<String>) {
         if let Ok(mut guard) = self.state.lock() {
             // Only set message if not already broken (preserve first error)
@@ -265,15 +183,7 @@ impl FailFastBarrier {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::utils::synchronization::FailFastBarrier;
-    ///
-    /// let barrier = FailFastBarrier::new(2)?;
-    /// assert!(!barrier.is_broken());
-    ///
-    /// barrier.break_barrier("test");
-    /// assert!(barrier.is_broken());
-    /// ```
+    /// The `examples::is_broken_example` test in this module runs this example.
     pub fn is_broken(&self) -> bool {
         self.state
             .lock()
@@ -284,7 +194,7 @@ impl FailFastBarrier {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{sync::Arc, thread};
 
     use super::*;
 
@@ -317,10 +227,8 @@ mod tests {
             handles.push(handle);
         }
 
-        // Give threads time to start waiting
-        thread::sleep(Duration::from_millis(10));
-
-        // Break the barrier
+        // Break the barrier: a thread already waiting is woken with the error, and one that
+        // has not reached `wait` yet sees the barrier broken there, so the order does not matter
         barrier.break_barrier("Test failure");
 
         // All waiting threads should get Err with error message
@@ -365,5 +273,103 @@ mod tests {
         let barrier2 = FailFastBarrier::new(2).unwrap();
         barrier2.break_barrier(String::from("owned error"));
         assert!(barrier2.is_broken());
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use std::{sync::Arc, thread};
+
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn fail_fast_barrier_example() -> Result<()> {
+        let barrier = Arc::new(FailFastBarrier::new(3)?);
+        let mut handles = vec![];
+
+        for i in 0..3 {
+            let barrier_clone = Arc::clone(&barrier);
+            let handle = thread::spawn(move || {
+                // Simulate some work
+                if i == 1 {
+                    // Thread 1 fails and breaks the barrier
+                    barrier_clone.break_barrier("Simulated failure");
+                    return Err("Simulated failure");
+                }
+
+                // Try to wait for all threads
+                match barrier_clone.wait() {
+                    Ok(()) => Ok("Success"),
+                    Err(_) => Err("Barrier was broken by another thread"),
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Thread 1 never arrives, so the others can only return through the break
+        let mut results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        results.sort_unstable();
+        assert_eq!(
+            results,
+            [
+                Err("Barrier was broken by another thread"),
+                Err("Barrier was broken by another thread"),
+                Err("Simulated failure"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn new_example() -> Result<()> {
+        let barrier = FailFastBarrier::new(4)?; // Wait for 4 threads
+        assert!(!barrier.is_broken());
+
+        // Zero count returns an error
+        assert!(FailFastBarrier::new(0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn wait_example() -> Result<()> {
+        let barrier = Arc::new(FailFastBarrier::new(2)?);
+        let barrier_clone = Arc::clone(&barrier);
+
+        let handle = thread::spawn(move || barrier_clone.wait());
+
+        // Main thread also waits; both pass once both have arrived
+        barrier.wait()?;
+        handle.join().unwrap()?;
+        Ok(())
+    }
+
+    #[test]
+    fn break_barrier_example() -> Result<()> {
+        let barrier = Arc::new(FailFastBarrier::new(3)?);
+
+        // Thread that will fail and break the barrier
+        let barrier_clone = Arc::clone(&barrier);
+        thread::spawn(move || {
+            // Break the barrier on failure
+            barrier_clone.break_barrier("Assembly failed to parse due to invalid metadata");
+        });
+
+        // Only two of the three parties ever arrive, so this returns through the break
+        assert!(barrier.wait().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn is_broken_example() -> Result<()> {
+        let barrier = FailFastBarrier::new(2)?;
+        assert!(!barrier.is_broken());
+
+        barrier.break_barrier("test");
+        assert!(barrier.is_broken());
+        Ok(())
     }
 }

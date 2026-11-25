@@ -211,8 +211,9 @@ impl MethodDefBuilder {
     /// Sets the parameter list starting index.
     ///
     /// This points to the first parameter in the Param table for this method.
-    /// Parameters are stored as a contiguous range in the Param table.
-    /// A value of 0 indicates no parameters.
+    /// Parameters are stored as a contiguous range in the Param table, up to the next
+    /// method's start (ECMA-335 II.22.26). Without it, the method starts an empty list at the
+    /// next Param row, so the parameters added after it are its own.
     ///
     /// # Arguments
     ///
@@ -268,7 +269,10 @@ impl MethodDefBuilder {
         })?;
 
         let rva = self.rva.unwrap_or(0); // Default to 0 (abstract/interface method)
-        let param_list = self.param_list.unwrap_or(0); // Default to 0 (no parameters)
+        let param_list = match self.param_list {
+            Some(list) => list,
+            None => assembly.next_rid(TableId::Param)?,
+        };
         let name_index = assembly.string_get_or_add(&name)?.placeholder();
         let signature_index = assembly.blob_add(&signature)?.placeholder();
         let rid = assembly.next_rid(TableId::MethodDef)?;
@@ -301,220 +305,210 @@ impl Default for MethodDefBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::method::{MethodAccessFlags, MethodImplCodeType, MethodModifiers},
+        testkit::fixture,
     };
 
     #[test]
     fn test_method_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            // Check existing MethodDef table count
-            let existing_method_count = assembly.original_table_row_count(TableId::MethodDef);
-            let _expected_rid = existing_method_count + 1;
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Check existing MethodDef table count
+        let existing_method_count = assembly.original_table_row_count(TableId::MethodDef);
+        let _expected_rid = existing_method_count + 1;
 
-            // Create a void method signature with no parameters
-            // Format: [calling_convention, param_count, return_type]
-            let void_signature = &[0x00, 0x00, 0x01]; // DEFAULT, 0 params, VOID
+        // Create a void method signature with no parameters
+        // Format: [calling_convention, param_count, return_type]
+        let void_signature = &[0x00, 0x00, 0x01]; // DEFAULT, 0 params, VOID
 
-            let ref_ = MethodDefBuilder::new()
-                .name("TestMethod")
-                .flags(MethodAccessFlags::PUBLIC.bits() | MethodModifiers::HIDE_BY_SIG.bits())
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(void_signature)
-                .rva(0) // No implementation
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MethodDefBuilder::new()
+            .name("TestMethod")
+            .flags(MethodAccessFlags::PUBLIC.bits() | MethodModifiers::HIDE_BY_SIG.bits())
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(void_signature)
+            .rva(0) // No implementation
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
-            // MethodDef table
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
+        // MethodDef table
     }
 
     #[test]
     fn test_method_builder_static_constructor() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            // Static constructor signature
-            let static_ctor_sig = &[0x00, 0x00, 0x01]; // DEFAULT, 0 params, VOID
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Static constructor signature
+        let static_ctor_sig = &[0x00, 0x00, 0x01]; // DEFAULT, 0 params, VOID
 
-            let ref_ = MethodDefBuilder::new()
-                .name(".cctor")
-                .flags(
-                    MethodAccessFlags::PRIVATE.bits()
-                        | MethodModifiers::STATIC.bits()
-                        | MethodModifiers::SPECIAL_NAME.bits()
-                        | MethodModifiers::RTSPECIAL_NAME.bits(),
-                )
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(static_ctor_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MethodDefBuilder::new()
+            .name(".cctor")
+            .flags(
+                MethodAccessFlags::PRIVATE.bits()
+                    | MethodModifiers::STATIC.bits()
+                    | MethodModifiers::SPECIAL_NAME.bits()
+                    | MethodModifiers::RTSPECIAL_NAME.bits(),
+            )
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(static_ctor_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
     }
 
     #[test]
     fn test_method_builder_instance_constructor() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            // Instance constructor signature
-            let instance_ctor_sig = &[0x20, 0x00, 0x01]; // HASTHIS, 0 params, VOID
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Instance constructor signature
+        let instance_ctor_sig = &[0x20, 0x00, 0x01]; // HASTHIS, 0 params, VOID
 
-            let ref_ = MethodDefBuilder::new()
-                .name(".ctor")
-                .flags(
-                    MethodAccessFlags::PUBLIC.bits()
-                        | MethodModifiers::SPECIAL_NAME.bits()
-                        | MethodModifiers::RTSPECIAL_NAME.bits(),
-                )
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(instance_ctor_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MethodDefBuilder::new()
+            .name(".ctor")
+            .flags(
+                MethodAccessFlags::PUBLIC.bits()
+                    | MethodModifiers::SPECIAL_NAME.bits()
+                    | MethodModifiers::RTSPECIAL_NAME.bits(),
+            )
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(instance_ctor_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
     }
 
     #[test]
     fn test_method_builder_with_return_value() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            // Method with return value (int32)
-            let method_with_return_sig = &[0x00, 0x00, 0x08]; // DEFAULT, 0 params, I4
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Method with return value (int32)
+        let method_with_return_sig = &[0x00, 0x00, 0x08]; // DEFAULT, 0 params, I4
 
-            let ref_ = MethodDefBuilder::new()
-                .name("GetValue")
-                .flags(
-                    MethodAccessFlags::PUBLIC.bits()
-                        | MethodModifiers::STATIC.bits()
-                        | MethodModifiers::HIDE_BY_SIG.bits(),
-                )
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(method_with_return_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MethodDefBuilder::new()
+            .name("GetValue")
+            .flags(
+                MethodAccessFlags::PUBLIC.bits()
+                    | MethodModifiers::STATIC.bits()
+                    | MethodModifiers::HIDE_BY_SIG.bits(),
+            )
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(method_with_return_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
     }
 
     #[test]
     fn test_method_builder_missing_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = MethodDefBuilder::new()
-                .flags(MethodAccessFlags::PUBLIC.bits())
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(&[0x00, 0x00, 0x01])
-                .build(&mut assembly);
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = MethodDefBuilder::new()
+            .flags(MethodAccessFlags::PUBLIC.bits())
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(&[0x00, 0x00, 0x01])
+            .build(&mut assembly);
 
-            // Should fail because name is required
-            assert!(result.is_err());
-        }
+        // Should fail because name is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_builder_missing_flags() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = MethodDefBuilder::new()
-                .name("TestMethod")
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(&[0x00, 0x00, 0x01])
-                .build(&mut assembly);
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = MethodDefBuilder::new()
+            .name("TestMethod")
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(&[0x00, 0x00, 0x01])
+            .build(&mut assembly);
 
-            // Should fail because flags are required
-            assert!(result.is_err());
-        }
+        // Should fail because flags are required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_builder_missing_impl_flags() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = MethodDefBuilder::new()
-                .name("TestMethod")
-                .flags(MethodAccessFlags::PUBLIC.bits())
-                .signature(&[0x00, 0x00, 0x01])
-                .build(&mut assembly);
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = MethodDefBuilder::new()
+            .name("TestMethod")
+            .flags(MethodAccessFlags::PUBLIC.bits())
+            .signature(&[0x00, 0x00, 0x01])
+            .build(&mut assembly);
 
-            // Should fail because impl_flags are required
-            assert!(result.is_err());
-        }
+        // Should fail because impl_flags are required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_builder_missing_signature() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let result = MethodDefBuilder::new()
-                .name("TestMethod")
-                .flags(MethodAccessFlags::PUBLIC.bits())
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .build(&mut assembly);
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let result = MethodDefBuilder::new()
+            .name("TestMethod")
+            .flags(MethodAccessFlags::PUBLIC.bits())
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .build(&mut assembly);
 
-            // Should fail because signature is required
-            assert!(result.is_err());
-        }
+        // Should fail because signature is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_method_builder_multiple_methods() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let void_signature = &[0x00, 0x00, 0x01]; // void return
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let void_signature = &[0x00, 0x00, 0x01]; // void return
 
-            // Create multiple methods
-            let ref1 = MethodDefBuilder::new()
-                .name("Method1")
-                .flags(MethodAccessFlags::PRIVATE.bits())
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(void_signature)
-                .build(&mut assembly)
-                .unwrap();
+        // Create multiple methods
+        let ref1 = MethodDefBuilder::new()
+            .name("Method1")
+            .flags(MethodAccessFlags::PRIVATE.bits())
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(void_signature)
+            .build(&mut assembly)
+            .unwrap();
 
-            let ref2 = MethodDefBuilder::new()
-                .name("Method2")
-                .flags(MethodAccessFlags::PUBLIC.bits())
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(void_signature)
-                .build(&mut assembly)
-                .unwrap();
+        let ref2 = MethodDefBuilder::new()
+            .name("Method2")
+            .flags(MethodAccessFlags::PUBLIC.bits())
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(void_signature)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Both should succeed and be different references
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
-        }
+        // Both should succeed and be different references
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
     }
 
     #[test]
     fn test_method_builder_default_values() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            // Test that optional fields default correctly
-            let ref_ = MethodDefBuilder::new()
-                .name("AbstractMethod")
-                .flags(MethodAccessFlags::PUBLIC.bits() | MethodModifiers::ABSTRACT.bits())
-                .impl_flags(MethodImplCodeType::IL.bits())
-                .signature(&[0x00, 0x00, 0x01])
-                // Not setting RVA or param_list - should default to 0
-                .build(&mut assembly)
-                .unwrap();
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Test that optional fields default correctly
+        let ref_ = MethodDefBuilder::new()
+            .name("AbstractMethod")
+            .flags(MethodAccessFlags::PUBLIC.bits() | MethodModifiers::ABSTRACT.bits())
+            .impl_flags(MethodImplCodeType::IL.bits())
+            .signature(&[0x00, 0x00, 0x01])
+            // Not setting RVA or param_list - should default to 0
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed with default values
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
-        }
+        // Should succeed with default values
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodDef));
     }
 }

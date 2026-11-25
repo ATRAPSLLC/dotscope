@@ -24,7 +24,7 @@ use std::{
 use log::{debug, trace};
 
 use crate::{
-    analysis::SsaOp,
+    analysis::SsaOpCilExt,
     cilassembly::CleanupRequest,
     compiler::PassPhase,
     deobfuscation::{
@@ -203,7 +203,7 @@ impl Technique for GenericStrings {
             return Detection::new_empty();
         }
 
-        // Phase 2: count SSA Call/CallVirt ops targeting these candidates.
+        // Phase 2: count SSA calls of these candidates.
         // This catches calls that were hidden behind delegate proxies — after
         // DelegateProxyResolutionPass resolves them, direct Call ops appear.
         let mut counts: HashMap<Token, usize> = candidates.iter().map(|&t| (t, 0)).collect();
@@ -212,11 +212,8 @@ impl Technique for GenericStrings {
         for entry in ctx.ssa_functions.iter() {
             for block in entry.value().blocks() {
                 for instr in block.instructions() {
-                    let token = match instr.op() {
-                        SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => {
-                            method.token()
-                        }
-                        _ => continue,
+                    let Some((token, _)) = instr.op().method_call() else {
+                        continue;
                     };
 
                     // Direct match
@@ -407,7 +404,7 @@ fn collect_decryptor_resources(assembly: &CilObject, decryptors: &HashSet<Token>
 
 #[cfg(test)]
 mod tests {
-    use crate::{deobfuscation::techniques::Technique, test::helpers::load_sample};
+    use crate::{deobfuscation::techniques::Technique, testkit::helpers::load_sample};
 
     /// Verify detection runs without error on a protected sample.
     ///
@@ -417,14 +414,14 @@ mod tests {
     /// simpler `string(int32)` / `string(string)` patterns from other packers.
     #[test]
     fn test_detect_no_panic_on_obfuscated() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_constants.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/mkaring_constants.exe");
         let technique = super::GenericStrings;
         let _detection = technique.detect(&asm);
     }
 
     #[test]
     fn test_detect_negative() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
         let technique = super::GenericStrings;
         let detection = technique.detect(&asm);
         assert!(!detection.is_detected());

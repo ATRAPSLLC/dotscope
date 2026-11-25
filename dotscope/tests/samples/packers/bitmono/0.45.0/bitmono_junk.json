@@ -1,0 +1,6 @@
+{
+  "Protections": [
+    { "Name": "BitMethodDotnet", "Enabled": true },
+    { "Name": "BillionNops", "Enabled": true }
+  ]
+}

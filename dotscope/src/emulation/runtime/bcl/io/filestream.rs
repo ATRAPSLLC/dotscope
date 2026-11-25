@@ -79,12 +79,14 @@ use log::debug;
 
 use crate::{
     emulation::{
-        runtime::hook::{Hook, HookContext, HookManager, PreHookResult},
+        runtime::{
+            bcl::crypto::transform_stream_data,
+            hook::{Hook, HookContext, HookManager, PreHookResult},
+        },
         thread::EmulationThread,
         tokens::io_fields,
         EmValue, HeapRef,
     },
-    utils::apply_crypto_transform,
     Result,
 };
 
@@ -910,21 +912,10 @@ fn streamreader_read_to_end_pre(
 
             let effective_data: &[u8] = stream_data.get(underlying_pos..).unwrap_or(&[]);
 
-            let transformed = if let Some((algorithm, key, iv, is_encryptor, cmode, padding)) =
-                try_hook!(thread.heap().get_crypto_transform_info(transform_ref))
-            {
-                apply_crypto_transform(
-                    &algorithm,
-                    &key,
-                    &iv,
-                    is_encryptor,
-                    effective_data,
-                    cmode,
-                    padding,
-                )
-                .unwrap_or_else(|| effective_data.to_vec())
-            } else {
-                effective_data.to_vec()
+            let effective_data = effective_data.to_vec();
+            let transformed = match transform_stream_data(thread, transform_ref, &effective_data) {
+                Ok(transformed) => transformed,
+                Err(result) => return result,
             };
 
             // Cache the transformed data for potential future reads
@@ -1065,11 +1056,11 @@ mod tests {
                 hook::{HookContext, HookManager, PreHookResult},
                 RuntimeState,
             },
-            AddressSpace, CaptureContext, EmValue, EmulationConfig, EmulationThread,
-            SharedFakeObjects, ThreadContext, ThreadId,
+            AddressSpace, CaptureContext, EmValue, EmulationThread, SharedFakeObjects,
+            ThreadContext, ThreadId,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::{create_test_thread, emulation_config},
     };
 
     /// Creates a test thread with a virtual filesystem containing "test.exe".
@@ -1083,7 +1074,7 @@ mod tests {
             address_space,
             Arc::new(RwLock::new(RuntimeState::new())),
             Arc::new(CaptureContext::new()),
-            Arc::new(EmulationConfig::default()),
+            Arc::new(emulation_config()),
             None,
             fake_objects,
             Arc::new(vfs),
@@ -1182,7 +1173,7 @@ mod tests {
             address_space,
             Arc::new(RwLock::new(RuntimeState::new())),
             Arc::new(CaptureContext::new()),
-            Arc::new(EmulationConfig::default()),
+            Arc::new(emulation_config()),
             None,
             fake_objects,
             Arc::new(vfs),

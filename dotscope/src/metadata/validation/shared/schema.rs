@@ -506,120 +506,108 @@ impl std::fmt::Display for SchemaValidationStatistics {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::metadata::cilassemblyview::CilAssemblyView;
+    use crate::{metadata::cilassemblyview::CilAssemblyView, testkit::fixture};
 
     #[test]
     fn test_schema_validator_creation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = SchemaValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = SchemaValidator::new(&scanner);
 
-                // Test basic functionality
-                let stats = validator.get_validation_statistics();
-                assert!(stats.total_tables > 0);
-                assert!(stats.total_rows > 0);
-            }
-        }
+        // Test basic functionality
+        let stats = validator.get_validation_statistics();
+        assert!(stats.total_tables > 0);
+        assert!(stats.total_rows > 0);
     }
 
     #[test]
     fn test_basic_structure_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = crate::metadata::cilassemblyview::CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = SchemaValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = crate::metadata::cilassemblyview::CilAssemblyView::from_path(&path)
+            .expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = SchemaValidator::new(&scanner);
 
-                // Should pass for valid assembly
-                if let Some(tables) = view.tables() {
-                    assert!(validator.validate_basic_structure(tables).is_ok());
-                }
-            }
+        // Should pass for valid assembly
+        if let Some(tables) = view.tables() {
+            assert!(validator.validate_basic_structure(tables).is_ok());
         }
     }
 
     #[test]
     fn test_rid_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = SchemaValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = SchemaValidator::new(&scanner);
 
-                // Test invalid RID (0)
-                assert!(validator.validate_rid(TableId::TypeDef, 0).is_err());
+        // Test invalid RID (0)
+        assert!(validator.validate_rid(TableId::TypeDef, 0).is_err());
 
-                // Test valid RID (if table has rows)
-                if scanner.table_row_count(TableId::TypeDef) > 0 {
-                    assert!(validator.validate_rid(TableId::TypeDef, 1).is_ok());
-                }
+        // Test valid RID (if table has rows)
+        if scanner.table_row_count(TableId::TypeDef) > 0 {
+            assert!(validator.validate_rid(TableId::TypeDef, 1).is_ok());
+        }
 
-                // Test out-of-bounds RID
-                let max_rid = scanner.table_row_count(TableId::TypeDef);
-                if max_rid > 0 {
-                    assert!(validator
-                        .validate_rid(TableId::TypeDef, max_rid + 1)
-                        .is_err());
-                }
-            }
+        // Test out-of-bounds RID
+        let max_rid = scanner.table_row_count(TableId::TypeDef);
+        if max_rid > 0 {
+            assert!(validator
+                .validate_rid(TableId::TypeDef, max_rid + 1)
+                .is_err());
         }
     }
 
     #[test]
     fn test_heap_reference_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = SchemaValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = SchemaValidator::new(&scanner);
 
-                // Test string heap validation
-                assert!(validator.validate_string_index(0).is_ok()); // Null reference
+        // Test string heap validation
+        assert!(validator.validate_string_index(0).is_ok()); // Null reference
 
-                // Test blob heap validation
-                assert!(validator.validate_blob_index(0).is_ok()); // Null reference
+        // Test blob heap validation
+        assert!(validator.validate_blob_index(0).is_ok()); // Null reference
 
-                // Test GUID heap validation
-                assert!(validator.validate_guid_index(0).is_ok()); // Null reference
+        // Test GUID heap validation
+        assert!(validator.validate_guid_index(0).is_ok()); // Null reference
 
-                // Test user string heap validation
-                assert!(validator.validate_user_string_index(0).is_ok()); // Null reference
-            }
-        }
+        // Test user string heap validation
+        assert!(validator.validate_user_string_index(0).is_ok()); // Null reference
     }
 
     #[test]
     fn test_validation_statistics() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = SchemaValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = SchemaValidator::new(&scanner);
 
-                let stats = validator.get_validation_statistics();
-                let stats_string = stats.to_string();
+        let stats = validator.get_validation_statistics();
+        let stats_string = stats.to_string();
 
-                assert!(stats_string.contains("tables"));
-                assert!(stats_string.contains("rows"));
-                assert!(stats_string.contains("Heaps"));
-            }
-        }
+        assert!(stats_string.contains("tables"));
+        assert!(stats_string.contains("rows"));
+        assert!(stats_string.contains("Heaps"));
     }
 
     #[test]
     fn test_coded_index_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = SchemaValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = SchemaValidator::new(&scanner);
 
-                // Test null coded index (should be valid)
-                let allowed_tables = &[TableId::TypeDef, TableId::TypeRef, TableId::TypeSpec];
-                assert!(validator.validate_coded_index(0, allowed_tables).is_ok());
+        // Test null coded index (should be valid)
+        let allowed_tables = &[TableId::TypeDef, TableId::TypeRef, TableId::TypeSpec];
+        assert!(validator.validate_coded_index(0, allowed_tables).is_ok());
 
-                // Note: Real coded index validation would require proper decoding
-                // This test just verifies the null case works
-            }
-        }
+        // Note: Real coded index validation would require proper decoding
+        // This test just verifies the null case works
     }
 }

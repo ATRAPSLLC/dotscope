@@ -5,7 +5,7 @@
 //!   reference `SsaType` / `SignatureLocalVariable` and so cannot live inside
 //!   analyssa.
 //! - [`SsaFunctionSemanticsExt`] delegates block- and loop-classification to
-//!   [`SemanticAnalyzer`](crate::analysis::cfg::SemanticAnalyzer), which itself
+//!   [`SemanticAnalyzer`], which itself
 //!   depends on dotscope's CFG-loop machinery (`LoopInfo`, dominator-based
 //!   loop detection).
 //!
@@ -39,6 +39,10 @@ use crate::{
 /// `SsaType` and `SignatureLocalVariable` which are CIL-side only.
 pub trait SsaFunctionCilExt {
     /// Optimizes local variables by removing unused ones and compacting indices.
+    ///
+    /// The declared types the function was lifted with
+    /// ([`SsaFunction::original_local_types`]) move with their locals, so each kept local keeps
+    /// its own declared type at its new index. Returns the old-to-new index map.
     fn optimize_locals(&mut self) -> Vec<Option<u16>>;
 
     /// Generates a `SignatureLocalVariables` from the function's locals.
@@ -117,7 +121,7 @@ impl SsaFunctionCilExt for SsaFunction<CilTarget> {
                 }
             }
         }
-        // Renumbering a local moves its rename group too. `rebuild_ssa` groups
+        // Renumbering a local moves its rename group too. Construction groups
         // variables by rename group but resolves argument/local representatives
         // by origin, so leaving the group pointing at the old slot silently
         // splits the value: the two views disagree about which names denote the
@@ -164,6 +168,22 @@ impl SsaFunctionCilExt for SsaFunction<CilTarget> {
                     }
                 }
             }
+        }
+
+        // The declared types follow their locals: the type at each new index is the type the
+        // local moved there was declared with. Locals construction allocated past the declared
+        // ones have no declared type; their indices are the highest, so they stay past the end.
+        let permuted: Option<Vec<SignatureLocalVariable>> =
+            self.original_local_types().map(|declared| {
+                remap
+                    .iter()
+                    .zip(declared)
+                    .filter(|(new, _)| new.is_some())
+                    .map(|(_, signature)| signature.clone())
+                    .collect()
+            });
+        if let Some(permuted) = permuted {
+            self.set_original_local_types(permuted);
         }
 
         let original = self.original_num_locals();
@@ -320,5 +340,54 @@ impl<T: Target> SsaFunctionSemanticsExt<T> for SsaFunction<T> {
 
     fn semantic_analyzer(&self) -> SemanticAnalyzer<'_, T> {
         SemanticAnalyzer::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{analysis::DefSite, metadata::signatures::TypeSignature};
+
+    /// A local declared as `base`.
+    fn declared(base: TypeSignature) -> SignatureLocalVariable {
+        SignatureLocalVariable {
+            modifiers: CustomModifiers::default(),
+            is_byref: false,
+            is_pinned: false,
+            base,
+        }
+    }
+
+    /// Dropping an unused local moves the ones after it down, and each keeps the type it was
+    /// declared with: the `float64` local 2 becomes local 1 and is still a `float64`, not the
+    /// `string` local 1 was declared as.
+    #[test]
+    fn compacted_locals_keep_their_declared_types() {
+        let mut ssa = SsaFunction::<CilTarget>::new(0, 3);
+        for local in [0, 2] {
+            ssa.create_variable(
+                VariableOrigin::Local(local),
+                0,
+                DefSite::entry(),
+                SsaType::Unknown,
+            );
+        }
+        ssa.set_original_local_types(vec![
+            declared(TypeSignature::I4),
+            declared(TypeSignature::String),
+            declared(TypeSignature::R8),
+        ]);
+
+        let remap = ssa.optimize_locals();
+
+        assert_eq!(remap, [Some(0), None, Some(1)]);
+        let types: Vec<_> = ssa
+            .generate_local_signature(None, None)
+            .unwrap()
+            .locals
+            .into_iter()
+            .map(|local| local.base)
+            .collect();
+        assert_eq!(types, [TypeSignature::I4, TypeSignature::R8]);
     }
 }

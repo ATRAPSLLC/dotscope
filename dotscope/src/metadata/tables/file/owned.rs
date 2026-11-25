@@ -24,6 +24,7 @@
 
 use crate::metadata::{
     customattributes::CustomAttributeValueList,
+    streams::SharedStr,
     tables::{AssemblyRefHash, FileAttributes},
     token::Token,
 };
@@ -103,7 +104,7 @@ pub struct File {
     /// The filename as it appears in the assembly manifest, resolved from
     /// the strings heap. This name is used to locate the file during
     /// assembly loading and verification.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Cryptographic hash value for integrity verification.
     ///

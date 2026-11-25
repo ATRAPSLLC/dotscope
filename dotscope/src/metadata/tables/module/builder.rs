@@ -399,7 +399,7 @@ fn generate_random_guid() -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::factories::table::assemblyref::get_test_assembly;
+    use crate::testkit::factories::table::assemblyref::get_test_assembly;
 
     #[test]
     fn test_module_builder_basic() -> Result<()> {

@@ -67,11 +67,7 @@ impl RowWritable for EventRaw {
         write_le_at_dyn(data, offset, self.name, sizes.is_large_str())?;
 
         // Write event_type coded index (2 or 4 bytes)
-        let encoded_index = sizes.encode_coded_index(
-            self.event_type.tag,
-            self.event_type.row,
-            CodedIndexType::TypeDefOrRef,
-        )?;
+        let encoded_index = self.event_type.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

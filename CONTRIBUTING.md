@@ -49,7 +49,7 @@ By participating in this project, you agree to abide by our Code of Conduct. We 
 
    ```bash
    cargo build
-   cargo test
+   cargo test-quick
    ```
 
 4. **Set up Pre-commit Hooks** (Optional but recommended)
@@ -138,20 +138,22 @@ git checkout -b fix/issue-number-description
 ```bash
 # Use the Makefile for comprehensive local testing
 make ci          # Run full CI suite locally
-make test        # Run all tests
+make test-quick  # Unit tests and the fast integration tests
+make test        # The full test tier: everything, packer suites and corpora included
+make test-oracle # The full tier, failing when dotnet, mono, ildasm or peverify is missing
 make fuzz        # Run fuzzing (requires nightly Rust)
 make coverage    # Generate coverage report
 make audit       # Security audit
 make check-all   # Full checks (format, clippy, tests, docs)
 
 # Or run individual commands:
-cargo test --all-features
+cargo test-full
 cargo clippy --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo doc --all-features --no-deps
 
-# For extended fuzzing (do this locally, not in CI):
-cd dotscope/fuzz && cargo +nightly fuzz run cilobject -- -max_total_time=1800  # 30 minutes
+# Fuzzing runs only locally, never in CI; for a longer run of one target:
+make fuzz FUZZ_TARGETS=cilobject FUZZ_TIME=1800  # 30 minutes
 ```
 
 ### 4. Submit Pull Request
@@ -173,23 +175,28 @@ cd dotscope/fuzz && cargo +nightly fuzz run cilobject -- -max_total_time=1800  #
 
 ### Test Types
 
-1. **Unit Tests**: Test individual functions and modules
+Tests run in the `ci-test` profile (release with debug assertions): unoptimised, the
+sample-driven tests take hours. The tiers are cargo aliases (`.cargo/config.toml`):
+
+- `cargo test-quick`: the unit tests, the integration tests outside a `full` module and the
+  fuzz regression replay.
+- `cargo test-full`: everything, including the packer suites, the runtime corpora, the codegen
+  validation sweep and lift verification.
+
+1. **Unit Tests**: Test individual functions and modules, in `#[cfg(test)]` modules
+
+2. **Integration Tests**: Test complete workflows, in one binary (`tests/it/main.rs`, one
+   module per suite). A slow suite goes under its `full` module.
 
    ```bash
-   cargo test
+   cargo test --profile ci-test --features z3 --test it -- ssa::
    ```
 
-2. **Integration Tests**: Test complete workflows
+3. **Fuzzing**: Test with random inputs, locally (CI replays the committed regressions only).
+   A fixed crash's input goes under `dotscope/tests/samples/fuzz-regressions/<target>/`
 
    ```bash
-   cargo test --test integration
-   ```
-
-3. **Fuzzing**: Test with random inputs
-
-   ```bash
-   cd dotscope/fuzz
-   cargo +nightly fuzz run cilobject
+   make fuzz FUZZ_TARGETS=cilobject
    ```
 
 4. **Benchmarks**: Performance tests
@@ -207,7 +214,8 @@ cd dotscope/fuzz && cargo +nightly fuzz run cilobject -- -max_total_time=1800  #
 
 ### Test Data
 
-- Use the sample files in `tests/samples/`
+- Use the sample files in `tests/samples/` through `dotscope::testkit::fixture`, and list new
+  ones in `tests/samples/MANIFEST.toml` (see `docs/testkit.md`)
 - Don't commit large binary files
 - Create minimal test cases for specific scenarios
 

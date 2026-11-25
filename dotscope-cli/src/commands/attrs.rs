@@ -142,7 +142,7 @@ fn resolve_owner(
         TableId::Assembly => {
             let name = assembly
                 .assembly()
-                .map_or_else(|| parent.token.to_string(), |a| a.name.clone());
+                .map_or_else(|| parent.token.to_string(), |a| a.name.to_string());
             ("assembly".to_string(), name)
         }
         TableId::Field => {
@@ -182,7 +182,7 @@ fn resolve_type_name(assembly: &CilObject, token: Token) -> String {
         let ns = &t.namespace;
         let name = &t.name;
         if ns.is_empty() {
-            name.clone()
+            name.to_string()
         } else {
             format!("{ns}.{name}")
         }
@@ -280,6 +280,7 @@ fn resolve_constructor_type(
                 return mr
                     .declaredby
                     .fullname()
+                    .map(|name| name.to_string())
                     .or_else(|| mr.declaredby.token().map(|t| t.to_string()))
                     .unwrap_or_else(|| "?".to_string());
             }
@@ -290,7 +291,7 @@ fn resolve_constructor_type(
             // Look up the method and get its declaring type
             if let Ok(method) = assembly.method(&constructor.token) {
                 if let Some(name) = method.declaring_type_fullname() {
-                    return name;
+                    return name.to_string();
                 }
             }
             constructor.token.to_string()
@@ -408,9 +409,11 @@ fn format_parsed_value(val: &CustomAttributeValue) -> (Vec<String>, Vec<String>)
 /// Format a single CustomAttributeArgument for display.
 fn format_arg(arg: &CustomAttributeArgument) -> String {
     match arg {
-        CustomAttributeArgument::Void => "void".to_string(),
         CustomAttributeArgument::Bool(b) => b.to_string(),
-        CustomAttributeArgument::Char(c) => format!("'{c}'"),
+        CustomAttributeArgument::Char(c) => match char::from_u32(u32::from(*c)) {
+            Some(c) => format!("'{c}'"),
+            None => format!("'\\u{c:04X}'"),
+        },
         CustomAttributeArgument::I1(v) => v.to_string(),
         CustomAttributeArgument::U1(v) => v.to_string(),
         CustomAttributeArgument::I2(v) => v.to_string(),
@@ -421,11 +424,12 @@ fn format_arg(arg: &CustomAttributeArgument) -> String {
         CustomAttributeArgument::U8(v) => v.to_string(),
         CustomAttributeArgument::R4(v) => v.to_string(),
         CustomAttributeArgument::R8(v) => v.to_string(),
-        CustomAttributeArgument::I(v) => v.to_string(),
-        CustomAttributeArgument::U(v) => v.to_string(),
-        CustomAttributeArgument::String(s) => format!("\"{s}\""),
-        CustomAttributeArgument::Type(t) => format!("typeof({t})"),
-        CustomAttributeArgument::Array(items) => {
+        CustomAttributeArgument::String(Some(s)) => format!("\"{s}\""),
+        CustomAttributeArgument::Type(Some(t)) => format!("typeof({t})"),
+        CustomAttributeArgument::String(None)
+        | CustomAttributeArgument::Type(None)
+        | CustomAttributeArgument::Array(_, None) => "null".to_string(),
+        CustomAttributeArgument::Array(_, Some(items)) => {
             let inner: Vec<String> = items.iter().map(format_arg).collect();
             format!("[{}]", inner.join(", "))
         }
@@ -434,6 +438,7 @@ fn format_arg(arg: &CustomAttributeArgument) -> String {
             let short = type_name.rsplit('.').next().unwrap_or(type_name);
             format!("{}({})", short, format_arg(value))
         }
+        CustomAttributeArgument::Boxed(value) => format_arg(value),
     }
 }
 

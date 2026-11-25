@@ -344,8 +344,7 @@ mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        prelude::*,
-        test::{
+        testkit::{
             factories::validation::raw_structure_table::*, get_testfile_wb, validator_test,
             TestAssembly,
         },
@@ -395,7 +394,6 @@ mod tests {
         validator_test(
             raw_table_validator_file_factory,
             "RawTableValidator",
-            "Parse",
             config,
             |context| validator.validate_raw(context),
         )
@@ -409,17 +407,14 @@ mod tests {
         let validator = RawTableValidator::new();
 
         fn clean_only_factory() -> Result<Vec<TestAssembly>> {
-            let Some(clean_testfile) = get_testfile_wb() else {
-                return Err(Error::Other("WindowsBase.dll not available".to_string()));
-            };
-            Ok(vec![TestAssembly::new(&clean_testfile, true)])
+            let clean_testfile = get_testfile_wb();
+            Ok(vec![TestAssembly::new(&clean_testfile)])
         }
 
         // Test disabled configuration
         let result_disabled = validator_test(
             clean_only_factory,
             "RawTableValidator",
-            "Parse",
             ValidationConfig {
                 enable_structural_validation: false,
                 ..Default::default()
@@ -442,7 +437,6 @@ mod tests {
         let result_enabled = validator_test(
             clean_only_factory,
             "RawTableValidator",
-            "Parse",
             ValidationConfig {
                 enable_structural_validation: true,
                 ..Default::default()

@@ -13,6 +13,7 @@ use crate::metadata::{
     customattributes::CustomAttributeValueList,
     marshalling::MarshallingInfo,
     signatures::SignatureField,
+    streams::SharedStr,
     tables::FieldAttributes,
     token::Token,
     typesystem::{CilPrimitive, CilTypeRef},
@@ -63,7 +64,7 @@ pub struct Field {
     ///
     /// A string from the String heap containing the field's identifier name.
     /// This name is used for field resolution and debugging information.
-    pub name: String,
+    pub name: SharedStr,
 
     /// The field's type signature.
     ///

@@ -26,7 +26,7 @@
 use crate::{
     compiler::EventLog,
     deobfuscation::techniques::{
-        Detection, Detections, Evidence, Technique, TechniqueCategory, WorkingAssembly,
+        Detection, Evidence, Technique, TechniqueCapability, TechniqueCategory, WorkingAssembly,
     },
     file::repair::RepairAction,
     CilObject, Result,
@@ -49,6 +49,10 @@ impl Technique for BitMonoPeRepair {
 
     fn category(&self) -> TechniqueCategory {
         TechniqueCategory::Protection
+    }
+
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![TechniqueCapability::ByteTransform]
     }
 
     fn detect(&self, assembly: &CilObject) -> Detection {
@@ -105,8 +109,7 @@ impl Technique for BitMonoPeRepair {
     fn byte_transform(
         &self,
         _assembly: &mut WorkingAssembly,
-        _detection: &Detection,
-        _detections: &Detections,
+        _detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         // PE repairs are applied during loading — no transform needed.
         Some(Ok(EventLog::new()))
@@ -117,13 +120,12 @@ impl Technique for BitMonoPeRepair {
 mod tests {
     use crate::{
         deobfuscation::techniques::{bitmono::BitMonoPeRepair, Technique},
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly =
-            load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_bitdecompiler.exe");
+        let assembly = load_sample("packers/bitmono/0.39.0/bitmono_bitdecompiler.exe");
 
         let technique = BitMonoPeRepair;
         let detection = technique.detect(&assembly);
@@ -140,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = BitMonoPeRepair;
         let detection = technique.detect(&assembly);

@@ -109,7 +109,7 @@ impl ProcessCell {
 
     /// Returns whether initialization has been performed.
     ///
-    /// This only checks the flag — it does not acquire any lock.
+    /// This only checks the flag - it does not acquire any lock.
     #[must_use]
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)

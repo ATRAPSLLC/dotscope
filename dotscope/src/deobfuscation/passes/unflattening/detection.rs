@@ -32,7 +32,10 @@ use analyssa::{
 use rayon::prelude::*;
 
 use crate::{
-    analysis::{ControlFlow, SsaCfg, SsaEvaluator, SsaFunction, SsaOp, SsaVarId, VariableOrigin},
+    analysis::{
+        ControlFlow, SsaCfg, SsaEvaluator, SsaFunction, SsaInstruction, SsaOp, SsaVarId,
+        VariableOrigin,
+    },
     deobfuscation::passes::unflattening::{
         dispatcher::{analyze_switch_dispatcher, Dispatcher, DispatcherInfo},
         statevar::{identify_state_variable, StateVariable},
@@ -288,16 +291,33 @@ impl<'a> CffDetector<'a> {
     /// The caller is responsible for filtering by confidence threshold.
     pub fn detect_all_dispatchers(&mut self) -> Vec<Dispatcher> {
         let patterns = self.detect_all();
+        let ssa = self.ssa;
         patterns
             .iter()
             .filter_map(Self::pattern_to_dispatcher)
+            .map(|dispatcher| {
+                // Record which instruction the switch is while the indices
+                // still mean something. The pass that consumes this runs after
+                // the blocks have been renumbered more than once, and only an
+                // identity survives that - see `Dispatcher::refresh`.
+                match ssa.block(dispatcher.block).and_then(|block| {
+                    block
+                        .instructions()
+                        .iter()
+                        .find(|instr| matches!(instr.op(), SsaOp::Switch { .. }))
+                        .and_then(SsaInstruction::id)
+                }) {
+                    Some(id) => dispatcher.with_switch_instr(id),
+                    None => dispatcher,
+                }
+            })
             .collect()
     }
 
     /// Detects all CFF patterns in the function.
     ///
     /// Returns all `CffPattern`s found, sorted by confidence (highest first).
-    /// Candidate analysis is parallelized — each candidate is scored
+    /// Candidate analysis is parallelized - each candidate is scored
     /// independently against a shared (pre-computed) dominator tree.
     fn detect_all(&mut self) -> Vec<CffPattern> {
         if self.ssa.block_count() < 4 {
@@ -505,7 +525,7 @@ impl<'a> CffDetector<'a> {
             .any(|instr| matches!(instr.op(), SsaOp::Switch { .. }));
 
         if has_switch {
-            // Reject switches on method arguments — they are user switches
+            // Reject switches on method arguments - they are user switches
             // (e.g., switch on a parameter in DemoSwitch), not CFF dispatchers.
             // Arguments are immutable and cannot be CFF state variables.
             //
@@ -800,7 +820,7 @@ impl<'a> CffDetector<'a> {
     /// opaque predicate branches merge at the entry block, creating PHIs with
     /// one real operand and one dead/undefined operand).
     fn trace_to_constant(&self, var: SsaVarId, max_depth: usize) -> Option<i64> {
-        // Iterative DFS with explicit worklist — a recursive version with no
+        // Iterative DFS with explicit worklist - a recursive version with no
         // visited set made NR's 667-case dispatcher hang by exploring O(N^depth)
         // paths. Here every SSA var is visited at most once, and the stack depth
         // is bounded by the worklist size, not by program call depth.
@@ -834,16 +854,16 @@ impl<'a> CffDetector<'a> {
                 continue;
             };
             let def_site = variable.def_site();
-            if def_site.instruction.is_some() {
-                continue; // instruction-defined but not found — stale
+            if def_site.index().is_some() {
+                continue; // instruction-defined but not found - stale
             }
-            let Some(block) = self.ssa.block(def_site.block) else {
+            let Some(block) = self.ssa.block(def_site.block()) else {
                 continue;
             };
             for phi in block.phi_nodes() {
                 if phi.result() == v {
                     // Push operands in reverse so pops happen in original order
-                    // — matches the recursive "return first constant" semantics.
+                    // - matches the recursive "return first constant" semantics.
                     for op in phi.operands().iter().rev() {
                         stack.push((op.value(), depth.saturating_sub(1)));
                     }
@@ -866,7 +886,7 @@ impl<'a> CffDetector<'a> {
         dispatcher_block: usize,
         dispatcher_var: SsaVarId,
     ) -> Option<i64> {
-        let mut evaluator = SsaEvaluator::new(self.ssa, self.config.pointer_size);
+        let mut evaluator = SsaEvaluator::new(self.ssa, self.config.machine);
         let mut current = 0usize;
         let mut visited = BitSet::new(self.ssa.block_count());
 
@@ -1076,7 +1096,7 @@ impl<'a> CffDetector<'a> {
         let dominance_ratio = dominated_count as f64 / case_blocks.count().max(1) as f64;
         score += dominance_ratio * w.dominance_ratio;
 
-        // Signal 9: Method coverage — fraction of ALL blocks dominated by this candidate.
+        // Signal 9: Method coverage - fraction of ALL blocks dominated by this candidate.
         // A real CFF dispatcher dominates most of the function (it controls nearly all
         // execution paths). A nested loop only dominates a small subset.
         let total_blocks = ssa.block_count();

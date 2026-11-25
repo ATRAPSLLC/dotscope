@@ -1,14 +1,11 @@
 //! Technique registry for managing available deobfuscation techniques.
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Mutex,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::deobfuscation::techniques::{
     bitmono::{
-        BitMonoAntiDebug, BitMonoCalli, BitMonoHooks, BitMonoJunk, BitMonoNops, BitMonoPeRepair,
-        BitMonoRenamer, BitMonoStrings, BitMonoUnmanaged,
+        BitMonoAntiDebug, BitMonoCalli, BitMonoHooks, BitMonoJunk, BitMonoLocals, BitMonoNops,
+        BitMonoPeRepair, BitMonoRenamer, BitMonoStrings, BitMonoTokens, BitMonoUnmanaged,
     },
     confuserex::{
         ConfuserExAntiDebug, ConfuserExAntiDump, ConfuserExAntiTamper, ConfuserExConstants,
@@ -24,8 +21,8 @@ use crate::deobfuscation::techniques::{
         JiejieNetArrays, JiejieNetConstants, JiejieNetResources, JiejieNetStrings, JiejieNetTypeOf,
     },
     netreactor::{
-        NetReactorAntiTamp, NetReactorAntiTrial, NetReactorLicenseCheck, NetReactorNecroBit,
-        NetReactorPrivateImpl, NetReactorResources,
+        NetReactorAntiTamp, NetReactorAntiTrial, NetReactorEmptyResource, NetReactorLicenseCheck,
+        NetReactorNecroBit, NetReactorPrivateImpl, NetReactorResources,
     },
     obfuscar::ObfuscarStrings,
     AttributionResult, Detections, Technique,
@@ -57,9 +54,6 @@ pub struct ObfuscatorSignature {
 /// handled by the separate [`ObfuscatorMatcher`].
 pub struct TechniqueRegistry {
     techniques: Vec<Box<dyn Technique>>,
-    /// Cache for `sorted_techniques()`: `(detection_generation, sorted_indices)`.
-    /// Invalidated when the detection generation counter changes.
-    sorted_cache: Mutex<(u64, Vec<usize>)>,
 }
 
 impl TechniqueRegistry {
@@ -68,25 +62,27 @@ impl TechniqueRegistry {
     pub fn new() -> Self {
         Self {
             techniques: Vec::new(),
-            sorted_cache: Mutex::new((u64::MAX, Vec::new())),
         }
     }
 
     /// Creates a registry pre-populated with all built-in techniques.
     ///
-    /// # Byte-capable techniques (12)
+    /// # Byte-capable techniques
     ///
     /// Generic:     metadata, ildasm, handlers, decompiler
     /// ConfuserEx:  marker, metadata, tamper, resources, natives
-    /// BitMono:     pe, hooks, junk
+    /// BitMono:     pe, tokens, hooks, junk
+    /// JIEJIE.NET:  arrays, resources
+    /// .NET Reactor: necrobit, resources
     ///
-    /// # SSA-capable techniques (17+5)
+    /// # SSA-capable techniques
     ///
     /// Generic:     flattening, strings, constants, debug, dump, opaquefields, delegates
     /// ConfuserEx:  constants, debug, dump
-    /// BitMono:     calli, strings, unmanaged, debug, nops, renamer
+    /// BitMono:     strings, unmanaged, debug, nops, renamer, locals
     /// JIEJIE.NET:  constants, strings, typeof, arrays, resources
     /// Obfuscar:    strings
+    /// .NET Reactor: antitamp, resources
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::with_config(50_000)
@@ -98,7 +94,7 @@ impl TechniqueRegistry {
     pub fn with_config(nop_threshold: usize) -> Self {
         let mut registry = Self::new();
 
-        // === Generic techniques ===
+        // Generic techniques
         registry.register(Box::new(GenericMetadata));
         registry.register(Box::new(GenericIldasm));
         registry.register(Box::new(GenericHandlers));
@@ -111,7 +107,7 @@ impl TechniqueRegistry {
         registry.register(Box::new(GenericOpaquePredicates));
         registry.register(Box::new(GenericDelegateProxy));
 
-        // === ConfuserEx techniques ===
+        // ConfuserEx techniques
         registry.register(Box::new(ConfuserExMarker));
         registry.register(Box::new(ConfuserExMetadata));
         registry.register(Box::new(ConfuserExAntiTamper));
@@ -122,10 +118,12 @@ impl TechniqueRegistry {
         registry.register(Box::new(ConfuserExAntiDebug));
         registry.register(Box::new(ConfuserExAntiDump));
 
-        // === BitMono techniques ===
+        // BitMono techniques
         registry.register(Box::new(BitMonoPeRepair));
+        registry.register(Box::new(BitMonoTokens));
         registry.register(Box::new(BitMonoHooks));
         registry.register(Box::new(BitMonoJunk));
+        registry.register(Box::new(BitMonoLocals));
         registry.register(Box::new(BitMonoCalli));
         registry.register(Box::new(BitMonoStrings));
         registry.register(Box::new(BitMonoUnmanaged));
@@ -133,21 +131,22 @@ impl TechniqueRegistry {
         registry.register(Box::new(BitMonoNops::new(nop_threshold)));
         registry.register(Box::new(BitMonoRenamer));
 
-        // === JIEJIE.NET techniques ===
+        // JIEJIE.NET techniques
         registry.register(Box::new(JiejieNetConstants));
         registry.register(Box::new(JiejieNetStrings));
         registry.register(Box::new(JiejieNetTypeOf));
         registry.register(Box::new(JiejieNetArrays));
         registry.register(Box::new(JiejieNetResources));
 
-        // === Obfuscar techniques ===
+        // Obfuscar techniques
         registry.register(Box::new(ObfuscarStrings));
 
-        // === .NET Reactor techniques ===
+        // .NET Reactor techniques
         registry.register(Box::new(NetReactorNecroBit));
         registry.register(Box::new(NetReactorAntiTrial));
         registry.register(Box::new(NetReactorAntiTamp));
         registry.register(Box::new(NetReactorLicenseCheck));
+        registry.register(Box::new(NetReactorEmptyResource));
         registry.register(Box::new(NetReactorPrivateImpl));
         registry.register(Box::new(NetReactorResources));
 
@@ -198,31 +197,13 @@ impl TechniqueRegistry {
     /// An ordered vec of technique references ready for sequential execution.
     #[must_use]
     pub fn sorted_techniques(&self, detections: &Detections) -> Vec<&dyn Technique> {
-        let gen = detections.generation();
-
-        // Check cache: if the detection generation hasn't changed, reuse indices.
-        if let Ok(cache) = self.sorted_cache.lock() {
-            if cache.0 == gen {
-                return cache
-                    .1
-                    .iter()
-                    .filter_map(|&i| self.techniques.get(i).map(|t| &**t))
-                    .collect();
-            }
-        }
-
-        // Cache miss — recompute.
-        let sorted_indices = self.compute_sorted_indices(detections);
-        let result: Vec<&dyn Technique> = sorted_indices
+        // Computed per call: a few dozen techniques sort in microseconds, and a cache keyed
+        // by the detections' generation answered one run with another's order, since every
+        // run's detections count generations from zero on a registry the runs share.
+        self.compute_sorted_indices(detections)
             .iter()
             .filter_map(|&i| self.techniques.get(i).map(|t| &**t))
-            .collect();
-
-        if let Ok(mut cache) = self.sorted_cache.lock() {
-            *cache = (gen, sorted_indices);
-        }
-
-        result
+            .collect()
     }
 
     /// Computes sorted technique indices via topological sort (Kahn's algorithm).
@@ -376,6 +357,7 @@ impl ObfuscatorMatcher {
                 "bitmono.nops",
                 "bitmono.unmanaged",
                 "bitmono.pe",
+                "bitmono.locals",
             ],
         });
 
@@ -391,6 +373,7 @@ impl ObfuscatorMatcher {
             "bitmono.junk",
             "bitmono.nops",
             "bitmono.pe",
+            "bitmono.locals",
         ];
         for sig in single_technique_signatures("BitMono", bitmono_ids, &[]) {
             matcher.add_signature(sig);
@@ -579,10 +562,33 @@ fn single_technique_signatures(
 
 #[cfg(test)]
 mod tests {
-    use crate::deobfuscation::techniques::{
-        Detection, Detections, ObfuscatorMatcher, ObfuscatorSignature, Technique,
-        TechniqueCategory, TechniqueRegistry,
+    use crate::{
+        deobfuscation::techniques::{
+            Detection, Detections, ObfuscatorMatcher, ObfuscatorSignature, Technique,
+            TechniqueCapability, TechniqueCategory, TechniqueRegistry, WorkingAssembly,
+        },
+        testkit::helpers::load_sample,
     };
+
+    #[test]
+    fn a_technique_declares_byte_transform_exactly_when_it_has_one() {
+        // Cleanup withholds what a failed or never-run byte transform's technique would remove,
+        // and the pipeline reruns for a pending one, both by the declared capability; the
+        // declaration must be the transform's. Every byte transform answers an empty detection,
+        // with an empty event log; a technique without one answers nothing.
+        let registry = TechniqueRegistry::with_defaults();
+        for technique in registry.techniques() {
+            let mut assembly =
+                WorkingAssembly::new(load_sample("packers/confuserex/1.6.0/original.exe"));
+            let has_transform = technique
+                .byte_transform(&mut assembly, &mut Detection::new_empty())
+                .is_some();
+            let declares = technique
+                .capabilities()
+                .contains(&TechniqueCapability::ByteTransform);
+            assert_eq!(has_transform, declares, "{}", technique.id());
+        }
+    }
 
     /// Minimal mock technique for registry tests.
     struct MockTechnique {
@@ -638,7 +644,7 @@ mod tests {
         }
     }
 
-    // === TechniqueRegistry tests ===
+    // TechniqueRegistry tests
 
     #[test]
     fn test_registry_new_is_empty() {
@@ -733,6 +739,36 @@ mod tests {
         assert!(ids.contains(&"new"));
     }
 
+    /// Two runs on one registry each count their detections' generations from zero: the
+    /// order one run's detections give is not the other's. A cache keyed by the generation
+    /// alone answered the second run with the first's, leaving out a technique only the first
+    /// run had superseded.
+    #[test]
+    fn runs_sharing_a_registry_get_their_own_order() {
+        let mut r = TechniqueRegistry::new();
+        r.register(Box::new(MockTechnique::new("old")));
+        r.register(Box::new(MockTechnique::with_supersedes("new", &["old"])));
+
+        // One insert each: the same generation
+        let mut first = Detections::new();
+        first.insert("new", Detection::new_detected(vec![], None));
+        let mut second = Detections::new();
+        second.insert("old", Detection::new_detected(vec![], None));
+        assert_eq!(first.generation(), second.generation());
+
+        let first_ids: Vec<&str> = r.sorted_techniques(&first).iter().map(|t| t.id()).collect();
+        let second_ids: Vec<&str> = r
+            .sorted_techniques(&second)
+            .iter()
+            .map(|t| t.id())
+            .collect();
+        assert!(!first_ids.contains(&"old"), "superseded in the first run");
+        assert!(
+            second_ids.contains(&"old"),
+            "nothing supersedes it in the second"
+        );
+    }
+
     #[test]
     fn test_sorted_techniques_supersedes_not_detected() {
         let mut r = TechniqueRegistry::new();
@@ -754,7 +790,7 @@ mod tests {
         assert!(r.techniques().len() >= 30);
     }
 
-    // === ObfuscatorMatcher tests ===
+    // ObfuscatorMatcher tests
 
     #[test]
     fn test_compute_attribution_no_match() {

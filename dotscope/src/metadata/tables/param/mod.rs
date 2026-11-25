@@ -22,7 +22,7 @@
 //!
 //! - [`ParamRaw`] - Raw table data with unresolved indexes for initial parsing
 //! - [`Param`] - Processed data with resolved parameter names
-//! - [`ParamLoader`] - Handles conversion between raw and processed representations
+//! - [`ParamLoader`](crate::metadata::loader::tables::ParamLoader) - Handles conversion between raw and processed representations
 //! - [`ParamMap`] - Thread-safe storage mapping tokens to processed entries
 //! - [`ParamList`] - Thread-safe collection for sequential access
 //!
@@ -64,17 +64,15 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::metadata::token::Token;
+use crate::{metadata::token::Token, utils::LazyList};
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 
@@ -84,11 +82,9 @@ pub use raw::*;
 /// by their metadata token. Used for resolving parameter information during method processing.
 pub type ParamMap = SkipMap<Token, ParamRc>;
 
-/// Thread-safe vector holding a list of [`Param`] entries.
-///
-/// Uses a lock-free vector implementation for efficient concurrent access.
-/// Provides sequential access to Param entries for iteration and batch processing.
-pub type ParamList = Arc<boxcar::Vec<ParamRc>>;
+/// Thread-safe list of [`Param`] entries, allocated on its first push: many methods have no
+/// Param rows.
+pub type ParamList = LazyList<ParamRc>;
 
 /// Reference-counted pointer to a [`Param`] entry.
 ///

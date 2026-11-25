@@ -37,6 +37,10 @@ use crate::{
 };
 
 impl RowWritable for GenericParamConstraintRaw {
+    fn sort_key(&self, _sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.owner, 0)))
+    }
+
     /// Serialize a GenericParamConstraint table row to binary format
     ///
     /// Writes the row data according to ECMA-335 §II.22.21 specification:
@@ -67,11 +71,7 @@ impl RowWritable for GenericParamConstraintRaw {
         )?;
 
         // Write TypeDefOrRef coded index for constraint
-        let constraint_value = sizes.encode_coded_index(
-            self.constraint.tag,
-            self.constraint.row,
-            CodedIndexType::TypeDefOrRef,
-        )?;
+        let constraint_value = self.constraint.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

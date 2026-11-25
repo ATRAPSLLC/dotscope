@@ -20,7 +20,7 @@
 //!
 //! - [`LocalScopeRaw`] - Raw table structure with unresolved indices
 //! - [`LocalScope`] - Owned variant with resolved references and scope information
-//! - [`LocalScopeLoader`] - Internal loader for processing `LocalScope` table data
+//! - [`LocalScopeLoader`](crate::metadata::loader::tables::LocalScopeLoader) - Internal loader for processing `LocalScope` table data
 //! - [`LocalScopeMap`] - Thread-safe concurrent map for caching scope entries
 //! - [`LocalScopeList`] - Thread-safe append-only vector for scope collections
 //! - [`LocalScopeRc`] - Reference-counted pointer for shared ownership
@@ -37,29 +37,35 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! # use dotscope::metadata::loader::LoaderContext;
-//! # fn example(context: &LoaderContext) -> dotscope::Result<()> {
-//! // Access local scopes through the loader context
-//! let local_scopes = &context.local_scopes;
+//! ```no_run
+//! use dotscope::{
+//!     metadata::tables::{LocalScopeBuilder, LocalScopeRaw},
+//!     CilAssembly, CilAssemblyView,
+//! };
 //!
-//! // Get a specific scope by RID
-//! if let Some(scope) = local_scopes.get(&1) {
-//!     // Check scope boundaries
-//!     println!("Scope starts at IL offset: {}", scope.start_offset);
-//!     println!("Scope length: {} bytes", scope.length);
-//!     println!("Scope ends at IL offset: {}", scope.end_offset());
+//! // A scope covering IL offsets 0x10..0x30 of the first method
+//! let mut assembly = CilAssembly::from_path("app.dll")?;
+//! LocalScopeBuilder::new()
+//!     .method(1)
+//!     .import_scope(0)
+//!     .variable_list(1)
+//!     .constant_list(1)
+//!     .start_offset(0x10)
+//!     .length(0x20)
+//!     .build(&mut assembly)?;
 //!
-//!     // Check scope contents
-//!     if scope.has_variables() {
-//!         println!("Scope contains variables starting at index: {}", scope.variable_list);
-//!     }
-//!     if scope.has_constants() {
-//!         println!("Scope contains constants starting at index: {}", scope.constant_list);
+//! let view = CilAssemblyView::from_mem(assembly.to_memory()?)?;
+//! if let Some(scopes) = view.tables().and_then(|t| t.table::<LocalScopeRaw>()) {
+//!     for scope in scopes.iter().filter_map(Result::ok) {
+//!         println!(
+//!             "method {}: IL {:#x}..{:#x}",
+//!             scope.method,
+//!             scope.start_offset,
+//!             scope.start_offset + scope.length
+//!         );
 //!     }
 //! }
-//! # Ok(())
-//! # }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Thread Safety
@@ -79,14 +85,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

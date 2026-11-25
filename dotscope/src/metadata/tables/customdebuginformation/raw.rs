@@ -133,8 +133,8 @@ impl CustomDebugInformationRaw {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use dotscope::metadata::tables::{CustomDebugInformationRaw, CodedIndex};
+    /// ```no_run
+    /// use dotscope::metadata::tables::{CodedIndex, CodedIndexType, CustomDebugInformationRaw};
     /// use dotscope::metadata::token::Token;
     /// use dotscope::metadata::typesystem::CilTypeReference;
     /// use dotscope::metadata::streams::{Guid, Blob};
@@ -149,7 +149,11 @@ impl CustomDebugInformationRaw {
     ///     rid: 1,
     ///     token: Token::new(0x37000001),
     ///     offset: 0,
-    ///     parent: CodedIndex { tag: dotscope::metadata::tables::TableId::MethodDef, row: 6, token: Token::new(0x06000006) },  // HasCustomDebugInformation coded index
+    ///     parent: CodedIndex::new(
+    ///         dotscope::metadata::tables::TableId::MethodDef,
+    ///         6,
+    ///         CodedIndexType::HasCustomDebugInformation,
+    ///     ),
     ///     kind: 1,        // GUID heap index pointing to Source Link GUID
     ///     value: 10,      // Blob heap index pointing to JSON data
     /// };
@@ -158,6 +162,7 @@ impl CustomDebugInformationRaw {
     /// // The value field now contains parsed CustomDebugInfo::SourceLink with structured JSON
     /// # Ok(())
     /// # }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     ///
     /// # Errors
@@ -178,7 +183,7 @@ impl CustomDebugInformationRaw {
         let parent_ref = get_ref(&self.parent);
         let kind_guid = guid_heap.get(self.kind as usize)?;
         let value_data = blob_heap.get(self.value as usize)?;
-        let debug_kind = CustomDebugKind::from_guid(kind_guid.to_bytes());
+        let debug_kind = CustomDebugKind::from_guid(kind_guid);
         let parsed_value = parse_custom_debug_blob(value_data, debug_kind)?;
 
         Ok(Arc::new(CustomDebugInformation {
@@ -186,6 +191,7 @@ impl CustomDebugInformationRaw {
             token: self.token,
             offset: self.offset,
             parent: parent_ref,
+            parent_token: self.parent.token,
             kind: kind_guid,
             value: parsed_value,
         }))

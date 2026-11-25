@@ -34,7 +34,7 @@
 //!
 //! ## Variable Types
 //! - [`crate::metadata::method::LocalVariable`] - Resolved local variable with type information
-//! - [`crate::metadata::method::VarArg`] - Variable argument parameter with type information
+//! - [`SignatureMethod::varargs`](crate::metadata::signatures::SignatureMethod::varargs) - Variable argument parameters with type information
 //!
 //! # Usage Patterns
 //!
@@ -88,7 +88,7 @@
 //!
 //! ## Variable Analysis
 //!
-//! ```rust,ignore
+//! ```
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -100,20 +100,12 @@
 //!     // Analyze local variables
 //!     if !method.local_vars.is_empty() {
 //!         println!("Method '{}' has {} local variables:", method.name, method.local_vars.len());
-//!         for (i, local) in method.local_vars.iter().enumerate() {
-//!             println!("  [{}] {} (by_ref: {}, pinned: {})",
+//!         for (i, local) in method.local_vars.iter() {
+//!             println!("  [{}] {:?} (by_ref: {}, pinned: {})",
 //!                      i, local.base.name(), local.is_byref, local.is_pinned);
 //!         }
 //!     }
-//!
-//!     // Analyze varargs
-//!     if !method.varargs.is_empty() {
-//!         println!("Method '{}' has {} varargs:", method.name, method.varargs.len());
-//!         for (i, vararg) in method.varargs.iter().enumerate() {
-//!             println!("  VarArg[{}] {} (by_ref: {})",
-//!                      i, vararg.base.name(), vararg.by_ref);
-//!         }
-//!     }
+
 //! }
 //! # Ok::<(), dotscope::Error>(())
 //! ```
@@ -137,7 +129,7 @@
 //!
 //! All components in this module are designed for safe concurrent access:
 //! - **Flag Types**: All bitflag types are [`std::marker::Copy`] and immutable, making them inherently thread-safe
-//! - **Variable Types**: [`crate::metadata::method::LocalVariable`] and [`crate::metadata::method::VarArg`] use [`std::sync::Arc`]-based reference counting for safe sharing
+//! - **Variable Types**: [`crate::metadata::method::LocalVariable`] and [`SignatureParameter`](crate::metadata::signatures::SignatureParameter) use [`std::sync::Arc`]-based reference counting for safe sharing
 //! - **Constants**: All mask constants are immutable and safe for concurrent access
 //! - **Extraction Methods**: All flag extraction methods are pure functions without shared state
 //!
@@ -151,7 +143,7 @@
 
 use crate::metadata::{
     signatures::{CustomModifier, SignatureLocalVariable, TypeSignature},
-    typesystem::{CilFlavor, CilModifier, CilTypeRef, CilTypeRefList},
+    typesystem::{CilFlavor, CilModifier, CilTypeRef},
 };
 
 /// Bitmask for extracting code type from [`crate::metadata::method::MethodImplCodeType`] implementation flags.
@@ -181,14 +173,17 @@ pub const METHOD_VTABLE_LAYOUT_MASK: u32 = 0x0100;
 // Method implementation flags split into logical groups
 
 metadata_flags! {
-    /// Method implementation code type flags as defined in ECMA-335 II.23.1.10.
+    /// Method implementation code type as defined in ECMA-335 II.23.1.11.
     ///
-    /// These flags specify how a method is implemented and where its code originates.
-    /// The flags are mutually exclusive - each method has exactly one implementation type.
+    /// The code type specifies how a method is implemented and where its code originates.
+    /// It is a two-bit enumeration, not a set of flags: each method has exactly one code
+    /// type, and its values share bits (`RUNTIME` is `NATIVE | OPTIL`, `IL` is zero), so it
+    /// is compared with `==`. `contains(IL)` holds for every method and `contains(NATIVE)`
+    /// for a runtime-implemented one.
     ///
     /// # ECMA-335 Reference
     ///
-    /// From Partition II, Section 23.1.10 (MethodImplAttributes):
+    /// From Partition II, Section 23.1.11 (MethodImplAttributes):
     /// > The CodeTypeMask sub-field of the Flags field in the MethodImpl table can hold any
     /// > of the values specified in the enumeration below. These values indicate the kind
     /// > of implementation the method has.
@@ -201,7 +196,7 @@ metadata_flags! {
     /// // Extract from raw implementation flags
     /// let raw_flags = 0x0001; // Native implementation
     /// let code_type = MethodImplCodeType::from_impl_flags(raw_flags);
-    /// assert!(code_type.contains(MethodImplCodeType::NATIVE));
+    /// assert!(code_type == MethodImplCodeType::NATIVE);
     /// ```
     pub struct MethodImplCodeType(u32);
 }
@@ -258,9 +253,9 @@ impl MethodImplCodeType {
     /// ```rust,no_run
     /// use dotscope::metadata::method::MethodImplCodeType;
     ///
-    /// let raw_flags = 0x1001; // RUNTIME + some other flags
+    /// let raw_flags = 0x1003; // RUNTIME, and INTERNAL_CALL outside the code type
     /// let code_type = MethodImplCodeType::from_impl_flags(raw_flags);
-    /// assert!(code_type.contains(MethodImplCodeType::RUNTIME));
+    /// assert!(code_type == MethodImplCodeType::RUNTIME);
     /// ```
     #[must_use]
     pub fn from_impl_flags(flags: u32) -> Self {
@@ -270,7 +265,7 @@ impl MethodImplCodeType {
 }
 
 metadata_flags! {
-    /// Method implementation management flags as defined in ECMA-335 II.23.1.10.
+    /// Method implementation management flags as defined in ECMA-335 II.23.1.11.
     ///
     /// These flags determine whether a method executes in the managed or unmanaged
     /// execution environment. Most .NET methods are managed, but some special methods
@@ -338,7 +333,7 @@ impl MethodImplManagement {
 }
 
 metadata_flags! {
-    /// Method implementation additional options as defined in ECMA-335 II.23.1.10.
+    /// Method implementation additional options as defined in ECMA-335 II.23.1.11.
     ///
     /// These flags provide additional control over method implementation behavior,
     /// covering aspects like inlining, synchronization, P/Invoke semantics, and
@@ -417,7 +412,8 @@ impl MethodImplOptions {
     /// Maximum valid value for method implementation attributes.
     ///
     /// This constant defines the upper bound for valid MethodImplAttributes
-    /// values and can be used for validation and range checking.
+    /// values and can be used for validation and range checking. It is a range, not a
+    /// flag: no method's options contain it.
     pub const MAX_METHOD_IMPL_VAL: Self = Self(0xFFFF);
 }
 
@@ -586,18 +582,18 @@ impl MethodAccessFlags {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use dotscope::metadata::method::MethodAccessFlags;
     ///
     /// // Public method
     /// let public_flags = 0x0006;
     /// let access = MethodAccessFlags::from_method_flags(public_flags);
-    /// assert!(access.contains(MethodAccessFlags::PUBLIC));
+    /// assert_eq!(access, MethodAccessFlags::PUBLIC);
     ///
     /// // Private method with other flags
     /// let private_flags = 0x0091; // PRIVATE + other flags
     /// let access = MethodAccessFlags::from_method_flags(private_flags);
-    /// assert!(access.contains(MethodAccessFlags::PRIVATE));
+    /// assert_eq!(access, MethodAccessFlags::PRIVATE);
     /// ```
     #[must_use]
     pub fn from_method_flags(flags: u32) -> Self {
@@ -628,7 +624,7 @@ impl MethodAccessFlags {
     /// This is the ergonomic counterpart to matching against the
     /// `COMPILER_CONTROLLED`/`PRIVATE`/…/`PUBLIC` constants. Downstream code that
     /// only needs to distinguish access levels (without preserving the raw bit
-    /// pattern) should prefer this accessor — pattern matching on the returned
+    /// pattern) should prefer this accessor - pattern matching on the returned
     /// [`MethodAccessLevel`] is exhaustive and cannot silently miss a variant.
     ///
     /// Unrecognized bit patterns (which should not appear in valid metadata)
@@ -657,7 +653,7 @@ impl MethodAccessFlags {
             0x0004 => MethodAccessLevel::Family,
             0x0005 => MethodAccessLevel::FamilyOrAssembly,
             0x0006 => MethodAccessLevel::Public,
-            // 0x0000 and any unrecognized value — keep the most restrictive interpretation.
+            // 0x0000 and any unrecognized value - keep the most restrictive interpretation.
             _ => MethodAccessLevel::CompilerControlled,
         }
     }
@@ -666,7 +662,7 @@ impl MethodAccessFlags {
 /// Discrete method accessibility level per ECMA-335 §II.23.1.10.
 ///
 /// Returned by [`MethodAccessFlags::access_level`]. The seven variants are
-/// fixed by the standard and are mutually exclusive — exactly one applies to
+/// fixed by the standard and are mutually exclusive - exactly one applies to
 /// any given method.
 ///
 /// The hierarchy from most restrictive to least restrictive is:
@@ -690,17 +686,17 @@ pub enum MethodAccessLevel {
     CompilerControlled,
     /// Accessible only by the parent type (ECMA-335 value `0x0001`).
     Private,
-    /// Accessible by sub-types only within this assembly — C# `private protected`
+    /// Accessible by sub-types only within this assembly - C# `private protected`
     /// (ECMA-335 value `0x0002`).
     FamilyAndAssembly,
-    /// Accessible by anyone in the assembly — C# `internal` (ECMA-335 value `0x0003`).
+    /// Accessible by anyone in the assembly - C# `internal` (ECMA-335 value `0x0003`).
     Assembly,
-    /// Accessible by type and sub-types — C# `protected` (ECMA-335 value `0x0004`).
+    /// Accessible by type and sub-types - C# `protected` (ECMA-335 value `0x0004`).
     Family,
-    /// Accessible by sub-types anywhere, plus anyone in the assembly — C# `protected internal`
+    /// Accessible by sub-types anywhere, plus anyone in the assembly - C# `protected internal`
     /// (ECMA-335 value `0x0005`).
     FamilyOrAssembly,
-    /// Accessible by anyone with visibility to the declaring scope — C# `public`
+    /// Accessible by anyone with visibility to the declaring scope - C# `public`
     /// (ECMA-335 value `0x0006`).
     Public,
 }
@@ -865,7 +861,7 @@ mod tests {
         );
         assert_eq!(MethodAccessLevel::Public.as_str(), "public");
 
-        // Display delegates to as_str — verify by formatting one variant.
+        // Display delegates to as_str - verify by formatting one variant.
         assert_eq!(format!("{}", MethodAccessLevel::Public), "public");
 
         // Strings must match MethodAccessFlags's Display so visus and other
@@ -903,7 +899,7 @@ metadata_flags! {
     /// // Extract from raw method attributes
     /// let override_flags = 0x0000; // Method override (reuses slot)
     /// let vtable = MethodVtableFlags::from_method_flags(override_flags);
-    /// assert!(vtable.contains(MethodVtableFlags::REUSE_SLOT));
+    /// assert!(vtable == MethodVtableFlags::REUSE_SLOT);
     ///
     /// let new_method_flags = 0x0100; // New virtual method
     /// let vtable = MethodVtableFlags::from_method_flags(new_method_flags);
@@ -953,7 +949,7 @@ impl MethodVtableFlags {
     /// // Method override (reuses existing vtable slot)
     /// let override_flags = 0x0040; // VIRTUAL without NEW_SLOT
     /// let vtable = MethodVtableFlags::from_method_flags(override_flags);
-    /// assert!(vtable.contains(MethodVtableFlags::REUSE_SLOT));
+    /// assert!(vtable == MethodVtableFlags::REUSE_SLOT);
     ///
     /// // New virtual method (gets new vtable slot)
     /// let new_virtual_flags = 0x0140; // VIRTUAL + NEW_SLOT
@@ -1267,6 +1263,10 @@ impl SectionFlags {
     /// type of data section and contains structured exception handling metadata.
     pub const EHTABLE: Self = Self(0x1);
 
+    /// The bits that name a section's kind (`CorILMethod_Sect_KindMask`): a section is an EH
+    /// table when these are [`Self::EHTABLE`] alone.
+    pub const KIND_MASK: Self = Self(0x3F);
+
     /// Reserved section type for optional IL tables.
     ///
     /// This flag is reserved by the ECMA-335 specification and shall be zero
@@ -1315,7 +1315,7 @@ impl SectionFlags {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```
 /// use dotscope::CilObject;
 /// use std::path::Path;
 ///
@@ -1328,8 +1328,8 @@ impl SectionFlags {
 ///         println!("Method '{}' has {} local variables:",
 ///                  method.name, method.local_vars.len());
 ///
-///         for (i, local_var) in method.local_vars.iter().enumerate() {
-///             let var_info = format!("  [{}] Type: {}, ByRef: {}, Pinned: {}, Modifiers: {}",
+///         for (i, local_var) in method.local_vars.iter() {
+///             let var_info = format!("  [{}] Type: {:?}, ByRef: {}, Pinned: {}, Modifiers: {}",
 ///                                   i,
 ///                                   local_var.base.name(),
 ///                                   local_var.is_byref,
@@ -1481,83 +1481,4 @@ impl LocalVariable {
             | CilFlavor::Unknown => TypeSignature::Object,
         })
     }
-}
-
-/// Variable argument parameter used in method signatures to describe vararg parameters.
-///
-/// `VarArg` represents a single parameter in the variable-length argument list of a
-/// method that uses varargs (...) calling convention. Each vararg parameter has its
-/// own type signature and modifiers, allowing for type-safe variable argument processing.
-///
-/// # Varargs in .NET
-///
-/// Variable arguments in .NET are less common than in C/C++ but are still supported
-/// for scenarios like P/Invoke to C libraries that use varargs, or for implementing
-/// methods like `String.Format` with variable parameter counts.
-///
-/// # Type Resolution
-///
-/// Like `LocalVariable`, `VarArg` contains fully resolved type references rather than
-/// raw signature data, making it efficient for analysis and code generation without
-/// requiring additional type lookups.
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// use dotscope::CilObject;
-/// use std::path::Path;
-///
-/// let assembly = CilObject::from_path(Path::new("tests/samples/WindowsBase.dll"))?;
-///
-/// for entry in assembly.methods().iter() {
-///     let method = entry.value();
-///
-///     if !method.varargs.is_empty() {
-///         println!("Method '{}' has {} vararg parameters:",
-///                  method.name, method.varargs.len());
-///
-///         for (i, vararg) in method.varargs.iter().enumerate() {
-///             let arg_info = format!("  VarArg[{}] Type: {}, ByRef: {}, Modifiers: {}",
-///                                   i,
-///                                   vararg.base.name(),
-///                                   vararg.by_ref,
-///                                   vararg.modifiers.len());
-///             println!("{}", arg_info);
-///         }
-///     }
-/// }
-/// # Ok::<(), dotscope::Error>(())
-/// ```
-///
-/// # Memory Management
-///
-/// - **Type References**: Use `Arc` for efficient sharing and thread safety
-/// - **Modifiers**: Reference-counted vectors for minimal memory overhead  
-/// - **Flags**: Simple boolean values for fast access
-///
-/// # Thread Safety
-///
-/// `VarArg` is thread-safe through its use of `Arc`-based type references.
-/// Multiple threads can safely access vararg parameter information concurrently.
-pub struct VarArg {
-    /// Custom modifiers applied to the parameter type.
-    ///
-    /// These are optional and required modifiers that change the semantic meaning
-    /// of the base parameter type. Common modifiers include `const`, `volatile`,
-    /// or custom attribute-based type modifications.
-    pub modifiers: CilTypeRefList,
-
-    /// Whether the parameter is passed by reference.
-    ///
-    /// When `true`, the parameter is passed by reference rather than by value.
-    /// This allows the called method to modify the original value in the caller's
-    /// context, similar to `ref` or `out` parameters in C#.
-    pub by_ref: bool,
-
-    /// The resolved base type of the parameter.
-    ///
-    /// This is the primary type of the vararg parameter after all type tokens
-    /// have been resolved to concrete type references. The type includes full
-    /// namespace and assembly qualification for unambiguous identification.
-    pub base: CilTypeRef,
 }

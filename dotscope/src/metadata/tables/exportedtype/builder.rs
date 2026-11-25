@@ -430,7 +430,7 @@ impl ExportedTypeBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// # use dotscope::prelude::*;
     /// # use std::path::Path;
     /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
@@ -442,7 +442,7 @@ impl ExportedTypeBuilder {
     ///     .public()
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created ExportedType with token: {}", exported_type_token);
+    /// println!("Created ExportedType with token: {:?}", exported_type_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {
@@ -525,7 +525,7 @@ mod tests {
     use crate::{
         cilassembly::ChangeRefKind,
         metadata::tables::{TableId, TypeAttributes},
-        test::factories::table::assemblyref::get_test_assembly,
+        testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

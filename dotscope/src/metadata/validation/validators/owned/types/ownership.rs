@@ -166,18 +166,6 @@ impl OwnedTypeOwnershipValidator {
 
                             });
                         }
-
-                        // Check for obviously invalid characters in nested type names
-                        if nested_type.name.contains('\0') {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Nested type '{}' owned by '{}' contains null character",
-                                    nested_type.name, type_entry.name
-                                ),
-
-                            });
-                        }
                     }
                     // Skip validation for nested types from other assemblies
                 }
@@ -367,19 +355,17 @@ impl Default for OwnedTypeOwnershipValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::type_ownership::owned_type_ownership_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_type_ownership_validator() -> Result<()> {
         let validator = OwnedTypeOwnershipValidator::new();
         let config = ValidationConfig {
@@ -390,7 +376,6 @@ mod tests {
         owned_validator_test(
             owned_type_ownership_validator_file_factory,
             "OwnedTypeOwnershipValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

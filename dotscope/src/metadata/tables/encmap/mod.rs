@@ -16,7 +16,7 @@
 //!
 //! - [`crate::metadata::tables::encmap::EncMapRaw`] - Raw table structure with original metadata tokens
 //! - [`crate::metadata::tables::encmap::EncMap`] - Type alias to EncMapRaw since no heap resolution is needed
-//! - [`crate::metadata::tables::encmap::EncMapLoader`] - Internal loader for processing EncMap table data
+//! - [`crate::metadata::loader::tables::EncMapLoader`] - Internal loader for processing EncMap table data
 //! - [`crate::metadata::tables::encmap::EncMapMap`] - Thread-safe concurrent map for caching EncMap entries
 //! - [`crate::metadata::tables::encmap::EncMapList`] - Thread-safe append-only vector for EncMap collections
 //! - [`crate::metadata::tables::encmap::EncMapRc`] - Reference-counted pointer for shared ownership
@@ -77,13 +77,11 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use raw::*;
 
 /// A map that holds the mapping of [`crate::metadata::token::Token`] to parsed [`crate::metadata::tables::encmap::EncMap`]

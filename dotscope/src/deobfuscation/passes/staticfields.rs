@@ -19,7 +19,7 @@
 //! # Value Extraction
 //!
 //! The pass is parameterized by a [`FieldValueExtractor`] that converts raw
-//! emulator values to SSA constants. This keeps the pass generic — techniques
+//! emulator values to SSA constants. This keeps the pass generic - techniques
 //! provide extractors for their specific value types (I32, String, etc.)
 //! without modifying the pass itself.
 //!
@@ -137,7 +137,7 @@ impl FieldValueExtractor for I64Extractor {
     ) -> Option<ConstValue> {
         match value {
             EmValue::I64(val) => Some(ConstValue::I64(*val)),
-            // I32 values in a container declared as I64 — widen
+            // I32 values in a container declared as I64 - widen
             EmValue::I32(val) => Some(ConstValue::I64(i64::from(*val))),
             other => {
                 debug!(
@@ -174,8 +174,8 @@ impl FieldValueExtractor for F64Extractor {
         value: &EmValue,
     ) -> Option<ConstValue> {
         match value {
-            EmValue::F64(val) => Some(ConstValue::F64(*val)),
-            EmValue::F32(val) => Some(ConstValue::F64(f64::from(*val))),
+            EmValue::F64(val) => Some(ConstValue::from(*val)),
+            EmValue::F32(val) => Some(ConstValue::from(f64::from(*val))),
             other => {
                 debug!(
                     "Float64ValueContainer: field 0x{:08X} has unexpected type {:?}",
@@ -224,7 +224,7 @@ impl FieldValueExtractor for StringExtractor {
                 }
             },
             EmValue::Null => {
-                // Null string — field initialized to null (rare but valid)
+                // Null string - field initialized to null (rare but valid)
                 Some(ConstValue::DecryptedString(Box::from("")))
             }
             other => {
@@ -378,7 +378,7 @@ impl StaticFieldResolutionPass {
 
                 if values.is_empty() && !self.field_tokens.is_empty() {
                     warn!(
-                        "{}: resolved 0/{} field values — container .cctor may have failed or \
+                        "{}: resolved 0/{} field values - container .cctor may have failed or \
                          field types are unsupported",
                         self.extractor.label(),
                         self.field_tokens.len()
@@ -431,7 +431,7 @@ impl SsaPass<CilTarget, CompilerContext> for StaticFieldResolutionPass {
     fn initialize(&mut self, _host: &CompilerContext) -> analyssa::Result<()> {
         // Eagerly initialize field values before parallel method processing.
         // This avoids a race condition where parallel run_on_method calls
-        // compete on lazy initialization — losing threads would see empty
+        // compete on lazy initialization - losing threads would see empty
         // resolved_values and skip methods that need processing.
         self.ensure_initialized();
         Ok(())
@@ -468,7 +468,7 @@ impl SsaPass<CilTarget, CompilerContext> for StaticFieldResolutionPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::LoadStaticField { dest, field } = instr.op() {
+                if let SsaOp::LoadStaticField { dest, field, .. } = instr.op() {
                     let field_token = field.token();
                     let value = values.get(&field_token).or_else(|| {
                         // MemberRef fallback: resolve to FieldDef and retry lookup

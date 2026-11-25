@@ -51,17 +51,18 @@ impl EmValue {
             )));
         }
 
+        let (left, right) = (self.on_stack(), other.on_stack());
         let result = match op {
-            CompareOp::Eq => self.cmp_eq(other)?,
-            CompareOp::Ne => !self.cmp_eq(other)?,
-            CompareOp::Lt => self.cmp_lt(other, false)?,
-            CompareOp::LtUn => self.cmp_lt(other, true)?,
-            CompareOp::Le => self.cmp_le(other, false)?,
-            CompareOp::LeUn => self.cmp_le(other, true)?,
-            CompareOp::Gt => self.cmp_gt(other, false)?,
-            CompareOp::GtUn => self.cmp_gt(other, true)?,
-            CompareOp::Ge => self.cmp_ge(other, false)?,
-            CompareOp::GeUn => self.cmp_ge(other, true)?,
+            CompareOp::Eq => left.cmp_eq(&right)?,
+            CompareOp::Ne => !left.cmp_eq(&right)?,
+            CompareOp::Lt => left.cmp_lt(&right, false)?,
+            CompareOp::LtUn => left.cmp_lt(&right, true)?,
+            CompareOp::Le => left.cmp_le(&right, false)?,
+            CompareOp::LeUn => left.cmp_le(&right, true)?,
+            CompareOp::Gt => left.cmp_gt(&right, false)?,
+            CompareOp::GtUn => left.cmp_gt(&right, true)?,
+            CompareOp::Ge => left.cmp_ge(&right, false)?,
+            CompareOp::GeUn => left.cmp_ge(&right, true)?,
         };
 
         Ok(EmValue::I32(i32::from(result)))
@@ -82,18 +83,6 @@ impl EmValue {
             (EmValue::Null, EmValue::Null) => Ok(true),
             (EmValue::ObjectRef(_), EmValue::Null) | (EmValue::Null, EmValue::ObjectRef(_)) => {
                 Ok(false)
-            }
-            (EmValue::Bool(a), EmValue::Bool(b)) => Ok(a == b),
-            (EmValue::Char(a), EmValue::Char(b)) => Ok(a == b),
-            // Cross-type comparisons for int32 stack types (I32, Bool, Char all use int32 on stack)
-            (EmValue::I32(a), EmValue::Bool(b)) | (EmValue::Bool(b), EmValue::I32(a)) => {
-                Ok(*a == i32::from(*b))
-            }
-            (EmValue::I32(a), EmValue::Char(b)) | (EmValue::Char(b), EmValue::I32(a)) => {
-                Ok(*a == (*b as u32) as i32)
-            }
-            (EmValue::Bool(a), EmValue::Char(b)) | (EmValue::Char(b), EmValue::Bool(a)) => {
-                Ok(i32::from(*a) == (*b as u32) as i32)
             }
             // Pointer comparisons
             (EmValue::NativeInt(a), EmValue::UnmanagedPtr(b))
@@ -147,10 +136,22 @@ impl EmValue {
         }
     }
 
-    /// Less-than-or-equal comparison (implemented as `!(a > b)`).
+    /// Less-than-or-equal comparison (`ble` / `ble.un`).
+    ///
+    /// For integers `a <= b` is `!(a > b)`. Floats are not totally ordered: with a NaN
+    /// operand the comparison is unordered, and `ble` does not branch while `ble.un` does
+    /// (ECMA-335 III.3.8, III.3.9), so the float case is stated directly rather than as the
+    /// complement of `cgt`, which would invert both.
     fn cmp_le(&self, other: &Self, unsigned: bool) -> Result<bool> {
-        // a <= b is equivalent to !(a > b)
-        self.cmp_gt(other, unsigned).map(|r| !r)
+        match (self, other) {
+            (EmValue::F32(a), EmValue::F32(b)) => {
+                Ok(a <= b || (unsigned && (a.is_nan() || b.is_nan())))
+            }
+            (EmValue::F64(a), EmValue::F64(b)) => {
+                Ok(a <= b || (unsigned && (a.is_nan() || b.is_nan())))
+            }
+            _ => self.cmp_gt(other, unsigned).map(|r| !r),
+        }
     }
 
     /// Greater-than comparison (`cgt` / `cgt.un` instructions).
@@ -193,10 +194,21 @@ impl EmValue {
         }
     }
 
-    /// Greater-than-or-equal comparison (implemented as `!(a < b)`).
+    /// Greater-than-or-equal comparison (`bge` / `bge.un`).
+    ///
+    /// For integers `a >= b` is `!(a < b)`. With a NaN operand a float comparison is
+    /// unordered: `bge` does not branch and `bge.un` does (ECMA-335 III.3.6, III.3.7), so
+    /// the float case is stated directly rather than as the complement of `clt`.
     fn cmp_ge(&self, other: &Self, unsigned: bool) -> Result<bool> {
-        // a >= b is equivalent to !(a < b)
-        self.cmp_lt(other, unsigned).map(|r| !r)
+        match (self, other) {
+            (EmValue::F32(a), EmValue::F32(b)) => {
+                Ok(a >= b || (unsigned && (a.is_nan() || b.is_nan())))
+            }
+            (EmValue::F64(a), EmValue::F64(b)) => {
+                Ok(a >= b || (unsigned && (a.is_nan() || b.is_nan())))
+            }
+            _ => self.cmp_lt(other, unsigned).map(|r| !r),
+        }
     }
 }
 
@@ -274,5 +286,56 @@ mod tests {
 
         assert_eq!(a.compare(&b, CompareOp::Eq).unwrap(), EmValue::I32(1));
         assert_eq!(a.compare(&c, CompareOp::Eq).unwrap(), EmValue::I32(0));
+    }
+
+    /// Every float comparison follows ECMA-335 over ordered and unordered operands: the
+    /// signed forms are the IEEE ordered comparisons (false when either operand is NaN), the
+    /// `.un` forms are true when the operands are unordered, `ceq` is false and `bne.un` true
+    /// for a NaN. Checked for both widths over infinities, signed zeros, ordinary values and
+    /// NaN.
+    #[test]
+    fn float_comparisons_follow_ordered_and_unordered_rules() {
+        let values = [
+            f64::NEG_INFINITY,
+            -1.5,
+            -0.0,
+            0.0,
+            1.5,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        type Rule = fn(f64, f64) -> bool;
+        let rules: [(CompareOp, Rule); 10] = [
+            (CompareOp::Eq, |a, b| a == b),
+            (CompareOp::Ne, |a, b| a != b),
+            (CompareOp::Lt, |a, b| a < b),
+            (CompareOp::LtUn, |a, b| a < b || a.is_nan() || b.is_nan()),
+            (CompareOp::Gt, |a, b| a > b),
+            (CompareOp::GtUn, |a, b| a > b || a.is_nan() || b.is_nan()),
+            (CompareOp::Le, |a, b| a <= b),
+            (CompareOp::LeUn, |a, b| a <= b || a.is_nan() || b.is_nan()),
+            (CompareOp::Ge, |a, b| a >= b),
+            (CompareOp::GeUn, |a, b| a >= b || a.is_nan() || b.is_nan()),
+        ];
+        let truth = |holds: bool| EmValue::I32(i32::from(holds));
+        for &a in &values {
+            for &b in &values {
+                for (op, rule) in rules {
+                    let expected = truth(rule(a, b));
+                    assert_eq!(
+                        EmValue::F64(a).compare(&EmValue::F64(b), op).unwrap(),
+                        expected,
+                        "{a} {op:?} {b} (F64)"
+                    );
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (a32, b32) = (a as f32, b as f32);
+                    assert_eq!(
+                        EmValue::F32(a32).compare(&EmValue::F32(b32), op).unwrap(),
+                        expected,
+                        "{a} {op:?} {b} (F32)"
+                    );
+                }
+            }
+        }
     }
 }

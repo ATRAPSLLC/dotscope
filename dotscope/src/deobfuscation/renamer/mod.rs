@@ -1,83 +1,34 @@
-//! Smart renaming subsystem for obfuscated .NET identifiers.
+//! Renaming of obfuscated .NET identifiers.
 //!
-//! This module provides a trait-based renaming pipeline that replaces obfuscated
-//! type, method, field, and parameter names with readable identifiers. The pipeline
-//! supports two providers:
-//!
-//! - [`SimpleProvider`](providers::SimpleProvider) — sequential alphabetic names (default)
-//! - [`LocalProvider`](providers::local::LocalProvider) — LLM-powered semantic names (requires `smart-rename` feature)
+//! Obfuscators replace type, method, field and parameter names with unprintable,
+//! colliding or meaningless strings. This module gives every such identifier a short
+//! sequential replacement from [`SimpleNameGenerator`]
+//! (`A`, `B`, ... for types, `a`, `b`, ... for methods, `f_a` for fields, `p_a` for
+//! parameters), so that decompiled output is legible. Each kind draws from its own
+//! counter. Names already present in the assembly are not reserved, so a replacement can
+//! coincide with an existing identifier.
 //!
 //! # Two-Phase Architecture
 //!
 //! Renaming is split into **collect** and **apply** phases to work around the
 //! `CilObject` → `CilAssembly` consumption boundary in `execute_cleanup()`:
 //!
-//! 1. [`renames_collect()`] — runs on `&CilObject` (before consumption), walks metadata
+//! 1. [`renames_collect()`] - runs on `&CilObject` (before consumption), walks metadata
 //!    tables, identifies obfuscated names, and generates replacement entries.
-//! 2. [`renames_apply()`] — runs on `&mut CilAssembly` (after consumption), applies
+//! 2. [`renames_apply()`] - runs on `&mut CilAssembly` (after consumption), applies
 //!    string heap modifications and handles shared-offset splitting.
 
-mod cascade;
-mod config;
-mod context;
-mod features;
-mod phases;
-mod prompt;
-mod providers;
-mod validate;
+mod names;
 
 use std::collections::{HashMap, HashSet};
 
-pub use config::SmartRenameConfig;
-
-use self::{
-    cascade::CascadeRenamer,
-    providers::{SimpleNameGenerator, SimpleProvider},
-};
+use self::names::SimpleNameGenerator;
 use crate::{
     cilassembly::CilAssembly,
     deobfuscation::utils::{is_obfuscated_name, is_special_name},
     metadata::tables::{FieldRaw, MethodDefRaw, ParamRaw, TableDataOwned, TableId, TypeDefRaw},
     CilObject, Result,
 };
-
-/// A provider that generates names from context.
-///
-/// Implementors must be `Send + Sync` for use from rayon parallel iterators.
-pub trait RenameProvider: Send + Sync {
-    /// Returns the provider name for logging and diagnostics.
-    fn name(&self) -> &'static str;
-
-    /// Performs one-time initialization (load model, etc.).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if initialization fails (e.g., model file not found).
-    fn initialize(&mut self) -> Result<()>;
-
-    /// Suggests a name for one identifier given its extracted features.
-    ///
-    /// Returns `None` if the provider cannot produce a valid name
-    /// (caller uses fallback).
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The extracted features for the identifier.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if inference fails unexpectedly.
-    fn suggest_name(&self, context: &context::RenameContext) -> Result<Option<String>>;
-
-    /// Performs cleanup (unload model, etc.).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if cleanup fails.
-    fn shutdown(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
 
 /// A single rename operation to be applied to the assembly.
 #[derive(Debug, Clone)]
@@ -92,103 +43,15 @@ pub struct RenameEntry {
     pub new_name: String,
 }
 
-/// Collects rename entries using the cascade engine with a smart provider.
+/// Collects rename entries for every obfuscated identifier in the assembly.
 ///
-/// When a [`SmartRenameConfig`] is provided, creates the appropriate provider
-/// and runs the full cascade (anchors → phases → members → types).
-/// Otherwise falls back to the simple sequential rename strategy.
-///
-/// # Arguments
-///
-/// * `assembly` - The assembly to scan for obfuscated names.
-/// * `config` - Optional smart rename configuration. When `Some`, uses the
-///   cascade engine with the configured provider.
-///
-/// # Returns
-///
-/// A vector of rename entries ready for [`renames_apply()`].
-///
-/// # Errors
-///
-/// Returns an error if provider initialization or name suggestion fails.
-pub fn renames_collect(
-    assembly: &CilObject,
-    config: Option<&SmartRenameConfig>,
-) -> Result<Vec<RenameEntry>> {
-    if let Some(cfg) = config {
-        let mut provider = providers::create_provider(Some(cfg));
-        provider.initialize()?;
-        let fallback = SimpleProvider::new();
-        let cascade = CascadeRenamer::new(assembly, provider.as_ref(), &fallback, cfg.clone());
-        let entries = cascade.execute()?;
-        provider.shutdown()?;
-        Ok(entries)
-    } else {
-        execute_simple_rename(assembly)
-    }
-}
-
-/// Applies collected rename entries to the assembly's string heap.
-///
-/// Handles shared string offsets correctly:
-/// - **First rename** at an offset: uses `string_update()` (affects all rows at that offset).
-/// - **Subsequent different names** at the same offset: uses `string_add()` to allocate a
-///   new string, then `table_row_update()` to point the specific row at it.
-///
-/// # Arguments
-///
-/// * `cil_assembly` - The mutable assembly to apply renames to.
-/// * `entries` - The rename entries to apply.
-///
-/// # Returns
-///
-/// The number of identifiers successfully renamed.
-///
-/// # Errors
-///
-/// Returns an error if string heap mutation or table row update fails.
-pub fn renames_apply(cil_assembly: &mut CilAssembly, entries: Vec<RenameEntry>) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let mut renamed_count: usize = 0;
-
-    // Track which string offsets have already been renamed and to what name
-    let mut renamed_offsets: HashMap<u32, String> = HashMap::new();
-
-    for entry in &entries {
-        if let Some(existing_name) = renamed_offsets.get(&entry.string_index) {
-            if *existing_name == entry.new_name {
-                // Same name as first rename — string_update already covers this
-                renamed_count = renamed_count.saturating_add(1);
-                continue;
-            }
-            // Different name at same offset — allocate new string and update the row
-            let change_ref = cil_assembly.string_add(&entry.new_name)?;
-            let placeholder = change_ref.placeholder();
-            update_row_name_field(cil_assembly, entry.table_id, entry.rid, placeholder)?;
-            renamed_count = renamed_count.saturating_add(1);
-        } else {
-            // First rename at this offset — modify in place
-            if cil_assembly
-                .string_update(entry.string_index, &entry.new_name)
-                .is_ok()
-            {
-                renamed_offsets.insert(entry.string_index, entry.new_name.clone());
-                renamed_count = renamed_count.saturating_add(1);
-            }
-        }
-    }
-
-    Ok(renamed_count)
-}
-
-/// Executes the simple sequential rename strategy.
-///
-/// Preserves exact behavior of the original `rename_obfuscated_names()`:
-/// iterates TypeDef → MethodDef → Field → Param tables, uses `seen_indices`
-/// dedup, and generates sequential names via [`SimpleNameGenerator`].
+/// Walks the TypeDef, MethodDef, Field and Param tables in that order and gives each
+/// obfuscated name (see [`is_obfuscated_name`]) that is not a special name (see
+/// [`is_special_name`]) a sequential replacement from [`SimpleNameGenerator`]. The
+/// `<Module>` type (TypeDef row 1) is never renamed. A string heap offset is renamed
+/// once: rows sharing an offset with an earlier entry are skipped, since
+/// [`renames_apply()`] rewrites the string in place and so renames every row that
+/// points at it.
 ///
 /// # Arguments
 ///
@@ -196,12 +59,13 @@ pub fn renames_apply(cil_assembly: &mut CilAssembly, entries: Vec<RenameEntry>) 
 ///
 /// # Returns
 ///
-/// A vector of rename entries with sequential alphabetic names.
+/// A vector of rename entries with sequential alphabetic names, ready for
+/// [`renames_apply()`].
 ///
 /// # Errors
 ///
 /// Returns an error if metadata table access fails.
-fn execute_simple_rename(assembly: &CilObject) -> Result<Vec<RenameEntry>> {
+pub fn renames_collect(assembly: &CilObject) -> Result<Vec<RenameEntry>> {
     let mut entries = Vec::new();
     let mut name_generator = SimpleNameGenerator::new();
 
@@ -319,6 +183,62 @@ fn execute_simple_rename(assembly: &CilObject) -> Result<Vec<RenameEntry>> {
     Ok(entries)
 }
 
+/// Applies collected rename entries to the assembly's string heap.
+///
+/// Handles shared string offsets correctly:
+/// - **First rename** at an offset: uses `string_update()` (affects all rows at that offset).
+/// - **Subsequent different names** at the same offset: uses `string_add()` to allocate a
+///   new string, then `table_row_update()` to point the specific row at it.
+///
+/// # Arguments
+///
+/// * `cil_assembly` - The mutable assembly to apply renames to.
+/// * `entries` - The rename entries to apply.
+///
+/// # Returns
+///
+/// The number of identifiers successfully renamed.
+///
+/// # Errors
+///
+/// Returns an error if string heap mutation or table row update fails.
+pub fn renames_apply(cil_assembly: &mut CilAssembly, entries: Vec<RenameEntry>) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut renamed_count: usize = 0;
+
+    // Track which string offsets have already been renamed and to what name
+    let mut renamed_offsets: HashMap<u32, String> = HashMap::new();
+
+    for entry in &entries {
+        if let Some(existing_name) = renamed_offsets.get(&entry.string_index) {
+            if *existing_name == entry.new_name {
+                // Same name as first rename — string_update already covers this
+                renamed_count = renamed_count.saturating_add(1);
+                continue;
+            }
+            // Different name at same offset — allocate new string and update the row
+            let change_ref = cil_assembly.string_add(&entry.new_name)?;
+            let placeholder = change_ref.placeholder();
+            update_row_name_field(cil_assembly, entry.table_id, entry.rid, placeholder)?;
+            renamed_count = renamed_count.saturating_add(1);
+        } else {
+            // First rename at this offset — modify in place
+            if cil_assembly
+                .string_update(entry.string_index, &entry.new_name)
+                .is_ok()
+            {
+                renamed_offsets.insert(entry.string_index, entry.new_name.clone());
+                renamed_count = renamed_count.saturating_add(1);
+            }
+        }
+    }
+
+    Ok(renamed_count)
+}
+
 /// Updates the name field of a metadata row to point at a new string.
 ///
 /// Reads the current row, replaces the name-bearing field with
@@ -330,7 +250,7 @@ fn execute_simple_rename(assembly: &CilObject) -> Result<Vec<RenameEntry>> {
 /// * `cil_assembly` - The assembly containing the metadata table.
 /// * `table_id` - Which metadata table to update.
 /// * `rid` - Row ID within the table (1-based).
-/// * `new_string_placeholder` - The placeholder value from [`string_add()`]
+/// * `new_string_placeholder` - The placeholder value from [`string_add()`](crate::CilAssembly::string_add)
 ///   pointing to the new string.
 ///
 /// # Errors
@@ -394,45 +314,14 @@ fn update_row_name_field(
 
 #[cfg(test)]
 mod tests {
-    // Only the `smart-rename`-off equivalence test uses this.
-    #[cfg(not(feature = "smart-rename"))]
-    use std::collections::HashSet;
-    #[cfg(feature = "smart-rename")]
-    use std::path::PathBuf;
-
+    use super::*;
     use crate::{
-        cilassembly::{CilAssembly, GeneratorConfig},
-        deobfuscation::renamer::{
-            self,
-            context::{IdentifierKind, RenameContext},
-            providers::SimpleProvider,
-            RenameProvider, SmartRenameConfig,
-        },
-        metadata::{
-            tables::{MethodDefRaw, TableId, TypeDefRaw},
-            validation::ValidationConfig,
-        },
-        test::helpers::load_sample,
-        CilObject,
+        cilassembly::GeneratorConfig, metadata::validation::ValidationConfig,
+        testkit::helpers::load_sample,
     };
 
-    const RENAMER_SAMPLE: &str = "tests/samples/packers/bitmono/0.39.0/bitmono_renamer.exe";
-    const ORIGINAL_SAMPLE: &str = "tests/samples/packers/bitmono/0.39.0/original.exe";
-
-    #[test]
-    fn test_simple_provider_via_trait() {
-        let provider: Box<dyn RenameProvider> = Box::new(SimpleProvider::new());
-
-        let ctx = RenameContext {
-            kind: Some(IdentifierKind::Type),
-            ..Default::default()
-        };
-        let name = provider.suggest_name(&ctx).unwrap();
-        assert_eq!(name, Some("A".to_string()));
-
-        let name2 = provider.suggest_name(&ctx).unwrap();
-        assert_eq!(name2, Some("B".to_string()));
-    }
+    const RENAMER_SAMPLE: &str = "packers/bitmono/0.39.0/bitmono_renamer.exe";
+    const ORIGINAL_SAMPLE: &str = "packers/bitmono/0.39.0/original.exe";
 
     /// Regression test: renaming obfuscated names must preserve TypeRef substring
     /// references in the string heap.
@@ -440,13 +329,13 @@ mod tests {
     fn test_rename_preserves_typeref_substring_references() {
         let assembly = load_sample(RENAMER_SAMPLE);
 
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
         assert!(!entries.is_empty(), "Expected at least one rename entry");
 
         let bytes = assembly.file().data().to_vec();
         let mut cil_assembly = CilAssembly::from_bytes(bytes).unwrap();
 
-        let count = renamer::renames_apply(&mut cil_assembly, entries).unwrap();
+        let count = renames_apply(&mut cil_assembly, entries).unwrap();
         assert!(count > 0, "Expected at least one rename");
 
         let output = cil_assembly
@@ -462,7 +351,7 @@ mod tests {
     #[test]
     fn test_no_renames_on_clean_assembly() {
         let assembly = load_sample(ORIGINAL_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
         assert!(
             entries.is_empty(),
             "Clean binary should have no obfuscated names, got {}",
@@ -474,7 +363,7 @@ mod tests {
     #[test]
     fn test_collect_entry_counts() {
         let assembly = load_sample(RENAMER_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
 
         let types = entries
             .iter()
@@ -499,11 +388,11 @@ mod tests {
         assert_eq!(params, 23, "Param entries");
     }
 
-    /// Sequential type names: SimpleProvider → validate → PascalCase produces A, B, C, D, E.
+    /// Types are renamed in table order to the sequential names A through H.
     #[test]
     fn test_collect_sequential_type_names() {
         let assembly = load_sample(RENAMER_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
 
         let type_names: Vec<&str> = entries
             .iter()
@@ -526,7 +415,7 @@ mod tests {
     #[test]
     fn test_collect_field_and_param_prefixes() {
         let assembly = load_sample(RENAMER_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
 
         for entry in entries.iter().filter(|e| e.table_id == TableId::Field) {
             assert!(
@@ -549,7 +438,7 @@ mod tests {
     #[test]
     fn test_collect_preserves_special_names() {
         let assembly = load_sample(RENAMER_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
 
         let strings = assembly
             .strings()
@@ -576,13 +465,13 @@ mod tests {
     fn test_roundtrip_apply_and_reload() {
         let assembly = load_sample(RENAMER_SAMPLE);
 
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
         assert!(!entries.is_empty());
 
         let bytes = assembly.file().data().to_vec();
         let mut cil_assembly = CilAssembly::from_bytes(bytes).unwrap();
 
-        let count = renamer::renames_apply(&mut cil_assembly, entries.clone()).unwrap();
+        let count = renames_apply(&mut cil_assembly, entries.clone()).unwrap();
         assert_eq!(count, entries.len(), "All entries should be applied");
 
         let output = cil_assembly
@@ -600,11 +489,11 @@ mod tests {
     #[test]
     fn test_roundtrip_verifies_renamed_types() {
         let assembly = load_sample(RENAMER_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
 
         let bytes = assembly.file().data().to_vec();
         let mut cil_assembly = CilAssembly::from_bytes(bytes).unwrap();
-        renamer::renames_apply(&mut cil_assembly, entries).unwrap();
+        renames_apply(&mut cil_assembly, entries).unwrap();
 
         let output = cil_assembly
             .into_cilobject_with(ValidationConfig::production(), GeneratorConfig::default())
@@ -647,11 +536,11 @@ mod tests {
     #[test]
     fn test_roundtrip_verifies_renamed_methods() {
         let assembly = load_sample(RENAMER_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
 
         let bytes = assembly.file().data().to_vec();
         let mut cil_assembly = CilAssembly::from_bytes(bytes).unwrap();
-        renamer::renames_apply(&mut cil_assembly, entries).unwrap();
+        renames_apply(&mut cil_assembly, entries).unwrap();
 
         let output = cil_assembly
             .into_cilobject_with(ValidationConfig::production(), GeneratorConfig::default())
@@ -691,48 +580,12 @@ mod tests {
         );
     }
 
-    /// `renames_collect(_, None)` should produce identical results to
-    /// `renames_collect(_, Some(&SmartRenameConfig::default()))` — both use SimpleProvider.
-    ///
-    /// Only with `smart-rename` off. With the feature on, `create_provider`
-    /// honours the `Some(..)` by building a `LocalProvider`, and
-    /// `SmartRenameConfig::default()` carries an empty `model_path` that
-    /// `LocalProvider::initialize` correctly rejects — so the two calls take
-    /// different providers by design and there is no equivalence to assert.
-    #[cfg(not(feature = "smart-rename"))]
-    #[test]
-    fn test_cascade_with_smart_config_none_matches_default() {
-        let assembly_a = load_sample(RENAMER_SAMPLE);
-        let entries_none = renamer::renames_collect(&assembly_a, None).unwrap();
-
-        let assembly_b = load_sample(RENAMER_SAMPLE);
-        let entries_default =
-            renamer::renames_collect(&assembly_b, Some(&SmartRenameConfig::default())).unwrap();
-
-        assert_eq!(
-            entries_none.len(),
-            entries_default.len(),
-            "Both paths should produce same number of entries"
-        );
-
-        let keys_none: HashSet<(TableId, u32)> =
-            entries_none.iter().map(|e| (e.table_id, e.rid)).collect();
-        let keys_default: HashSet<(TableId, u32)> = entries_default
-            .iter()
-            .map(|e| (e.table_id, e.rid))
-            .collect();
-        assert_eq!(
-            keys_none, keys_default,
-            "Both paths should target the same (table, rid) pairs"
-        );
-    }
-
     /// Applying two entries with the same `string_index` and same `new_name` should
     /// succeed without error — the second is a no-op covered by `string_update`.
     #[test]
     fn test_apply_renames_idempotent_same_offset() {
         let assembly = load_sample(RENAMER_SAMPLE);
-        let entries = renamer::renames_collect(&assembly, None).unwrap();
+        let entries = renames_collect(&assembly).unwrap();
         assert!(!entries.is_empty());
 
         // Pick the first entry and duplicate it
@@ -742,87 +595,10 @@ mod tests {
         let bytes = assembly.file().data().to_vec();
         let mut cil_assembly = CilAssembly::from_bytes(bytes).unwrap();
 
-        let count = renamer::renames_apply(&mut cil_assembly, dup).unwrap();
+        let count = renames_apply(&mut cil_assembly, dup).unwrap();
         assert_eq!(
             count, 2,
             "Both entries should count as renamed (second is a covered no-op)"
         );
-    }
-
-    /// Manual test for the LLM-backed smart renamer.
-    ///
-    /// Requires the `smart-rename` feature and a local GGUF model file.
-    /// Run with: `cargo test --release -p dotscope --lib --features smart-rename test_smart_rename_llm -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    #[cfg(feature = "smart-rename")]
-    fn test_smart_rename_llm() {
-        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../qwen2.5-coder-3b-instruct-q4_k_m.gguf");
-        assert!(
-            model_path.exists(),
-            "GGUF model not found at {}",
-            model_path.display()
-        );
-
-        let assembly = load_sample(RENAMER_SAMPLE);
-
-        let config = SmartRenameConfig {
-            model_path,
-            ..SmartRenameConfig::default()
-        };
-
-        let entries = renamer::renames_collect(&assembly, Some(&config)).unwrap();
-        assert!(!entries.is_empty(), "Smart renamer should produce entries");
-
-        // Log all entries for manual inspection
-        for entry in &entries {
-            eprintln!(
-                "  {:?} RID {} → {:?}",
-                entry.table_id, entry.rid, entry.new_name
-            );
-        }
-
-        let types = entries
-            .iter()
-            .filter(|e| e.table_id == TableId::TypeDef)
-            .count();
-        let methods = entries
-            .iter()
-            .filter(|e| e.table_id == TableId::MethodDef)
-            .count();
-        let fields = entries
-            .iter()
-            .filter(|e| e.table_id == TableId::Field)
-            .count();
-        let params = entries
-            .iter()
-            .filter(|e| e.table_id == TableId::Param)
-            .count();
-        eprintln!(
-            "Smart rename: {types} types, {methods} methods, {fields} fields, {params} params"
-        );
-
-        // Same entry counts as simple renamer (same identifiers detected)
-        assert_eq!(types, 5, "TypeDef entries");
-        assert_eq!(methods, 17, "MethodDef entries");
-        assert_eq!(fields, 1, "Field entries");
-        assert_eq!(params, 19, "Param entries");
-
-        // Roundtrip: apply and regenerate
-        let bytes = assembly.file().data().to_vec();
-        let mut cil_assembly = CilAssembly::from_bytes(bytes).unwrap();
-        let count = renamer::renames_apply(&mut cil_assembly, entries).unwrap();
-        assert!(count > 0, "Should apply at least one rename");
-
-        let output = cil_assembly
-            .into_cilobject_with(ValidationConfig::production(), GeneratorConfig::default())
-            .expect("Roundtrip with smart renames should succeed");
-
-        CilObject::from_mem_with_validation(
-            output.file().data().to_vec(),
-            ValidationConfig::production(),
-        )
-        .expect("Reloaded assembly should pass production validation");
     }
 }

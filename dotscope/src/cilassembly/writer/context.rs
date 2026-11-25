@@ -15,7 +15,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! let mut ctx = WriteContext::new(assembly, output)?;
 //!
 //! // Write all content - ctx tracks positions
@@ -33,7 +33,12 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     cilassembly::{
         changes::AssemblyChanges,
-        writer::{heaps::HeapRemapping, output::Output},
+        writer::{
+            blobs::TypedBlob,
+            heaps::HeapRemapping,
+            output::Output,
+            remapper::{RidRemapper, TokenRemap},
+        },
         CilAssembly,
     },
     file::pe::{OptionalHeader, SectionTable},
@@ -271,10 +276,13 @@ pub struct WriteContext<'a> {
     /// Serialized export table bytes for mixed-mode assemblies with native exports.
     pub export_table_bytes: Option<Vec<u8>>,
 
-    /// Original debug directory location (RVA, size). Stored but not used since
-    /// debug data becomes invalid after assembly modification. The directory
-    /// entry is zeroed during generation.
+    /// Original debug directory location (RVA, size). A write that changes nothing copies
+    /// the directory and its data; any other write drops them, since the debug data no
+    /// longer describes the code.
     pub original_debug_dir: Option<(u32, u32)>,
+
+    /// Where the copied debug directory sits in the output (RVA, size), when it was kept.
+    pub debug_dir: Option<(u32, u32)>,
 
     /// Original certificate directory location (file offset, size). Certificates
     /// are invalidated by any modification. Unlike other directories, this uses
@@ -314,28 +322,37 @@ pub struct WriteContext<'a> {
     /// rows that reference heap entries.
     pub heap_remapping: HeapRemapping,
 
-    /// Token remapping for table modifications. When rows are added or deleted,
-    /// tokens shift. This map translates original tokens to new tokens.
-    pub token_remapping: HashMap<u32, u32>,
+    /// How the tokens outside the tables (instruction operands, local signatures, catch
+    /// types, the entry point) are renumbered once rows are deleted or deduplicated.
+    pub tokens: TokenRemap,
 
-    /// TypeDef RID remapping for signature blob processing. When TypeDef rows are
-    /// deleted, RIDs shift. Signature blobs contain TypeDefOrRef encoded tokens
-    /// that must be updated with the new TypeDef RIDs.
-    pub typedef_rid_remap: HashMap<u32, u32>,
+    /// How the tables stream renumbers rows: deletions, then the order of every table the
+    /// format requires sorted. Set when the tables stream is written, for what is written
+    /// after it and names rows by number (the Portable PDB an image embeds).
+    pub rows: RidRemapper,
 
-    /// TypeRef RID remapping for signature blob processing. When TypeRef rows are
-    /// deleted, RIDs shift. Signature blobs contain TypeDefOrRef encoded tokens
-    /// that must be updated with the new TypeRef RIDs.
-    pub typeref_rid_remap: HashMap<u32, u32>,
+    /// The row count of every table in the written tables stream, by
+    /// [`TableId`](crate::metadata::tables::TableId); set with [`rows`](Self::rows).
+    pub output_rows: [u32; 64],
 
-    /// TypeSpec RID remapping for signature blob processing. The
-    /// `TypeDefOrRefOrSpecEncoded` operand of `ELEMENT_TYPE_CLASS` /
-    /// `ELEMENT_TYPE_VALUETYPE` can reference TypeSpec rows in addition
-    /// to TypeDef / TypeRef. Without this remap, signatures (notably the
-    /// `LocalVarSig` blob in StandAloneSig) keep pointing at the old
-    /// TypeSpec RID after surrounding rows are deleted, breaking strict
-    /// reload of the regenerated assembly.
-    pub typespec_rid_remap: HashMap<u32, u32>,
+    /// The blobs whose content names rows or blobs (signatures, and the Portable PDB blobs),
+    /// by the index the blob heap writer meets them at: the rows they name are renumbered
+    /// with [`tokens`](Self::tokens), and the blobs they name follow the rebuilt heap.
+    pub typed_blobs: HashMap<u32, TypedBlob>,
+
+    /// Every `#Strings` offset a row of the written tables names, an offset inside another
+    /// string's bytes (a shared tail) among them: the heap writer keeps each one pointing at
+    /// the same string when the heap is rebuilt. Sorted ascending without duplicates, so the
+    /// writer finds the offsets inside each entry by binary search.
+    pub referenced_string_offsets: Vec<u32>,
+
+    /// Every `#Blob` offset a row of the written tables names: the heap writer writes each one
+    /// that is not an entry of the heap's own walk (an offset inside another blob) as an entry
+    /// of its own, so it keeps naming the same bytes.
+    pub referenced_blob_offsets: HashSet<u32>,
+
+    /// Every `#US` offset an `ldstr` of a written body names, kept the same way.
+    pub referenced_userstring_offsets: HashSet<u32>,
 
     /// StandAloneSig RIDs to skip during table writing (duplicates).
     /// When multiple StandAloneSig entries have identical blob content,
@@ -508,6 +525,7 @@ impl<'a> WriteContext<'a> {
             export_table_bytes: None,
 
             original_debug_dir: None,
+            debug_dir: None,
             original_certificate_dir: None,
             pe_resource_offset: 0,
             pe_resource_size: 0,
@@ -517,10 +535,13 @@ impl<'a> WriteContext<'a> {
             original_method_rva_delta: 0,
             resource_offset_remap: HashMap::new(),
             heap_remapping: HeapRemapping::default(),
-            token_remapping: HashMap::new(),
-            typedef_rid_remap: HashMap::new(),
-            typeref_rid_remap: HashMap::new(),
-            typespec_rid_remap: HashMap::new(),
+            tokens: TokenRemap::default(),
+            rows: RidRemapper::default(),
+            output_rows: [0; 64],
+            typed_blobs: HashMap::new(),
+            referenced_string_offsets: Vec::new(),
+            referenced_blob_offsets: HashSet::new(),
+            referenced_userstring_offsets: HashSet::new(),
             standalonesig_skip: HashSet::new(),
 
             entry_point_token,

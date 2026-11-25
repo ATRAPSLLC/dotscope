@@ -18,8 +18,8 @@
 //!
 //! ## Usage Examples
 //!
-//! ```rust,ignore
-//! # use dotscope::metadata::tables::encmap::EncMapRaw;
+//! ```no_run
+//! # use dotscope::metadata::tables::EncMapRaw;
 //! # use dotscope::metadata::token::Token;
 //! # fn example(raw: EncMapRaw) -> dotscope::Result<()> {
 //! // Access original token information
@@ -27,9 +27,9 @@
 //! println!("Original token: {:#010x}", original_token.value());
 //!
 //! // Extract table and row information
-//! let table_id = original_token.table_id();
-//! let row_id = original_token.row_id();
-//! println!("Token maps table {} row {}", table_id as u8, row_id);
+//! let table_id = original_token.table();
+//! let row_id = original_token.row();
+//! println!("Token maps table {} row {}", table_id, row_id);
 //! # Ok(())
 //! # }
 //! ```
@@ -113,12 +113,13 @@ impl EncMapRaw {
     /// This method currently cannot fail as `EncMap` entries are self-contained.
     ///
     /// ## Examples
-    /// ```rust,ignore
-    /// # use dotscope::metadata::tables::encmap::EncMapRaw;
+    /// ```no_run
+    /// # use dotscope::metadata::tables::EncMapRaw;
     /// # fn example(raw: EncMapRaw) -> dotscope::Result<()> {
     /// let owned = raw.to_owned()?;
     /// # Ok(())
     /// # }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_owned(&self) -> Result<EncMapRc> {
         Ok(Arc::new(self.clone()))

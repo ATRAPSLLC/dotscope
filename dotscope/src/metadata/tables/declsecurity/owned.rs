@@ -163,16 +163,8 @@ impl DeclSecurity {
         matches!(self.action, SecurityAction::InheritanceDemand)
     }
 
-    /// Check if this declaration grants unrestricted permissions
-    ///
-    /// Returns `true` if the associated permission set allows unrestricted
-    /// access to the protected resource. This is typically used for highly
-    /// trusted code that needs full system access.
-    ///
-    /// # Security Implications
-    ///
-    /// Unrestricted permissions should be granted sparingly and only to
-    /// fully trusted assemblies, as they bypass most security checks.
+    /// Whether the declaration's permission set is the unrestricted one, which holds every
+    /// permission (see [`crate::metadata::security::PermissionSet::is_unrestricted`]).
     #[must_use]
     pub fn is_unrestricted(&self) -> bool {
         self.permission_set.is_unrestricted()
@@ -239,37 +231,37 @@ impl DeclSecurity {
         match &self.parent {
             CilTypeReference::TypeDef(typedef) => {
                 if let Some(strong_ref) = typedef.upgrade() {
-                    strong_ref
-                        .security
-                        .set(Security {
+                    strong_ref.security.push_row(
+                        self.token,
+                        Security {
                             action: self.action,
                             permission_set: self.permission_set.clone(),
-                        })
-                        .ok();
+                        },
+                    );
                 }
                 Ok(())
             }
             CilTypeReference::MethodDef(method) => {
                 if let Some(method) = method.upgrade() {
-                    method
-                        .security
-                        .set(Security {
+                    method.security.push_row(
+                        self.token,
+                        Security {
                             action: self.action,
                             permission_set: self.permission_set.clone(),
-                        })
-                        .ok();
+                        },
+                    );
                 }
 
                 Ok(())
             }
             CilTypeReference::Assembly(assembly) => {
-                assembly
-                    .security
-                    .set(Security {
+                assembly.security.push_row(
+                    self.token,
+                    Security {
                         action: self.action,
                         permission_set: self.permission_set.clone(),
-                    })
-                    .ok();
+                    },
+                );
 
                 Ok(())
             }

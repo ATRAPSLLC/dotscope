@@ -24,7 +24,7 @@
 //!
 //! ## Related Modules
 //!
-//! - [`crate::metadata::tables::types::read::traits`] - Corresponding read traits
+//! - [`RowReadable`](crate::metadata::tables::types::RowReadable) - Corresponding read trait
 //! - [`crate::metadata::tables::types::write::data`] - Owned row data enum for modification pipeline
 
 use crate::{
@@ -77,4 +77,26 @@ pub trait RowWritable: Sized + Send + TableRow {
         rid: u32,
         sizes: &TableInfoRef,
     ) -> Result<()>;
+
+    /// The key this row is ordered by, when its table is one the format
+    /// requires sorted, or `None` for every other table.
+    ///
+    /// ECMA-335 §II.22 requires ClassLayout, Constant, CustomAttribute,
+    /// DeclSecurity, FieldLayout, FieldMarshal, FieldRVA, GenericParam,
+    /// GenericParamConstraint, ImplMap, InterfaceImpl, MethodImpl,
+    /// MethodSemantics and NestedClass to be sorted, and the Portable PDB
+    /// format adds LocalScope, StateMachineMethod and CustomDebugInformation.
+    /// The runtime binary-searches them, so a row out of place is a row it
+    /// does not find. A coded index sorts by its encoded value, which is how
+    /// the format defines the order; a second component breaks ties where the
+    /// format names two columns. Rows with equal keys keep the order they were
+    /// in, which for InterfaceImpl is the order a type declares its interfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a coded index in the key cannot be encoded.
+    fn sort_key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        let _ = sizes;
+        Ok(None)
+    }
 }

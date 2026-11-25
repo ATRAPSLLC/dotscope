@@ -1,24 +1,33 @@
 //! Benchmarks for [`CilAssemblyView`] loading with and without metadata validation.
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
-use std::path::PathBuf;
+use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use dotscope::{CilAssemblyView, ValidationConfig};
+use dotscope::{testkit::fixture, CilAssemblyView, ValidationConfig};
 
 /// Benchmark loading a `CilAssemblyView` with and without metadata validation.
 pub fn criterion_benchmark(c: &mut Criterion) {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+    let path = fixture("WindowsBase.dll");
     c.bench_function("bench_cilassemblyview", |b| {
         b.iter(|| {
-            let _ = CilAssemblyView::from_path(&path);
+            black_box(
+                CilAssemblyView::from_path(&path)
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 
     c.bench_function("bench_cilassemblyview_validation", |b| {
         b.iter(|| {
-            let _ = CilAssemblyView::from_path_with_validation(&path, ValidationConfig::strict());
+            black_box(
+                CilAssemblyView::from_path_with_validation(&path, ValidationConfig::strict())
+                    .expect("the benchmarked work succeeds on its input"),
+            );
         });
     });
 }

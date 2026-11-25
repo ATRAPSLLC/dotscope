@@ -333,7 +333,7 @@ instructions) but NOT removed — out of scope for NRS.
 | 12 | StrongNamePatcher | **Missing** | — | No strong name verification removal. NR inserts signature verification flows with crypto-based validation that need specific pattern matching (MD5/Rijndael locals) and branch forcing. |
 | 13 | TypeRestorer | **Missing** | — | No type restoration from `System.Object` placeholders. Requires cross-method type inference based on usage patterns (de4dot's `TypesRestorerBase`). This is a deep analysis pass, not simple pattern matching. |
 | 14 | Cleaner | **Covered** | `execute_cleanup`, `NeutralizationPass`, DCE | dotscope's cleanup pipeline (orphan removal, heap compaction, PE generation) and neutralization pass cover the same ground. Attribute stripping and dead `.cctor` removal are already handled. |
-| 15 | SymbolRenamer | **Covered** | `renamer/` module | dotscope's `SmartRenameConfig` with cascading phases and configurable providers covers symbol renaming. |
+| 15 | SymbolRenamer | **Covered** | `renamer/` module | dotscope's cleanup renames obfuscated identifiers to short sequential names (`CleanupConfig::rename_obfuscated_names`). |
 
 
 ### Detailed Gap Descriptions

@@ -66,13 +66,21 @@
 //!
 //! Register custom method stubs for BCL methods:
 //!
-//! ```rust,ignore
-//! # use dotscope::emulation::ProcessBuilder;
+//! ```
+//! use dotscope::emulation::{Hook, PreHookResult, ProcessBuilder};
+//! use dotscope::CilObject;
+//!
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! let my_custom_stub = Hook::new("trace-assembly-load")
+//!     .match_name("System.Reflection", "Assembly", "Load")
+//!     .pre(|_ctx, _thread| PreHookResult::Continue);
+//!
 //! let process = ProcessBuilder::new()
 //!     .assembly(assembly)
-//!     .stub(signature, my_custom_stub)
+//!     .hook(my_custom_stub)
 //!     .no_default_stubs() // Optionally disable built-in stubs
 //!     .build()?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use std::{path::Path, sync::Arc};
@@ -87,13 +95,16 @@ use crate::{
         filesystem::VirtualFs,
         loader::{DataLoader, PeLoader, PeLoaderConfig},
         memory::{AddressSpace, MemoryProtection, SharedHeap},
-        process::{CaptureConfig, EmulationConfig, EmulationProcess, TracingConfig},
+        process::{
+            CaptureConfig, EmulationConfig, EmulationLimits, EmulationProcess, TracingConfig,
+        },
         runtime::{Hook, RuntimeState},
         thread::ThreadContext,
         tracer::{TraceListener, TraceWriter},
         EmValue,
     },
     metadata::{
+        streams::SharedStr,
         tables::{FieldRvaRaw, ModuleRaw},
         token::Token,
         typesystem::PointerSize,
@@ -133,7 +144,6 @@ fn populate_fieldrva_statics(assembly: &CilObject, address_space: &AddressSpace)
 
     let types = assembly.types();
     let file = assembly.file();
-    let pe_data = file.data();
     let ptr_size = PointerSize::from_is_64bit(file.pe().is_64bit);
 
     for row in fieldrva_table {
@@ -150,17 +160,11 @@ fn populate_fieldrva_statics(assembly: &CilObject, address_space: &AddressSpace)
             continue;
         };
 
-        // Convert RVA to file offset
-        let Ok(file_offset) = file.rva_to_offset(row.rva as usize) else {
+        // The field's bytes as the loaded image holds them
+        let Ok(data) = file.rva_slice(row.rva as usize, field_type_size) else {
             continue;
         };
-
-        let Some(end) = file_offset.checked_add(field_type_size) else {
-            continue;
-        };
-        let Some(data) = pe_data.get(file_offset..end) else {
-            continue;
-        };
+        let data = data.as_ref();
 
         // Convert to EmValue based on size
         let value = match field_type_size {
@@ -389,6 +393,8 @@ enum VirtualFsEntry {
     Data { vfs_path: String, data: Vec<u8> },
     /// Map from an existing CowFile (takes ownership).
     CowFile { vfs_path: String, cow: CowFile },
+    /// A further name of a file mapped under `target`.
+    Alias { vfs_path: String, target: String },
 }
 
 impl ProcessBuilder {
@@ -664,6 +670,19 @@ impl ProcessBuilder {
     pub fn with_max_heap_bytes(mut self, max: usize) -> Self {
         self.config.limits.max_heap_bytes = max;
         self.config.memory.max_heap_size = max;
+        self
+    }
+
+    /// Sets every execution limit at once, the managed heap's size with its
+    /// ceiling as [`with_max_heap_bytes`](Self::with_max_heap_bytes) does.
+    ///
+    /// # Arguments
+    ///
+    /// * `limits` - The limits the process runs under.
+    #[must_use]
+    pub fn with_limits(mut self, limits: EmulationLimits) -> Self {
+        self.config.memory.max_heap_size = limits.max_heap_bytes;
+        self.config.limits = limits;
         self
     }
 
@@ -1040,6 +1059,17 @@ impl ProcessBuilder {
         self
     }
 
+    /// Makes `vfs_path` a further name of the virtual file mapped under `target_path`, so one
+    /// file is reached by both without being held (or forked with the process) twice.
+    #[must_use]
+    pub fn with_virtual_file_alias(mut self, vfs_path: &str, target_path: &str) -> Self {
+        self.virtual_fs_entries.push(VirtualFsEntry::Alias {
+            vfs_path: vfs_path.to_string(),
+            target: target_path.to_string(),
+        });
+        self
+    }
+
     /// Disables registration of default BCL stubs.
     ///
     /// By default, the builder registers stubs for common BCL methods
@@ -1067,7 +1097,7 @@ impl ProcessBuilder {
     ///
     /// # Arguments
     ///
-    /// * `listener` - A boxed [`TraceListener`](crate::emulation::TraceListener) implementation
+    /// * `listener` - A boxed [`TraceListener`] implementation
     #[must_use]
     pub fn with_trace_listener(mut self, listener: Box<dyn TraceListener>) -> Self {
         self.trace_listeners.push(listener);
@@ -1180,7 +1210,7 @@ impl ProcessBuilder {
                 .unwrap_or(assembly.file().data());
             let name = assembly
                 .assembly()
-                .map_or_else(|| "primary".to_string(), |a| a.name.clone());
+                .map_or_else(|| "primary".to_string(), |a| a.name.to_string());
             if let Ok(image) = loader.load(pe_bytes, &address_space, name) {
                 loaded_images.push(image);
             }
@@ -1243,7 +1273,7 @@ impl ProcessBuilder {
             self.assembly
                 .as_ref()
                 .and_then(|a| a.assembly())
-                .map_or_else(|| "emulation".to_string(), |asm| asm.name.clone())
+                .map_or_else(|| "emulation".to_string(), |asm| asm.name.to_string())
         });
 
         // Create trace writer if tracing is enabled or listeners are registered
@@ -1280,6 +1310,9 @@ impl ProcessBuilder {
                 VirtualFsEntry::CowFile { vfs_path, cow } => {
                     virtual_fs.map_cow(&vfs_path, cow);
                 }
+                VirtualFsEntry::Alias { vfs_path, target } => {
+                    virtual_fs.alias(&vfs_path, &target);
+                }
             }
         }
 
@@ -1298,7 +1331,10 @@ impl ProcessBuilder {
                 let module_table = tables.table::<ModuleRaw>()?;
                 // Module is RID 1 by definition (ECMA-335 II.22.30).
                 let module_row = module_table.get(1).ok().flatten()?;
-                strings.get(module_row.name as usize).ok().map(String::from)
+                strings
+                    .get(module_row.name as usize)
+                    .ok()
+                    .map(SharedStr::from)
             });
 
             if let Some(name) = module_name {

@@ -290,6 +290,7 @@ pub const FE_INITOBJ: u8 = 0x15;
 pub const FE_CONSTRAINED: u8 = 0x16;
 pub const FE_CPBLK: u8 = 0x17;
 pub const FE_INITBLK: u8 = 0x18;
+pub const FE_NO: u8 = 0x19;
 pub const FE_RETHROW: u8 = 0x1A;
 pub const FE_SIZEOF: u8 = 0x1C;
 pub const FE_REFANYTYPE: u8 = 0x1D;

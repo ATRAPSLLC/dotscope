@@ -42,9 +42,10 @@ mod context;
 mod data;
 mod graph;
 mod inheritance;
+pub mod tables;
 
-pub(crate) use context::LoaderContext;
-pub(crate) use data::CilObjectData;
+pub use context::{LoaderContext, PdbSource};
+pub use data::CilObjectData;
 
 /// Static registry of all metadata table loaders.
 ///
@@ -85,59 +86,59 @@ pub(crate) use data::CilObjectData;
 /// 3. Update any loaders that depend on the new table
 /// 4. Test that the dependency graph remains acyclic
 static LOADERS: [&'static dyn MetadataLoader; 54] = [
-    &crate::metadata::tables::AssemblyLoader,
-    &crate::metadata::tables::AssemblyOsLoader,
-    &crate::metadata::tables::AssemblyProcessorLoader,
-    &crate::metadata::tables::AssemblyRefLoader,
-    &crate::metadata::tables::AssemblyRefOsLoader,
-    &crate::metadata::tables::AssemblyRefProcessorLoader,
-    &crate::metadata::tables::ClassLayoutLoader,
-    &crate::metadata::tables::ConstantLoader,
-    &crate::metadata::tables::CustomAttributeLoader,
-    &crate::metadata::tables::DeclSecurityLoader,
-    &crate::metadata::tables::DocumentLoader,
-    &crate::metadata::tables::MethodDebugInformationLoader,
-    &crate::metadata::tables::LocalScopeLoader,
-    &crate::metadata::tables::LocalVariableLoader,
-    &crate::metadata::tables::LocalConstantLoader,
-    &crate::metadata::tables::ImportScopeLoader,
-    &crate::metadata::tables::StateMachineMethodLoader,
-    &crate::metadata::tables::CustomDebugInformationLoader,
-    &crate::metadata::tables::EncLogLoader,
-    &crate::metadata::tables::EncMapLoader,
-    &crate::metadata::tables::EventLoader,
-    &crate::metadata::tables::EventMapLoader,
-    &crate::metadata::tables::EventPtrLoader,
-    &crate::metadata::tables::ExportedTypeLoader,
-    &crate::metadata::tables::FieldLoader,
-    &crate::metadata::tables::FieldPtrLoader,
-    &crate::metadata::tables::MethodPtrLoader,
-    &crate::metadata::tables::FieldLayoutLoader,
-    &crate::metadata::tables::FieldMarshalLoader,
-    &crate::metadata::tables::FieldRvaLoader,
-    &crate::metadata::tables::FileLoader,
-    &crate::metadata::tables::GenericParamLoader,
-    &crate::metadata::tables::GenericParamConstraintLoader,
-    &crate::metadata::tables::ImplMapLoader,
-    &crate::metadata::tables::InterfaceImplLoader,
-    &crate::metadata::tables::ManifestResourceLoader,
-    &crate::metadata::tables::MemberRefLoader,
-    &crate::metadata::tables::MethodDefLoader,
-    &crate::metadata::tables::MethodImplLoader,
-    &crate::metadata::tables::MethodSemanticsLoader,
-    &crate::metadata::tables::MethodSpecLoader,
-    &crate::metadata::tables::ModuleLoader,
-    &crate::metadata::tables::ModuleRefLoader,
-    &crate::metadata::tables::NestedClassLoader,
-    &crate::metadata::tables::ParamLoader,
-    &crate::metadata::tables::ParamPtrLoader,
-    &crate::metadata::tables::PropertyLoader,
-    &crate::metadata::tables::PropertyMapLoader,
-    &crate::metadata::tables::PropertyPtrLoader,
-    &crate::metadata::tables::StandAloneSigLoader,
-    &crate::metadata::tables::TypeDefLoader,
-    &crate::metadata::tables::TypeRefLoader,
-    &crate::metadata::tables::TypeSpecLoader,
+    &tables::AssemblyLoader,
+    &tables::AssemblyOsLoader,
+    &tables::AssemblyProcessorLoader,
+    &tables::AssemblyRefLoader,
+    &tables::AssemblyRefOsLoader,
+    &tables::AssemblyRefProcessorLoader,
+    &tables::ClassLayoutLoader,
+    &tables::ConstantLoader,
+    &tables::CustomAttributeLoader,
+    &tables::DeclSecurityLoader,
+    &tables::DocumentLoader,
+    &tables::MethodDebugInformationLoader,
+    &tables::LocalScopeLoader,
+    &tables::LocalVariableLoader,
+    &tables::LocalConstantLoader,
+    &tables::ImportScopeLoader,
+    &tables::StateMachineMethodLoader,
+    &tables::CustomDebugInformationLoader,
+    &tables::EncLogLoader,
+    &tables::EncMapLoader,
+    &tables::EventLoader,
+    &tables::EventMapLoader,
+    &tables::EventPtrLoader,
+    &tables::ExportedTypeLoader,
+    &tables::FieldLoader,
+    &tables::FieldPtrLoader,
+    &tables::MethodPtrLoader,
+    &tables::FieldLayoutLoader,
+    &tables::FieldMarshalLoader,
+    &tables::FieldRvaLoader,
+    &tables::FileLoader,
+    &tables::GenericParamLoader,
+    &tables::GenericParamConstraintLoader,
+    &tables::ImplMapLoader,
+    &tables::InterfaceImplLoader,
+    &tables::ManifestResourceLoader,
+    &tables::MemberRefLoader,
+    &tables::MethodDefLoader,
+    &tables::MethodImplLoader,
+    &tables::MethodSemanticsLoader,
+    &tables::MethodSpecLoader,
+    &tables::ModuleLoader,
+    &tables::ModuleRefLoader,
+    &tables::NestedClassLoader,
+    &tables::ParamLoader,
+    &tables::ParamPtrLoader,
+    &tables::PropertyLoader,
+    &tables::PropertyMapLoader,
+    &tables::PropertyPtrLoader,
+    &tables::StandAloneSigLoader,
+    &tables::TypeDefLoader,
+    &tables::TypeRefLoader,
+    &tables::TypeSpecLoader,
     &inheritance::InheritanceResolver,
 ];
 
@@ -160,37 +161,81 @@ use crate::{metadata::tables::TableId, project::ProjectContext, Error, Result};
 /// 1. Building the complete dependency graph from [`LOADERS`]
 /// 2. Validating dependencies and checking for cycles
 /// 3. Computing topological sort to generate execution levels
-/// 4. Caching the final execution plan for all future use
+/// 4. Locating the levels where a project load meets the other assemblies
+///    ([`ExecutionPlan`]), from the loaders those meeting points depend on rather than
+///    from fixed level numbers
+/// 5. Caching the final execution plan for all future use
 ///
 /// # Thread Safety
 ///
 /// [`LazyLock`] ensures thread-safe initialization even under concurrent access.
 /// The cached execution levels are immutable after creation.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Initialization will panic if:
-/// - The static loader dependency graph contains cycles
-/// - Required loaders are missing from the [`LOADERS`] array
-///
-/// These conditions indicate programming errors that should be caught during development.
-static EXECUTION_LEVELS: LazyLock<Vec<Vec<&'static dyn MetadataLoader>>> = LazyLock::new(|| {
-    let graph = match build_dependency_graph(&LOADERS) {
-        Ok(g) => g,
-        Err(e) => {
-            log::error!(
-                "Static loader dependency graph is invalid - check for missing loaders or circular dependencies: {e}"
-            );
-            return Vec::new();
-        }
-    };
-    graph.topological_levels().unwrap_or_else(|e| {
-        log::error!(
-            "Static loader dependency graph must be acyclic - check loader dependencies for cycles: {e}"
-        );
-        Vec::new()
-    })
+/// Holds the reason the plan cannot be built when the static loader dependency graph is
+/// invalid (a cycle, or a dependency no loader provides). Every load then fails with that
+/// reason as an [`Error::Configuration`] instead of running no loaders at all. Such a graph
+/// is a programming error, and `execution_levels_run_every_loader_once_after_its_dependencies`
+/// fails on it.
+static EXECUTION_PLAN: LazyLock<std::result::Result<ExecutionPlan, String>> = LazyLock::new(|| {
+    build_dependency_graph(&LOADERS)
+        .and_then(|graph| graph.topological_levels())
+        .map_err(|e| format!("the static loader dependency graph is invalid: {e}"))
+        .and_then(ExecutionPlan::new)
 });
+
+/// The levels the loaders run in, and where a project load meets the other assemblies.
+struct ExecutionPlan {
+    /// The loaders by level: each level runs after every level before it.
+    levels: Vec<Vec<&'static dyn MetadataLoader>>,
+    /// The level before which a project load binds its TypeRefs to the other assemblies'
+    /// TypeDefs: the first one after the TypeDef, TypeRef and NestedClass loaders, whose
+    /// rows give the full names the binding matches (a nested type's name includes its
+    /// enclosing types).
+    bind_typerefs_before: usize,
+    /// The level before which a project load waits until every assembly has resolved its
+    /// inheritance: the first one after the [`inheritance::InheritanceResolver`].
+    inheritance_resolved_before: usize,
+}
+
+impl ExecutionPlan {
+    /// Locate the project meeting points in `levels`.
+    ///
+    /// # Errors
+    /// Returns why the plan is unusable: a loader the meeting points name is not
+    /// scheduled, or the TypeRefs would bind after the inheritance resolver reads them.
+    fn new(levels: Vec<Vec<&'static dyn MetadataLoader>>) -> std::result::Result<Self, String> {
+        let level_of = |describe: &str, matches: &dyn Fn(&dyn MetadataLoader) -> bool| {
+            levels
+                .iter()
+                .position(|level| level.iter().any(|loader| matches(*loader)))
+                .ok_or_else(|| format!("the loader plan has no {describe}"))
+        };
+        let table_level = |table: TableId| {
+            level_of(&format!("{table:?} loader"), &|loader| {
+                loader.table_id() == Some(table)
+            })
+        };
+        let inheritance = level_of("inheritance resolver", &|loader| {
+            loader.name() == std::any::type_name::<inheritance::InheritanceResolver>()
+        })?;
+        let bind_typerefs_before = table_level(TableId::TypeDef)?
+            .max(table_level(TableId::TypeRef)?)
+            .max(table_level(TableId::NestedClass)?)
+            .saturating_add(1);
+        if bind_typerefs_before > inheritance {
+            return Err(
+                "the loader plan resolves inheritance before the TypeRefs can bind".to_string(),
+            );
+        }
+        Ok(Self {
+            levels,
+            bind_typerefs_before,
+            inheritance_resolved_before: inheritance.saturating_add(1),
+        })
+    }
+}
 
 /// Trait for metadata table loaders.
 ///
@@ -216,34 +261,9 @@ static EXECUTION_LEVELS: LazyLock<Vec<Vec<&'static dyn MetadataLoader>>> = LazyL
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::loader::{MetadataLoader, LoaderContext};
-/// use dotscope::metadata::tables::TableId;
-/// use dotscope::Result;
-///
-/// struct MyTableLoader;
-///
-/// impl MetadataLoader for MyTableLoader {
-///     fn load(&self, context: &LoaderContext) -> Result<()> {
-///         // Access dependency data
-///         let assembly_data = context.assemblies();
-///
-///         // Process this table's data
-///         // ...
-///
-///         Ok(())
-///     }
-///
-///     fn table_id(&self) -> TableId {
-///         TableId::MyTable
-///     }
-///
-///     fn dependencies(&self) -> &'static [TableId] {
-///         &[TableId::Assembly, TableId::Module]
-///     }
-/// }
-/// ```
-pub(crate) trait MetadataLoader: Send + Sync {
+/// Every table has one; `AssemblyLoader` (`metadata/tables/assembly/loader.rs`) is a
+/// complete implementation.
+pub trait MetadataLoader: Send + Sync {
     /// Load this metadata table using the provided [`LoaderContext`].
     ///
     /// This method processes the metadata for this loader's specific table type, integrating
@@ -272,7 +292,7 @@ pub(crate) trait MetadataLoader: Send + Sync {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// fn load(&self, context: &LoaderContext) -> Result<()> {
     ///     // Get required metadata streams
     ///     let table_stream = context.table_stream()?;
@@ -306,7 +326,7 @@ pub(crate) trait MetadataLoader: Send + Sync {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// use dotscope::metadata::tables::TableId;
     ///
     /// // Regular table loader
@@ -363,7 +383,7 @@ pub(crate) trait MetadataLoader: Send + Sync {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// use dotscope::metadata::tables::TableId;
     ///
     /// // A TypeDef loader that depends on MethodDef and Field tables
@@ -377,6 +397,14 @@ pub(crate) trait MetadataLoader: Send + Sync {
     /// }
     /// ```
     fn dependencies(&self) -> &'static [TableId];
+
+    /// The loader's type name, which identifies it.
+    ///
+    /// Loaders are unit structs, and Rust does not guarantee distinct addresses for
+    /// distinct zero-sized values, so a loader's address does not identify it.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Build a dependency graph from a collection of loaders.
@@ -393,7 +421,7 @@ pub(crate) trait MetadataLoader: Send + Sync {
 ///    - Query each loader for its dependencies via [`MetadataLoader::dependencies`]
 ///    - Validate that all dependencies have corresponding registered loaders
 ///    - Construct bidirectional dependency mappings for efficient traversal
-/// 4. **Cycle Detection**: In debug builds, performs comprehensive cycle detection
+/// 4. **Cycle Detection**: Checks the table dependencies for cycles
 /// 5. **Validation**: Ensures the graph can produce a valid topological ordering
 ///
 /// # Arguments
@@ -410,23 +438,14 @@ pub(crate) trait MetadataLoader: Send + Sync {
 ///
 /// This function returns errors in the following cases:
 /// - **Missing Dependency**: A loader declares a dependency on a table with no registered loader
-/// - **Circular Dependency**: The dependency relationships form cycles (detected in debug builds)
+/// - **Circular Dependency**: The dependency relationships form cycles
 /// - **Invalid State**: Internal graph construction fails due to inconsistent loader data
 ///
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::loader::{build_dependency_graph, LOADERS};
-///
-/// match build_dependency_graph(&LOADERS) {
-///     Ok(graph) => {
-///         let levels = graph.topological_levels()?;
-///         println!("Graph has {} execution levels", levels.len());
-///     }
-///     Err(e) => eprintln!("Failed to build dependency graph: {}", e),
-/// }
-/// ```
+/// The `tests::execution_levels_run_every_loader_once_after_its_dependencies` test in this
+/// module checks the schedule it builds.
 ///
 /// # Thread Safety
 ///
@@ -453,7 +472,7 @@ fn build_dependency_graph(
 ///
 /// # Execution Strategy
 ///
-/// 1. **Level Access**: Retrieves pre-computed execution levels from the static [`EXECUTION_LEVELS`] cache
+/// 1. **Level Access**: Retrieves pre-computed execution levels from the static [`EXECUTION_PLAN`] cache
 /// 2. **Parallel Execution**: For each level:
 ///    - Executes all loaders in the level concurrently using [rayon]  
 ///    - Waits for all loaders in the level to complete before proceeding
@@ -486,33 +505,13 @@ fn build_dependency_graph(
 /// - **Loader Execution Errors**: Individual loader failures during metadata processing
 /// - **Context Errors**: Issues accessing metadata streams or storing processed data
 /// - **Concurrency Errors**: Resource contention or synchronization failures
-///
-/// Note: Dependency graph and topological sort errors are caught at static initialization time
-/// and will panic during the first call to this function if the loader dependencies are invalid.
+/// - **Invalid Plan**: The static loader dependency graph is invalid
+///   ([`EXECUTION_PLAN`]); every load then fails with an [`Error::Configuration`]
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::loader::{LoaderContext, execute_loaders_in_parallel};
-/// use dotscope::file::CilObject;
-///
-/// // Load .NET assembly file
-/// let cil_object = CilObject::parse_file("example.dll")?;
-///
-/// // Create loader context
-/// let context = LoaderContext::new(&cil_object)?;
-///
-/// // Execute all metadata loaders in parallel
-/// match execute_loaders_in_parallel(&context) {
-///     Ok(()) => {
-///         println!("All metadata tables loaded successfully");
-///         // Access loaded data via context methods
-///         let assemblies = context.assemblies();
-///         let types = context.type_defs();
-///     }
-///     Err(e) => eprintln!("Metadata loading failed: {}", e),
-/// }
-/// ```
+/// The `examples::from_assembly_view_example` test in `loader/data.rs` runs every loader
+/// through it.
 ///
 /// # Thread Safety
 ///
@@ -524,13 +523,16 @@ fn build_dependency_graph(
 ///
 /// The function automatically manages CPU resources through rayon's thread pool and
 /// ensures proper cleanup if any loader fails during execution.
-pub(crate) fn execute_loaders_in_parallel(
+pub fn execute_loaders_in_parallel(
     context: &LoaderContext,
     project_context: Option<&ProjectContext>,
 ) -> Result<()> {
     let start = Instant::now();
-    // Access pre-computed execution levels (computed once per process)
-    let levels = &*EXECUTION_LEVELS;
+    // Access the pre-computed execution plan (computed once per process)
+    let plan = EXECUTION_PLAN
+        .as_ref()
+        .map_err(|reason| Error::Configuration(reason.clone()))?;
+    let levels = &plan.levels;
     let table_count: usize = levels.iter().map(|l| l.len()).sum();
     debug!(
         "Loading metadata: {} tables in {} dependency levels",
@@ -539,22 +541,21 @@ pub(crate) fn execute_loaders_in_parallel(
     );
 
     for (level_index, level) in levels.iter().enumerate() {
-        if level_index == 4 {
+        if level_index == plan.bind_typerefs_before {
             if let Some(proj_ctx) = project_context {
                 context.types.build_fullnames();
 
                 proj_ctx.wait_stage2()?;
 
-                // Redirect TypeRefs to their canonical TypeDefs from external assemblies
+                // Redirect TypeRefs to their canonical TypeDefs from external assemblies,
+                // each in the assembly its resolution scope names
                 for entry in context.types.iter() {
                     let type_rc = entry.value();
                     if !type_rc.is_typeref() {
                         continue;
                     }
 
-                    if let Some(canonical_typedef) =
-                        context.types.resolve_type_global(&type_rc.fullname())
-                    {
+                    if let Some(canonical_typedef) = context.types.resolve_typeref_scoped(type_rc) {
                         if !context
                             .types
                             .redirect_typeref_to_typedef(type_rc.token, &canonical_typedef)
@@ -569,7 +570,7 @@ pub(crate) fn execute_loaders_in_parallel(
             }
         }
 
-        if level_index == 7 {
+        if level_index == plan.inheritance_resolved_before {
             if let Some(proj_ctx) = project_context {
                 proj_ctx.wait_stage3()?;
             }
@@ -588,4 +589,104 @@ pub(crate) fn execute_loaders_in_parallel(
 
     debug!("Metadata loaded in {}ms", start.elapsed().as_millis());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The schedule the loads run on puts every loader exactly once, and each one after
+    /// the loader of every table it depends on.
+    ///
+    /// The order is checked here from each loader's own `dependencies()`, not from the
+    /// graph's bookkeeping, so a graph that drops a loader (two loaders for one table
+    /// share a key) or schedules one too early fails even when its own checks pass.
+    #[test]
+    fn execution_levels_run_every_loader_once_after_its_dependencies() {
+        let levels = &EXECUTION_PLAN
+            .as_ref()
+            .expect("the static loader dependency graph is valid")
+            .levels;
+        let scheduled: usize = levels.iter().map(Vec::len).sum();
+        assert_eq!(
+            scheduled,
+            LOADERS.len(),
+            "every registered loader is scheduled exactly once"
+        );
+
+        let level_of = |loader: &dyn MetadataLoader| {
+            let matches: Vec<usize> = levels
+                .iter()
+                .enumerate()
+                .flat_map(|(index, level)| {
+                    level
+                        .iter()
+                        .filter(|l| l.name() == loader.name())
+                        .map(move |_| index)
+                })
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{} appears in exactly one level",
+                loader.name()
+            );
+            matches[0]
+        };
+
+        for loader in LOADERS {
+            let level = level_of(loader);
+            for dependency in loader.dependencies() {
+                let providers: Vec<&dyn MetadataLoader> = LOADERS
+                    .iter()
+                    .copied()
+                    .filter(|l| l.table_id() == Some(*dependency))
+                    .collect();
+                assert_eq!(
+                    providers.len(),
+                    1,
+                    "table {dependency:?} has exactly one loader"
+                );
+                assert!(
+                    level_of(providers[0]) < level,
+                    "{} runs after the loader of {dependency:?}",
+                    loader.name()
+                );
+            }
+        }
+    }
+
+    /// A cycle between table loaders is refused when the graph is built, naming a table
+    /// on it, rather than surfacing later as a schedule that cannot make progress.
+    #[test]
+    fn a_dependency_cycle_is_refused_when_the_graph_is_built() {
+        struct Cyclic(TableId, &'static [TableId]);
+
+        impl MetadataLoader for Cyclic {
+            fn load(&self, _context: &LoaderContext) -> Result<()> {
+                Ok(())
+            }
+
+            fn table_id(&self) -> Option<TableId> {
+                Some(self.0)
+            }
+
+            fn dependencies(&self) -> &'static [TableId] {
+                self.1
+            }
+        }
+
+        static TYPE_DEF: Cyclic = Cyclic(TableId::TypeDef, &[TableId::Field]);
+        static FIELD: Cyclic = Cyclic(TableId::Field, &[TableId::TypeDef]);
+
+        let Err(error) = build_dependency_graph(&[&TYPE_DEF, &FIELD]) else {
+            panic!("a cyclic loader graph builds");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("Circular dependency")
+                && (message.contains("TypeDef") || message.contains("Field")),
+            "unexpected error: {message}"
+        );
+    }
 }

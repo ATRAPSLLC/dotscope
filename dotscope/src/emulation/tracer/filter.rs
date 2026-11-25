@@ -20,8 +20,9 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use dotscope::emulation::{TraceFilter, MethodPattern};
+//! ```
+//! use dotscope::emulation::{MethodPattern, TraceFilter};
+//! use dotscope::metadata::token::Token;
 //!
 //! // Only trace a specific decryptor method
 //! let filter = TraceFilter {
@@ -135,11 +136,7 @@ impl TraceFilter {
         }
 
         // Check token whitelist
-        if !self.method_tokens.is_empty() && !self.method_tokens.contains(&method_token) {
-            return false;
-        }
-
-        true
+        self.method_tokens.is_empty() || self.method_tokens.contains(&method_token)
     }
 
     /// Checks if a method should be traced using name-based patterns.

@@ -527,65 +527,58 @@ impl TokenValidationResult {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::metadata::cilassemblyview::CilAssemblyView;
+    use crate::{metadata::cilassemblyview::CilAssemblyView, testkit::fixture};
 
     #[test]
     fn test_token_validator_creation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = TokenValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = TokenValidator::new(&scanner);
 
-                // Test basic functionality - just ensure method works
-                let _count = validator.table_row_count(TableId::TypeDef);
-            }
-        }
+        // Test basic functionality - just ensure method works
+        let _count = validator.table_row_count(TableId::TypeDef);
     }
 
     #[test]
     fn test_token_bounds_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = TokenValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = TokenValidator::new(&scanner);
 
-                // Test invalid RID (0)
-                let invalid_token = Token::new(0x02000000); // TypeDef with RID 0
-                assert!(validator.validate_token_bounds(invalid_token).is_err());
+        // Test invalid RID (0)
+        let invalid_token = Token::new(0x02000000); // TypeDef with RID 0
+        assert!(validator.validate_token_bounds(invalid_token).is_err());
 
-                // Test valid token bounds (if TypeDef table has rows)
-                if validator.table_row_count(TableId::TypeDef) > 0 {
-                    let valid_token = Token::new(0x02000001); // TypeDef with RID 1
-                    assert!(validator.validate_token_bounds(valid_token).is_ok());
-                }
-            }
+        // Test valid token bounds (if TypeDef table has rows)
+        if validator.table_row_count(TableId::TypeDef) > 0 {
+            let valid_token = Token::new(0x02000001); // TypeDef with RID 1
+            assert!(validator.validate_token_bounds(valid_token).is_ok());
         }
     }
 
     #[test]
     fn test_token_table_type_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = TokenValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = TokenValidator::new(&scanner);
 
-                if validator.table_row_count(TableId::TypeDef) > 0 {
-                    let typedef_token = Token::new(0x02000001); // TypeDef with RID 1
+        if validator.table_row_count(TableId::TypeDef) > 0 {
+            let typedef_token = Token::new(0x02000001); // TypeDef with RID 1
 
-                    // Should pass for TypeDef table
-                    assert!(validator
-                        .validate_token_table_type(typedef_token, TableId::TypeDef)
-                        .is_ok());
+            // Should pass for TypeDef table
+            assert!(validator
+                .validate_token_table_type(typedef_token, TableId::TypeDef)
+                .is_ok());
 
-                    // Should fail for MethodDef table
-                    assert!(validator
-                        .validate_token_table_type(typedef_token, TableId::MethodDef)
-                        .is_err());
-                }
-            }
+            // Should fail for MethodDef table
+            assert!(validator
+                .validate_token_table_type(typedef_token, TableId::MethodDef)
+                .is_err());
         }
     }
 
@@ -613,45 +606,41 @@ mod tests {
 
     #[test]
     fn test_null_token_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = TokenValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = TokenValidator::new(&scanner);
 
-                let null_token = Token::new(0);
+        let null_token = Token::new(0);
 
-                // Should pass when nullable is true
-                assert!(validator.validate_null_token(null_token, true).is_ok());
+        // Should pass when nullable is true
+        assert!(validator.validate_null_token(null_token, true).is_ok());
 
-                // Should fail when nullable is false
-                assert!(validator.validate_null_token(null_token, false).is_err());
-            }
-        }
+        // Should fail when nullable is false
+        assert!(validator.validate_null_token(null_token, false).is_err());
     }
 
     #[test]
     fn test_typed_token_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = TokenValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = TokenValidator::new(&scanner);
 
-                if validator.table_row_count(TableId::TypeDef) > 0 {
-                    let typedef_token = Token::new(0x02000001); // TypeDef with RID 1
-                    let allowed_tables = &[TableId::TypeDef, TableId::TypeRef, TableId::TypeSpec];
+        if validator.table_row_count(TableId::TypeDef) > 0 {
+            let typedef_token = Token::new(0x02000001); // TypeDef with RID 1
+            let allowed_tables = &[TableId::TypeDef, TableId::TypeRef, TableId::TypeSpec];
 
-                    // Should pass since TypeDef is in allowed tables
-                    assert!(validator
-                        .validate_typed_token(typedef_token, allowed_tables)
-                        .is_ok());
+            // Should pass since TypeDef is in allowed tables
+            assert!(validator
+                .validate_typed_token(typedef_token, allowed_tables)
+                .is_ok());
 
-                    // Should fail if TypeDef is not in allowed tables
-                    let not_allowed = &[TableId::MethodDef, TableId::Field];
-                    assert!(validator
-                        .validate_typed_token(typedef_token, not_allowed)
-                        .is_err());
-                }
-            }
+            // Should fail if TypeDef is not in allowed tables
+            let not_allowed = &[TableId::MethodDef, TableId::Field];
+            assert!(validator
+                .validate_typed_token(typedef_token, not_allowed)
+                .is_err());
         }
     }
 }

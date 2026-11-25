@@ -31,7 +31,7 @@
 //! - [PE Format Specification](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format)
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Write,
     path::Path,
     sync::Arc,
@@ -43,34 +43,45 @@ use strum::IntoEnumIterator;
 #[cfg(feature = "x86")]
 use crate::analysis::x86_native_body_size;
 use crate::{
+    assembly::{decode_stream, Operand},
     cilassembly::{
-        changes::{AssemblyChanges, ChangeRef},
+        changes::{AssemblyChanges, ChangeRef, METHOD_BODY_PLACEHOLDER_BASE},
+        cleanup::collect_referenced_heap_entries,
+        debugtables::replaced_method_bodies,
         writer::{
+            blobs::{debug_blobs, signature_blobs, BlobRemap},
             context::{SectionWriteInfo, WriteContext, FILE_ALIGNMENT_DEFAULT},
             fields::{resolve_field_data_rva, write_field_data},
             fixups::{apply_all_fixups, fixup_metadata_stream_headers},
             heaps::{
                 patch_row_heap_refs, precompute_heap_offsets, stream_blob_heap, stream_guid_heap,
-                stream_strings_heap, stream_userstring_heap,
+                stream_strings_heap, stream_userstring_heap, SourceHeaps,
             },
             methods::rebuild_method_body,
             output::Output,
+            pdb::{rebuild_embedded_pdb, ImageChanges},
             relocations::{generate_relocations, RelocationConfig},
             remapper::{RemapReferences, RidRemapper},
         },
         CilAssembly, Operation, TableModifications,
     },
     dispatch_table_type,
-    file::pe::{
-        relocate_resource_section, DataDirectoryType, DosHeader, PeCharacteristics, SectionTable,
+    file::{
+        debug::{debug_type, DebugDirectoryEntry},
+        pe::{
+            relocate_resource_section, DataDirectoryType, DosHeader, Import, PeCharacteristics,
+            SectionTable,
+        },
+        File,
     },
     metadata::{
         cor20header::Cor20Flags,
         exports::NativeExports,
         imports::NativeImports,
-        method::MethodImplCodeType,
+        method::{MethodBody, MethodImplCodeType},
+        pdb::{embedded_portable_pdb, PORTABLE_CODEVIEW_MINOR_VERSION},
         root::Root,
-        streams::{Blob, Guid, StreamHeader, Strings, UserStrings},
+        streams::StreamHeader,
         tablefields::get_heap_fields,
         tables::{
             skip_unreadable, ManifestResourceRaw, MethodDefRaw, RowWritable, StandAloneSigRaw,
@@ -79,7 +90,7 @@ use crate::{
         token::Token,
     },
     utils::{align_to, calculate_table_row_size},
-    Error, Result,
+    Error, Parser, Result,
 };
 
 /// Upper bound on how far the native-stub decoder will scan for a function end.
@@ -87,6 +98,7 @@ use crate::{
 /// The scan window is otherwise "this PE section", which for a small file can still be the
 /// bulk of it. A native stub in a mixed-mode assembly is kilobytes of code; anything past this
 /// is not a stub whose extent we failed to find, it is a region we should refuse to guess at.
+#[cfg(feature = "x86")]
 const MAX_NATIVE_BODY_SCAN_BYTES: usize = 64 * 1024;
 
 /// IAT (Import Address Table) size for .NET executables (8 bytes).
@@ -126,6 +138,24 @@ pub struct GeneratorConfig {
     ///
     /// Default: `false`
     pub skip_original_method_bodies: bool,
+
+    /// What the write does with a reference to a row it deletes.
+    ///
+    /// Default: [`DanglingPolicy::Error`]
+    pub dangling: DanglingPolicy,
+}
+
+/// What a write does with a reference to a row it deletes.
+///
+/// Deleting a row shifts the rows after it, so a reference to the deleted row has nowhere
+/// to go: the writer never retargets it to a neighbour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DanglingPolicy {
+    /// Fail the write with [`Error::DanglingReference`].
+    #[default]
+    Error,
+    /// Write a null reference in its place, and log a warning naming both rows.
+    Null,
 }
 
 impl GeneratorConfig {
@@ -136,6 +166,7 @@ impl GeneratorConfig {
     /// A new `GeneratorConfig` with:
     /// - `excluded_sections`: empty
     /// - `skip_original_method_bodies`: `false`
+    /// - `dangling`: [`DanglingPolicy::Error`]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -178,6 +209,122 @@ impl GeneratorConfig {
         self.skip_original_method_bodies = enabled;
         self
     }
+
+    /// Sets what the write does with a reference to a row it deletes.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - Fail the write, or write a null reference
+    ///
+    /// # Returns
+    ///
+    /// The modified configuration for method chaining.
+    #[must_use]
+    pub fn with_dangling(mut self, policy: DanglingPolicy) -> Self {
+        self.dangling = policy;
+        self
+    }
+}
+
+/// The tables ECMA-335 §II.22 and the Portable PDB format require sorted, in
+/// the order the writer settles them.
+///
+/// A table comes after every sorted table its key refers to: a
+/// GenericParamConstraint is keyed by its GenericParam, and a CustomAttribute
+/// or CustomDebugInformation by a parent that can be a row of most of the
+/// others. Its key is then computed with those references already remapped to
+/// where their rows land.
+const SORTED_TABLES: &[TableId] = &[
+    TableId::GenericParam,
+    TableId::GenericParamConstraint,
+    TableId::InterfaceImpl,
+    TableId::DeclSecurity,
+    TableId::MethodImpl,
+    TableId::MethodSemantics,
+    TableId::NestedClass,
+    TableId::ClassLayout,
+    TableId::FieldLayout,
+    TableId::FieldRVA,
+    TableId::FieldMarshal,
+    TableId::Constant,
+    TableId::ImplMap,
+    TableId::LocalScope,
+    TableId::StateMachineMethod,
+    TableId::CustomAttribute,
+    TableId::CustomDebugInformation,
+];
+
+/// A row of any table, as the writer serializes it.
+///
+/// [`RowWritable`] is implemented per row type and is not object safe; this
+/// lets one routine produce the rows of every table.
+trait RowSource {
+    /// The row's [sort key](RowWritable::sort_key).
+    fn key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>>;
+
+    /// Serializes the row, as [`RowWritable::row_write`].
+    fn write(
+        &self,
+        data: &mut [u8],
+        offset: &mut usize,
+        rid: u32,
+        sizes: &TableInfoRef,
+    ) -> Result<()>;
+}
+
+impl<R: RowWritable> RowSource for R {
+    fn key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        self.sort_key(sizes)
+    }
+
+    fn write(
+        &self,
+        data: &mut [u8],
+        offset: &mut usize,
+        rid: u32,
+        sizes: &TableInfoRef,
+    ) -> Result<()> {
+        self.row_write(data, offset, rid, sizes)
+    }
+}
+
+/// Receives each row written: its RID, its sort key when its table is sorted,
+/// and its bytes.
+type RowSink<'a> = dyn FnMut(u32, Option<(u32, u32)>, &[u8]) -> Result<()> + 'a;
+
+/// What rows need from the write context once the method bodies, field data
+/// and resources are laid out: where RVAs and offsets moved, and which
+/// duplicate signatures are dropped.
+struct RowFixups {
+    method_body_rva_map: HashMap<u32, u32>,
+    field_data_rva_map: HashMap<u32, u32>,
+    resource_offset_remap: HashMap<u32, u32>,
+    original_rva_delta: i32,
+    standalonesig_skip: HashSet<u32>,
+}
+
+impl RowFixups {
+    fn from_context(ctx: &WriteContext) -> Self {
+        Self {
+            method_body_rva_map: ctx.method_body_rva_map.clone(),
+            field_data_rva_map: ctx.field_data_rva_map.clone(),
+            resource_offset_remap: ctx.resource_offset_remap.clone(),
+            original_rva_delta: ctx.original_method_rva_delta,
+            standalonesig_skip: ctx.standalonesig_skip.clone(),
+        }
+    }
+
+    /// Applies the RVA and offset fixups to a serialized row of `table_id`.
+    fn apply(&self, buffer: &mut [u8], table_id: TableId) {
+        PeGenerator::apply_rva_fixups(
+            buffer,
+            table_id,
+            &self.method_body_rva_map,
+            &self.field_data_rva_map,
+            &self.resource_offset_remap,
+            self.original_rva_delta,
+        );
+    }
 }
 
 /// PE file generator that orchestrates complete file generation.
@@ -189,14 +336,14 @@ impl GeneratorConfig {
 ///
 /// The generator supports configuration options via [`GeneratorConfig`]:
 ///
-/// ```rust,ignore
+/// ```text
 /// let generator = PeGenerator::new(&assembly)
 ///     .with_config(GeneratorConfig::default());
 /// ```
 ///
 /// Or using the builder pattern:
 ///
-/// ```rust,ignore
+/// ```text
 /// let generator = PeGenerator::with_config(
 ///     &assembly,
 ///     GeneratorConfig::new()
@@ -323,17 +470,7 @@ impl<'a> PeGenerator<'a> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use dotscope::cilassembly::{CilAssembly, PeGenerator};
-    ///
-    /// let assembly = CilAssembly::new(view);
-    /// // ... modify assembly ...
-    ///
-    /// let generator = PeGenerator::new(&assembly);
-    /// let pe_bytes = generator.generate_to_memory()?;
-    ///
-    /// // Use pe_bytes for further processing
-    /// ```
+    /// The `examples::to_memory_example` test in this module runs this example.
     pub fn to_memory(&self) -> Result<Vec<u8>> {
         // Estimate file size for initial allocation
         let estimated_size = self.estimate_file_size()?;
@@ -415,33 +552,30 @@ impl<'a> PeGenerator<'a> {
                 }
             }
 
-            let remapper = RidRemapper::from_changes(changes, &original_counts);
+            let remapper =
+                RidRemapper::from_changes(changes, &original_counts, self.config.dangling);
             if !remapper.is_empty() {
-                ctx.token_remapping = remapper.build_token_remapping();
-                // Store TypeDef RID remapping for signature blob processing
-                // Note: typedef_remap() filters out deleted TypeDefs so signatures
-                // referencing deleted types won't be corrupted by remapping to other types
-                if let Some(typedef_remap) = remapper.typedef_remap() {
-                    ctx.typedef_rid_remap = typedef_remap;
-                }
-                // Store TypeRef RID remapping for signature blob processing
-                // When orphaned TypeRefs are removed, signature blobs must also be updated
-                if let Some(typeref_remap) = remapper.typeref_remap() {
-                    ctx.typeref_rid_remap = typeref_remap;
-                }
-                // Store TypeSpec RID remapping for signature blob processing.
-                // `ELEMENT_TYPE_CLASS` / `ELEMENT_TYPE_VALUETYPE` operands are
-                // `TypeDefOrRefOrSpecEncoded`, so a `LocalVarSig` (or any other
-                // signature) can carry a TypeSpec token that needs to follow
-                // the row shift when neighbouring TypeSpecs are deleted.
-                if let Some(typespec_remap) = remapper.typespec_remap() {
-                    ctx.typespec_rid_remap = typespec_remap;
-                }
+                ctx.tokens = remapper.token_remap();
+                // The blobs signature columns reference, whose type tokens follow the rows
+                // the remap renumbers.
+                ctx.typed_blobs = signature_blobs(self.assembly);
             }
+            // The Portable PDB blobs whose content names rows or blobs: the blobs they name
+            // move whenever the heap is rebuilt, with or without row renumbering, and the
+            // rows a change adds are named by placeholder
+            ctx.typed_blobs.extend(debug_blobs(self.assembly));
 
             // Build StandAloneSig deduplication mapping
             self.build_standalonesig_dedup(&mut ctx, changes);
         }
+
+        // Every heap offset the tables and the bodies name, so that a heap rebuilt by
+        // deduplication or edits keeps the ones inside another entry's bytes as well as the
+        // entries
+        let (strings, blobs, _) = collect_referenced_heap_entries(self.assembly);
+        ctx.referenced_string_offsets = strings;
+        ctx.referenced_blob_offsets = blobs;
+        ctx.referenced_userstring_offsets = collect_referenced_userstring_offsets(self.assembly);
 
         // Pre-compute heap offsets - needed for method bodies that reference newly added
         // userstrings (ldstr instructions) and other heap entries. This resolves ChangeRefs to
@@ -483,6 +617,11 @@ impl<'a> PeGenerator<'a> {
         // in .text (no .rsrc section). These must be carried over to the new .text.
         self.write_embedded_pe_resources(&mut ctx)?;
 
+        // The debug directory: kept as it is when the write changes nothing, and with the
+        // PDB it embeds regenerated (and every entry that names that PDB following it) when
+        // the write moves what the PDB describes
+        self.write_debug_data(&mut ctx, changes)?;
+
         // Calculate .text section size and update sections vector
         ctx.text_section_size = ctx
             .pos()
@@ -514,15 +653,15 @@ impl<'a> PeGenerator<'a> {
             "PE layout: .text={}, methods={} bytes, metadata={} bytes",
             ctx.text_section_size, ctx.method_bodies_size, ctx.metadata_size
         );
-        debug!("Applied {} RID remappings", ctx.token_remapping.len());
+        debug!("Applied {} RID remappings", ctx.tokens.len());
 
         Ok(ctx)
     }
 
     /// Estimates the total file size for initial allocation.
     ///
-    /// This provides a conservative over-estimate. The actual file will be
-    /// truncated to the correct size at the end.
+    /// The output starts at this size, grows when a write runs past it (the estimate leaves
+    /// out table rows and index widening), and is truncated to the actual size at the end.
     ///
     /// # Returns
     ///
@@ -587,14 +726,40 @@ impl<'a> PeGenerator<'a> {
     /// Estimates additional heap space needed for modifications.
     ///
     /// Calculates the total bytes needed for all appended heap entries including
-    /// strings, blobs, GUIDs, and user strings.
+    /// strings, blobs, GUIDs, and user strings, plus what a replacement heap holds past the
+    /// heap it replaces (the original file's size already counts the original heaps).
     ///
     /// # Returns
     ///
     /// The estimated additional heap space in bytes.
     fn estimate_heap_expansion(&self) -> u64 {
+        let view = self.assembly.view();
         let changes = self.assembly.changes();
         let mut expansion = 0u64;
+
+        // A replacement heap's growth over the heap it replaces, read through the selector
+        // the write uses
+        let source = SourceHeaps::new(view, changes);
+        for (source, original) in [
+            (
+                source.strings,
+                view.strings().map_or(0, |heap| heap.data().len()),
+            ),
+            (
+                source.blobs,
+                view.blobs().map_or(0, |heap| heap.data().len()),
+            ),
+            (
+                source.guids,
+                view.guids().map_or(0, |heap| heap.data().len()),
+            ),
+            (
+                source.userstrings,
+                view.userstrings().map_or(0, |heap| heap.data().len()),
+            ),
+        ] {
+            expansion = expansion.saturating_add(source.len().saturating_sub(original) as u64);
+        }
 
         // Add space for appended strings
         for (data, _) in changes.string_heap_changes.appended_iter() {
@@ -612,10 +777,11 @@ impl<'a> PeGenerator<'a> {
         let guid_count = changes.guid_heap_changes.appended_iter().count() as u64;
         expansion = expansion.saturating_add(guid_count.saturating_mul(16));
 
-        // Add space for appended user strings
+        // Add space for appended user strings: UTF-16, at most two bytes per UTF-8 byte, a
+        // compressed length of up to 4 bytes and the terminal byte
         for (data, _) in changes.userstring_heap_changes.appended_iter() {
-            // +5 for max compressed length prefix
-            expansion = expansion.saturating_add((data.len() as u64).saturating_add(5));
+            expansion =
+                expansion.saturating_add((data.len() as u64).saturating_mul(2).saturating_add(5));
         }
 
         expansion
@@ -717,7 +883,8 @@ impl<'a> PeGenerator<'a> {
     ///
     /// Clones the original optional header and zeroes invalid data directories:
     /// - CertificateTable: Signature is invalidated by any modification
-    /// - Debug: Debug info becomes stale (IL offsets change, PDB correlation breaks)
+    /// - Debug: Debug info becomes stale (IL offsets change, PDB correlation breaks); a write
+    ///   that changes nothing copies it back in (`write_debug_data`)
     ///
     /// Original directory locations are stored in ctx for zeroing actual data regions.
     ///
@@ -876,8 +1043,8 @@ impl<'a> PeGenerator<'a> {
     ///
     /// The import list is built by merging:
     /// 1. mscoree.dll with _CorExeMain/_CorDllMain (always first)
-    /// 2. Original imports from the source PE (excluding mscoree.dll)
-    /// 3. User-added imports from assembly changes
+    /// 2. Original imports from the source PE, but mscoree.dll's entry point
+    /// 3. User-added imports from assembly changes, but those already imported
     ///
     /// # Arguments
     ///
@@ -886,48 +1053,60 @@ impl<'a> PeGenerator<'a> {
     /// # Returns
     ///
     /// A `NativeImports` containing all imports with mscoree.dll first.
+    ///
+    /// # Errors
+    ///
+    /// When the original import table cannot be read in full, or an import cannot be held
+    /// (an empty name, ordinal 0, neither a name nor an ordinal): the table written would
+    /// lack it. A function the image imports twice from one DLL keeps both entries, each with
+    /// its own IAT slot.
     fn build_import_list(&self, ctx: &WriteContext) -> Result<NativeImports> {
         let view = self.assembly.view();
+        let pe = view.file().pe();
+        if let Some(error) = &pe.import_error {
+            return Err(Error::LayoutFailed(format!(
+                "{error}, so it cannot be written back"
+            )));
+        }
 
-        // Collect non-mscoree imports from original PE
+        let is_entry_point = |dll: &str, function: Option<&str>| {
+            dll.eq_ignore_ascii_case("mscoree.dll")
+                && matches!(function, Some("_CorExeMain" | "_CorDllMain"))
+        };
+        let add = |imports: &mut NativeImports, dll: &str, import: &Import| -> Result<()> {
+            imports.add_dll(dll)?;
+            match (&import.name, import.ordinal) {
+                (Some(name), _) => imports.add_function(dll, name),
+                (None, Some(ordinal)) => imports.add_function_by_ordinal(dll, ordinal),
+                (None, None) => Err(Error::LayoutFailed(format!(
+                    "an import from {dll} has neither a name nor an ordinal"
+                ))),
+            }
+        };
+
+        // Collect the original imports as they are, a function imported twice included, but
+        // mscoree.dll's entry point, which is written first
         let mut other_imports = NativeImports::new();
         other_imports.set_pe_format(ctx.is_pe32_plus);
-
-        if let Some(pe_imports) = view.file().imports() {
-            let original = NativeImports::from_pe_imports(pe_imports, ctx.is_pe32_plus)?;
-            for desc in original.descriptors() {
-                // Skip mscoree.dll - we'll add it correctly as first import
-                if desc.dll_name.eq_ignore_ascii_case("mscoree.dll") {
-                    continue;
-                }
-                if other_imports.add_dll(&desc.dll_name).is_ok() {
-                    for func in &desc.functions {
-                        if let Some(ref name) = func.name {
-                            let _ = other_imports.add_function(&desc.dll_name, name);
-                        } else if let Some(ordinal) = func.ordinal {
-                            let _ = other_imports.add_function_by_ordinal(&desc.dll_name, ordinal);
-                        }
-                    }
-                }
+        for import in &pe.imports {
+            if !is_entry_point(&import.dll, import.name.as_deref()) {
+                other_imports.add_entry(&import.dll, import)?;
             }
         }
 
-        // Add user-specified imports from changes
+        // Add user-specified imports from changes, but what is already imported
         let new_imports = self.assembly.changes().native_imports().native();
         for desc in new_imports.descriptors() {
-            // Skip mscoree.dll - protected
-            if desc.dll_name.eq_ignore_ascii_case("mscoree.dll") {
-                continue;
-            }
-            // Add or merge with existing
-            if !other_imports.has_dll(&desc.dll_name) {
-                let _ = other_imports.add_dll(&desc.dll_name);
-            }
             for func in &desc.functions {
-                if let Some(ref name) = func.name {
-                    let _ = other_imports.add_function(&desc.dll_name, name);
-                } else if let Some(ordinal) = func.ordinal {
-                    let _ = other_imports.add_function_by_ordinal(&desc.dll_name, ordinal);
+                let imported = other_imports.descriptors().any(|existing| {
+                    existing.dll_name == desc.dll_name
+                        && existing.functions.iter().any(|f| {
+                            f.name == func.name
+                                && (func.name.is_some() || f.ordinal == func.ordinal)
+                        })
+                });
+                if !imported && !is_entry_point(&desc.dll_name, func.name.as_deref()) {
+                    add(&mut other_imports, &desc.dll_name, func)?;
                 }
             }
         }
@@ -950,13 +1129,8 @@ impl<'a> PeGenerator<'a> {
 
         // Add all other imports after mscoree.dll
         for desc in other_imports.descriptors() {
-            final_imports.add_dll(&desc.dll_name)?;
             for func in &desc.functions {
-                if let Some(ref name) = func.name {
-                    let _ = final_imports.add_function(&desc.dll_name, name);
-                } else if let Some(ordinal) = func.ordinal {
-                    let _ = final_imports.add_function_by_ordinal(&desc.dll_name, ordinal);
-                }
+                final_imports.add_entry(&desc.dll_name, func)?;
             }
         }
 
@@ -993,7 +1167,7 @@ impl<'a> PeGenerator<'a> {
 
     /// Checks if this assembly needs native import table entries.
     ///
-    /// Returns `true` if the original PE had native imports (e.g., mscoree.dll)
+    /// Returns `true` if the original PE had an import table, whatever of it could be read,
     /// or if the user has added new native imports. .NET Core assemblies compiled
     /// for x64 typically have no IAT, no import table, and no native entry point;
     /// adding these unconditionally triggers CoreCLR's `CheckILOnly` validation
@@ -1001,18 +1175,19 @@ impl<'a> PeGenerator<'a> {
     fn needs_native_imports(&self) -> bool {
         let view = self.assembly.view();
 
-        // Check if original PE had any imports
-        if view.file().imports().is_some() {
+        // Check if original PE had an import table: the loader goes by its RVA, whatever its
+        // size says (BitMono writes 0)
+        if view
+            .file()
+            .pe()
+            .get_data_directory(DataDirectoryType::ImportTable)
+            .is_some_and(|directory| directory.virtual_address != 0)
+        {
             return true;
         }
 
         // Check if user has added any native imports
-        let user_imports = self.assembly.changes().native_imports().native();
-        if !user_imports.is_empty() {
-            return true;
-        }
-
-        false
+        !self.assembly.changes().native_imports().native().is_empty()
     }
 
     /// Writes the COR20 (CLR) header.
@@ -1045,7 +1220,7 @@ impl<'a> PeGenerator<'a> {
 
         // Write using the struct's write_to method
         // MetaData RVA and Size will be fixed up later in apply_fixups
-        // Entry point token remapping is also handled in fixups (after token_remapping is built)
+        // Entry point token remapping is also handled in fixups (after the token remap is built)
         cor20_header.write_to(ctx)?;
 
         Ok(())
@@ -1103,7 +1278,7 @@ impl<'a> PeGenerator<'a> {
                         // changes.method_bodies() and will be written separately below.
                         // This happens when cleanup patches a method body and stores it
                         // with a placeholder RVA.
-                        if ChangeRef::is_placeholder(original_rva) {
+                        if original_rva >= METHOD_BODY_PLACEHOLDER_BASE {
                             continue;
                         }
 
@@ -1115,36 +1290,22 @@ impl<'a> PeGenerator<'a> {
                         written_rvas.insert(original_rva);
 
                         let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
-                        let is_native = code_type.contains(MethodImplCodeType::NATIVE);
+                        let is_native = code_type == MethodImplCodeType::NATIVE;
 
-                        if is_native || code_type.contains(MethodImplCodeType::RUNTIME) {
+                        if is_native || code_type == MethodImplCodeType::RUNTIME {
                             // Native/runtime methods contain x86/x64 machine code, not CIL.
                             // Copy the raw bytes as-is. Size is determined by decoding
                             // x86 instructions to find the function's RET instruction.
                             #[cfg(feature = "x86")]
                             {
-                                let offset = file.rva_to_offset(original_rva as usize)?;
-
-                                // Clamp the scan window to the PE section containing the stub,
+                                // Clamp the scan window to the section containing the stub,
                                 // and to an absolute ceiling. Handing the decoder "everything
                                 // from here to EOF" let a single native method absorb the rest
                                 // of the input file into the output as one body, and made the
                                 // decode cost proportional to file size rather than to the stub.
-                                let section_end = file
-                                    .sections()
-                                    .iter()
-                                    .find_map(|section| {
-                                        let start = section.pointer_to_raw_data as usize;
-                                        let end =
-                                            start.saturating_add(section.size_of_raw_data as usize);
-                                        (offset >= start && offset < end).then_some(end)
-                                    })
-                                    .unwrap_or_else(|| file.data().len())
-                                    .min(file.data().len());
-                                let available = section_end
-                                    .saturating_sub(offset)
-                                    .min(MAX_NATIVE_BODY_SCAN_BYTES);
-                                let scan_data = file.data_slice(offset, available)?;
+                                let section = file.section_bounded(original_rva as usize)?;
+                                let available = section.len().min(MAX_NATIVE_BODY_SCAN_BYTES);
+                                let scan_data = section.get(..available).unwrap_or(section);
 
                                 let body_size = x86_native_body_size(scan_data, file.pe().is_64bit);
 
@@ -1162,7 +1323,7 @@ impl<'a> PeGenerator<'a> {
                                     )));
                                 }
 
-                                let body_data = file.data_slice(offset, body_size)?;
+                                let body_data = scan_data.get(..body_size).unwrap_or(scan_data);
 
                                 // Native code needs 4-byte alignment for consistency
                                 ctx.align_to_4_with_padding()?;
@@ -1173,18 +1334,12 @@ impl<'a> PeGenerator<'a> {
                             }
                         } else {
                             // CIL method - parse, remap tokens, and rebuild
-                            let offset = file.rva_to_offset(original_rva as usize)?;
-                            let remaining =
-                                file.data().len().checked_sub(offset).ok_or_else(|| {
-                                    Error::LayoutFailed(
-                                        "Method offset exceeds file size".to_string(),
-                                    )
-                                })?;
-                            let available_data = file.data_slice(offset, remaining)?;
+                            let available_data = file.section_bounded(original_rva as usize)?;
 
                             let rebuilt = rebuild_method_body(
                                 available_data,
-                                &ctx.token_remapping,
+                                Token::from_parts(TableId::MethodDef, row.rid),
+                                &ctx.tokens,
                                 &ctx.heap_remapping.userstrings,
                                 None,
                             )?;
@@ -1204,15 +1359,63 @@ impl<'a> PeGenerator<'a> {
             }
         }
 
+        // The surviving MethodDef row each new body is the body of, by its placeholder RVA.
+        // A body no surviving row has is dead and is not written: its method was deleted, or
+        // regenerated again under a newer placeholder, and it may name rows deleted with it.
+        let mut owners: HashMap<u32, Token> = HashMap::new();
+        let mut own = |rid: u32, row: &TableDataOwned| {
+            if let TableDataOwned::MethodDef(method) = row {
+                if method.rva >= METHOD_BODY_PLACEHOLDER_BASE {
+                    owners
+                        .entry(method.rva)
+                        .or_insert_with(|| Token::from_parts(TableId::MethodDef, rid));
+                }
+            }
+        };
+        match changes.get_table_modifications(TableId::MethodDef) {
+            Some(TableModifications::Replaced(rows)) => {
+                for (rid, row) in (1u32..).zip(rows) {
+                    own(rid, row);
+                }
+            }
+            Some(TableModifications::Sparse {
+                operations,
+                deleted_rows,
+                ..
+            }) => {
+                // The last operation on a row is the row the write emits.
+                let mut last: BTreeMap<u32, &TableDataOwned> = BTreeMap::new();
+                for op in operations {
+                    if let Operation::Insert(rid, row) | Operation::Update(rid, row) = &op.operation
+                    {
+                        last.insert(*rid, row);
+                    }
+                }
+                for (rid, row) in last {
+                    if !deleted_rows.contains(&rid) {
+                        own(rid, row);
+                    }
+                }
+            }
+            None => {}
+        }
+
         // Write new method bodies (sorted by placeholder RVA)
         let mut bodies: Vec<_> = changes.method_bodies().collect();
         bodies.sort_by_key(|(placeholder, _)| *placeholder);
 
         for (placeholder_rva, body_bytes) in bodies {
+            let Some(&owner) = owners.get(&placeholder_rva) else {
+                continue;
+            };
+            // A stored body's `ldstr` operands name strings by their input offsets (new
+            // strings carry placeholders instead), so they move with the heap as the input
+            // bodies' do.
             let rebuilt = rebuild_method_body(
                 body_bytes,
-                &ctx.token_remapping,
-                &HashMap::new(),
+                owner,
+                &ctx.tokens,
+                &ctx.heap_remapping.userstrings,
                 Some(changes),
             )?;
 
@@ -1267,9 +1470,8 @@ impl<'a> PeGenerator<'a> {
         // Each resource in the CLR resource section is: [4-byte LE length][data].
         // ManifestResource.offset_field points to the start of the length prefix.
         if cor20.resource_rva != 0 && cor20.resource_size != 0 {
-            let resource_file_offset = file.rva_to_offset(cor20.resource_rva as usize)?;
             let original_data =
-                file.data_slice(resource_file_offset, cor20.resource_size as usize)?;
+                file.rva_slice(cor20.resource_rva as usize, cor20.resource_size as usize)?;
 
             // Check if any ManifestResource rows have been deleted. If not, fast-path:
             // copy everything as-is.
@@ -1349,7 +1551,7 @@ impl<'a> PeGenerator<'a> {
                 }
             } else {
                 // No deletions — copy all original resources as-is
-                ctx.write(original_data)?;
+                ctx.write(&original_data)?;
             }
         }
 
@@ -1480,12 +1682,7 @@ impl<'a> PeGenerator<'a> {
             })
             .collect();
 
-        let version_padded_len = root
-            .version
-            .len()
-            .checked_add(3)
-            .ok_or_else(|| Error::LayoutFailed("Version length overflow".to_string()))?
-            & !3;
+        let version_padded_len = root.version_field_size();
         let version_len_u32 = u32::try_from(version_padded_len).map_err(|_| {
             Error::LayoutFailed(format!(
                 "Version length {version_padded_len} exceeds u32 range"
@@ -1657,7 +1854,7 @@ impl<'a> PeGenerator<'a> {
                         &strings_remap,
                         &blobs_remap,
                         &guids_remap,
-                    );
+                    )?;
                 }
 
                 ctx.write_at(row_offset, &row_buffer)?;
@@ -1726,7 +1923,7 @@ impl<'a> PeGenerator<'a> {
             };
 
             // Check if it's a placeholder
-            if ChangeRef::is_placeholder(value) {
+            if ChangeRef::is_heap_placeholder(value) {
                 if let Some(change_ref) = changes.lookup_by_placeholder(value) {
                     if let Some(resolved) = change_ref.offset() {
                         // Write the resolved value back
@@ -1777,11 +1974,7 @@ impl<'a> PeGenerator<'a> {
 
         // Base header: signature (4) + major (2) + minor (2) + reserved (4) + version_length (4)
         let base_size: usize = 16;
-        // Version string aligned to 4 bytes
-        let version_len = root.version.len();
-        // Safe cast: version_len is a string length which is always small
-        let aligned_version = usize::try_from(align_to(version_len as u64, 4))
-            .unwrap_or_else(|_| version_len.saturating_add(4));
+        let aligned_version = root.version_field_size();
         // Flags (2) + stream count (2)
         let flags_and_count: usize = 4;
         // Stream headers: each is offset (4) + size (4) + name (variable, 4-byte aligned)
@@ -1814,40 +2007,7 @@ impl<'a> PeGenerator<'a> {
     fn write_heaps(&self, ctx: &mut WriteContext, changes: &AssemblyChanges) -> Result<()> {
         let view = self.assembly.view();
 
-        // Default empty heap data
-        let empty_strings: &[u8] = &[0u8];
-        let empty_blob: &[u8] = &[0u8];
-        let empty_guid: &[u8] = &[];
-        let empty_us: &[u8] = &[0u8];
-
-        // Get source heap data
-        let strings_data: &[u8] = changes
-            .string_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.strings().map(Strings::data))
-            .unwrap_or(empty_strings);
-
-        let blob_data: &[u8] = changes
-            .blob_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.blobs().map(Blob::data))
-            .unwrap_or(empty_blob);
-
-        let guid_data: &[u8] = changes
-            .guid_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.guids().map(Guid::data))
-            .unwrap_or(empty_guid);
-
-        let us_data: &[u8] = changes
-            .userstring_heap_changes
-            .replacement_heap()
-            .map(Vec::as_slice)
-            .or_else(|| view.userstrings().map(UserStrings::data))
-            .unwrap_or(empty_us);
+        let source = SourceHeaps::new(view, changes);
 
         // Write #Strings heap
         ctx.align_to_4();
@@ -1855,9 +2015,9 @@ impl<'a> PeGenerator<'a> {
         let strings_result = stream_strings_heap(
             &mut ctx.output,
             ctx.strings_heap_offset,
-            strings_data,
+            source.strings,
             &changes.string_heap_changes,
-            &changes.referenced_string_offsets,
+            &ctx.referenced_string_offsets,
         )?;
         ctx.strings_heap_size = strings_result.bytes_written;
         ctx.heap_remapping.strings = strings_result.remapping;
@@ -1869,8 +2029,9 @@ impl<'a> PeGenerator<'a> {
         let us_result = stream_userstring_heap(
             &mut ctx.output,
             ctx.us_heap_offset,
-            us_data,
+            source.userstrings,
             &changes.userstring_heap_changes,
+            &ctx.referenced_userstring_offsets,
         )?;
         ctx.us_heap_size = us_result.bytes_written;
         ctx.heap_remapping.userstrings = us_result.remapping;
@@ -1882,7 +2043,7 @@ impl<'a> PeGenerator<'a> {
         let guid_result = stream_guid_heap(
             &mut ctx.output,
             ctx.guid_heap_offset,
-            guid_data,
+            source.guids,
             &changes.guid_heap_changes,
         )?;
         ctx.guid_heap_size = guid_result.bytes_written;
@@ -1895,11 +2056,14 @@ impl<'a> PeGenerator<'a> {
         let blob_result = stream_blob_heap(
             &mut ctx.output,
             ctx.blob_heap_offset,
-            blob_data,
+            source.blobs,
             &changes.blob_heap_changes,
-            &ctx.typedef_rid_remap,
-            &ctx.typeref_rid_remap,
-            &ctx.typespec_rid_remap,
+            &BlobRemap {
+                blobs: &ctx.typed_blobs,
+                tokens: &ctx.tokens,
+                changes,
+            },
+            &ctx.referenced_blob_offsets,
         )?;
         ctx.blob_heap_size = blob_result.bytes_written;
         ctx.heap_remapping.blobs = blob_result.remapping;
@@ -1963,7 +2127,8 @@ impl<'a> PeGenerator<'a> {
         }
 
         // Build RID remapper for handling row deletions
-        let remapper = RidRemapper::from_changes(changes, &original_counts);
+        let mut remapper =
+            RidRemapper::from_changes(changes, &original_counts, self.config.dangling);
 
         // Calculate new row counts for all tables and build valid bitvector
         let mut valid = tables.valid;
@@ -2016,6 +2181,35 @@ impl<'a> PeGenerator<'a> {
             })
         };
 
+        // Settle the order of every table the format requires sorted before
+        // anything is written: tables written earlier hold references into
+        // them (an attribute on a generic parameter, a constraint on it), so
+        // where each of their rows lands has to be known first. `SORTED_TABLES`
+        // lists a table after the sorted tables its key refers to, so each key
+        // is computed with those references already in their final form.
+        let fixups = RowFixups::from_context(ctx);
+        for &table_id in SORTED_TABLES {
+            if valid & (1u64 << (table_id as u64)) == 0 {
+                continue;
+            }
+            let mut rows = Vec::new();
+            self.emit_table_rows(
+                &fixups,
+                table_id,
+                &output_table_info,
+                changes,
+                &remapper,
+                &mut |rid, key, _| {
+                    rows.push((rid, key.unwrap_or_default()));
+                    Ok(())
+                },
+            )?;
+            remapper.set_sort_order(table_id, &rows);
+        }
+        let sorted = SORTED_TABLES.iter().fold(tables.sorted, |bits, &table_id| {
+            bits | (1u64 << (table_id as u64))
+        });
+
         // Write tables stream header using OUTPUT table info
         let mut header_buffer = Vec::new();
 
@@ -2031,8 +2225,8 @@ impl<'a> PeGenerator<'a> {
         header_buffer.write_all(&[0x01])?;
         // Valid bitvector
         header_buffer.write_all(&valid.to_le_bytes())?;
-        // Sorted bitvector
-        header_buffer.write_all(&tables.sorted.to_le_bytes())?;
+        // Sorted bitvector: every table the format requires sorted now is
+        header_buffer.write_all(&sorted.to_le_bytes())?;
 
         // Row counts for each present table
         for table_id in TableId::iter() {
@@ -2050,13 +2244,27 @@ impl<'a> PeGenerator<'a> {
                 continue;
             }
 
-            self.write_table_data(ctx, table_id, &output_table_info, changes, &remapper)?;
+            self.write_table_data(
+                ctx,
+                &fixups,
+                table_id,
+                &output_table_info,
+                changes,
+                &remapper,
+            )?;
         }
 
         ctx.tables_stream_size = ctx
             .pos()
             .checked_sub(ctx.tables_stream_offset)
             .ok_or_else(|| Error::LayoutFailed("Tables stream size underflow".to_string()))?;
+
+        for (table_id, count) in &new_row_counts {
+            if let Some(slot) = ctx.output_rows.get_mut(*table_id as usize) {
+                *slot = *count;
+            }
+        }
+        ctx.rows = remapper;
 
         Ok(())
     }
@@ -2126,27 +2334,13 @@ impl<'a> PeGenerator<'a> {
         }
     }
 
-    /// Writes table data with unified handling for all cases.
+    /// Writes one table's rows.
     ///
-    /// This function handles:
-    /// - Tables with no modifications (simple iteration)
-    /// - Tables with Replaced modifications (full replacement)
-    /// - Tables with Sparse modifications (updates, deletes, inserts)
-    ///
-    /// All rows are read from parsed table data and written with the output format.
-    /// RID remapping is applied to all cross-table references.
-    ///
-    /// # Arguments
-    ///
-    /// * `ctx` - The write context
-    /// * `table_id` - The table being written
-    /// * `output_table_info` - Table size information for output assembly
-    /// * `changes` - Assembly changes for modifications and placeholder resolution
-    /// * `remapper` - RID remapper for handling row deletions
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(())` on success.
+    /// Rows come from [`emit_table_rows`](Self::emit_table_rows). A table the
+    /// format requires sorted is written in its sort order, the order the
+    /// remapper was told about in [`write_tables_stream`](Self::write_tables_stream),
+    /// so the references other tables hold to its rows already point where
+    /// they land; every other table is written as it comes.
     ///
     /// # Errors
     ///
@@ -2154,27 +2348,92 @@ impl<'a> PeGenerator<'a> {
     fn write_table_data(
         &self,
         ctx: &mut WriteContext,
+        fixups: &RowFixups,
         table_id: TableId,
         output_table_info: &TableInfoRef,
         changes: &AssemblyChanges,
         remapper: &RidRemapper,
     ) -> Result<()> {
-        // Compute row size from table info
-        let output_row_size = calculate_table_row_size(table_id, output_table_info) as usize;
+        if !SORTED_TABLES.contains(&table_id) {
+            return self.emit_table_rows(
+                fixups,
+                table_id,
+                output_table_info,
+                changes,
+                remapper,
+                &mut |_, _, row| ctx.write(row),
+            );
+        }
 
-        // Clone to avoid borrow issues with ctx
-        let method_body_rva_map = ctx.method_body_rva_map.clone();
-        let field_data_rva_map = ctx.field_data_rva_map.clone();
-        let resource_offset_remap = ctx.resource_offset_remap.clone();
-        let original_rva_delta = ctx.original_method_rva_delta;
+        let row_size = calculate_table_row_size(table_id, output_table_info) as usize;
+        let mut keys = Vec::new();
+        let mut bytes = Vec::new();
+        self.emit_table_rows(
+            fixups,
+            table_id,
+            output_table_info,
+            changes,
+            remapper,
+            &mut |_, key, row| {
+                keys.push(key.unwrap_or_default());
+                bytes.extend_from_slice(row);
+                Ok(())
+            },
+        )?;
+
+        // The same stable sort `set_sort_order` recorded, over the same keys.
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by_key(|&index| keys.get(index).copied());
+        for index in order {
+            let start = index
+                .checked_mul(row_size)
+                .ok_or_else(|| Error::LayoutFailed("Row offset overflow".to_string()))?;
+            let row = bytes
+                .get(start..start.saturating_add(row_size))
+                .ok_or_else(|| Error::LayoutFailed("Row out of range".to_string()))?;
+            ctx.write(row)?;
+        }
+        Ok(())
+    }
+
+    /// Produces a table's rows as they are written, in table order.
+    ///
+    /// Handles tables with no modifications, fully replaced tables, and sparse
+    /// modifications (updates, deletes, inserts). Every row has its references
+    /// remapped and its RVAs fixed up, and is handed to `sink` with the RID it
+    /// is known by (its original RID, or the RID it was inserted at) and its
+    /// [sort key](RowWritable::sort_key).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if row serialization fails or `sink` does.
+    fn emit_table_rows(
+        &self,
+        fixups: &RowFixups,
+        table_id: TableId,
+        output_table_info: &TableInfoRef,
+        changes: &AssemblyChanges,
+        remapper: &RidRemapper,
+        sink: &mut RowSink<'_>,
+    ) -> Result<()> {
+        let output_row_size = calculate_table_row_size(table_id, output_table_info) as usize;
         let needs_remapping = remapper.needs_remapping(table_id);
+        let mut buffer = vec![0u8; output_row_size];
+
+        // Serializes one row, fixes up its RVAs, and hands it on.
+        let mut emit = |rid: u32, row: &dyn RowSource, buffer: &mut Vec<u8>| -> Result<()> {
+            let key = row.key(output_table_info)?;
+            let mut buf_offset = 0;
+            row.write(buffer, &mut buf_offset, rid, output_table_info)?;
+            fixups.apply(buffer, table_id);
+            sink(rid, key, buffer)
+        };
 
         // Get table modification info (if any)
         let table_mod = changes.get_table_modifications(table_id);
 
         // Handle fully replaced tables
         if let Some(TableModifications::Replaced(rows)) = table_mod {
-            let mut buffer = vec![0u8; output_row_size];
             for (idx, row) in rows.iter().enumerate() {
                 let rid_idx = idx
                     .checked_add(1)
@@ -2186,20 +2445,9 @@ impl<'a> PeGenerator<'a> {
                 let mut resolved_row = row.clone();
                 resolved_row.resolve_placeholders(changes);
                 if needs_remapping {
-                    resolved_row.remap_references(remapper);
+                    resolved_row.remap_references(remapper)?;
                 }
-
-                let mut buf_offset = 0;
-                resolved_row.row_write(&mut buffer, &mut buf_offset, rid, output_table_info)?;
-                Self::apply_rva_fixups(
-                    &mut buffer,
-                    table_id,
-                    &method_body_rva_map,
-                    &field_data_rva_map,
-                    &resource_offset_remap,
-                    original_rva_delta,
-                );
-                ctx.write(&buffer)?;
+                emit(rid, &resolved_row, &mut buffer)?;
             }
             return Ok(());
         }
@@ -2253,8 +2501,7 @@ impl<'a> PeGenerator<'a> {
             .ok_or_else(|| Error::LayoutFailed("No tables stream".to_string()))?;
         let original_row_count = tables.table_row_count(table_id);
 
-        // Write original rows (using parsed table data)
-        let mut buffer = vec![0u8; output_row_size];
+        // Original rows (using parsed table data)
         dispatch_table_type!(table_id, |RawType| {
             if let Some(table) = tables.table::<RawType>() {
                 for rid in 1..=original_row_count {
@@ -2264,7 +2511,9 @@ impl<'a> PeGenerator<'a> {
                     }
 
                     // Skip StandAloneSig duplicates (deduplication)
-                    if table_id == TableId::StandAloneSig && ctx.standalonesig_skip.contains(&rid) {
+                    if table_id == TableId::StandAloneSig
+                        && fixups.standalonesig_skip.contains(&rid)
+                    {
                         continue;
                     }
 
@@ -2273,40 +2522,21 @@ impl<'a> PeGenerator<'a> {
                         let mut resolved_row = (*row_data).clone();
                         resolved_row.resolve_placeholders(changes);
                         if needs_remapping {
-                            resolved_row.remap_references(remapper);
+                            resolved_row.remap_references(remapper)?;
                         }
-                        let mut buf_offset = 0;
-                        resolved_row.row_write(
-                            &mut buffer,
-                            &mut buf_offset,
-                            rid,
-                            output_table_info,
-                        )?;
+                        emit(rid, &resolved_row, &mut buffer)?;
                     } else if let Some(mut row) = table.get(rid)? {
                         // Use parsed original row
                         if needs_remapping {
-                            row.remap_references(remapper);
+                            row.remap_references(remapper)?;
                         }
-                        let mut buf_offset = 0;
-                        row.row_write(&mut buffer, &mut buf_offset, rid, output_table_info)?;
-                    } else {
-                        continue; // Row not found (shouldn't happen)
+                        emit(rid, &row, &mut buffer)?;
                     }
-
-                    Self::apply_rva_fixups(
-                        &mut buffer,
-                        table_id,
-                        &method_body_rva_map,
-                        &field_data_rva_map,
-                        &resource_offset_remap,
-                        original_rva_delta,
-                    );
-                    ctx.write(&buffer)?;
                 }
             }
         });
 
-        // Append inserted rows
+        // Inserted rows
         for (rid, insert_data) in &inserts {
             // Check if insert was subsequently updated
             let final_data = updates.get(rid).unwrap_or(insert_data);
@@ -2314,20 +2544,9 @@ impl<'a> PeGenerator<'a> {
             let mut resolved_row = (*final_data).clone();
             resolved_row.resolve_placeholders(changes);
             if needs_remapping {
-                resolved_row.remap_references(remapper);
+                resolved_row.remap_references(remapper)?;
             }
-
-            let mut buf_offset = 0;
-            resolved_row.row_write(&mut buffer, &mut buf_offset, *rid, output_table_info)?;
-            Self::apply_rva_fixups(
-                &mut buffer,
-                table_id,
-                &method_body_rva_map,
-                &field_data_rva_map,
-                &resource_offset_remap,
-                original_rva_delta,
-            );
-            ctx.write(&buffer)?;
+            emit(*rid, &resolved_row, &mut buffer)?;
         }
 
         Ok(())
@@ -2398,7 +2617,7 @@ impl<'a> PeGenerator<'a> {
         // copied original method bodies
         let new_rva = if let Some(&mapped_rva) = method_body_rva_map.get(&rva) {
             mapped_rva
-        } else if rva < 0xF000_0000 {
+        } else if rva < METHOD_BODY_PLACEHOLDER_BASE {
             // Original RVA not in map - apply delta as fallback
             // (used when method bodies region was copied as a whole).
             // If the delta overflows i32, leave the row unchanged rather than
@@ -2422,7 +2641,7 @@ impl<'a> PeGenerator<'a> {
     /// Scans the StandAloneSig table and identifies entries with identical blob content.
     /// For each group of duplicates, keeps one canonical entry and maps others to it.
     /// Updates `ctx.standalonesig_skip` with RIDs to skip during table writing,
-    /// and adds token remappings to `ctx.token_remapping` including RID shifts.
+    /// and adds token remappings to `ctx.tokens` including RID shifts.
     fn build_standalonesig_dedup(&self, ctx: &mut WriteContext, changes: &AssemblyChanges) {
         let view = self.assembly.view();
         let Some(tables) = view.tables() else {
@@ -2537,13 +2756,13 @@ impl<'a> PeGenerator<'a> {
                 // Duplicate: map to canonical's output RID
                 if let Some(&canon_output) = rid_to_output.get(&canonical_rid) {
                     let new_token = Token::from_parts(TableId::StandAloneSig, canon_output).value();
-                    ctx.token_remapping.insert(old_token, new_token);
+                    ctx.tokens.insert(old_token, new_token);
                 }
             } else if let Some(&new_rid) = rid_to_output.get(&sig.rid) {
                 // Non-duplicate: map to shifted output RID if different
                 if sig.rid != new_rid {
                     let new_token = Token::from_parts(TableId::StandAloneSig, new_rid).value();
-                    ctx.token_remapping.insert(old_token, new_token);
+                    ctx.tokens.insert(old_token, new_token);
                 }
             }
         }
@@ -2559,7 +2778,7 @@ impl<'a> PeGenerator<'a> {
                             let old_token = Token::from_parts(TableId::StandAloneSig, *rid).value();
                             let new_token =
                                 Token::from_parts(TableId::StandAloneSig, new_rid).value();
-                            ctx.token_remapping.insert(old_token, new_token);
+                            ctx.tokens.insert(old_token, new_token);
                         }
                     }
                 }
@@ -2644,7 +2863,7 @@ impl<'a> PeGenerator<'a> {
     /// loader jumps to this entry point, which then transfers control to the CLR.
     ///
     /// The stub format is:
-    /// - For PE32: `ff 25 xx xx xx xx` (jmp dword ptr [VA]) - 6 bytes
+    /// - For PE32: `ff 25 xx xx xx xx` (jmp dword ptr \[VA\]) - 6 bytes
     /// - For PE32+: `ff 25 00 00 00 00` (jmp qword ptr [rip+0]) followed by 8-byte address
     ///
     /// # Arguments
@@ -2729,64 +2948,42 @@ impl<'a> PeGenerator<'a> {
     fn write_export_data(&self, ctx: &mut WriteContext) -> Result<()> {
         let view = self.assembly.view();
 
-        // Get original exports from the PE file
-        let original_exports = if let Some(pe_exports) = view.file().exports() {
-            NativeExports::from_pe_exports(pe_exports)?
-        } else {
-            NativeExports::new("")
-        };
-
+        let pe = view.file().pe();
+        if let Some(error) = &pe.export_error {
+            return Err(Error::LayoutFailed(format!(
+                "{error}, so it cannot be written back"
+            )));
+        }
         let new_exports = self.assembly.changes().native_exports().native();
 
-        // Skip if no exports at all
-        if original_exports.is_empty() && new_exports.is_empty() {
-            return Ok(());
+        // The original directory, with every ordinal and name it holds
+        let mut merged = match &pe.export_header {
+            Some(header) => NativeExports::from_pe_exports(header, &pe.exports)?,
+            None if new_exports.is_empty() => return Ok(()),
+            None => NativeExports::new(new_exports.dll_name()),
+        };
+        // A name the changes set replaces the original's
+        if !new_exports.dll_name().is_empty() {
+            merged.set_dll_name(new_exports.dll_name())?;
         }
 
-        // Clone original exports and merge in new ones
-        let mut merged = if !original_exports.is_empty() {
-            let mut merged = NativeExports::new(original_exports.dll_name());
-
-            // Copy original functions
-            for func in original_exports.functions() {
-                if let Some(ref name) = func.name {
-                    let _ = merged.add_function(name, func.ordinal, func.address);
-                } else {
-                    let _ = merged.add_function_by_ordinal(func.ordinal, func.address);
-                }
-            }
-
-            // Copy original forwarders
-            for fwd in original_exports.forwarders() {
-                if let Some(ref name) = fwd.name {
-                    let _ = merged.add_forwarder(name, fwd.ordinal, &fwd.target);
-                }
-            }
-            merged
-        } else if !new_exports.is_empty() {
-            NativeExports::new(new_exports.dll_name())
-        } else {
-            return Ok(());
-        };
-
-        // Add new exports from changes
+        // Add new exports from changes, but the names already exported
         for func in new_exports.functions() {
-            if let Some(ref name) = func.name {
-                if !merged.has_function(name) {
-                    let _ = merged.add_function(name, func.ordinal, func.address);
-                }
-            } else {
-                let _ = merged.add_function_by_ordinal(func.ordinal, func.address);
+            match &func.name {
+                Some(name) if merged.has_function(name) => {}
+                Some(name) => merged.add_function(name, func.ordinal, func.address)?,
+                None => merged.add_function_by_ordinal(func.ordinal, func.address)?,
             }
         }
         for fwd in new_exports.forwarders() {
-            if let Some(ref name) = fwd.name {
-                let _ = merged.add_forwarder(name, fwd.ordinal, &fwd.target);
+            match &fwd.name {
+                Some(name) if merged.has_function(name) => {}
+                name => merged.add_forwarder(
+                    name.as_deref().unwrap_or_default(),
+                    fwd.ordinal,
+                    &fwd.target,
+                )?,
             }
-        }
-
-        if merged.is_empty() {
-            return Ok(());
         }
 
         ctx.align_to_4();
@@ -2839,15 +3036,8 @@ impl<'a> PeGenerator<'a> {
         }
 
         // Resources are embedded in .text — read from original file
-        let Ok(offset) = file.rva_to_offset(res_rva as usize) else {
-            return Ok(()); // Can't resolve, skip
-        };
-
-        let Some(end) = offset.checked_add(res_size as usize) else {
-            return Ok(()); // Overflow, skip
-        };
-        let Some(data) = file.data().get(offset..end) else {
-            return Ok(()); // Out of bounds, skip
+        let Ok(data) = file.rva_slice(res_rva as usize, res_size as usize) else {
+            return Ok(()); // Not in the image, skip
         };
 
         // Write at aligned position in new .text
@@ -2857,7 +3047,7 @@ impl<'a> PeGenerator<'a> {
 
         // Clone and relocate the resource directory entries if RVA changed
         if res_rva == new_rva {
-            ctx.write(data)?;
+            ctx.write(&data)?;
         } else {
             let mut rsrc_data = data.to_vec();
             relocate_resource_section(&mut rsrc_data, res_rva, new_rva)?;
@@ -3014,17 +3204,7 @@ impl<'a> PeGenerator<'a> {
     ) -> Result<u32> {
         let view = self.assembly.view();
         let file = view.file();
-
-        let Some(end) = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)
-        else {
-            return Ok(0);
-        };
-        let Some(data) = file
-            .data()
-            .get(section.pointer_to_raw_data as usize..end as usize)
-        else {
+        let Some((data, extent)) = section_contents(file, section) else {
             return Ok(0);
         };
 
@@ -3037,7 +3217,7 @@ impl<'a> PeGenerator<'a> {
             ctx.write(&rsrc_data)?;
         }
 
-        Ok(section.virtual_size)
+        Ok(extent)
     }
 
     /// Writes reloc section data with proper CoreCLR compliance.
@@ -3060,13 +3240,7 @@ impl<'a> PeGenerator<'a> {
         let file = view.file();
 
         // Get original reloc data if present
-        let existing_data = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)
-            .and_then(|end| {
-                file.data()
-                    .get(section.pointer_to_raw_data as usize..end as usize)
-            });
+        let existing_data = section_contents(file, section).map(|(data, _)| data);
 
         // Build relocation configuration
         let config = RelocationConfig {
@@ -3096,9 +3270,206 @@ impl<'a> PeGenerator<'a> {
         Ok(Some(size))
     }
 
-    /// Writes a generic section by copying data as-is.
+    /// Writes the debug directory, and the data each of its entries points at, into `.text`,
+    /// pointing the entries at the copies (the PE format's `IMAGE_DEBUG_DIRECTORY`, 28 bytes
+    /// an entry).
     ///
-    /// Returns the size of data written, or 0 if no data.
+    /// A write that changes nothing copies every entry as it is. Otherwise each entry is
+    /// kept only while it still describes the output:
+    ///
+    /// - an embedded Portable PDB is regenerated for the rows and bodies the write moved
+    ///   ([`rebuild_embedded_pdb`]); the Portable PDB CodeView entry then names the new
+    ///   PDB's id (GUID and time stamp), and a PDB checksum entry is recomputed over it;
+    /// - a CodeView or checksum entry for a PDB this write does not produce (a standalone
+    ///   `.pdb`, or a Windows PDB) is kept only when no type-system row moved, no table's row
+    ///   count changed and no method body was replaced: that PDB still matches the output
+    ///   exactly then, and names rows that are not there otherwise;
+    /// - every other entry (the deterministic build marker among them) is kept as it is.
+    ///
+    /// An embedded PDB that does not regenerate (it does not read) is dropped with the
+    /// entries naming it, and logged: a PDB describing rows the output does not have would
+    /// be worse than none.
+    ///
+    /// # Errors
+    ///
+    /// When the directory or an entry's data lies outside the input, or the regenerated PDB
+    /// cannot be written.
+    fn write_debug_data(&self, ctx: &mut WriteContext, changes: &AssemblyChanges) -> Result<()> {
+        const ENTRY: usize = 28;
+        if ctx.original_debug_dir.is_none() {
+            return Ok(());
+        }
+        let view = self.assembly.view();
+        let file = view.file();
+        let entries = file.debug_directory()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut output: Vec<(DebugDirectoryEntry, Vec<u8>)> = Vec::with_capacity(entries.len());
+        if !changes.has_changes() {
+            for entry in entries {
+                let data = if entry.size == 0 {
+                    Vec::new()
+                } else {
+                    file.debug_data(&entry)?
+                };
+                output.push((entry, data));
+            }
+        } else {
+            let replaced = replaced_method_bodies(self.assembly, changes);
+            let original = view.tables();
+            let rows_unchanged = TableId::iter()
+                .filter(|table| (*table as u8) < TableId::Document as u8)
+                .all(|table| {
+                    original.map_or(0, |tables| tables.table_row_count(table))
+                        == ctx.output_rows.get(table as usize).copied().unwrap_or(0)
+                });
+            let layout_unchanged = rows_unchanged
+                && ctx.tokens.is_empty()
+                && ctx.rows.is_empty()
+                && replaced.is_empty();
+
+            let tokens = &ctx.tokens;
+            let rows = &ctx.rows;
+            let token = |token: Token| -> Option<Token> {
+                if token.row() == 0 {
+                    return Some(token);
+                }
+                let table = TableId::from_token_type(token.table())?;
+                if rows.is_reordered(table) {
+                    rows.surviving(table, token.row())
+                        .map(|row| Token::from_parts(table, row))
+                } else {
+                    tokens.surviving(token.value()).map(Token::new)
+                }
+            };
+            let rebuilt = match embedded_portable_pdb(file) {
+                Ok(Some(pdb)) => {
+                    let image = ImageChanges {
+                        token: &token,
+                        replaced_bodies: &replaced,
+                        rows: ctx.output_rows,
+                    };
+                    match rebuild_embedded_pdb(&pdb, &image) {
+                        Ok(rebuilt) => Some(rebuilt),
+                        Err(e) => {
+                            log::warn!(
+                                "the embedded Portable PDB does not regenerate ({e}); the \
+                                 output drops it and the entries naming it"
+                            );
+                            None
+                        }
+                    }
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    log::warn!(
+                        "the embedded Portable PDB does not read ({e}); the output drops it \
+                         and the entries naming it"
+                    );
+                    None
+                }
+            };
+            let embeds = entries
+                .iter()
+                .any(|entry| entry.kind == debug_type::EMBEDDED_PORTABLE_PDB);
+
+            for mut entry in entries {
+                let portable_codeview = entry.kind == debug_type::CODEVIEW
+                    && entry.minor_version == PORTABLE_CODEVIEW_MINOR_VERSION;
+                // An entry naming the embedded PDB: its CodeView record and its checksum.
+                let names_embedded =
+                    embeds && (portable_codeview || entry.kind == debug_type::PDB_CHECKSUM);
+                let data = match entry.kind {
+                    debug_type::EMBEDDED_PORTABLE_PDB => match &rebuilt {
+                        Some(pdb) => pdb.embedded_entry()?,
+                        None => continue,
+                    },
+                    _ if names_embedded => {
+                        let Some(pdb) = &rebuilt else {
+                            continue;
+                        };
+                        let mut data = file.debug_data(&entry)?;
+                        if entry.kind == debug_type::CODEVIEW {
+                            // `RSDS`, the GUID, the age, the path: the GUID and the entry's
+                            // time stamp are the PDB's id.
+                            let Some(guid) = data.get_mut(4..20) else {
+                                continue;
+                            };
+                            guid.copy_from_slice(&pdb.id[..16]);
+                            entry.timestamp = u32::from_le_bytes([
+                                pdb.id[16], pdb.id[17], pdb.id[18], pdb.id[19],
+                            ]);
+                            data
+                        } else {
+                            // The algorithm's name, NUL-terminated, then the checksum.
+                            let Some(end) = data.iter().position(|&byte| byte == 0) else {
+                                continue;
+                            };
+                            let name = String::from_utf8_lossy(data.get(..end).unwrap_or_default())
+                                .into_owned();
+                            let Some(checksum) = pdb.checksum(&name) else {
+                                continue;
+                            };
+                            data.truncate(end.saturating_add(1));
+                            data.extend_from_slice(&checksum);
+                            data
+                        }
+                    }
+                    debug_type::CODEVIEW | debug_type::PDB_CHECKSUM => {
+                        if !layout_unchanged {
+                            continue;
+                        }
+                        file.debug_data(&entry)?
+                    }
+                    _ if entry.size == 0 => Vec::new(),
+                    _ => file.debug_data(&entry)?,
+                };
+                entry.size = u32::try_from(data.len()).map_err(|_| {
+                    Error::LayoutFailed("Debug entry data exceeds u32 range".to_string())
+                })?;
+                output.push((entry, data));
+            }
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+
+        let mut directory = Vec::with_capacity(output.len().saturating_mul(ENTRY));
+        for (entry, data) in &output {
+            let (mut rva, mut pointer) = (0u32, 0u32);
+            if !data.is_empty() {
+                ctx.align_to_4_with_padding()?;
+                // An entry whose data was not mapped keeps having no RVA, and one the input
+                // had no file pointer for keeps having none
+                if entry.rva != 0 {
+                    rva = ctx.current_rva();
+                }
+                if entry.file_offset != 0 {
+                    pointer = u32::try_from(ctx.pos()).map_err(|_| {
+                        Error::LayoutFailed("Debug data offset exceeds u32 range".to_string())
+                    })?;
+                }
+                ctx.write(data)?;
+            }
+            directory.extend_from_slice(&entry.characteristics.to_le_bytes());
+            directory.extend_from_slice(&entry.timestamp.to_le_bytes());
+            directory.extend_from_slice(&entry.major_version.to_le_bytes());
+            directory.extend_from_slice(&entry.minor_version.to_le_bytes());
+            directory.extend_from_slice(&entry.kind.to_le_bytes());
+            directory.extend_from_slice(&entry.size.to_le_bytes());
+            directory.extend_from_slice(&rva.to_le_bytes());
+            directory.extend_from_slice(&pointer.to_le_bytes());
+        }
+        ctx.align_to_4_with_padding()?;
+        let size = u32::try_from(directory.len())
+            .map_err(|_| Error::LayoutFailed("Debug directory exceeds u32 range".to_string()))?;
+        ctx.debug_dir = Some((ctx.current_rva(), size));
+        ctx.write(&directory)?;
+        Ok(())
+    }
+
     /// Returns how many bytes have been written since `start`.
     ///
     /// Measured from the output position rather than trusted from a return value, so
@@ -3116,47 +3487,248 @@ impl<'a> PeGenerator<'a> {
             .map_err(|_| Error::LayoutFailed("Section written size exceeds u32 range".to_string()))
     }
 
+    /// Writes a generic section by copying its contents as-is.
+    ///
+    /// Returns the section's size in the image, or 0 if it has no data.
     fn write_generic_section(&self, ctx: &mut WriteContext, section: &SectionTable) -> Result<u32> {
         let view = self.assembly.view();
-        let file = view.file();
-
-        // Skip sections with no data
-        if section.size_of_raw_data == 0 {
-            return Ok(0);
-        }
-
-        let Some(end) = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)
-        else {
+        let Some((data, extent)) = section_contents(view.file(), section) else {
             return Ok(0);
         };
-        let Some(data) = file
-            .data()
-            .get(section.pointer_to_raw_data as usize..end as usize)
-        else {
-            return Ok(0);
-        };
-
         ctx.write(data)?;
-
-        Ok(section.virtual_size)
+        Ok(extent)
     }
+}
+
+/// Every `#US` offset an `ldstr` of the assembly's bodies names: the original bodies and the
+/// ones a change stores. A body that does not decode names none it can be held to.
+fn collect_referenced_userstring_offsets(assembly: &CilAssembly) -> HashSet<u32> {
+    let mut offsets = HashSet::new();
+    let mut scan = |body: &[u8]| {
+        let Ok(header) = MethodBody::from(body) else {
+            return;
+        };
+        let Some(code) = header
+            .size_header
+            .checked_add(header.size_code)
+            .and_then(|end| body.get(header.size_header..end))
+        else {
+            return;
+        };
+        let Ok(instructions) = decode_stream(&mut Parser::new(code), 0) else {
+            return;
+        };
+        for instruction in instructions {
+            if let Operand::Token(token) = instruction.operand {
+                if token.table() == 0x70 {
+                    offsets.insert(token.row());
+                }
+            }
+        }
+    };
+    let view = assembly.view();
+    let file = view.file();
+    if let Some(methods) = view.tables().and_then(|t| t.table::<MethodDefRaw>()) {
+        for row in methods.iter().flatten() {
+            let code_type = MethodImplCodeType::from_impl_flags(row.impl_flags);
+            if row.rva == 0
+                || row.rva >= METHOD_BODY_PLACEHOLDER_BASE
+                || matches!(
+                    code_type,
+                    MethodImplCodeType::NATIVE | MethodImplCodeType::RUNTIME
+                )
+            {
+                continue;
+            }
+            if let Ok(body) = file.section_bounded(row.rva as usize) {
+                scan(body);
+            }
+        }
+    }
+    for (_, body) in assembly.changes().method_bodies() {
+        scan(body);
+    }
+    offsets
+}
+
+/// A section's contents as the loader maps them ([`SectionMap::contents`]): the raw data the
+/// file holds within its size in the image, and that size. `None` when it holds no data.
+///
+/// [`SectionMap::contents`]: crate::file::sectionmap::SectionMap::contents
+fn section_contents<'a>(file: &'a File, section: &SectionTable) -> Option<(&'a [u8], u32)> {
+    let (extent, data) = file.section_map().contents(file.data(), section);
+    (!data.is_empty()).then_some((data, extent))
 }
 
 #[cfg(test)]
 mod tests {
+
     use tempfile::NamedTempFile;
 
     use crate::{
         cilassembly::{writer::generator::PeGenerator, CilAssembly},
-        metadata::{signatures::TypeSignature, tables::TableId},
-        CilAssemblyView, MethodBuilder,
+        metadata::{
+            signatures::TypeSignature,
+            tables::{
+                CodedIndex, CodedIndexType, CustomAttributeBuilder, CustomAttributeRaw,
+                GenericParamBuilder, GenericParamConstraintRaw, GenericParamRaw, TableId,
+            },
+            token::Token,
+        },
+        testkit::fixture,
+        CilAssemblyView, CilObject, MethodBuilder,
     };
+
+    const SAMPLE: &str = "crafted_2.exe";
+
+    /// An attribute added to a method goes where the CustomAttribute table's
+    /// sort order puts it, not at the end, and the method finds it. Appended
+    /// under a header that still called the table sorted, the runtime's binary
+    /// search would miss it.
+    #[test]
+    fn an_added_attribute_is_written_where_its_table_sorts_it() {
+        let target = Token::new(0x0600_0001);
+        let before = CilObject::from_path(fixture(SAMPLE))
+            .and_then(|object| object.method(&target))
+            .expect("the method loads")
+            .custom_attributes
+            .count();
+
+        let view = CilAssemblyView::from_path(fixture(SAMPLE)).expect("the sample loads");
+        // Copy an existing attribute's constructor and blob, so the added one
+        // decodes like any other.
+        let (constructor, value) = {
+            let row = view
+                .tables()
+                .and_then(|tables| tables.table::<CustomAttributeRaw>())
+                .and_then(|table| table.get(1).ok().flatten())
+                .expect("the sample has attributes");
+            let value = view
+                .blobs()
+                .and_then(|blobs| blobs.get(row.value as usize).ok())
+                .expect("the attribute's blob")
+                .to_vec();
+            (row.constructor, value)
+        };
+        let mut assembly = CilAssembly::new(view);
+        CustomAttributeBuilder::new()
+            .parent(CodedIndex::new(
+                TableId::MethodDef,
+                target.row(),
+                CodedIndexType::HasCustomAttribute,
+            ))
+            .constructor(constructor)
+            .value(&value)
+            .build(&mut assembly)
+            .expect("the attribute is added");
+
+        let written = assembly
+            .into_cilobject()
+            .expect("the output loads, sort order included");
+        let method = written.method(&target).expect("the method survives");
+        assert_eq!(method.custom_attributes.count(), before + 1);
+
+        let parents: Vec<Token> = written
+            .tables()
+            .and_then(|tables| tables.table::<CustomAttributeRaw>())
+            .expect("the attribute table")
+            .iter()
+            .flatten()
+            .map(|row| row.parent.token)
+            .collect();
+        let at = parents.iter().position(|parent| *parent == target);
+        assert!(
+            at.is_some_and(|at| at + 1 < parents.len()),
+            "the attribute sorts ahead of the rest, not after them: {at:?} of {}",
+            parents.len()
+        );
+    }
+
+    /// Each generic parameter constraint as the owner of its parameter, the
+    /// parameter's name, and the constraint.
+    fn constraints_of(object: &CilObject) -> Vec<(Token, String, Token)> {
+        let tables = object.tables().expect("tables");
+        let strings = object.strings().expect("strings");
+        let params = tables
+            .table::<GenericParamRaw>()
+            .expect("generic parameters");
+        let mut described: Vec<(Token, String, Token)> = tables
+            .table::<GenericParamConstraintRaw>()
+            .expect("constraints")
+            .iter()
+            .flatten()
+            .map(|constraint| {
+                let param = params
+                    .get(constraint.owner)
+                    .ok()
+                    .flatten()
+                    .expect("the constraint's parameter");
+                let name = strings
+                    .get(param.name as usize)
+                    .expect("the name")
+                    .to_string();
+                (param.owner.token, name, constraint.constraint.token)
+            })
+            .collect();
+        described.sort();
+        described
+    }
+
+    /// Adding a generic parameter whose owner sorts ahead of every other
+    /// moves each existing parameter down a row, and every constraint follows
+    /// its own parameter there.
+    #[test]
+    fn constraints_follow_their_parameters_when_the_parameters_are_sorted() {
+        let original = CilObject::from_path(fixture(SAMPLE)).expect("the sample loads");
+        let expected = constraints_of(&original);
+        assert!(
+            !expected.is_empty(),
+            "the sample constrains generic parameters"
+        );
+
+        // The first type that has no parameters of its own: its owner key is
+        // below every existing parameter's.
+        let owners: Vec<Token> = original
+            .tables()
+            .and_then(|tables| tables.table::<GenericParamRaw>())
+            .expect("generic parameters")
+            .iter()
+            .flatten()
+            .map(|param| param.owner.token)
+            .collect();
+        let owner = (2..)
+            .map(|rid| Token::from_parts(TableId::TypeDef, rid))
+            .find(|token| !owners.contains(token))
+            .expect("a type without parameters");
+        assert!(
+            owners
+                .iter()
+                .any(|existing| existing.value() > owner.value()),
+            "the new parameter sorts ahead of an existing one"
+        );
+
+        let view = CilAssemblyView::from_path(fixture(SAMPLE)).expect("the sample loads");
+        let mut assembly = CilAssembly::new(view);
+        GenericParamBuilder::new()
+            .name("TAdded")
+            .number(0)
+            .owner(CodedIndex::new(
+                TableId::TypeDef,
+                owner.row(),
+                CodedIndexType::TypeOrMethodDef,
+            ))
+            .build(&mut assembly)
+            .expect("the parameter is added");
+
+        let written = assembly
+            .into_cilobject()
+            .expect("the output loads, sort order included");
+        assert_eq!(constraints_of(&written), expected);
+    }
 
     #[test]
     fn test_pe_generator_basic() {
-        let view = CilAssemblyView::from_path(std::path::Path::new("tests/samples/crafted_2.exe"))
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))
             .expect("Failed to load test assembly");
         let assembly = view.to_owned();
 
@@ -3181,7 +3753,7 @@ mod tests {
 
     #[test]
     fn test_pe_generator_with_modifications() {
-        let view = CilAssemblyView::from_path(std::path::Path::new("tests/samples/crafted_2.exe"))
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))
             .expect("Failed to load test assembly");
 
         let original_method_count = view
@@ -3227,7 +3799,7 @@ mod tests {
 
     #[test]
     fn test_pe_generator_to_memory() {
-        let view = CilAssemblyView::from_path(std::path::Path::new("tests/samples/crafted_2.exe"))
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))
             .expect("Failed to load test assembly");
         let assembly = view.to_owned();
 
@@ -3267,7 +3839,7 @@ mod tests {
 
     #[test]
     fn test_pe_generator_to_memory_can_reload() {
-        let view = CilAssemblyView::from_path(std::path::Path::new("tests/samples/crafted_2.exe"))
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))
             .expect("Failed to load test assembly");
         let assembly = view.to_owned();
 
@@ -3285,7 +3857,7 @@ mod tests {
 
     #[test]
     fn test_pe_generator_to_memory_with_modifications() {
-        let view = CilAssemblyView::from_path(std::path::Path::new("tests/samples/crafted_2.exe"))
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))
             .expect("Failed to load test assembly");
 
         let original_method_count = view
@@ -3333,7 +3905,7 @@ mod tests {
 
     #[test]
     fn test_pe_generator_file_and_memory_produce_same_result() {
-        let view = CilAssemblyView::from_path(std::path::Path::new("tests/samples/crafted_2.exe"))
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))
             .expect("Failed to load test assembly");
         let assembly = view.to_owned();
 
@@ -3362,5 +3934,35 @@ mod tests {
             file_bytes, memory_bytes,
             "File and memory generation should produce identical bytes"
         );
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::{testkit::fixture, CilAssemblyView, Result};
+
+    /// An assembly written to memory loads back with the same methods.
+    #[test]
+    fn to_memory_example() -> Result<()> {
+        let assembly = CilAssembly::from_path(fixture("crafted_2.exe"))?;
+        // ... modify assembly ...
+
+        let pe_bytes = PeGenerator::new(&assembly).to_memory()?;
+
+        let original = assembly
+            .view()
+            .tables()
+            .expect("tables")
+            .table_row_count(TableId::MethodDef);
+        let written = CilAssemblyView::from_mem(pe_bytes)?;
+        assert_eq!(
+            written
+                .tables()
+                .expect("tables")
+                .table_row_count(TableId::MethodDef),
+            original
+        );
+        Ok(())
     }
 }

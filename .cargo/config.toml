@@ -8,8 +8,24 @@
 #
 # Capping here rather than only in the Makefile means the guard holds for anyone who runs
 # cargo directly. Cargo's `[env]` does not override a variable that is already set, so the
-# unit-test run — which is cheap per test and wants every core — opts back up to full
-# parallelism by exporting `RUST_TEST_THREADS` itself; see the `test` target in the Makefile.
+# test tiers, cheap per test and wanting every core, opt back up to full parallelism by
+# exporting `RUST_TEST_THREADS` themselves; see the `test-*` targets in the Makefile.
 # An explicit `-- --test-threads=N` also still wins, which is what `make test-doc` and CI use.
 [env]
 RUST_TEST_THREADS = "8"
+
+# Test tiers, defined once and run by name from the Makefile, GitHub CI and GitLab (cargo
+# aliases work where `make` does not, such as the Windows runner). Both use the `ci-test`
+# profile (release with debug assertions and overflow checks) and the z3 feature.
+#
+# test-quick: the unit tests, the integration tests outside a `full` module, the fuzz
+#             regression replay and the allocation checks.
+# test-full:  every test: also the `full` modules (packer suites, runtime corpora, codegen
+#             validation), the lift verification sweep and the fuzz regression replay.
+#
+# The oracle tier is test-full with DOTSCOPE_REQUIRE_TOOLS=1 (`make test-oracle`).
+# test-quick already ends in `--`, so harness arguments follow it directly
+# (`cargo test-quick --nocapture`); a second `--` would make them a test-name filter.
+[alias]
+test-quick = "test --workspace --profile ci-test --features z3 --no-fail-fast --lib --bins --test it --test fuzz_regressions --test allocations -- --skip full::"
+test-full = "test --workspace --profile ci-test --features z3 --no-fail-fast --lib --bins --tests"

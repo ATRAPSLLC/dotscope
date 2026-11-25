@@ -185,7 +185,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test::factories::table::assemblyref::get_test_assembly;
+    use crate::testkit::factories::table::assemblyref::get_test_assembly;
 
     #[test]
     fn test_paramptr_builder_new() {

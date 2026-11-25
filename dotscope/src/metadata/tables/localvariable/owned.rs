@@ -4,7 +4,7 @@
 //! the high-level, resolved form of `LocalVariable` table entries with
 //! all heap references resolved to actual string data.
 
-use crate::metadata::token::Token;
+use crate::metadata::{streams::SharedStr, token::Token};
 
 /// High-level representation of a `LocalVariable` table entry
 ///
@@ -14,12 +14,14 @@ use crate::metadata::token::Token;
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::metadata::tables::LocalVariable;
 ///
+/// # fn example(variable: &LocalVariable) {
 /// // Access variable information
 /// println!("Variable '{}' at index {} with attributes 0x{:X}",
 ///          variable.name, variable.index, variable.attributes);
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct LocalVariable {
@@ -50,5 +52,5 @@ pub struct LocalVariable {
     ///
     /// The actual name string for this local variable. May be empty for
     /// anonymous or compiler-generated variables where no name was specified.
-    pub name: String,
+    pub name: SharedStr,
 }

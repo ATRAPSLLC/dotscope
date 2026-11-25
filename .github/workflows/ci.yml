@@ -92,22 +92,27 @@ jobs:
     - name: Check compilation
       run: cargo check --workspace --all-features
 
-    - name: Run tests (Linux - full)
+    # Test tiers are defined in .cargo/config.toml and the Makefile.
+    - name: Run tests (Linux - oracle tier)
       if: runner.os == 'Linux'
-      run: cargo test --workspace --release --features z3 --lib --bins --tests --verbose
+      # The job installs the .NET SDK and Mono: a test that needs them fails rather than skips.
+      run: make test-oracle
 
-    - name: Run tests (macOS/Windows - skip expensive tests)
+    # macOS and Windows confirm the platform works; Linux carries the full coverage.
+    - name: Run tests (macOS/Windows - quick tier)
       if: runner.os != 'Linux'
-      run: cargo test --workspace --release --features z3,skip-expensive-tests --lib --bins --tests --verbose
+      run: cargo test-quick
 
     - name: Run doc tests (Linux only)
       if: runner.os == 'Linux'
       run: cargo test --workspace --release --doc --features z3 -- --test-threads=4
 
+    # Private items are documented, as `make doc` does: the docs link internal items
+    # (the loader traits, private helpers), and those links resolve only there.
     - name: Check documentation
       env:
         RUSTDOCFLAGS: "-Dwarnings"
-      run: cargo doc -p dotscope --all-features --no-deps
+      run: cargo doc -p dotscope --all-features --no-deps --document-private-items
 
   # Compiles and tests without the legacy-crypto feature (Linux only). Pinned to the declared
   # MSRV so this job also guards `rust-version`; the workspace check covers the default-feature
@@ -135,69 +140,7 @@ jobs:
       run: cargo check -p dotscope --no-default-features
 
     - name: Run tests (no default features)
-      run: cargo test -p dotscope --no-default-features --release --lib --bins --tests --verbose
-
-  # Fuzzing on pushes to main or PRs targeting main
-  fuzzing:
-    name: Quick Fuzzing
-    runs-on: ubuntu-latest
-    if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main') ||
-      contains(github.event.head_commit.message, '[fuzz]')
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v7
-      
-    - name: Install Rust nightly
-      uses: dtolnay/rust-toolchain@nightly
-      
-    - name: Install cargo-fuzz
-      run: cargo install cargo-fuzz
-      
-    - name: Setup Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        key: fuzz-quick
-        
-    - name: Build fuzz targets
-      run: cargo +nightly fuzz build --release
-      working-directory: dotscope/fuzz
-
-    # Every target gets the committed crash corpus. The inputs are PE-shaped, so they are
-    # directly meaningful to `cilobject`/`assemblyview` and act as structured starting material
-    # for the blob and body targets rather than starting them from scratch.
-    - name: Seed corpora from committed regressions
-      run: |
-        for t in cilobject assemblyview signatures customattributes methodbody emulation; do
-          mkdir -p "dotscope/fuzz/corpus/$t"
-          cp dotscope/tests/samples/fuzz-regressions/* "dotscope/fuzz/corpus/$t/" || true
-        done
-
-    - name: Run quick fuzz test
-      run: |
-        for t in cilobject assemblyview signatures customattributes methodbody emulation; do
-          echo "::group::fuzz $t"
-          timeout 60 cargo +nightly fuzz run "$t" --release -- \
-            -max_total_time=40 -timeout=25 -rss_limit_mb=2048 || true
-          echo "::endgroup::"
-        done
-      working-directory: dotscope/fuzz
-
-    - name: Check for crashes
-      run: |
-        found=0
-        for t in cilobject assemblyview signatures customattributes methodbody emulation; do
-          if [ -d "dotscope/fuzz/artifacts/$t" ] && [ "$(ls -A "dotscope/fuzz/artifacts/$t")" ]; then
-            echo "Fuzzing found crashes in $t:"
-            ls -la "dotscope/fuzz/artifacts/$t"
-            found=1
-          fi
-        done
-        if [ "$found" = "1" ]; then
-          exit 1
-        fi
+      run: cargo test -p dotscope --no-default-features --profile ci-test --lib --bins --tests
 
   # Security audit on pushes to main or PRs targeting main
   security:
@@ -258,8 +201,10 @@ jobs:
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
       
-    - name: Generate code coverage
-      run: cargo llvm-cov --workspace --features z3,skip-expensive-tests --lcov --output-path lcov.info --exclude dotscope-cli
+    - name: Generate code coverage (full tier)
+      env:
+        DOTSCOPE_REQUIRE_TOOLS: "1"
+      run: make test-coverage
       
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v7

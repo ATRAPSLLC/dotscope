@@ -10,15 +10,7 @@
 //! references that survive heap rebuilding and deduplication. After the assembly is
 //! written, these references resolve to their final heap offsets.
 //!
-//! ```rust,ignore
-//! use dotscope::cilassembly::changes::{HeapChanges, ChangeRefKind};
-//!
-//! let mut changes = HeapChanges::<String>::new_strings(100);
-//! let string_ref = changes.append("MyString".to_string());
-//!
-//! // After assembly write, the ref resolves to final offset
-//! // let final_offset = string_ref.offset().unwrap();
-//! ```
+//! The `examples::module_example` test in this module runs this example.
 //!
 //! # Architecture
 //!
@@ -40,7 +32,7 @@ use std::{
 
 use crate::{
     cilassembly::changes::{
-        hash_blob, hash_guid, hash_string, ChangeRef, ChangeRefKind, ChangeRefRc,
+        hash_blob, hash_guid, hash_string, ChangeIds, ChangeRef, ChangeRefKind, ChangeRefRc,
     },
     utils::compressed_uint_size,
 };
@@ -89,6 +81,15 @@ pub struct HeapChanges<T> {
 
     /// The kind of heap this tracks changes for
     heap_kind: ChangeRefKind,
+
+    /// The ids the assembly's changes take, shared with its other heaps and its tables
+    ids: ChangeIds,
+
+    /// The positions in `appended` of each content hash, in append order: finding an
+    /// appended item by its content is one lookup instead of a scan of every item appended,
+    /// which made adding items with deduplication quadratic. Kept in step with `appended` by
+    /// every method that changes it.
+    by_content: HashMap<u64, Vec<usize>>,
 }
 
 impl<T> HeapChanges<T> {
@@ -97,19 +98,42 @@ impl<T> HeapChanges<T> {
     /// # Arguments
     ///
     /// * `heap_kind` - The kind of heap this tracks changes for.
-    fn new(heap_kind: ChangeRefKind) -> Self {
+    /// * `ids` - The ids the assembly's changes take.
+    fn new(heap_kind: ChangeRefKind, ids: ChangeIds) -> Self {
         Self {
             appended: Vec::new(),
             modified_items: HashMap::new(),
             removed_indices: HashSet::new(),
             replacement_heap: None,
             heap_kind,
+            ids,
+            by_content: HashMap::new(),
         }
     }
 
     /// Returns the heap kind this tracker is for.
     pub fn heap_kind(&self) -> ChangeRefKind {
         self.heap_kind
+    }
+
+    /// Drops the items appended after the first `len`, which the writer then
+    /// never sees.
+    #[cfg(feature = "compiler")]
+    pub fn truncate_appended(&mut self, len: usize) {
+        self.appended.truncate(len);
+        for positions in self.by_content.values_mut() {
+            positions.retain(|position| *position < len);
+        }
+        self.by_content.retain(|_, positions| !positions.is_empty());
+    }
+
+    /// Records `value` as appended, with its content hash for [`Self::by_content`] lookups.
+    fn push_appended(&mut self, value: T, content_hash: u64, change_ref: &ChangeRefRc) {
+        self.by_content
+            .entry(content_hash)
+            .or_default()
+            .push(self.appended.len());
+        self.appended.push((value, Arc::clone(change_ref)));
     }
 
     /// Returns the number of items that have been added to this heap.
@@ -168,6 +192,7 @@ impl<T> HeapChanges<T> {
 
         // Clear existing changes since they would apply to the original heap
         self.appended.clear();
+        self.by_content.clear();
         self.modified_items.clear();
         self.removed_indices.clear();
     }
@@ -247,13 +272,13 @@ impl<T> HeapChanges<T> {
 
 impl HeapChanges<String> {
     /// Creates a new string heap changes tracker.
-    pub fn new_strings() -> Self {
-        Self::new(ChangeRefKind::String)
+    pub fn new_strings(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::String, ids)
     }
 
     /// Creates a new user string heap changes tracker.
-    pub fn new_userstrings() -> Self {
-        Self::new(ChangeRefKind::UserString)
+    pub fn new_userstrings(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::UserString, ids)
     }
 
     /// Appends a string and returns a ChangeRef for it.
@@ -262,9 +287,24 @@ impl HeapChanges<String> {
     /// the assembly is written.
     pub fn append(&mut self, value: String) -> ChangeRefRc {
         let content_hash = hash_string(&value);
-        let change_ref = Arc::new(ChangeRef::new_heap(self.heap_kind, content_hash));
-        self.appended.push((value, Arc::clone(&change_ref)));
+        let change_ref = Arc::new(ChangeRef::new_heap(
+            self.heap_kind,
+            content_hash,
+            self.ids.next(),
+        ));
+        self.push_appended(value, content_hash, &change_ref);
         change_ref
+    }
+
+    /// The first appended string equal to `value`, found through its content hash.
+    #[must_use]
+    pub fn find_appended(&self, value: &str) -> Option<&ChangeRefRc> {
+        self.by_content
+            .get(&hash_string(value))?
+            .iter()
+            .filter_map(|position| self.appended.get(*position))
+            .find(|(appended, _)| appended == value)
+            .map(|(_, change_ref)| change_ref)
     }
 
     /// Calculates the binary size for #Strings heap additions.
@@ -297,15 +337,19 @@ impl HeapChanges<String> {
 
 impl HeapChanges<Vec<u8>> {
     /// Creates a new blob heap changes tracker.
-    pub fn new_blobs() -> Self {
-        Self::new(ChangeRefKind::Blob)
+    pub fn new_blobs(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::Blob, ids)
     }
 
     /// Appends a blob and returns a ChangeRef for it.
     pub fn append(&mut self, value: Vec<u8>) -> ChangeRefRc {
         let content_hash = hash_blob(&value);
-        let change_ref = Arc::new(ChangeRef::new_heap(self.heap_kind, content_hash));
-        self.appended.push((value, Arc::clone(&change_ref)));
+        let change_ref = Arc::new(ChangeRef::new_heap(
+            self.heap_kind,
+            content_hash,
+            self.ids.next(),
+        ));
+        self.push_appended(value, content_hash, &change_ref);
         change_ref
     }
 
@@ -328,15 +372,19 @@ impl HeapChanges<Vec<u8>> {
 
 impl HeapChanges<[u8; 16]> {
     /// Creates a new GUID heap changes tracker.
-    pub fn new_guids() -> Self {
-        Self::new(ChangeRefKind::Guid)
+    pub fn new_guids(ids: ChangeIds) -> Self {
+        Self::new(ChangeRefKind::Guid, ids)
     }
 
     /// Appends a GUID and returns a ChangeRef for it.
     pub fn append(&mut self, value: [u8; 16]) -> ChangeRefRc {
         let content_hash = hash_guid(&value);
-        let change_ref = Arc::new(ChangeRef::new_heap(self.heap_kind, content_hash));
-        self.appended.push((value, Arc::clone(&change_ref)));
+        let change_ref = Arc::new(ChangeRef::new_heap(
+            self.heap_kind,
+            content_hash,
+            self.ids.next(),
+        ));
+        self.push_appended(value, content_hash, &change_ref);
         change_ref
     }
 
@@ -354,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_string_heap_changes() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         assert!(!changes.has_additions());
         assert!(!changes.has_changes());
 
@@ -374,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_blob_heap_changes() {
-        let mut changes = HeapChanges::<Vec<u8>>::new_blobs();
+        let mut changes = HeapChanges::<Vec<u8>>::new_blobs(ChangeIds::new());
 
         let ref1 = changes.append(vec![1, 2, 3]);
         let ref2 = changes.append(vec![4, 5, 6, 7]);
@@ -388,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_guid_heap_changes() {
-        let mut changes = HeapChanges::<[u8; 16]>::new_guids();
+        let mut changes = HeapChanges::<[u8; 16]>::new_guids(ChangeIds::new());
 
         let guid1 = [0u8; 16];
         let guid2 = [1u8; 16];
@@ -404,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_userstring_heap_changes() {
-        let mut changes = HeapChanges::<String>::new_userstrings();
+        let mut changes = HeapChanges::<String>::new_userstrings(ChangeIds::new());
         assert_eq!(changes.heap_kind(), ChangeRefKind::UserString);
 
         let _ref1 = changes.append("test".to_string());
@@ -417,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_modifications() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         assert!(!changes.has_modifications());
 
         changes.add_modification(50, "modified".to_string());
@@ -430,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_removals() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         assert!(!changes.has_removals());
 
         changes.add_removal(25);
@@ -443,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_replacement_heap() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let _ref1 = changes.append("will be cleared".to_string());
         assert_eq!(changes.additions_count(), 1);
 
@@ -456,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_mark_ref_removed() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let ref1 = changes.append("test".to_string());
 
         assert!(!changes.is_ref_removed(&ref1));
@@ -468,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_appended_iter() {
-        let mut changes = HeapChanges::<String>::new_strings();
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         changes.append("one".to_string());
         changes.append("two".to_string());
 
@@ -476,5 +524,84 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].0, "one");
         assert_eq!(items[1].0, "two");
+    }
+
+    /// The content index finds what a scan of the appended strings finds: the first equal
+    /// string, nothing for a string never appended, and nothing once the strings it held are
+    /// gone with a replaced heap.
+    #[test]
+    fn appended_strings_are_found_by_content() {
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
+        let first = changes.append("repeated".to_string());
+        changes.append("other".to_string());
+        changes.append("repeated".to_string());
+        let scan = |changes: &HeapChanges<String>, value: &str| {
+            changes
+                .appended_iter()
+                .find(|(appended, _)| appended == value)
+                .map(|(_, change_ref)| change_ref.id())
+        };
+        for value in ["repeated", "other", "absent", ""] {
+            assert_eq!(
+                changes.find_appended(value).map(|r| r.id()),
+                scan(&changes, value),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            changes.find_appended("repeated").map(|r| r.id()),
+            Some(first.id())
+        );
+
+        // A replaced heap drops what was appended: a position the index held for it cannot
+        // put a later duplicate ahead of the first one appended since
+        changes.replace_heap(vec![0]);
+        assert!(changes.find_appended("repeated").is_none());
+        changes.append("z".to_string());
+        let again = changes.append("repeated".to_string());
+        changes.append("repeated".to_string());
+        assert_eq!(
+            changes.find_appended("repeated").map(|r| r.id()),
+            Some(again.id())
+        );
+    }
+
+    /// Rolling appended strings back takes them out of the content index too: the first
+    /// string appended since the rollback is found, not a later duplicate at a position the
+    /// rolled-back string held.
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn truncated_strings_leave_the_content_index() {
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
+        changes.append("kept".to_string());
+        changes.append("between".to_string());
+        changes.append("rolled back".to_string());
+        changes.truncate_appended(1);
+        assert!(changes.find_appended("kept").is_some());
+        assert!(changes.find_appended("rolled back").is_none());
+        let again = changes.append("rolled back".to_string());
+        changes.append("rolled back".to_string());
+        assert_eq!(
+            changes.find_appended("rolled back").map(|r| r.id()),
+            Some(again.id())
+        );
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::Result;
+
+    /// An appended string is tracked with a reference that resolves to its heap offset only
+    /// when the assembly is written.
+    #[test]
+    fn module_example() -> Result<()> {
+        let mut changes = HeapChanges::<String>::new_strings(ChangeIds::new());
+        let string_ref = changes.append("MyString".to_string());
+
+        assert_eq!(changes.appended_iter().count(), 1);
+        assert!(!string_ref.is_resolved());
+        Ok(())
     }
 }

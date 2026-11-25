@@ -28,6 +28,13 @@ use crate::{
 };
 
 impl RowWritable for InterfaceImplRaw {
+    // By class alone: within a class the rows stay in declaration order,
+    // which is the order the type lists its interfaces in. Compilers do not
+    // sort by the interface, and the format does not ask them to.
+    fn sort_key(&self, _sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.class, 0)))
+    }
+
     /// Write an InterfaceImpl table row to binary data
     ///
     /// Serializes one InterfaceImpl table entry to the metadata tables stream format, handling
@@ -61,11 +68,7 @@ impl RowWritable for InterfaceImplRaw {
         write_le_at_dyn(data, offset, self.class, sizes.is_large(TableId::TypeDef))?;
 
         // Write interface coded index (2 or 4 bytes)
-        let encoded_interface = sizes.encode_coded_index(
-            self.interface.tag,
-            self.interface.row,
-            CodedIndexType::TypeDefOrRef,
-        )?;
+        let encoded_interface = self.interface.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,
@@ -373,7 +376,8 @@ mod tests {
             token: Token::new(0x09000001),
             offset: 0,
             class: 0x8000,
-            interface: CodedIndex::new(TableId::TypeDef, 0x4000, CodedIndexType::TypeDefOrRef),
+            // TypeDefOrRef takes two tag bits: row 0x3FFF is the highest a two-byte column holds
+            interface: CodedIndex::new(TableId::TypeDef, 0x3FFF, CodedIndexType::TypeDefOrRef),
         };
 
         // Test combinations: (large_typedef, large_other_tables, expected_size)
@@ -419,6 +423,10 @@ mod tests {
             assert_eq!(
                 deserialized_row.interface.tag,
                 interface_impl_row.interface.tag
+            );
+            assert_eq!(
+                deserialized_row.interface.row,
+                interface_impl_row.interface.row
             );
         }
     }

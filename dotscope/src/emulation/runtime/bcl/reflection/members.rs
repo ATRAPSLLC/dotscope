@@ -304,7 +304,11 @@ fn field_get_field_type_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread)
             try_hook!(thread.heap().get_reflection_field_info(*fi_ref))
         {
             if let Some(asm) = thread.assembly().cloned() {
-                if let Some(sig) = asm.types().get_field_signature(&field_token) {
+                if let Some(sig) = asm
+                    .fields()
+                    .get(&field_token)
+                    .map(|entry| entry.value().signature.base.clone())
+                {
                     if let Ok(cil_type) = TypeResolver::new(asm.types()).resolve(&sig) {
                         if let Ok(type_ref) = thread
                             .heap_mut()
@@ -330,9 +334,9 @@ fn member_get_metadata_token_pre(
     thread: &mut EmulationThread,
 ) -> PreHookResult {
     if let Some(EmValue::ObjectRef(member_ref)) = ctx.this {
-        if let Ok(obj) = thread.heap().get(*member_ref) {
+        if let Ok(obj) = thread.heap().get_shared(*member_ref).as_deref() {
             #[allow(clippy::cast_possible_wrap)]
-            let token = match &obj {
+            let token = match obj {
                 HeapObject::ReflectionField { field_token, .. } => Some(field_token.value() as i32),
                 HeapObject::ReflectionMethod { method_token, .. } => {
                     Some(method_token.value() as i32)
@@ -358,8 +362,8 @@ fn member_get_declaring_type_pre(
     thread: &mut EmulationThread,
 ) -> PreHookResult {
     if let Some(EmValue::ObjectRef(member_ref)) = ctx.this {
-        if let Ok(obj) = thread.heap().get(*member_ref) {
-            let declaring_token = match &obj {
+        if let Ok(obj) = thread.heap().get_shared(*member_ref).as_deref() {
+            let declaring_token = match obj {
                 HeapObject::ReflectionField {
                     declaring_type_token,
                     ..
@@ -801,9 +805,9 @@ fn extract_member_custom_attrs(
         Some(EmValue::ObjectRef(href)) => *href,
         _ => return None,
     };
-    match thread.heap().get(href) {
+    match thread.heap().get_shared(href).as_deref() {
         Ok(HeapObject::ReflectionMethod { method_token, .. }) => asm
-            .method(&method_token)
+            .method(method_token)
             .ok()
             .map(|m| m.custom_attributes.clone()),
         Ok(HeapObject::ReflectionField {
@@ -811,9 +815,9 @@ fn extract_member_custom_attrs(
             declaring_type_token,
             ..
         }) => {
-            let cil_type = asm.types().resolve(&declaring_type_token)?;
+            let cil_type = asm.types().resolve(declaring_type_token)?;
             for (_, field_rc) in cil_type.fields.iter() {
-                if field_rc.token == field_token {
+                if field_rc.token == *field_token {
                     return Some(field_rc.custom_attributes.clone());
                 }
             }
@@ -824,7 +828,7 @@ fn extract_member_custom_attrs(
             property_name,
             ..
         }) => {
-            let cil_type = asm.types().resolve(&declaring_type_token)?;
+            let cil_type = asm.types().resolve(declaring_type_token)?;
             for (_, prop_rc) in cil_type.properties.iter() {
                 if prop_rc.name == property_name.as_ref() {
                     return Some(prop_rc.custom_attributes.clone());
@@ -845,7 +849,7 @@ mod tests {
             EmValue,
         },
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     #[test]

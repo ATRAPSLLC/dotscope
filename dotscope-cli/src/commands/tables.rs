@@ -267,7 +267,7 @@ macro_rules! table_formatter_with {
     };
 }
 
-// --- Core Type System (0x00-0x08) ---
+// Core Type System (0x00-0x08)
 
 fn format_module(
     tables: &TablesHeader<'_>,
@@ -392,7 +392,7 @@ table_formatter_with!(format_param, ParamRaw, "Param",
     ]
 );
 
-// --- Type Relationships (0x09-0x0A) ---
+// Type Relationships (0x09-0x0A)
 
 table_formatter!(
     format_interfaceimpl,
@@ -412,7 +412,7 @@ table_formatter_with!(format_memberref, MemberRefRaw, "MemberRef",
     ]
 );
 
-// --- Attributes & Constants (0x0B-0x0E) ---
+// Attributes & Constants (0x0B-0x0E)
 
 table_formatter_with!(format_constant, ConstantRaw, "Constant",
     &["Type", "Parent", "Value"],
@@ -453,7 +453,7 @@ table_formatter_with!(format_declsecurity, DeclSecurityRaw, "DeclSecurity",
     ]
 );
 
-// --- Layout & Signatures (0x0F-0x11) ---
+// Layout & Signatures (0x0F-0x11)
 
 table_formatter!(
     format_classlayout,
@@ -483,7 +483,7 @@ table_formatter_with!(format_standalonesig, StandAloneSigRaw, "StandAloneSig",
     ]
 );
 
-// --- Events (0x12-0x14) ---
+// Events (0x12-0x14)
 
 table_formatter!(
     format_eventmap,
@@ -511,7 +511,7 @@ table_formatter_with!(format_event, EventRaw, "Event",
     ]
 );
 
-// --- Properties (0x15-0x17) ---
+// Properties (0x15-0x17)
 
 table_formatter!(
     format_propertymap,
@@ -539,7 +539,7 @@ table_formatter_with!(format_property, PropertyRaw, "Property",
     ]
 );
 
-// --- Method Semantics (0x18-0x19) ---
+// Method Semantics (0x18-0x19)
 
 table_formatter!(
     format_methodsemantics,
@@ -565,7 +565,7 @@ table_formatter!(
     ]
 );
 
-// --- References & Mapping (0x1A-0x1D) ---
+// References & Mapping (0x1A-0x1D)
 
 table_formatter_with!(format_moduleref, ModuleRefRaw, "ModuleRef",
     &["Name"],
@@ -602,7 +602,7 @@ table_formatter!(
     |row: &FieldRvaRaw| vec![format!("0x{:08X}", row.rva), row.field.to_string(),]
 );
 
-// --- Edit-and-Continue (0x1E-0x1F) ---
+// Edit-and-Continue (0x1E-0x1F)
 
 fn format_enclog(tables: &TablesHeader<'_>) -> anyhow::Result<TableDetailOutput> {
     let table = tables
@@ -659,7 +659,7 @@ fn format_encmap(tables: &TablesHeader<'_>) -> anyhow::Result<TableDetailOutput>
     })
 }
 
-// --- Assembly Info (0x20-0x28) ---
+// Assembly Info (0x20-0x28)
 
 fn format_assembly(
     tables: &TablesHeader<'_>,
@@ -835,7 +835,7 @@ table_formatter_with!(format_manifestresource, ManifestResourceRaw, "ManifestRes
     ]
 );
 
-// --- Nested Classes (0x29) ---
+// Nested Classes (0x29)
 
 table_formatter!(
     format_nestedclass,
@@ -848,7 +848,7 @@ table_formatter!(
     ]
 );
 
-// --- Generic Parameters (0x2A-0x2C) ---
+// Generic Parameters (0x2A-0x2C)
 
 table_formatter_with!(format_genericparam, GenericParamRaw, "GenericParam",
     &["Number", "Flags", "Owner", "Name"],
@@ -881,7 +881,7 @@ table_formatter!(
     ]
 );
 
-// --- Debug Information (0x30-0x37) ---
+// Debug Information (0x30-0x37)
 
 table_formatter_with!(format_document, DocumentRaw, "Document",
     &["Name", "HashAlgorithm", "Hash", "Language"],

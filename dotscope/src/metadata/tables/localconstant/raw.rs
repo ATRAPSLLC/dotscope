@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        signatures::{parse_field_signature, SignatureField, TypeSignature},
-        streams::{Blob, Strings},
+        pdb::LocalConstantSig,
+        streams::{Blob, SharedStr, Strings},
         tables::{LocalConstant, LocalConstantRc, TableInfoRef, TableRow},
         token::Token,
     },
@@ -75,10 +75,11 @@ impl LocalConstantRaw {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// # use dotscope::metadata::tables::localconstant::LocalConstantRaw;
+    /// ```no_run
+    /// # use dotscope::metadata::tables::LocalConstantRaw;
     /// # use dotscope::metadata::token::Token;
-    /// # fn example() -> dotscope::Result<()> {
+    /// # use dotscope::metadata::streams::{Blob, Strings};
+    /// # fn example(strings: &Strings, blobs: &Blob) -> dotscope::Result<()> {
     /// let constant_raw = LocalConstantRaw {
     ///     rid: 1,
     ///     token: Token::new(0x34000001),
@@ -90,23 +91,23 @@ impl LocalConstantRaw {
     /// let constant = constant_raw.to_owned(strings, blobs)?;
     /// # Ok(())
     /// # }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_owned(&self, strings: &Strings, blobs: &Blob) -> Result<LocalConstantRc> {
         let name = if self.name == 0 {
-            String::new()
+            SharedStr::default()
         } else {
-            strings.get(self.name as usize)?.to_string()
+            strings.get_shared(self.name as usize)?
         };
 
-        let signature = if self.signature == 0 {
-            SignatureField {
-                modifiers: Vec::new(),
-                base: TypeSignature::Void,
-            }
-        } else {
-            let signature_blob = blobs.get(self.signature as usize)?;
-            parse_field_signature(signature_blob)?
-        };
+        // A constant's signature is its type and value: there is no constant without one
+        if self.signature == 0 {
+            return Err(malformed_error!(
+                "LocalConstant row {} has no signature",
+                self.rid
+            ));
+        }
+        let signature = LocalConstantSig::parse(blobs.get(self.signature as usize)?)?;
 
         let constant = LocalConstant {
             rid: self.rid,

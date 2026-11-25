@@ -29,6 +29,10 @@ use crate::{
 };
 
 impl RowWritable for NestedClassRaw {
+    fn sort_key(&self, _sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.nested_class, 0)))
+    }
+
     /// Serialize a NestedClass table row to binary format
     ///
     /// Writes the row data according to ECMA-335 §II.22.32 specification:

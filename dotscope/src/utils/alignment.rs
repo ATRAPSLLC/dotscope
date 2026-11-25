@@ -20,17 +20,7 @@
 //!
 //! # Examples
 //!
-//! ```rust,ignore
-//! use dotscope::utils::alignment::{align_to_4_bytes, align_to};
-//!
-//! // ECMA-335 metadata heap alignment
-//! assert_eq!(align_to_4_bytes(17), 20);
-//! assert_eq!(align_to_4_bytes(20), 20); // Already aligned
-//!
-//! // PE section alignment
-//! assert_eq!(align_to(1000, 512), 1024);  // File alignment
-//! assert_eq!(align_to(5000, 4096), 8192); // Memory alignment
-//! ```
+//! The `examples::module_example` test in this module runs this example.
 
 /// Aligns a value to the next 4-byte boundary as required by ECMA-335 metadata heaps.
 ///
@@ -49,14 +39,7 @@
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::alignment::align_to_4_bytes;
-///
-/// assert_eq!(align_to_4_bytes(1), 4);
-/// assert_eq!(align_to_4_bytes(4), 4);   // Already aligned
-/// assert_eq!(align_to_4_bytes(17), 20);
-/// assert_eq!(align_to_4_bytes(100), 100); // Already aligned
-/// ```
+/// The `examples::align_to_4_bytes_example` test in this module runs this example.
 #[inline]
 pub fn align_to_4_bytes(value: u64) -> u64 {
     value.saturating_add(3) & !3
@@ -85,21 +68,7 @@ pub fn align_to_4_bytes(value: u64) -> u64 {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::alignment::align_to;
-///
-/// // PE file alignment (512 bytes)
-/// assert_eq!(align_to(1000, 512), 1024);
-/// assert_eq!(align_to(512, 512), 512); // Already aligned
-///
-/// // PE section alignment (4096 bytes)
-/// assert_eq!(align_to(5000, 4096), 8192);
-/// assert_eq!(align_to(4096, 4096), 4096); // Already aligned
-///
-/// // Data structure alignment (16 bytes)
-/// assert_eq!(align_to(100, 16), 112);
-/// assert_eq!(align_to(128, 16), 128); // Already aligned
-/// ```
+/// The `examples::align_to_example` test in this module runs this example.
 #[inline]
 pub fn align_to(value: u64, alignment: u64) -> u64 {
     debug_assert!(
@@ -206,5 +175,48 @@ mod tests {
         // Zero is not a power of 2, should panic
         let result = std::panic::catch_unwind(|| align_to(100, 0));
         assert!(result.is_err(), "align_to with 0 alignment should panic");
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn module_example() -> Result<()> {
+        // ECMA-335 metadata heap alignment
+        assert_eq!(align_to_4_bytes(17), 20);
+        assert_eq!(align_to_4_bytes(20), 20); // Already aligned
+
+        // PE section alignment
+        assert_eq!(align_to(1000, 512), 1024); // File alignment
+        assert_eq!(align_to(5000, 4096), 8192); // Memory alignment
+        Ok(())
+    }
+
+    #[test]
+    fn align_to_4_bytes_example() -> Result<()> {
+        assert_eq!(align_to_4_bytes(1), 4);
+        assert_eq!(align_to_4_bytes(4), 4); // Already aligned
+        assert_eq!(align_to_4_bytes(17), 20);
+        assert_eq!(align_to_4_bytes(100), 100); // Already aligned
+        Ok(())
+    }
+
+    #[test]
+    fn align_to_example() -> Result<()> {
+        // PE file alignment (512 bytes)
+        assert_eq!(align_to(1000, 512), 1024);
+        assert_eq!(align_to(512, 512), 512); // Already aligned
+
+        // PE section alignment (4096 bytes)
+        assert_eq!(align_to(5000, 4096), 8192);
+        assert_eq!(align_to(4096, 4096), 4096); // Already aligned
+
+        // Data structure alignment (16 bytes)
+        assert_eq!(align_to(100, 16), 112);
+        assert_eq!(align_to(128, 16), 128); // Already aligned
+        Ok(())
     }
 }

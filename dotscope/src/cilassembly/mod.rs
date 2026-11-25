@@ -102,7 +102,7 @@
 //! ## **Core Types**
 //! - [`crate::cilassembly::CilAssembly`] - Main mutable assembly (this file)
 //! - [`crate::cilassembly::changes::AssemblyChanges`] - Central change tracking
-//! - [`crate::cilassembly::changes::heap::HeapChanges`] - Heap modification tracking
+//! - [`crate::cilassembly::HeapChanges`] - Heap modification tracking
 //! - [`crate::cilassembly::modifications::TableModifications`] - Table change strategies
 //! - [`crate::cilassembly::operation::TableOperation`] - Timestamped operations
 //! - [`crate::cilassembly::operation::Operation`] - Operation variants
@@ -145,6 +145,7 @@ use crate::{
         },
         tables::{
             skip_unreadable, AssemblyRefRaw, CodedIndex, CodedIndexType, TableDataOwned, TableId,
+            TypeDefRaw, TypeRefRaw,
         },
         token::Token,
     },
@@ -153,29 +154,38 @@ use crate::{
 
 mod builders;
 mod changes;
-mod cleanup;
+pub mod cleanup;
+mod debugtables;
 mod modifications;
 mod operation;
 mod resolver;
-mod writer;
+pub mod writer;
 
 pub use builders::{
     ClassBuilder, EnumBuilder, EventBuilder, InterfaceBuilder, MethodBodyBuilder, MethodBuilder,
     PropertyBuilder,
 };
-pub use changes::{AssemblyChanges, ChangeRef, ChangeRefKind, ChangeRefRc, HeapChanges};
+#[cfg(feature = "compiler")]
+pub use changes::Savepoint;
+pub use changes::{
+    AssemblyChanges, BlobComposite, ChangeIds, ChangeRef, ChangeRefKind, ChangeRefRc,
+    CompositeImport, HeapChanges,
+};
 pub use cleanup::CleanupRequest;
 #[cfg(feature = "deobfuscation")]
-pub(crate) use cleanup::{
-    compute_entry_points, expand_type_tokens, extract_local_var_sig_rid, find_unreferenced_types,
-    with_method_body,
+pub use cleanup::{
+    compute_entry_points, execute_cleanup, expand_type_tokens, extract_local_var_sig_rid,
+    find_unreferenced_types, with_method_body, TypeNames,
 };
 pub use modifications::TableModifications;
 pub use operation::{Operation, TableOperation};
-pub use resolver::LastWriteWinsResolver;
-pub use writer::GeneratorConfig;
+pub use resolver::{
+    Conflict, ConflictResolver, LastWriteWinsResolver, OperationResolution, Resolution,
+};
 use writer::PeGenerator;
-pub(crate) use writer::ResolvePlaceholders;
+#[cfg(any(test, feature = "testkit"))]
+pub use writer::{calculate_field_size, debug_blobs, signature_blobs, BlobKind};
+pub use writer::{DanglingPolicy, GeneratorConfig, ResolvePlaceholders};
 
 /// A mutable view of a .NET assembly that tracks changes for editing operations.
 ///
@@ -191,6 +201,9 @@ pub struct CilAssembly {
     view: CilAssemblyView,
     changes: AssemblyChanges,
     pending_cleanup: cleanup::CleanupRequest,
+    /// Whether [`Self::add_cleanup`] has been called since the last generation: until then
+    /// the pending request's settings are the defaults, not anyone's choice.
+    cleanup_added: bool,
 }
 
 impl CilAssembly {
@@ -219,6 +232,7 @@ impl CilAssembly {
             changes: AssemblyChanges::new(),
             view,
             pending_cleanup: cleanup::CleanupRequest::new(),
+            cleanup_added: false,
         }
     }
 
@@ -297,7 +311,9 @@ impl CilAssembly {
 
     /// Adds a cleanup request to be executed before PE generation.
     ///
-    /// Multiple cleanup requests can be added and will be merged together.
+    /// Multiple cleanup requests can be added and will be merged together. The first request's
+    /// settings ([`CleanupRequest::with_settings`]) apply, and each later request can only
+    /// narrow them: orphans and empty types are removed when every request asks for it.
     /// The cleanup is executed once when `to_file()`, `to_memory()`, or similar
     /// generation methods are called.
     ///
@@ -324,7 +340,13 @@ impl CilAssembly {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn add_cleanup(&mut self, request: &cleanup::CleanupRequest) {
-        self.pending_cleanup.merge(request);
+        if self.cleanup_added {
+            self.pending_cleanup.merge(request);
+            self.pending_cleanup.narrow_settings(request);
+        } else {
+            self.pending_cleanup = request.clone();
+            self.cleanup_added = true;
+        }
     }
 
     /// Returns a reference to the pending cleanup request.
@@ -335,10 +357,29 @@ impl CilAssembly {
         &self.pending_cleanup
     }
 
-    /// Executes pending cleanup, adding deletions to AssemblyChanges.
+    /// Writes this assembly with `write`: finalized for generation first, its placeholders
+    /// indexed while the writer resolves them, and the index dropped when it is done, whether
+    /// the write succeeds or fails. Every way of writing an assembly goes through here.
     ///
-    /// This is called internally before PE generation. It can only be called
-    /// once because row deletions cause RID shifting.
+    /// # Errors
+    ///
+    /// Returns an error if finalizing (cleanup) or the write fails.
+    fn generate<R>(&mut self, write: impl FnOnce(&CilAssembly) -> Result<R>) -> Result<R> {
+        self.finalize_for_generation()?;
+        self.changes.index_placeholders();
+        let written = write(self);
+        self.changes.drop_placeholder_index();
+        written
+    }
+
+    /// Prepares the changes for PE generation: executes pending cleanup, adding its
+    /// deletions to AssemblyChanges, then keeps the assembly's own Portable PDB tables true
+    /// to the methods the changes delete, replace the bodies of and add
+    /// ([`debugtables::follow_method_changes`]).
+    ///
+    /// This is called internally before PE generation. Cleanup runs once because row
+    /// deletions cause RID shifting; following the debug tables again removes and adds
+    /// nothing more.
     ///
     /// # Returns
     ///
@@ -348,23 +389,22 @@ impl CilAssembly {
     ///
     /// Returns an error if cleanup execution fails.
     fn finalize_for_generation(&mut self) -> Result<cleanup::CleanupStats> {
-        if self.pending_cleanup.is_empty() {
-            // Even without cleanup deletions, string heap modifications require
-            // referenced_string_offsets to be populated for correct substring remapping.
-            // The .NET string heap uses substring sharing (e.g., "Console" as a suffix
-            // of "writeToConsole"). When the heap is rebuilt after modifications, all
-            // table references (including TypeRef) need correct offset remapping.
-            if self.changes.string_heap_changes.modifications_count() > 0 {
-                let _ = cleanup::mark_unreferenced_heap_entries(self)?;
-            }
-            return Ok(cleanup::CleanupStats::new());
-        }
+        // Without a cleanup request no heap entry is removed: the writer collects the offsets
+        // the tables name on every write, so a string named inside another one keeps its
+        // bytes whatever else changes in the heap
+        let stats = if self.pending_cleanup.is_empty() {
+            cleanup::CleanupStats::new()
+        } else {
+            // Take ownership of the request (clears pending_cleanup and avoids borrow conflict)
+            let request = std::mem::take(&mut self.pending_cleanup);
+            self.cleanup_added = false;
 
-        // Take ownership of the request (clears pending_cleanup and avoids borrow conflict)
-        let request = std::mem::take(&mut self.pending_cleanup);
+            // Execute cleanup ONCE - this adds all deletions to self.changes
+            cleanup::execute_cleanup(self, &request)?
+        };
 
-        // Execute cleanup ONCE - this adds all deletions to self.changes
-        let stats = cleanup::execute_cleanup(self, &request)?;
+        // After cleanup, whose deletions are method changes the debug tables follow too
+        debugtables::follow_method_changes(self)?;
         Ok(stats)
     }
 
@@ -433,6 +473,19 @@ impl CilAssembly {
     pub fn blob_add(&mut self, data: &[u8]) -> Result<ChangeRefRc> {
         let change_ref = self.changes.blob_heap_changes.append(data.to_vec());
         Ok(change_ref)
+    }
+
+    /// Adds a blob whose content names other blobs (a document name, an imports blob), which
+    /// the writer encodes once the blobs it names have offsets.
+    ///
+    /// The blob takes an entry of the heap like any other, and its reference resolves to its
+    /// offset when the assembly is written.
+    pub fn blob_add_composite(&mut self, composite: BlobComposite) -> ChangeRefRc {
+        let change_ref = self.changes.blob_heap_changes.append(Vec::new());
+        self.changes
+            .blob_composites
+            .insert(change_ref.id(), composite);
+        change_ref
     }
 
     /// Adds a GUID to the GUID heap and returns its index.
@@ -625,9 +678,8 @@ impl CilAssembly {
     pub fn string_remove(&mut self, index: u32) -> Result<()> {
         let original_heap_size = self
             .view()
-            .streams()
-            .iter()
-            .find(|s| s.name == "#Strings")
+            .metadata_root()
+            .stream("#Strings")
             .map_or(0, |s| s.size);
 
         if index >= original_heap_size {
@@ -686,7 +738,7 @@ impl CilAssembly {
     pub fn guid_update(&mut self, index: u32, new_guid: &[u8; 16]) -> Result<()> {
         // Check if this is a placeholder value (from a newly added GUID)
         // Placeholders have the high bit or marker bit set
-        let lookup_key = if ChangeRef::is_placeholder(index) {
+        let lookup_key = if ChangeRef::is_heap_placeholder(index) {
             // For placeholders, use directly - the streaming code looks up by placeholder
             index
         } else {
@@ -713,7 +765,7 @@ impl CilAssembly {
     /// Currently always succeeds, but returns `Result` for future extensibility.
     pub fn guid_remove(&mut self, index: u32) -> Result<()> {
         // Check if this is a placeholder value (from a newly added GUID)
-        let lookup_key = if ChangeRef::is_placeholder(index) {
+        let lookup_key = if ChangeRef::is_heap_placeholder(index) {
             index
         } else {
             // Convert 1-based sequential index to byte offset
@@ -761,6 +813,9 @@ impl CilAssembly {
     /// append/modify/remove operations will be applied to this replacement heap
     /// instead of the original.
     ///
+    /// A heap that does not parse is written as it is while nothing else changes in it; a write
+    /// that would apply changes to one fails with [`Error::LayoutFailed`].
+    ///
     /// # Arguments
     ///
     /// * `heap_data` - The raw bytes that will form the new string heap
@@ -773,8 +828,8 @@ impl CilAssembly {
     /// # let view = CilAssemblyView::from_path(&Path::new("assembly.dll"))?;
     /// let mut assembly = CilAssembly::new(view);
     ///
-    /// // Replace with custom string heap containing "Hello\0World\0"
-    /// let custom_heap = b"Hello\0World\0".to_vec();
+    /// // The empty string first, then "Hello" and "World"
+    /// let custom_heap = b"\0Hello\0World\0".to_vec();
     /// assembly.string_add_heap(custom_heap)?;
     /// # Ok::<(), dotscope::Error>(())
     /// ```
@@ -794,6 +849,9 @@ impl CilAssembly {
     /// append/modify/remove operations will be applied to this replacement heap
     /// instead of the original.
     ///
+    /// A heap that does not parse is written as it is while nothing else changes in it; a write
+    /// that would apply changes to one fails with [`Error::LayoutFailed`].
+    ///
     /// # Arguments
     ///
     /// * `heap_data` - The raw bytes that will form the new blob heap
@@ -806,8 +864,8 @@ impl CilAssembly {
     /// # let view = CilAssemblyView::from_path(&Path::new("assembly.dll"))?;
     /// let mut assembly = CilAssembly::new(view);
     ///
-    /// // Replace with custom blob heap containing length-prefixed blobs
-    /// let custom_heap = vec![0x03, 0x01, 0x02, 0x03, 0x02, 0xFF, 0xFE];
+    /// // The empty blob first, then two length-prefixed blobs
+    /// let custom_heap = vec![0x00, 0x03, 0x01, 0x02, 0x03, 0x02, 0xFF, 0xFE];
     /// assembly.blob_add_heap(custom_heap)?;
     /// # Ok::<(), dotscope::Error>(())
     /// ```
@@ -826,6 +884,9 @@ impl CilAssembly {
     /// If there is no existing GUID heap, a new one will be created. All subsequent
     /// append/modify/remove operations will be applied to this replacement heap
     /// instead of the original.
+    ///
+    /// A heap that does not parse is written as it is while nothing else changes in it; a write
+    /// that would apply changes to one fails with [`Error::LayoutFailed`].
     ///
     /// # Arguments
     ///
@@ -861,6 +922,9 @@ impl CilAssembly {
     /// append/modify/remove operations will be applied to this replacement heap
     /// instead of the original.
     ///
+    /// A heap that does not parse is written as it is while nothing else changes in it; a write
+    /// that would apply changes to one fails with [`Error::LayoutFailed`].
+    ///
     /// # Arguments
     ///
     /// * `heap_data` - The raw bytes that will form the new user string heap
@@ -873,8 +937,8 @@ impl CilAssembly {
     /// # let view = CilAssemblyView::from_path(&Path::new("assembly.dll"))?;
     /// let mut assembly = CilAssembly::new(view);
     ///
-    /// // Replace with custom user string heap containing UTF-16 strings with length prefixes
-    /// let custom_heap = vec![0x07, 0x48, 0x00, 0x65, 0x00, 0x6C, 0x00, 0x01]; // "Hel" + terminator
+    /// // The empty entry first, then "Hel": a length, UTF-16 code units and the terminal byte
+    /// let custom_heap = vec![0x00, 0x07, 0x48, 0x00, 0x65, 0x00, 0x6C, 0x00, 0x00];
     /// assembly.userstring_add_heap(custom_heap)?;
     /// # Ok::<(), dotscope::Error>(())
     /// ```
@@ -987,7 +1051,7 @@ impl CilAssembly {
 
         // Create and register the ChangeRef for this inserted row
         // Resolve the token immediately since we know both the table ID and RID
-        let change_ref = ChangeRef::new_table_row(table_id);
+        let change_ref = ChangeRef::new_table_row(table_id, self.changes.change_ids.next())?;
         let token = Token::from_parts(table_id, new_rid);
         change_ref.resolve_to_token(token);
         let change_ref_rc = change_ref.into_rc();
@@ -1021,8 +1085,7 @@ impl CilAssembly {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_file<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
-        self.finalize_for_generation()?;
-        PeGenerator::new(self).to_file(path)
+        self.generate(|assembly| PeGenerator::new(assembly).to_file(path))
     }
 
     /// Writes the assembly to a file with custom configuration.
@@ -1057,8 +1120,7 @@ impl CilAssembly {
         path: P,
         config: GeneratorConfig,
     ) -> Result<()> {
-        self.finalize_for_generation()?;
-        PeGenerator::with_config(self, config).to_file(path)
+        self.generate(|assembly| PeGenerator::with_config(assembly, config).to_file(path))
     }
 
     /// Generates the assembly to memory as a byte vector.
@@ -1088,8 +1150,7 @@ impl CilAssembly {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_memory(&mut self) -> Result<Vec<u8>> {
-        self.finalize_for_generation()?;
-        PeGenerator::new(self).to_memory()
+        self.generate(|assembly| PeGenerator::new(assembly).to_memory())
     }
 
     /// Generates the assembly to memory with custom configuration.
@@ -1122,11 +1183,10 @@ impl CilAssembly {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_memory_with_config(&mut self, config: GeneratorConfig) -> Result<Vec<u8>> {
-        self.finalize_for_generation()?;
-        PeGenerator::with_config(self, config).to_memory()
+        self.generate(|assembly| PeGenerator::with_config(assembly, config).to_memory())
     }
 
-    /// Converts this `CilAssembly` into a [`CilObject`](crate::CilObject) for analysis.
+    /// Converts this `CilAssembly` into a [`CilObject`] for analysis.
     ///
     /// This method writes all modifications to memory, then parses the result
     /// as a `CilObject`. Use this after making modifications to obtain a
@@ -1134,7 +1194,7 @@ impl CilAssembly {
     ///
     /// # Returns
     ///
-    /// A [`CilObject`](crate::CilObject) containing the modified assembly.
+    /// A [`CilObject`] containing the modified assembly.
     ///
     /// # Usage Examples
     ///
@@ -1160,12 +1220,11 @@ impl CilAssembly {
     /// Returns an error if writing modifications fails or if the result
     /// cannot be parsed as a valid .NET assembly.
     pub fn into_cilobject(mut self) -> Result<CilObject> {
-        self.finalize_for_generation()?;
-        let bytes = PeGenerator::new(&self).to_memory()?;
+        let bytes = self.generate(|assembly| PeGenerator::new(assembly).to_memory())?;
         CilObject::from_mem_with_validation(bytes, ValidationConfig::production())
     }
 
-    /// Converts this `CilAssembly` into a [`CilObject`](crate::CilObject) with custom options.
+    /// Converts this `CilAssembly` into a [`CilObject`] with custom options.
     ///
     /// Like [`into_cilobject`](Self::into_cilobject) but allows specifying both
     /// the validation configuration and generator configuration for the resulting assembly.
@@ -1178,7 +1237,7 @@ impl CilAssembly {
     ///
     /// # Returns
     ///
-    /// A [`CilObject`](crate::CilObject) containing the modified assembly.
+    /// A [`CilObject`] containing the modified assembly.
     ///
     /// # Errors
     ///
@@ -1189,8 +1248,9 @@ impl CilAssembly {
         validation_config: ValidationConfig,
         generator_config: GeneratorConfig,
     ) -> Result<CilObject> {
-        self.finalize_for_generation()?;
-        let bytes = PeGenerator::with_config(&self, generator_config).to_memory()?;
+        let bytes = self.generate(|assembly| {
+            PeGenerator::with_config(assembly, generator_config).to_memory()
+        })?;
         CilObject::from_mem_with_validation(bytes, validation_config)
     }
 
@@ -1523,6 +1583,28 @@ impl CilAssembly {
         exports.add_native_forwarder(function_name, ordinal, target)
     }
 
+    /// Sets the name the native export table exports under, which the written image's export
+    /// directory holds in place of the original's.
+    ///
+    /// # Errors
+    ///
+    /// When the name is empty or holds a null byte.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use dotscope::{CilAssemblyView, CilAssembly};
+    /// # use std::path::Path;
+    /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
+    /// let mut assembly = CilAssembly::new(view);
+    /// assembly.set_native_export_dll_name("MyLibrary.dll")?;
+    /// assembly.add_native_export_function("MyFunction", 1, 0x1000)?;
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    pub fn set_native_export_dll_name(&mut self, dll_name: &str) -> Result<()> {
+        self.changes.native_exports_mut().set_dll_name(dll_name)
+    }
+
     /// Gets read-only access to the unified import container.
     ///
     /// Returns the unified import container that provides access to both CIL and native
@@ -1643,24 +1725,11 @@ impl CilAssembly {
     ///
     /// Returns an error if the string cannot be added to the heap.
     pub fn string_get_or_add(&mut self, value: &str) -> Result<ChangeRefRc> {
-        if let Some(existing_ref) = self.string_find(value) {
-            return Ok(existing_ref);
+        // A string this session appended already: found through the heap's content index
+        if let Some(existing_ref) = self.changes.string_heap_changes.find_appended(value) {
+            return Ok(existing_ref.clone());
         }
         self.string_add(value)
-    }
-
-    /// Helper method to find an existing string in the current heap changes.
-    ///
-    /// This searches through the strings added in the current session
-    /// to avoid duplicates within the same session.
-    fn string_find(&self, value: &str) -> Option<ChangeRefRc> {
-        let heap_changes = &self.changes.string_heap_changes;
-        for (existing_string, change_ref) in heap_changes.appended_iter() {
-            if existing_string == value {
-                return Some(change_ref.clone());
-            }
-        }
-        None
     }
 
     /// Finds an AssemblyRef by its name.
@@ -1718,19 +1787,125 @@ impl CilAssembly {
 
     /// Finds the AssemblyRef for the core library.
     ///
-    /// This method searches the AssemblyRef table to find the core library
-    /// reference, which can be any of:
-    /// - "mscorlib" (classic .NET Framework)
-    /// - "System.Runtime" (.NET Core/.NET 5+)
-    /// - "System.Private.CoreLib" (some .NET implementations)
+    /// The core library is the assembly defining `System.Object`, so the scope
+    /// of the module's own `System.Object` reference names it (its
+    /// `System.ValueType` reference in a module declaring only value types),
+    /// whatever the library is called on the runtime the module targets. Among
+    /// several such references the lowest row decides, as the compiler emits
+    /// its rows before anything appended to the image later.
     ///
     /// # Returns
     ///
-    /// A [`CodedIndex`] pointing to the core library AssemblyRef, or None if not found.
+    /// A [`CodedIndex`] pointing to the core library AssemblyRef, or None when
+    /// the module imports neither type from another assembly (the core library
+    /// itself, for instance).
     pub fn find_core_library_ref(&self) -> Option<CodedIndex> {
-        self.find_assembly_ref_by_name("mscorlib")
-            .or_else(|| self.find_assembly_ref_by_name("System.Runtime"))
-            .or_else(|| self.find_assembly_ref_by_name("System.Private.CoreLib"))
+        let scope = self.core_library_scope()?;
+        (scope.tag == TableId::AssemblyRef).then(|| {
+            CodedIndex::new(
+                TableId::AssemblyRef,
+                scope.row,
+                CodedIndexType::Implementation,
+            )
+        })
+    }
+
+    /// Finds the TypeRef through which the module imports `namespace.name` from
+    /// its core library (see [`CilAssembly::find_core_library_ref`]).
+    ///
+    /// A module can import one type from several scopes - an obfuscator built
+    /// against another runtime adds references to that runtime's core library -
+    /// and only the reference into the module's core library resolves wherever
+    /// the module runs. Falls back to the lowest TypeRef of that name when the
+    /// core library does not provide the type.
+    ///
+    /// # Returns
+    ///
+    /// A `TypeDefOrRef` [`CodedIndex`] for the TypeRef, or None when the module
+    /// does not import the type.
+    pub fn find_corelib_typeref(&self, namespace: &str, name: &str) -> Option<CodedIndex> {
+        let corelib = self.core_library_scope();
+        let mut rows = self.typeref_rows_named(namespace, name);
+        let first = rows.next()?;
+        let row = match corelib {
+            Some(scope) if scope != first.resolution_scope => rows
+                .find(|row| row.resolution_scope == scope)
+                .unwrap_or(first),
+            _ => first,
+        };
+        Some(CodedIndex::new(
+            TableId::TypeRef,
+            row.rid,
+            CodedIndexType::TypeDefOrRef,
+        ))
+    }
+
+    /// Finds the core library type `namespace.name` as this module names it: its TypeRef into
+    /// the core library ([`CilAssembly::find_corelib_typeref`]), or, in a module that references
+    /// no core library (the core library itself), its own TypeDef of that name.
+    ///
+    /// # Returns
+    ///
+    /// A `TypeDefOrRef` [`CodedIndex`], or None when the module neither imports the type nor,
+    /// being the core library, defines it.
+    #[must_use]
+    pub fn find_corelib_type(&self, namespace: &str, name: &str) -> Option<CodedIndex> {
+        if let Some(found) = self.find_corelib_typeref(namespace, name) {
+            return Some(found);
+        }
+        if self.find_core_library_ref().is_some() {
+            return None;
+        }
+        let view = self.view();
+        let (tables, strings) = (view.tables()?, view.strings()?);
+        tables
+            .table::<TypeDefRaw>()
+            .into_iter()
+            .flat_map(|table| table.iter().filter_map(skip_unreadable))
+            .find(|row| {
+                strings
+                    .get(row.type_name as usize)
+                    .is_ok_and(|found| found == name)
+                    && strings
+                        .get(row.type_namespace as usize)
+                        .is_ok_and(|found| found == namespace)
+            })
+            .map(|row| CodedIndex::new(TableId::TypeDef, row.rid, CodedIndexType::TypeDefOrRef))
+    }
+
+    /// Returns the resolution scope of the module's core library imports.
+    ///
+    /// That is the scope of its `System.Object` reference, or of its
+    /// `System.ValueType` reference in a module declaring only value types;
+    /// the core library defines both.
+    fn core_library_scope(&self) -> Option<CodedIndex> {
+        self.typeref_rows_named("System", "Object")
+            .next()
+            .or_else(|| self.typeref_rows_named("System", "ValueType").next())
+            .map(|root| root.resolution_scope)
+    }
+
+    /// Returns the original TypeRef rows naming `namespace.name`, lowest row first.
+    fn typeref_rows_named<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> impl Iterator<Item = TypeRefRaw> + 'a {
+        let strings = self.view.strings();
+        let is_named = move |row: &TypeRefRaw| {
+            strings.is_some_and(|strings| {
+                strings.get(row.type_name as usize).is_ok_and(|n| n == name)
+                    && strings
+                        .get(row.type_namespace as usize)
+                        .is_ok_and(|ns| ns == namespace)
+            })
+        };
+        self.view
+            .tables()
+            .and_then(|tables| tables.table::<TypeRefRaw>())
+            .into_iter()
+            .flat_map(|table| table.iter().filter_map(skip_unreadable))
+            .filter(is_named)
     }
 
     /// Adds a method signature to the blob heap and returns its index.
@@ -1867,127 +2042,262 @@ impl fmt::Debug for CilAssembly {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::{test::factories::table::cilassembly::create_test_typedef_row, Error};
+    use crate::{
+        metadata::{tables::TypeDefBuilder, validation::ValidationConfig},
+        testkit::{
+            factories::table::cilassembly::create_test_typedef_row,
+            fixture,
+            helpers::{load_sample, runtime_type_handle_rows, TWO_CORELIB_FIXTURES},
+        },
+        CilObject, Error,
+    };
+
+    /// The index a write builds answers every placeholder as the scan of the change sets
+    /// does (heap entries of all four heaps and table rows), misses what the scan misses, and
+    /// is gone once the write ends: a row added after a write is found by its placeholder.
+    #[test]
+    fn placeholders_are_found_the_same_with_and_without_the_index() {
+        let mut assembly = load_sample("packers/confuserex/1.6.0/original.exe").into_assembly();
+        let mut placeholders = Vec::new();
+        for i in 0..50u8 {
+            placeholders.push(assembly.string_add(&format!("s{i}")).unwrap().placeholder());
+            placeholders.push(assembly.blob_add(&[i, 1, 2]).unwrap().placeholder());
+            placeholders.push(assembly.guid_add(&[i; 16]).unwrap().placeholder());
+            placeholders.push(
+                assembly
+                    .userstring_add(&format!("u{i}"))
+                    .unwrap()
+                    .placeholder(),
+            );
+            let row = TypeDefBuilder::new()
+                .name(format!("T{i}"))
+                .namespace("Index")
+                .build(&mut assembly)
+                .unwrap();
+            placeholders.push(row.placeholder());
+        }
+        // A placeholder no change carries
+        placeholders.push(0x8000_0000 | 0x00FF_FFFF);
+
+        let scanned: Vec<Option<u64>> = placeholders
+            .iter()
+            .map(|p| assembly.changes().lookup_by_placeholder(*p).map(|r| r.id()))
+            .collect();
+        assert!(scanned.iter().take(250).all(Option::is_some));
+        assembly.changes_mut().index_placeholders();
+        let indexed: Vec<Option<u64>> = placeholders
+            .iter()
+            .map(|p| assembly.changes().lookup_by_placeholder(*p).map(|r| r.id()))
+            .collect();
+        assembly.changes_mut().drop_placeholder_index();
+        assert_eq!(indexed, scanned);
+
+        assembly.to_memory().unwrap();
+        let later = assembly.string_add("after the write").unwrap();
+        assert_eq!(
+            assembly
+                .changes()
+                .lookup_by_placeholder(later.placeholder())
+                .map(|r| r.id()),
+            Some(later.id())
+        );
+    }
+
+    /// A cleanup request's settings are the cleanup's: a request that keeps empty types keeps
+    /// them, where merging it into the default pending request removed them anyway (the
+    /// deobfuscator's `remove_empty_types: false` did nothing). A later request narrows them.
+    #[test]
+    fn a_cleanup_request_keeps_its_settings() {
+        let surviving = |requests: &[CleanupRequest]| -> Vec<String> {
+            let mut assembly = load_sample("packers/confuserex/1.6.0/original.exe").into_assembly();
+            for name in ["Removed", "Empty"] {
+                TypeDefBuilder::new()
+                    .name(name)
+                    .namespace("Cleanup")
+                    .build(&mut assembly)
+                    .unwrap();
+            }
+            let written = CilObject::from_mem_with_validation(
+                assembly.to_memory().unwrap(),
+                ValidationConfig::analysis(),
+            )
+            .unwrap();
+            let removed = written
+                .types()
+                .iter()
+                .find(|entry| entry.value().name == "Removed")
+                .map(|entry| *entry.key())
+                .unwrap();
+            let mut assembly = written.into_assembly();
+            for request in requests {
+                let mut request = request.clone();
+                request.add_type(removed);
+                assembly.add_cleanup(&request);
+            }
+            let cleaned = CilObject::from_mem_with_validation(
+                assembly.to_memory().unwrap(),
+                ValidationConfig::analysis(),
+            )
+            .unwrap();
+            cleaned
+                .types()
+                .iter()
+                .filter(|entry| entry.value().namespace == "Cleanup")
+                .map(|entry| entry.value().name.to_string())
+                .collect()
+        };
+        let keeps_empty = CleanupRequest::with_settings(true, false);
+        assert_eq!(surviving(std::slice::from_ref(&keeps_empty)), ["Empty"]);
+        assert!(surviving(&[CleanupRequest::new()]).is_empty());
+        assert_eq!(
+            surviving(&[CleanupRequest::new(), keeps_empty]),
+            ["Empty"],
+            "a later request narrows the settings"
+        );
+    }
+
+    /// A replacement heap that does not parse is written as it is, but changes cannot be
+    /// applied to it: the writer dropped it and kept only the additions, leaving every
+    /// reference into it dangling, where it must refuse.
+    #[test]
+    fn changes_to_a_heap_that_does_not_parse_are_refused() {
+        type Edit = fn(&mut CilAssembly) -> Result<()>;
+        let cases: [(&str, Edit); 4] = [
+            ("#Strings", |a| {
+                a.string_add_heap(b"Hello\0World\0".to_vec())?;
+                a.string_add("added").map(drop)
+            }),
+            ("#Blob", |a| {
+                a.blob_add_heap(vec![1, 2, 3])?;
+                a.blob_add(&[4, 5]).map(drop)
+            }),
+            ("#GUID", |a| {
+                a.guid_add_heap(vec![7; 8])?;
+                a.guid_add(&[9; 16]).map(drop)
+            }),
+            ("#US", |a| {
+                a.userstring_add_heap(vec![3, b'a', 0, 0])?;
+                a.userstring_add("added").map(drop)
+            }),
+        ];
+        let mut wrong = Vec::new();
+        for (heap, edit) in cases {
+            let mut assembly = load_sample("crafted_2.exe").into_assembly();
+            edit(&mut assembly).unwrap();
+            match assembly.to_memory() {
+                Err(Error::LayoutFailed(message)) if message.contains(heap) => {}
+                other => wrong.push(format!("{heap}: {:?}", other.map(|bytes| bytes.len()))),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     #[test]
     fn test_convert_from_view() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(_assembly) = CilAssembly::from_path(&path) {
-            // Basic smoke test - conversion should succeed
-        }
+        let path = fixture("WindowsBase.dll");
+        let _assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Basic smoke test - conversion should succeed
     }
 
     #[test]
     fn test_add_string() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let ref1 = assembly.string_add("Hello").unwrap();
-            let ref2 = assembly.string_add("World").unwrap();
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let ref1 = assembly.string_add("Hello").unwrap();
+        let ref2 = assembly.string_add("World").unwrap();
 
-            assert_ne!(ref1.placeholder(), ref2.placeholder());
-            assert!(ref2.placeholder() > ref1.placeholder());
-        }
+        assert_ne!(ref1.placeholder(), ref2.placeholder());
+        assert!(ref2.placeholder() > ref1.placeholder());
     }
 
     #[test]
     fn test_add_blob() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let ref1 = assembly.blob_add(&[1, 2, 3]).unwrap();
-            let ref2 = assembly.blob_add(&[4, 5, 6]).unwrap();
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let ref1 = assembly.blob_add(&[1, 2, 3]).unwrap();
+        let ref2 = assembly.blob_add(&[4, 5, 6]).unwrap();
 
-            assert_ne!(ref1.placeholder(), ref2.placeholder());
-            assert!(ref2.placeholder() > ref1.placeholder());
-        }
+        assert_ne!(ref1.placeholder(), ref2.placeholder());
+        assert!(ref2.placeholder() > ref1.placeholder());
     }
 
     #[test]
     fn test_add_guid() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let guid1 = [
-                0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-                0x77, 0x88,
-            ];
-            let guid2 = [
-                0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                0x88, 0x99,
-            ];
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let guid1 = [
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let guid2 = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99,
+        ];
 
-            let ref1 = assembly.guid_add(&guid1).unwrap();
-            let ref2 = assembly.guid_add(&guid2).unwrap();
+        let ref1 = assembly.guid_add(&guid1).unwrap();
+        let ref2 = assembly.guid_add(&guid2).unwrap();
 
-            assert_ne!(ref1.placeholder(), ref2.placeholder());
-            assert!(ref2.placeholder() > ref1.placeholder());
-        }
+        assert_ne!(ref1.placeholder(), ref2.placeholder());
+        assert!(ref2.placeholder() > ref1.placeholder());
     }
 
     #[test]
     fn test_add_userstring() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            let ref1 = assembly.userstring_add("Hello").unwrap();
-            let ref2 = assembly.userstring_add("World").unwrap();
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        let ref1 = assembly.userstring_add("Hello").unwrap();
+        let ref2 = assembly.userstring_add("World").unwrap();
 
-            assert_ne!(ref1.placeholder(), ref2.placeholder());
-            assert!(ref2.placeholder() > ref1.placeholder());
-        }
+        assert_ne!(ref1.placeholder(), ref2.placeholder());
+        assert!(ref2.placeholder() > ref1.placeholder());
     }
 
     #[test]
     fn test_table_row_assignment_uses_correct_rid() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(mut assembly) = CilAssembly::from_path(&path) {
-            // Create a minimal TypeDef row for testing
-            if let Ok(typedef_row) = create_test_typedef_row() {
-                // Add table row should return a ChangeRefRc
-                if let Ok(change_ref) = assembly.table_row_add(TableId::TypeDef, typedef_row) {
-                    // Verify the ChangeRef is for the TypeDef table
-                    assert!(
-                        change_ref.kind().is_table(),
-                        "ChangeRef should be a table row reference"
-                    );
-                    assert_eq!(
-                        change_ref.kind().table_id(),
-                        Some(TableId::TypeDef),
-                        "ChangeRef should be for TypeDef table"
-                    );
+        let path = fixture("WindowsBase.dll");
+        let mut assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Create a minimal TypeDef row for testing
+        let typedef_row = create_test_typedef_row().expect("the TypeDef row builds");
+        let change_ref = assembly
+            .table_row_add(TableId::TypeDef, typedef_row)
+            .expect("the row is added");
+        assert!(
+            change_ref.kind().is_table(),
+            "ChangeRef should be a table row reference"
+        );
+        assert_eq!(
+            change_ref.kind().table_id(),
+            Some(TableId::TypeDef),
+            "ChangeRef should be for TypeDef table"
+        );
 
-                    // Add another row should get a different ChangeRef
-                    if let Ok(typedef_row2) = create_test_typedef_row() {
-                        if let Ok(change_ref2) =
-                            assembly.table_row_add(TableId::TypeDef, typedef_row2)
-                        {
-                            // The two ChangeRefs should have different IDs
-                            assert_ne!(
-                                change_ref.id(),
-                                change_ref2.id(),
-                                "Different rows should have different ChangeRef IDs"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // Another row gets a different ChangeRef.
+        let typedef_row2 = create_test_typedef_row().expect("the TypeDef row builds");
+        let change_ref2 = assembly
+            .table_row_add(TableId::TypeDef, typedef_row2)
+            .expect("the second row is added");
+        assert_ne!(
+            change_ref.id(),
+            change_ref2.id(),
+            "Different rows should have different ChangeRef IDs"
+        );
     }
 
     #[test]
     fn test_heap_changes_initialized() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(assembly) = CilAssembly::from_path(&path) {
-            // Verify heap changes are properly initialized
-            // The additions count should be 0 initially
-            assert_eq!(assembly.changes.string_heap_changes.additions_count(), 0);
-            assert_eq!(assembly.changes.blob_heap_changes.additions_count(), 0);
-            assert_eq!(assembly.changes.guid_heap_changes.additions_count(), 0);
-            assert_eq!(
-                assembly.changes.userstring_heap_changes.additions_count(),
-                0
-            );
-        }
+        let path = fixture("WindowsBase.dll");
+        let assembly = CilAssembly::from_path(&path).expect("the fixture loads");
+        // Verify heap changes are properly initialized
+        // The additions count should be 0 initially
+        assert_eq!(assembly.changes.string_heap_changes.additions_count(), 0);
+        assert_eq!(assembly.changes.blob_heap_changes.additions_count(), 0);
+        assert_eq!(assembly.changes.guid_heap_changes.additions_count(), 0);
+        assert_eq!(
+            assembly.changes.userstring_heap_changes.additions_count(),
+            0
+        );
     }
 
     /// Mono runtime compatibility tests for assembly modification and execution
@@ -2001,13 +2311,15 @@ mod tests {
                 tables::{CodedIndex, CodedIndexType, MemberRefBuilder, TableId, TypeRefBuilder},
                 token::Token,
             },
-            test::mono::*,
+            testkit::mono::*,
         };
 
         #[test]
         fn test_mono_runtime_compatibility() -> Result<()> {
             // Create test runner using the new utilities
-            let runner = TestRunner::new()?;
+            let Some(runner) = TestRunner::new()? else {
+                return Ok(());
+            };
 
             // Define the assembly modification that adds a simple method
             let modify_assembly = |assembly: &mut CilAssembly| -> Result<()> {
@@ -2032,6 +2344,7 @@ mod tests {
                 &runner,
                 compilation::templates::HELLO_WORLD,
                 modify_assembly,
+                |_| Vec::new(),
             )?;
 
             // Assert all architectures passed all tests
@@ -2052,9 +2365,10 @@ mod tests {
                     result.architecture.name, result.errors
                 );
                 assert!(
-                    result.disassembly_success,
+                    result.disassembly_success != Some(false),
                     "Disassembly verification failed for {}: {:?}",
-                    result.architecture.name, result.errors
+                    result.architecture.name,
+                    result.errors
                 );
                 assert!(
                     result.reflection_success,
@@ -2086,7 +2400,9 @@ mod tests {
         #[test]
         fn test_mono_enhanced_modifications() -> Result<()> {
             // Create test runner using the new utilities
-            let runner = TestRunner::new()?;
+            let Some(runner) = TestRunner::new()? else {
+                return Ok(());
+            };
 
             // Test string modification by adding a simple method
             let modify_assembly = |assembly: &mut CilAssembly| -> Result<()> {
@@ -2136,6 +2452,7 @@ mod tests {
                 &runner,
                 compilation::templates::HELLO_WORLD,
                 modify_assembly,
+                |_| Vec::new(),
             )?;
 
             // Assert all tests passed
@@ -2161,6 +2478,7 @@ mod tests {
                 stdcall: false,
                 thiscall: false,
                 fastcall: false,
+                unmanaged: false,
                 param_count_generic: 0,
                 param_count: 1, // One string parameter
                 return_type: SignatureParameter {
@@ -2215,7 +2533,9 @@ mod tests {
         #[test]
         fn test_mono_mathematical_operations() -> Result<()> {
             // Test advanced mathematical operations and complex arithmetic
-            let runner = TestRunner::new()?;
+            let Some(runner) = TestRunner::new()? else {
+                return Ok(());
+            };
 
             let modify_assembly = |assembly: &mut CilAssembly| -> Result<()> {
                 // Create method that performs multiple arithmetic operations
@@ -2268,7 +2588,7 @@ mod tests {
                 Ok(())
             };
 
-            let results = run_complete_test_with_reflection(
+            let results = run_complete_test(
                 &runner,
                 compilation::templates::HELLO_WORLD,
                 modify_assembly,
@@ -2320,7 +2640,9 @@ mod tests {
         #[test]
         fn test_mono_local_variables_and_stack_operations() -> Result<()> {
             // Test local variable manipulation and stack operations
-            let runner = TestRunner::new()?;
+            let Some(runner) = TestRunner::new()? else {
+                return Ok(());
+            };
 
             let modify_assembly = |assembly: &mut CilAssembly| -> Result<()> {
                 // TestLocalVariables: temp1=input*2, temp2=temp1+5, return temp2-temp1 (always 5)
@@ -2368,7 +2690,7 @@ mod tests {
                 Ok(())
             };
 
-            let results = run_complete_test_with_reflection(
+            let results = run_complete_test(
                 &runner,
                 compilation::templates::HELLO_WORLD,
                 modify_assembly,
@@ -2418,7 +2740,9 @@ mod tests {
         #[test]
         fn test_mono_multiple_method_cross_references() -> Result<()> {
             // Test multiple methods that call each other
-            let runner = TestRunner::new()?;
+            let Some(runner) = TestRunner::new()? else {
+                return Ok(());
+            };
 
             let modify_assembly = |assembly: &mut CilAssembly| -> Result<()> {
                 // DoubleNumber: value * 2
@@ -2506,7 +2830,7 @@ mod tests {
                 Ok(())
             };
 
-            let results = run_complete_test_with_reflection(
+            let results = run_complete_test(
                 &runner,
                 compilation::templates::HELLO_WORLD,
                 modify_assembly,
@@ -2576,9 +2900,11 @@ mod tests {
         #[test]
         fn test_mono_blob_heap_and_complex_signatures() -> Result<()> {
             // Test blob heap modifications with complex method signatures
-            let runner = TestRunner::new()?;
+            let Some(runner) = TestRunner::new()? else {
+                return Ok(());
+            };
 
-            let results = run_complete_test_with_reflection(
+            let results = run_complete_test(
                 &runner,
                 compilation::templates::HELLO_WORLD,
                 |assembly: &mut CilAssembly| -> Result<()> {
@@ -2704,10 +3030,12 @@ mod tests {
         fn test_mono_reflection_detects_wrong_results() -> Result<()> {
             // Negative test: verify that our test framework actually detects wrong results
             // This ensures we're not just passing everything blindly
-            let runner = TestRunner::new()?;
+            let Some(runner) = TestRunner::new()? else {
+                return Ok(());
+            };
 
             // Create a simple Add method: returns a + b
-            let results = run_complete_test_with_reflection(
+            let results = run_complete_test(
                 &runner,
                 compilation::templates::HELLO_WORLD,
                 |assembly: &mut CilAssembly| -> Result<()> {
@@ -2758,6 +3086,41 @@ mod tests {
             }
 
             Ok(())
+        }
+    }
+
+    #[test]
+    fn a_type_imported_from_two_core_libraries_resolves_to_the_modules_own() {
+        // A module importing `System.RuntimeTypeHandle` from System.Private.CoreLib as
+        // well as from its own mscorlib takes its core library, and the type, from
+        // mscorlib, whichever of the two TypeRefs the table lists first.
+        for name in TWO_CORELIB_FIXTURES {
+            let path = fixture(&format!("metadata/layouts/{name}"));
+            let rows = runtime_type_handle_rows(&path);
+            let (own, foreign) = (rows["mscorlib"], rows["System.Private.CoreLib"]);
+            assert_eq!(
+                foreign < own,
+                name.contains("foreign_first"),
+                "{name} lists the foreign TypeRef where its name says"
+            );
+
+            let assembly = CilAssembly::from_path(&path).unwrap();
+            let corelib = assembly.find_core_library_ref().unwrap();
+            assert_eq!(
+                Some(corelib.row),
+                assembly
+                    .find_assembly_ref_by_name("mscorlib")
+                    .map(|mscorlib| mscorlib.row),
+                "{name}"
+            );
+            let handle = assembly
+                .find_corelib_typeref("System", "RuntimeTypeHandle")
+                .unwrap();
+            assert_eq!((handle.tag, handle.row), (TableId::TypeRef, own), "{name}");
+            assert!(
+                assembly.find_corelib_typeref("No.Such", "Type").is_none(),
+                "{name}"
+            );
         }
     }
 }

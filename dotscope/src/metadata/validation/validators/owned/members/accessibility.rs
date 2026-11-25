@@ -172,7 +172,7 @@ impl OwnedAccessibilityValidator {
             }
 
             // Validate that types which ARE nested have proper nested visibility.
-            // Only check TypeDef entries (0x02) — TypeRef entries lack flags metadata.
+            // Only check TypeDef entries (0x02) - TypeRef entries lack flags metadata.
             if type_entry.token.table() == 0x02 && type_entry.enclosing_type.get().is_some() {
                 // This is a nested type - it must use nested visibility flags (0x02-0x07)
                 // It cannot use top-level visibility (NOT_PUBLIC=0x00, PUBLIC=0x01)
@@ -319,6 +319,9 @@ impl OwnedAccessibilityValidator {
                 }
             }
 
+            // ECMA-335 II.12: an interface may have static fields, constant or not, but no
+            // instance fields. (CLS-compliant interfaces define no fields at all, but that is a
+            // language rule, not one the runtime enforces.)
             if type_entry.flags.is_interface() {
                 for (_, field) in type_entry.fields.iter() {
                     if !field.flags.is_static() {
@@ -326,17 +329,6 @@ impl OwnedAccessibilityValidator {
                             validator: self.name().to_string(),
                             message: format!(
                                 "Interface '{}' contains non-static field '{}'",
-                                type_entry.name, field.name
-                            ),
-                        });
-                    }
-
-                    if !field.flags.is_literal() {
-                        // Not LITERAL
-                        return Err(Error::ValidationOwnedFailed {
-                            validator: self.name().to_string(),
-                            message: format!(
-                                "Interface '{}' contains non-constant field '{}'",
                                 type_entry.name, field.name
                             ),
                         });
@@ -417,19 +409,17 @@ impl Default for OwnedAccessibilityValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::members_accessibility::owned_accessibility_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_accessibility_validator() -> Result<()> {
         let validator = OwnedAccessibilityValidator::new();
         let config = ValidationConfig {
@@ -440,7 +430,6 @@ mod tests {
         owned_validator_test(
             owned_accessibility_validator_file_factory,
             "OwnedAccessibilityValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

@@ -25,9 +25,9 @@
 //! call       TimeSpan::get_TotalMilliseconds()
 //! ldc.r8     5000.0
 //! ble.un.s   <skip_label>
+//! ldc.i4.1                         ; the dividend (0.39 pushes 1)
 //! ldc.i4.0
 //! stloc      <int_local>
-//! ldloc      <int_local>
 //! ldloc      <int_local>
 //! div                              ; divide-by-zero crash
 //! pop
@@ -40,11 +40,13 @@
 //! - `DateTime::op_Subtraction` (time difference)
 //! - `TimeSpan::get_TotalMilliseconds` (threshold comparison)
 //!
-//! A method containing all three is flagged as having the anti-debug pattern.
+//! A method containing all three and the divide-by-zero crash is flagged as
+//! having the anti-debug pattern. The three calls alone are what any code
+//! measuring elapsed time makes.
 //!
 //! # SSA Pass
 //!
-//! The removal pass lives in [`crate::deobfuscation::passes::bitmono::debug`]
+//! The removal pass is [`SentinelTaintRemovalPass`],
 //! and uses forward-only taint analysis seeded from the three sentinel API calls
 //! to automatically identify and remove all dependent obfuscation code.
 
@@ -52,6 +54,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     analysis::CilTarget,
+    assembly::Instruction,
     compiler::{CompilerContext, PassPhase, SsaPass},
     deobfuscation::{
         context::AnalysisContext,
@@ -59,9 +62,48 @@ use crate::{
         techniques::{Detection, Evidence, Technique, TechniqueCategory},
         utils::find_methods_calling_apis,
     },
-    metadata::token::Token,
+    metadata::{method::Method, token::Token},
     CilObject,
 };
+
+/// The local an `stloc` (`store`) or `ldloc` names, in any of its forms.
+pub fn local_slot(instruction: &Instruction, store: bool) -> Option<u16> {
+    let rest = instruction
+        .mnemonic
+        .strip_prefix(if store { "stloc" } else { "ldloc" })?;
+    match rest {
+        ".0" => Some(0),
+        ".1" => Some(1),
+        ".2" => Some(2),
+        ".3" => Some(3),
+        ".s" => instruction.get_u8_operand().map(u16::from),
+        "" => instruction.get_u16_operand(),
+        _ => None,
+    }
+}
+
+/// Whether `method` holds the injection's crash: a division by a local just
+/// set to zero whose result nothing reads - `ldc.i4.0; stloc x; ldloc x; div;
+/// pop` after any dividend (BitMono 0.39 pushes `1`), or `ldloc x` as the
+/// dividend too.
+fn has_divide_by_zero_crash(method: &Method) -> bool {
+    let instructions: Vec<_> = method.instructions().collect();
+    (0..instructions.len()).any(|at| {
+        let tail = instructions.get(at..).unwrap_or_default();
+        let [zero, store, divisor, rest @ ..] = tail else {
+            return false;
+        };
+        let slot = local_slot(store, true);
+        if zero.mnemonic != "ldc.i4.0" || slot.is_none() || local_slot(divisor, false) != slot {
+            return false;
+        }
+        let rest = match rest {
+            [again, rest @ ..] if local_slot(again, false) == slot => rest,
+            _ => rest,
+        };
+        matches!(rest, [div, pop, ..] if div.mnemonic == "div" && pop.mnemonic == "pop")
+    })
+}
 
 /// Findings from BitMono AntiDebugBreakpoints detection.
 #[derive(Debug)]
@@ -99,11 +141,20 @@ impl Technique for BitMonoAntiDebug {
         let patterns = &["get_UtcNow", "op_Subtraction", "get_TotalMilliseconds"];
         let matches = find_methods_calling_apis(assembly, patterns);
 
-        // Require all three sentinel APIs in the same method
+        // All three sentinel APIs in one method are what any code measuring
+        // elapsed time calls - mono's `System.dll` does it to pace a timer.
+        // What only the injection has is its crash: a local set to zero,
+        // divided by itself, the quotient dropped.
         let method_tokens: HashSet<Token> = matches
             .into_iter()
             .filter(|(_, idxs)| idxs.contains(&0) && idxs.contains(&1) && idxs.contains(&2))
             .map(|(token, _)| token)
+            .filter(|token| {
+                assembly
+                    .methods()
+                    .get(token)
+                    .is_some_and(|entry| has_divide_by_zero_crash(entry.value()))
+            })
             .collect();
 
         if method_tokens.is_empty() {
@@ -151,30 +202,42 @@ impl Technique for BitMonoAntiDebug {
 mod tests {
     use crate::{
         deobfuscation::techniques::{bitmono::BitMonoAntiDebug, Technique},
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly = load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_antidebug.exe");
+        let assembly = load_sample("packers/bitmono/0.39.0/bitmono_antidebug.exe");
 
         let technique = BitMonoAntiDebug;
         let detection = technique.detect(&assembly);
 
         // BitMonoAntiDebug is an SSA technique, but its IL-level detect()
-        // scans for sentinel API calls (UtcNow, op_Subtraction, TotalMilliseconds).
-        // These should be present in the antidebug sample.
-        if detection.is_detected() {
-            assert!(
-                !detection.evidence().is_empty(),
-                "Positive detection should include evidence"
-            );
-        }
+        // scans for the sentinel API calls (UtcNow, op_Subtraction,
+        // TotalMilliseconds) and the divide-by-zero crash they guard.
+        assert!(
+            detection.is_detected(),
+            "the antidebug sample carries the injected timing checks"
+        );
+        assert!(
+            !detection.evidence().is_empty(),
+            "Positive detection should include evidence"
+        );
+    }
+
+    /// Code that measures elapsed time calls the same three APIs; without the
+    /// injection's divide-by-zero crash it is not BitMono's. Mono's
+    /// `System.dll` paces a timer that way, and the removal pass used to strip
+    /// its arithmetic and force its branch.
+    #[test]
+    fn test_detect_elapsed_time_code_is_not_the_injection() {
+        let assembly = load_sample("mono_4.5/System.dll");
+        assert!(!BitMonoAntiDebug.detect(&assembly).is_detected());
     }
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = BitMonoAntiDebug;
         let detection = technique.detect(&assembly);

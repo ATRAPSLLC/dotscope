@@ -27,8 +27,8 @@
 //!
 //! Creating a capture context with default settings (captures everything):
 //!
-//! ```ignore
-//! use dotscope::emulation::capture::CaptureContext;
+//! ```no_run
+//! use dotscope::emulation::CaptureContext;
 //!
 //! let ctx = CaptureContext::new();
 //!
@@ -44,8 +44,8 @@
 //!
 //! Creating a minimal context for assembly extraction only:
 //!
-//! ```ignore
-//! use dotscope::emulation::capture::CaptureContext;
+//! ```no_run
+//! use dotscope::emulation::CaptureContext;
 //!
 //! let ctx = CaptureContext::assemblies_only();
 //! // Strings, file ops, and network ops will not be captured
@@ -95,9 +95,9 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use dotscope::emulation::capture::CaptureContext;
-/// use dotscope::emulation::process::CaptureConfig;
+/// ```no_run
+/// use dotscope::emulation::CaptureContext;
+/// use dotscope::emulation::CaptureConfig;
 ///
 /// // Capture only assemblies and strings
 /// let config = CaptureConfig {
@@ -169,8 +169,25 @@ pub struct CaptureContext {
     /// during emulation, useful for tracking memory state evolution.
     snapshots: RwLock<Vec<MemorySnapshot>>,
 
+    /// The manifest resources the program opened, and which method opened
+    /// each, in the order they were first opened.
+    ///
+    /// Which resource a protection's runtime reads is the one thing its code
+    /// says about it for certain, even when the name it asks for is itself
+    /// encrypted.
+    resource_reads: RwLock<Vec<ResourceRead>>,
+
     /// Aggregate statistics for all captured data.
     stats: RwLock<CaptureStats>,
+}
+
+/// A manifest resource the emulated program opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceRead {
+    /// The `ManifestResource` token of the resource.
+    pub resource: Token,
+    /// The method that asked for it, when one was executing.
+    pub reader: Option<Token>,
 }
 
 /// Aggregate statistics about data captured during emulation.
@@ -181,7 +198,9 @@ pub struct CaptureContext {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use dotscope::emulation::CaptureContext;
+///
 /// let ctx = CaptureContext::new();
 /// // ... run emulation ...
 ///
@@ -241,7 +260,9 @@ impl CaptureContext {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::emulation::CaptureContext;
+    ///
     /// let ctx = CaptureContext::new();
     /// assert!(ctx.config().assemblies);
     /// assert!(ctx.config().strings);
@@ -275,7 +296,9 @@ impl CaptureContext {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::emulation::{CaptureConfig, CaptureContext};
+    ///
     /// let config = CaptureConfig {
     ///     assemblies: true,
     ///     strings: false,  // Don't capture strings
@@ -296,6 +319,7 @@ impl CaptureContext {
             file_operations: RwLock::new(Vec::new()),
             network_operations: RwLock::new(Vec::new()),
             snapshots: RwLock::new(Vec::new()),
+            resource_reads: RwLock::new(Vec::new()),
             stats: RwLock::new(CaptureStats::default()),
         }
     }
@@ -446,6 +470,29 @@ impl CaptureContext {
         self.assemblies
             .read()
             .map(|a| a.clone())
+            .unwrap_or_default()
+    }
+
+    /// Records that `reader` opened the manifest resource `resource`.
+    ///
+    /// Recorded whatever the capture configuration: it is two tokens per read,
+    /// and the resources a run touched, and whose code touched them, are
+    /// needed to know which ones a protection's runtime owns.
+    pub fn record_resource_read(&self, resource: Token, reader: Option<Token>) {
+        let read = ResourceRead { resource, reader };
+        if let Ok(mut reads) = self.resource_reads.write() {
+            if !reads.contains(&read) {
+                reads.push(read);
+            }
+        }
+    }
+
+    /// The manifest resources the program opened, and which method opened
+    /// each, in the order they were first opened.
+    pub fn resource_reads(&self) -> Vec<ResourceRead> {
+        self.resource_reads
+            .read()
+            .map(|reads| reads.clone())
             .unwrap_or_default()
     }
 

@@ -40,8 +40,8 @@ use crate::{emulation::ThreadId, metadata::token::Token};
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use dotscope::emulation::capture::CaptureSource;
+/// ```no_run
+/// use dotscope::emulation::CaptureSource;
 /// use dotscope::emulation::ThreadId;
 /// use dotscope::metadata::token::Token;
 ///
@@ -117,7 +117,8 @@ impl CaptureSource {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```no_run
+/// # let ctx = dotscope::emulation::CaptureContext::new();
 /// for assembly in ctx.assemblies() {
 ///     // Check if it's a valid PE/COFF file
 ///     if assembly.data.starts_with(b"MZ") {
@@ -128,6 +129,7 @@ impl CaptureSource {
 ///         )?;
 ///     }
 /// }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct CapturedAssembly {
@@ -224,7 +226,8 @@ pub enum AssemblyLoadMethod {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// # let ctx = dotscope::emulation::CaptureContext::new();
 /// for string in ctx.strings() {
 ///     // Look for URLs
 ///     if string.value.starts_with("http") {
@@ -533,7 +536,10 @@ pub enum NetworkOpKind {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use dotscope::emulation::NetworkOpKind;
+/// # let ctx = dotscope::emulation::CaptureContext::new();
+///
 /// for op in ctx.network_operations() {
 ///     match op.operation {
 ///         NetworkOpKind::HttpGet | NetworkOpKind::HttpPost => {

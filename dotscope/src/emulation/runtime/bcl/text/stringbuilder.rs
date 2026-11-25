@@ -130,8 +130,10 @@ pub fn register(manager: &HookManager) -> Result<()> {
 
 /// Reads the StringBuilder buffer from the heap. Returns (buffer, capacity).
 fn read_sb(thread: &EmulationThread, href: crate::emulation::HeapRef) -> Option<(String, usize)> {
-    if let Ok(HeapObject::StringBuilder { buffer, capacity }) = thread.heap().get(href) {
-        Some((buffer, capacity))
+    if let Ok(HeapObject::StringBuilder { buffer, capacity }) =
+        thread.heap().get_shared(href).as_deref()
+    {
+        Some((buffer.to_string(), *capacity))
     } else {
         None
     }
@@ -493,7 +495,7 @@ mod tests {
     use crate::{
         emulation::runtime::hook::HookManager,
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     fn ctx<'a>(method: &'a str, this: Option<&'a EmValue>, args: &'a [EmValue]) -> HookContext<'a> {

@@ -45,7 +45,10 @@ use log::warn;
 use crate::{
     emulation::{
         memory::{DictionaryKey, HeapObject},
-        runtime::hook::{Hook, HookContext, HookManager, PreHookResult},
+        runtime::{
+            bcl::io::stream::stream_dispose_pre,
+            hook::{Hook, HookContext, HookManager, PreHookResult},
+        },
         thread::EmulationThread,
         EmValue,
     },
@@ -62,13 +65,14 @@ pub fn register(manager: &HookManager) -> Result<()> {
 }
 
 fn register_interfaces(manager: &HookManager) -> Result<()> {
-    // IDisposable.Dispose() — emitted by the compiler in foreach loops
-    // (callvirt System.IDisposable::Dispose() on the enumerator). Safe no-op
-    // since our enumerator heap objects are managed and don't hold resources.
+    // IDisposable.Dispose(), which the compiler emits for `foreach` enumerators and `using`
+    // blocks (callvirt System.IDisposable::Dispose()). Emulated objects hold nothing to
+    // release, but a CryptoStream disposed this way flushes its final block, as the runtime's
+    // does, which the stream hook does.
     manager.register(
         Hook::new("System.IDisposable.Dispose")
             .match_name("System", "IDisposable", "Dispose")
-            .pre(|_ctx, _thread| PreHookResult::Bypass(None)),
+            .pre(stream_dispose_pre),
     )?;
     Ok(())
 }
@@ -176,8 +180,8 @@ fn stack_get_count_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 fn stack_contains_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(stack_ref)) = ctx.this {
         if let Some(needle) = ctx.args.first() {
-            let obj = try_hook!(thread.heap().get(*stack_ref));
-            if let HeapObject::Stack { elements } = obj {
+            let obj = try_hook!(thread.heap().get_shared(*stack_ref));
+            if let HeapObject::Stack { elements } = &*obj {
                 let found = elements.iter().any(|e| e.clr_equals(needle));
                 return PreHookResult::Bypass(Some(EmValue::I32(i32::from(found))));
             }
@@ -307,8 +311,8 @@ fn queue_get_count_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> P
 fn queue_contains_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(queue_ref)) = ctx.this {
         if let Some(needle) = ctx.args.first() {
-            let obj = try_hook!(thread.heap().get(*queue_ref));
-            if let HeapObject::Queue { elements } = obj {
+            let obj = try_hook!(thread.heap().get_shared(*queue_ref));
+            if let HeapObject::Queue { elements } = &*obj {
                 let found = elements.iter().any(|e| e.clr_equals(needle));
                 return PreHookResult::Bypass(Some(EmValue::I32(i32::from(found))));
             }
@@ -452,10 +456,10 @@ fn hashset_clear_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pre
 fn hashset_union_with_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(set_ref)) = ctx.this {
         if let Some(EmValue::ObjectRef(source_ref)) = ctx.args.first() {
-            let source = try_hook!(thread.heap().get(*source_ref));
-            let elements: Vec<EmValue> = match source {
-                HeapObject::Array { elements, .. } => elements,
-                HeapObject::List { elements } => elements,
+            let source = try_hook!(thread.heap().get_shared(*source_ref));
+            let elements: Vec<EmValue> = match &*source {
+                HeapObject::Array { elements, .. } => elements.to_vec(),
+                HeapObject::List { elements } => elements.to_vec(),
                 _ => Vec::new(),
             };
             for elem in &elements {
@@ -474,7 +478,7 @@ mod tests {
     use crate::{
         emulation::runtime::hook::HookManager,
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     fn ctx<'a>(

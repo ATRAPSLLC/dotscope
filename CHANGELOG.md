@@ -5,6 +5,220 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-11-24
+
+A correctness release built on analyssa 0.7.1. Every assembly of the test corpus loads, lifts
+to SSA the verifier accepts and writes back holding what it held; generated code is
+translation-validated; and the public API changed wherever it could not state what the
+metadata means, so this release has many breaking changes.
+
+### Changed
+
+- **Built on analyssa 0.7.1** (**BREAKING**): a call is one `SsaOp::Call` holding `CallData`
+  and its `Callee` (read through `SsaOpCilExt::method_call`), CIL prefixes sit on the
+  operation they prefix (`CilPrefix`), evaluators take a `Machine` instead of a
+  `PointerSize`, a float constant is `ConstValue::Float(FloatBits)` and `EmValue` converts
+  from a `ConstValue` with `TryFrom`.
+- **Code generation is rebuilt** (#288): it emits in SSA order, moves a value to its use only
+  where that is unobservable, shares slots and makes one parallel copy per phi edge. Every
+  generated body is translation-validated (`compiler::validate_lift`); a refused one keeps
+  its IL (`EventKind::CodegenRefused`). `SsaCodeGenerator::compile` is all or nothing and
+  `generate_with_assembly` is removed.
+- **One work budget and one set of emulation limits**: `EngineConfig::budget` bounds every
+  pass and the scheduler (`with_budget` replaces `with_max_iterations`),
+  `EmulationConfig::limits` is the one `EmulationLimits` (`ProcessBuilder::with_limits`) and
+  `EngineConfig::unflattening` the one `UnflattenConfig`.
+- **Validators enforce only ECMA-335 rules and what the runtime refuses**, so assemblies the
+  runtime loads validate.
+- **Every codec encodes back what it reads**: custom attributes, marshalling, declarative
+  security, method bodies, signatures, sequence points and custom debug information follow
+  the ECMA-335 and Portable PDB grammars.
+- **Loading is faster and smaller**: over the 1017-assembly corpus, 25% less time, a third
+  lower peak memory and 36% fewer allocations. Names read from `#Strings` share one copy
+  (`SharedStr`; a `Document`'s name is a `DocumentName`, its hash `SharedBytes`) and are
+  returned shared, `CilType::fullname()` returns a `FullName`, and per-type lists are
+  allocated on first push.
+- Output is deterministic, and a failing load names the first failing row in token order.
+- **BREAKING** API changes besides the above:
+  - assembly: `FlowType::CallIndirect` (`calli`) and `MethodJump` (`jmp`), both `Call`
+    before; `Instruction::fall_through` and `FlowType::falls_through`; a branch operand is
+    `Operand::Target(rva)`.
+  - loading: `CilObject::from_view` and `from_view_with_validation` return a `ViewLoadError`
+    that keeps the view; a coded index whose tag names no table reads as null
+    (`TableInfo::decode_coded_index` returns `Option`, #290).
+  - metadata: a type's `FieldList`, `PropertyList`, `EventList` and `modifiers`, `ParamList`
+    and `Method::local_vars` are `LazyList`s, and attached lists (`Property::fn_other`,
+    `Event::fn_on_other`, `security`) are `RowList`s; `Identity::PubKey`/`EcmaKey` hold an
+    `Arc<[u8]>` and `Identity::Token` is in .NET's byte order; custom attribute values hold
+    `Option` for null, a `Boxed` argument and `FieldOrPropType`; `MarshallingInfo` is one
+    native type; `SecurityAction` and `SecurityPermissionFlags` take the runtime's values;
+    `CustomDebugInfo` is decoded by kind; `SignatureMethod` gains `unmanaged`;
+    `TypeSignature::ModifiedRequired`/`ModifiedOptional` hold the type they modify; the
+    compressed integer writers return `Result`; `Resources` is keyed by token; the raw
+    `to_owned` of TypeDef, MethodDef, EventMap, PropertyMap and LocalScope rows takes the
+    table's `MemberRanges`.
+  - writing: a reference to a deleted row fails the write with `Error::DanglingReference` (or
+    is null under `DanglingPolicy::Null`) instead of moving to the next row.
+  - emulation: `ManagedHeap::iter` yields `Arc<HeapObject>`, hook results are checked
+    against the method's signature, `NewObjResolution::HookedBypass` carries the value
+    `newobj` pushes, and `MethodBuilder::build` refuses a bodyless method that is not
+    P/Invoke, internal-call or runtime-implemented.
+
+### Added
+
+- Portable PDB: every load reads the embedded PDB or the image's own debug tables,
+  `CilObject::pdb()` gives every table with queries, and `with_pdb` / `with_pdb_bytes` attach
+  a standalone `.pdb`.
+- `.resources` values of user types are kept (`ResourceType::Serialized`) and read as MS-NRBF
+  (`resources::nrbf`); compiled XAML reads as a BAML document (`resources::baml`).
+- Metadata queries: `Root::stream` and `unread_streams`, `Param::from_signature`,
+  `type_tokens` on signatures, `TokenResolver::generic_definition`,
+  `CilAssembly::find_corelib_type`, `CilObject::fields` and `custom_attributes`,
+  `CilType::enum_underlying`, `MemberRanges` (`TablesHeader::member_ranges` and
+  `member_rids`), `PdbStream::to_bytes`, and `Method::code_kind` / `MethodCodeKind` /
+  `Method::code_rva`.
+- `dotscope::io` (the binary codecs), SSA forms for `arglist`, `mkrefany`, `refanyval` and
+  `refanytype`, and the hidden, unstable `testkit` feature.
+- Crate-internal members of public types are public (`CilObject::from_project`,
+  `CilAssemblyView::load_with_validation`, `assembly::decode_method`, `CustomAttributeParser`,
+  `TokenResolver::new`, ...), and every type the public API takes, returns or holds can be
+  imported (`deny(unnameable_types)` keeps it so).
+- Deobfuscation: `bitmono.tokens`, `bitmono.locals` and `netreactor.emptyresource`, a metadata
+  repair registry, and exports of `repair_pe`, unflattening and the conflict resolution types.
+
+### Removed
+
+- **BREAKING**: the LLM renamer: the `smart-rename` feature (dotscope and dotscope-cli),
+  `SmartRenameConfig`, `CleanupConfig::smart_rename`, the CLI's `--rename-ai` and the
+  `mistralrs` and `tokio` dependencies. Cleanup renames to sequential names as before.
+- **BREAKING**: configuration nothing read (`DecryptorHeuristics`, `UnflatteningThresholds`,
+  `detection_threshold`, `verify_semantics`, `resolution_strategies`,
+  `EngineConfig::target_obfuscator` and `with_target_obfuscator`),
+  `analysis::conv_op_for_target`, `Method::varargs`, `Method::is_forwarded_pinvoke` (always
+  false; `Method::is_forward_ref` is the `ForwardRef` test),
+  `AssemblyChanges::referenced_string_offsets` (nothing read it), the public table loaders
+  and the `skip-expensive-tests` feature.
+
+### Fixed
+
+#### Loading and metadata
+
+- Images load as the CLR loads them: stream directories, the `#~` ExtraData word, `#JTD`
+  tables, any metadata version text, zero-length heaps and ConfuserEx's "invalid metadata"
+  (#289); bytes at an RVA are read through one section map.
+- Signatures parse in one pass bounded by their bytes: array and modified types no longer
+  misparse what follows them. Custom attribute arguments are read by the constructor's
+  signature and enums by their underlying type.
+- Type flavors, nested generic instances and core library types no longer depend on loader
+  timing, and Portable PDB data, sequence points and StateMachineMethod rows load as the
+  compilers write them.
+- Native imports and exports are walked as the Windows loader walks them, DLL names compared
+  ignoring case.
+- A method's code type is compared as the two-bit field it is (`is_code_il` held for every
+  method).
+- List columns are read once per table into runs clamped to their table, so a hostile column
+  no longer costs billions of iterations or quadratic memory.
+
+#### Project loading
+
+- A panic while loading no longer hangs `ProjectLoader::build`; a dependency that fails is
+  left out and reported in `failed_loads`, `strict_mode` fails on a missing or failing one,
+  and `missing_dependencies` lists only names not found. Dependency names must be simple file
+  names resolving inside the search directory, and `max_assemblies` bounds a build.
+- A TypeRef binds in the assembly its AssemblyRef names, and `CilProject` lists its
+  assemblies in identity order.
+
+#### ILAsm output
+
+- Strings and names share one escaper (several were written unescaped), a user string that
+  is not valid UTF-16 is written as `bytearray`, floats round-trip, general arrays keep their
+  bounds and `.locals` comes from the parsed signature.
+
+#### Write path and cleanup
+
+- An assembly written back unchanged holds what it held: large and fat method bodies, shared
+  heap tails, user strings, the debug directory, every exception clause, and the native
+  import and export tables. A row whose coded index tag names no table (ConfuserEx's "invalid
+  metadata") no longer fails the write (#290).
+- The debug directory follows the write (#291): a write that renumbers rows or replaces
+  bodies regenerates the embedded Portable PDB and the entries naming it, and in-image debug
+  tables follow the methods it deletes, replaces and adds; a write that does neither keeps
+  the CodeView entry of a standalone PDB, which still matches the output.
+- Heap placeholders no longer pass for offsets, an index too wide for its column is refused,
+  replaced bodies follow a moved user string heap, and renamed strings keep their tails.
+  Writes no longer scan every change per placeholder or string (adding 8000 types: about 9x
+  fewer instructions; 20000 renamed strings: about 125x).
+- Cleanup keeps what surviving metadata names, deletes nested types at every depth and keeps
+  the enclosing chain of a surviving one; `add_cleanup` narrows earlier requests instead of
+  resetting them.
+- `.resources` streams are written as `ResourceWriter` writes them, and `repair_pe` repairs
+  any directory count past 16.
+
+#### Analysis and code generation
+
+- Every corpus method lifts to SSA the verifier accepts (typed arithmetic, enums as their
+  underlying integer, `.locals init` locals read zero), and code the runtime refuses (falling
+  off the end, a branch into an operand, a join at two stack depths) is an error.
+- Constant folding respects width, kind and NaN, writes each constant in its variable's
+  type, drops the phi operands of the edges a folded branch removes, pure-call folding needs
+  a pure callee, and the `z3` solver states every operation as the value it computes.
+- Integers narrower than 32 bits compute as the `int32` the evaluation stack holds (#288):
+  the lift states each widening as a conversion, a conversion reads its operand at its own
+  width, a store into a narrower slot truncates, and generated code keeps every narrow value
+  in its stack form. Comparisons, remainders, phis and address offsets over mixed widths
+  are no longer folded wrongly.
+- The x86 lift of native stubs is exact or refuses (flags, partial registers, MUL/DIV,
+  extensions, shifts and rotates), so a stub it cannot follow stays native.
+- Exception clauses come nested first in a stable order, generated code handles `calli`,
+  typed element access and values leaving a `try` through its `finally`, and a filter ends
+  at its `endfilter`.
+- Call graphs and class hierarchy analysis find every override and implementation, end on
+  inheritance cycles and order callees first.
+
+#### Emulation
+
+- A virtual call runs the receiver's override, or the hook of its runtime type, before the
+  base method's hook (a user `ToString`, a CryptoStream read through `Stream.Read`).
+- Heap objects and statics sit behind `Arc` and are copied on the first write after a fork;
+  an array index is an integer; `ldfld`/`stfld` through a field pointer reach the struct.
+- Hook results are checked against the method's signature, `newobj` pushes what a
+  constructor hook constructs, delegates dispatch through a MemberRef `Invoke`, pass their
+  target and return multicast calls to the caller, and an `Assembly.Load`ed assembly runs
+  against its own metadata.
+- The single-byte `conv.ovf.*` opcodes, `no.`, float comparisons on NaN, `Math.Round` and
+  strings (UTF-16 code units, O(1) `Length` and `Chars`) behave as in .NET; symmetric
+  crypto, CryptoStream and compression throw the runtime's exceptions instead of returning
+  their input.
+
+#### Deobfuscation
+
+- Control flow unflattening repairs each rewired edge instead of spilling values to locals
+  and rebuilding the method.
+- Passes remove only what nothing reads, a failing pass rolls its method back
+  (`EventKind::PassFailed`), and a byte transform that found nothing no longer reruns the
+  pipeline.
+- Decryption no longer falls back to seed 0, keeps a state machine a failed call site still
+  reads, caches values per generic instantiation, and folds opaque fields only from detected
+  fields never stored at runtime.
+- BitMono tokens resolve by signature, ConfuserEx output passes validation, and .NET Reactor
+  samples get their resources and `typeof`s back.
+
+#### Tests
+
+- The suite fails instead of skipping: every sample is a manifest fixture, every corpus
+  assembly must load and every method lift, and no verdict depends on machine load. Packer
+  samples are checked by what they print under Mono and deobfuscated twice to byte-identical
+  output, the System.Reflection.Metadata oracle compares every corpus assembly, failing fuzz
+  inputs are replayed as regression tests, benchmarks measure time and memory, and every
+  documentation example compiles and runs as a doc test. Random mixed-width methods are
+  lifted, optimised and regenerated against an interpreter of their CIL.
+
+### Dependencies
+
+- `analyssa` 0.6.0 → 0.7.1, `z3` 0.21.0 → 0.23.0, `iced-x86` 1.21.0 → 1.22.0, and patch
+  updates of the rest.
+- `mistralrs` and `tokio` removed; `toml` and `proptest` are optional, for `testkit`.
+
 ## [0.9.1] - 2026-09-05
 
 A dependency release, and the defects that adopting the dependency exposed.
@@ -187,6 +401,9 @@ miscompilations in the SSA back end and layout defects in the PE writer.
   grandparent frame, queued `finally` blocks were never drained once a catch was
   selected, a `leave` out of nested `finally`s spun on `endfinally`, and a filter
   returning zero terminated emulation instead of resuming the handler search.
+  A CLR exception raised by an instruction the controller completes (`unbox` of
+  null or of another type, a failed `castclass`, `initobj` through null) is thrown at that
+  instruction and reaches its handlers; it ended the run as an emulation error.
 - **PE writer layout.** Heap offsets were computed twice from different inputs,
   so offsets baked into tables and IL disagreed with where data was written;
   heap index widths were inherited from the input and truncated above 0xFFFF;

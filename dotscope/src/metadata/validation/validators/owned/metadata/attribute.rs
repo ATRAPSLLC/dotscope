@@ -2,27 +2,20 @@
 //!
 //! This validator provides comprehensive validation of custom attributes according to ECMA-335
 //! specifications within the context of fully resolved .NET metadata. It operates on resolved
-//! custom attribute structures to ensure proper attribute usage rules, constructor calls,
-//! target compatibility, and inheritance patterns. This validator runs with priority 130
-//! in the owned validation stage.
+//! custom attribute structures to check that their arguments are well formed. This validator
+//! runs with priority 130 in the owned validation stage.
 //!
 //! # Architecture
 //!
-//! The attribute validation system implements comprehensive custom attribute validation in sequential order:
-//! 1. **Attribute Usage Validation** - Ensures custom attributes follow AttributeUsage constraints and target compatibility
-//! 2. **Constructor Call Validation** - Validates attribute constructor parameters and argument limits
-//! 3. **Target Compatibility Validation** - Ensures attributes are applied to valid targets with proper placement rules
-//!
-//! The implementation validates custom attributes according to ECMA-335 specifications,
-//! ensuring proper attribute usage patterns and preventing malformed attribute data.
-//! All validation includes argument checking and suspicious pattern detection.
+//! **Attribute Usage Validation** checks each attribute's fixed and named arguments against
+//! ECMA-335 II.23.3: an enum argument names its enum type, no argument is void, and a named
+//! argument names a field or property. It enforces no limits of its own: counts, lengths and
+//! contents ECMA-335 allows are allowed.
 //!
 //! # Key Components
 //!
 //! - [`crate::metadata::validation::validators::owned::metadata::attribute::OwnedAttributeValidator`] - Main validator implementation providing comprehensive attribute validation
 //! - [`crate::metadata::validation::validators::owned::metadata::attribute::OwnedAttributeValidator::validate_attribute_usage_rules`] - Attribute usage constraint validation with target checking
-//! - [`crate::metadata::validation::validators::owned::metadata::attribute::OwnedAttributeValidator::validate_attribute_constructor_calls`] - Constructor parameter validation with argument limit checking
-//! - [`crate::metadata::validation::validators::owned::metadata::attribute::OwnedAttributeValidator::validate_attribute_target_compatibility`] - Target compatibility validation with placement rule verification
 //! - [`crate::metadata::validation::validators::owned::metadata::attribute::OwnedAttributeValidator::validate_attribute_usage`] - Individual attribute validation with argument checking
 //!
 //! # Usage Examples
@@ -44,12 +37,8 @@
 //! # Error Handling
 //!
 //! This validator returns [`crate::Error::ValidationOwnedFailed`] for:
-//! - Invalid custom attribute usage patterns (malformed fixed/named arguments)
-//! - Attribute constructor call violations (excessive arguments, duplicate named args)
-//! - Target compatibility violations (invalid placement, suspicious patterns)
-//! - Attribute argument validation failures (invalid types, null characters in strings)
-//! - Named argument violations (empty names, excessive counts)
-//! - Suspicious attribute patterns (excessively long strings, deep array nesting)
+//! - Malformed fixed or named arguments (void values, enums without their type)
+//! - Named arguments with empty names
 //!
 //! # Thread Safety
 //!
@@ -74,12 +63,9 @@
 //! - [ECMA-335 II.23.3](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - Custom Attribute encoding
 //! - [ECMA-335 IV](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - Attribute class specifications
 
-use std::collections::HashSet;
-
 use crate::{
     metadata::{
         customattributes::{CustomAttributeArgument, CustomAttributeValue},
-        typesystem::CilTypeReference,
         validation::{
             context::{OwnedValidationContext, ValidationContext},
             traits::OwnedValidator,
@@ -147,8 +133,8 @@ impl OwnedAttributeValidator {
     /// - Custom attributes have invalid usage patterns on types or methods
     /// - Attribute arguments are malformed or invalid
     fn validate_attribute_usage_rules(&self, context: &OwnedValidationContext) -> Result<()> {
-        // Validate attributes on types
-        for type_entry in context.all_types() {
+        // Validate attributes on this assembly's types; another assembly's are validated with it
+        for type_entry in context.target_assembly_types() {
             for (_, custom_attr) in type_entry.custom_attributes.iter() {
                 if let Err(e) = self.validate_attribute_usage(custom_attr, "Type") {
                     let type_name = &type_entry.name;
@@ -273,290 +259,32 @@ impl OwnedAttributeValidator {
             | CustomAttributeArgument::U8(_)
             | CustomAttributeArgument::R4(_)
             | CustomAttributeArgument::R8(_)
-            | CustomAttributeArgument::I(_)
-            | CustomAttributeArgument::U(_)
             | CustomAttributeArgument::Type(_) => true,
 
-            CustomAttributeArgument::String(s) => !s.contains('\0'),
+            // A .NET string may hold any UTF-16 unit, NUL included
+            CustomAttributeArgument::String(_) => true,
 
-            CustomAttributeArgument::Array(elements) => elements
+            CustomAttributeArgument::Array(_, elements) => elements
                 .iter()
+                .flatten()
                 .all(|elem| self.is_valid_attribute_argument(elem)),
 
             CustomAttributeArgument::Enum(type_name, underlying_value) => {
                 !type_name.is_empty() && self.is_valid_attribute_argument(underlying_value)
             }
 
-            CustomAttributeArgument::Void => false,
-        }
-    }
-
-    /// Validates attribute constructor calls and parameter compatibility.
-    ///
-    /// Ensures that custom attributes use valid constructors with proper
-    /// parameter types and counts matching the attribute class definition.
-    /// Validates argument limits and named argument uniqueness.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - Owned validation context containing resolved custom attribute structures via [`crate::metadata::validation::context::OwnedValidationContext`]
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - All attribute constructor calls are valid
-    /// * `Err(`[`crate::Error::ValidationOwnedFailed`]`)` - Constructor call violations found
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::ValidationOwnedFailed`] if:
-    /// - Fixed arguments exceed reasonable limits (>20)
-    /// - Named arguments exceed reasonable limits (>50)
-    /// - Named arguments have duplicate names
-    fn validate_attribute_constructor_calls(&self, context: &OwnedValidationContext) -> Result<()> {
-        for type_entry in context.all_types() {
-            for (_, custom_attr) in type_entry.custom_attributes.iter() {
-                if custom_attr.fixed_args.len() > 20 {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!(
-                            "Custom attribute on type '{}' has excessive fixed arguments ({})",
-                            type_entry.name,
-                            custom_attr.fixed_args.len()
-                        ),
-                    });
-                }
-
-                if custom_attr.named_args.len() > 50 {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!(
-                            "Custom attribute on type '{}' has excessive named arguments ({})",
-                            type_entry.name,
-                            custom_attr.named_args.len()
-                        ),
-                    });
-                }
-
-                let mut named_arg_names = HashSet::new();
-                for named_arg in &custom_attr.named_args {
-                    if !named_arg_names.insert(&named_arg.name) {
-                        return Err(Error::ValidationOwnedFailed {
-                            validator: self.name().to_string(),
-                            message: format!(
-                                "Custom attribute on type '{}' has duplicate named argument '{}'",
-                                type_entry.name, named_arg.name
-                            ),
-                        });
-                    }
-                }
+            // The grammar names a boxed value's type before it, and has no type for a box
+            CustomAttributeArgument::Boxed(value) => {
+                !matches!(**value, CustomAttributeArgument::Boxed(_))
+                    && self.is_valid_attribute_argument(value)
             }
         }
-
-        Ok(())
-    }
-
-    /// Validates attribute target compatibility and placement rules.
-    ///
-    /// Ensures that attributes are only applied to valid targets according
-    /// to their AttributeUsage declarations and .NET framework rules.
-    /// Detects suspicious attribute patterns that might indicate malformed data.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - Owned validation context containing resolved custom attribute structures via [`crate::metadata::validation::context::OwnedValidationContext`]
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - All attribute target compatibility rules are followed
-    /// * `Err(`[`crate::Error::ValidationOwnedFailed`]`)` - Target compatibility violations found
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::ValidationOwnedFailed`] if:
-    /// - Attributes have suspicious patterns on types, fields, or methods
-    /// - Attribute placement violates target compatibility rules
-    fn validate_attribute_target_compatibility(
-        &self,
-        context: &OwnedValidationContext,
-    ) -> Result<()> {
-        let methods = context.object().methods();
-
-        // Check type-level attributes
-        for type_entry in context.all_types() {
-            for (_, custom_attr) in type_entry.custom_attributes.iter() {
-                if self.has_suspicious_attribute_pattern(custom_attr) {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!(
-                            "Type '{}' has custom attribute with suspicious pattern",
-                            type_entry.name
-                        ),
-                    });
-                }
-            }
-
-            for (_, field) in type_entry.fields.iter() {
-                for (_, custom_attr) in field.custom_attributes.iter() {
-                    if self.has_suspicious_attribute_pattern(custom_attr) {
-                        return Err(Error::ValidationOwnedFailed {
-                            validator: self.name().to_string(),
-                            message: format!(
-                                "Field '{}' in type '{}' has custom attribute with suspicious pattern",
-                                field.name, type_entry.name
-                            ),
-
-                        });
-                    }
-                }
-            }
-        }
-
-        for method_entry in methods {
-            let method = method_entry.value();
-            for (_, custom_attr) in method.custom_attributes.iter() {
-                if self.has_suspicious_attribute_pattern(custom_attr) {
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!(
-                            "Method '{}' has custom attribute with suspicious pattern",
-                            method.name
-                        ),
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Checks for suspicious custom attribute patterns that might indicate malformed data.
-    ///
-    /// Detects potentially problematic attribute patterns while avoiding false positives
-    /// for legitimate custom attributes. Looks for excessively long strings, deep nesting,
-    /// and similar names that could indicate corruption or malicious intent.
-    ///
-    /// # Arguments
-    ///
-    /// * `custom_attr` - Custom attribute value to check via [`crate::metadata::customattributes::CustomAttributeValue`]
-    ///
-    /// # Returns
-    ///
-    /// * `true` - Suspicious patterns detected
-    /// * `false` - No concerning patterns found
-    fn has_suspicious_attribute_pattern(&self, custom_attr: &CustomAttributeValue) -> bool {
-        for arg in &custom_attr.fixed_args {
-            if let CustomAttributeArgument::String(s) = arg {
-                if s.len() > 10000 {
-                    return true;
-                }
-            }
-        }
-
-        if self.has_deep_array_nesting(custom_attr, 0) {
-            return true;
-        }
-
-        if custom_attr.named_args.len() > 20 {
-            let mut similar_names: usize = 0;
-            for i in 0..custom_attr.named_args.len() {
-                for j in i.saturating_add(1)..custom_attr.named_args.len() {
-                    let (Some(arg_i), Some(arg_j)) =
-                        (custom_attr.named_args.get(i), custom_attr.named_args.get(j))
-                    else {
-                        continue;
-                    };
-                    if Self::are_similar_names(&arg_i.name, &arg_j.name) {
-                        similar_names = similar_names.saturating_add(1);
-                        if similar_names > 5 {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Checks for excessively deep array nesting in custom attributes.
-    ///
-    /// Recursively examines array arguments to detect suspicious nesting patterns
-    /// that could indicate malformed or malicious attribute data.
-    ///
-    /// # Arguments
-    ///
-    /// * `custom_attr` - Custom attribute value to examine via [`crate::metadata::customattributes::CustomAttributeValue`]
-    /// * `depth` - Current nesting depth for recursion tracking
-    ///
-    /// # Returns
-    ///
-    /// * `true` - Deep nesting detected (>10 levels)
-    /// * `false` - Nesting depth is reasonable
-    #[allow(clippy::self_only_used_in_recursion)]
-    fn has_deep_array_nesting(&self, custom_attr: &CustomAttributeValue, depth: usize) -> bool {
-        if depth > 10 {
-            return true;
-        }
-
-        for arg in &custom_attr.fixed_args {
-            if let CustomAttributeArgument::Array(elements) = arg {
-                for element in elements {
-                    if let CustomAttributeArgument::Array(_) = element {
-                        let temp_attr = CustomAttributeValue {
-                            fixed_args: vec![element.clone()],
-                            named_args: vec![],
-                            constructor: CilTypeReference::None,
-                            blob_index: 0,
-                        };
-                        if self.has_deep_array_nesting(&temp_attr, depth.saturating_add(1)) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Checks if two names are suspiciously similar (potential typosquatting).
-    ///
-    /// Compares two strings to detect if they differ by only one character,
-    /// which could indicate typosquatting or corruption in attribute names.
-    ///
-    /// # Arguments
-    ///
-    /// * `name1` - First name to compare
-    /// * `name2` - Second name to compare
-    ///
-    /// # Returns
-    ///
-    /// * `true` - Names are suspiciously similar (same length, one character difference)
-    /// * `false` - Names are sufficiently different
-    fn are_similar_names(name1: &str, name2: &str) -> bool {
-        if name1.len() != name2.len() {
-            return false;
-        }
-
-        let mut differences: usize = 0;
-        for (c1, c2) in name1.chars().zip(name2.chars()) {
-            if c1 != c2 {
-                differences = differences.saturating_add(1);
-                if differences > 1 {
-                    return false;
-                }
-            }
-        }
-
-        differences == 1
     }
 }
 
 impl OwnedValidator for OwnedAttributeValidator {
     fn validate_owned(&self, context: &OwnedValidationContext) -> Result<()> {
         self.validate_attribute_usage_rules(context)?;
-        self.validate_attribute_constructor_calls(context)?;
-        self.validate_attribute_target_compatibility(context)?;
         Ok(())
     }
 
@@ -580,19 +308,17 @@ impl Default for OwnedAttributeValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::attribute::owned_attribute_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_attribute_validator() -> Result<()> {
         let validator = OwnedAttributeValidator::new();
         let config = ValidationConfig {
@@ -603,7 +329,6 @@ mod tests {
         owned_validator_test(
             owned_attribute_validator_file_factory,
             "OwnedAttributeValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

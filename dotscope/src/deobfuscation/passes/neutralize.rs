@@ -29,19 +29,23 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use dotscope::compiler::NeutralizationPass;
-//!
-//! let pass = NeutralizationPass::new(&removed_tokens);
-//! pass.run_on_method(&mut ssa, method_token, &ctx, &assembly)?;
-//! ```
+//! The `tests::test_neutralization_removes_tainted_instructions` test in this module runs
+//! the pass on a method whose call to a removed method feeds an addition.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use analyssa::{
+    analysis::WorkBudget,
+    events::Event,
+    ir::function::SsaEditOptions,
+    scheduling::{FunctionPass, PassEnv},
+};
 
 use crate::{
-    analysis::{find_token_dependencies, CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp},
-    compiler::{CompilerContext, EventKind, SsaPass},
-    deobfuscation::utils::retain_removable,
+    analysis::{
+        find_token_dependencies, CilTarget, ConstValue, SsaFunction, SsaInstruction, SsaOp,
+    },
+    compiler::{EventKind, ModificationScope},
     metadata::token::Token,
 };
 
@@ -76,6 +80,29 @@ impl<'a> NeutralizationPass<'a> {
     #[must_use]
     pub fn new(removed_tokens: &'a HashSet<Token>) -> Self {
         Self { removed_tokens }
+    }
+
+    /// Whether this pass has a neutralized form for the instruction.
+    ///
+    /// Everything that is not a terminator becomes a `Nop`, and a conditional
+    /// branch becomes a jump to whichever arm survives. The other terminators
+    /// have no such form: a `ret` still has to return and a `throw` still has
+    /// to throw, so they are left as they are.
+    ///
+    /// Which makes them survivors, and that is the point of asking. The removal
+    /// set is what [`SsaFunction::retain_unread_removals`] reads as *these
+    /// definitions are going*, and a `ret` counted as going stops rescuing the
+    /// value it returns. The definition is then NOPed out from under a `ret`
+    /// that stays, leaving a method whose reconstruction fails on an undefined
+    /// use - one method of `mkaring_normal.exe` reduced to `ret v5` with nothing
+    /// defining `v5`.
+    ///
+    /// # Arguments
+    ///
+    /// * `instr` - The instruction to judge.
+    fn is_rewritable(instr: &SsaInstruction) -> bool {
+        !instr.is_terminator()
+            || matches!(instr.op(), SsaOp::Branch { .. } | SsaOp::BranchCmp { .. })
     }
 
     /// Checks if a block is "fully tainted" - all PHIs and instructions are tainted.
@@ -235,30 +262,31 @@ impl<'a> NeutralizationPass<'a> {
     /// # Arguments
     ///
     /// * `ssa` - The SSA function to neutralize. Modified in place.
+    /// * `budget` - The work budget the taint propagation runs under.
     ///
     /// # Returns
     ///
     /// The number of elements neutralized (instructions + PHIs + branch conversions).
-    fn neutralize_method(&self, ssa: &mut SsaFunction) -> usize {
+    fn neutralize_method(&self, ssa: &mut SsaFunction, budget: &WorkBudget) -> usize {
         if self.removed_tokens.is_empty() {
             return 0;
         }
 
         // Run taint analysis to find all instructions dependent on removed tokens
-        let taint = find_token_dependencies(ssa, self.removed_tokens.iter().copied());
+        let taint = find_token_dependencies(ssa, self.removed_tokens.iter().copied(), budget);
         if taint.tainted_instr_count() == 0 && taint.tainted_phis().is_empty() {
             return 0;
         }
 
         // Collect tainted sets for block analysis. Never neutralize
-        // `DecryptedString` constants — they are recovered user data, not
+        // `DecryptedString` constants - they are recovered user data, not
         // protection infrastructure. Bidirectional taint reaches them through
         // shared data flow (e.g. a `String.Concat` over both a decrypted string
         // and a value from a removed decryptor), but the string itself is
         // legitimate. Excluding them here rather than at rewrite time keeps the
         // candidate set equal to what is actually removed, which both the
         // branch-target choice and the liveness closure below depend on.
-        let mut tainted_instrs: HashSet<(usize, usize)> = taint
+        let tainted_instrs: HashSet<(usize, usize)> = taint
             .tainted_instructions()
             .iter()
             .copied()
@@ -276,76 +304,86 @@ impl<'a> NeutralizationPass<'a> {
                     })
             })
             .collect();
-        let mut tainted_phis_set: HashSet<(usize, usize)> =
+        let tainted_phis_set: HashSet<(usize, usize)> =
             taint.tainted_phis().iter().copied().collect();
 
         // Refuse to destroy a definition something still reads. Dropping a phi
         // makes its result undefined, and NOPing an instruction makes its
         // destination undefined; either leaves a read the SSA verifier rejects,
         // failing the whole method rather than the one rewrite.
-        retain_removable(ssa, &mut tainted_instrs, &mut tainted_phis_set);
-        if tainted_instrs.is_empty() && tainted_phis_set.is_empty() {
+        // Two questions, two sets, and conflating them is a miscompile.
+        //
+        // *Is this block protection code?* is what decides which arm of a
+        // branch survives, and it is answered by the taint: a block whose every
+        // instruction is tainted is protection, whatever the rewrite then does
+        // about it.
+        //
+        // *Will this instruction be removed?* is what decides whether the
+        // definitions it reads may go, and it is answered by the removal set
+        // after the guard has kept everything that must stay.
+        //
+        // Answering the first question with the second makes the branch choice
+        // depend on which definitions happened to be rescued, and the arm
+        // holding the user's code gets dropped.
+        // Exit reachability, needed to judge a branch whose arms are both
+        // protection; computed here because the removal set below depends on
+        // that judgement.
+        let can_reach_exit = Self::find_blocks_reaching_exit(ssa);
+
+        let mut removable_instrs: BTreeSet<(usize, usize)> = tainted_instrs
+            .iter()
+            .copied()
+            .filter(|&(block_idx, instr_idx)| {
+                ssa.block(block_idx)
+                    .and_then(|b| b.instructions().get(instr_idx))
+                    .is_some_and(Self::is_rewritable)
+            })
+            .collect();
+        let mut removable_phis: BTreeSet<(usize, usize)> =
+            tainted_phis_set.iter().copied().collect();
+
+        ssa.retain_unread_removals(&mut removable_instrs, &mut removable_phis);
+        if removable_instrs.is_empty() && removable_phis.is_empty() {
             return 0;
         }
 
-        // Find blocks that can reach exit (for fallback target selection)
-        let can_reach_exit = Self::find_blocks_reaching_exit(ssa);
-
-        let mut count: usize = 0;
-
-        // 1. Remove tainted PHI nodes
-        // Collect PHIs to remove (block_idx, phi_idx) sorted in reverse order
-        // so we can remove them without invalidating indices
-        let mut tainted_phis: Vec<(usize, usize)> = tainted_phis_set.iter().copied().collect();
-        tainted_phis.sort_by(|a, b| b.cmp(a)); // Sort descending
-
-        for (block_idx, phi_idx) in tainted_phis {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if phi_idx < block.phi_nodes().len() {
-                    block.phi_nodes_mut().remove(phi_idx);
-                    count = count.saturating_add(1);
-                }
-            }
-        }
+        // PHIs to remove (block_idx, phi_idx) in reverse order, so removing
+        // one does not shift the index of another still to go.
+        let tainted_phis: Vec<(usize, usize)> = removable_phis.iter().rev().copied().collect();
 
         // 2. Handle tainted instructions (including terminators)
         // First pass: collect what operations to apply (to avoid borrow conflicts)
         let mut actions: Vec<(usize, usize, InstrAction)> = Vec::new();
 
-        // Sorted so the rewrite order does not depend on hash iteration order.
-        let mut removals: Vec<(usize, usize)> = tainted_instrs.iter().copied().collect();
-        removals.sort_unstable();
-
-        for &(block_idx, instr_idx) in &removals {
+        for &(block_idx, instr_idx) in &removable_instrs {
             if let Some(block) = ssa.block(block_idx) {
                 if let Some(instr) = block.instructions().get(instr_idx) {
-                    let action = if instr.is_terminator() {
-                        match instr.op() {
-                            SsaOp::Branch {
-                                true_target,
-                                false_target,
-                                ..
-                            }
-                            | SsaOp::BranchCmp {
-                                true_target,
-                                false_target,
-                                ..
-                            } => {
-                                let target = Self::choose_branch_target(
-                                    ssa,
-                                    *true_target,
-                                    *false_target,
-                                    &tainted_instrs,
-                                    &tainted_phis_set,
-                                    &can_reach_exit,
-                                );
-                                Some(InstrAction::Jump(target))
-                            }
-                            // Leave other terminators (Return, Throw, etc.) alone
-                            _ => None,
+                    let action = match instr.op() {
+                        SsaOp::Branch {
+                            true_target,
+                            false_target,
+                            ..
                         }
-                    } else {
-                        Some(InstrAction::Nop)
+                        | SsaOp::BranchCmp {
+                            true_target,
+                            false_target,
+                            ..
+                        } => {
+                            let target = Self::choose_branch_target(
+                                ssa,
+                                *true_target,
+                                *false_target,
+                                &tainted_instrs,
+                                &tainted_phis_set,
+                                &can_reach_exit,
+                            );
+                            Some(InstrAction::Jump(target))
+                        }
+                        _ if !instr.is_terminator() => Some(InstrAction::Nop),
+                        // [`Self::is_rewritable`] keeps these out of the
+                        // removal set; the arm is what makes that the only
+                        // place the question is answered.
+                        _ => None,
                     };
 
                     if let Some(action) = action {
@@ -355,24 +393,44 @@ impl<'a> NeutralizationPass<'a> {
             }
         }
 
-        // Second pass: apply the actions
-        for (block_idx, instr_idx, action) in actions {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(instr) = block.instruction_mut(instr_idx) {
-                    match action {
-                        InstrAction::Nop => instr.set_op(SsaOp::Nop),
-                        InstrAction::Jump(target) => instr.set_op(SsaOp::Jump { target }),
-                    }
-                    count = count.saturating_add(1);
-                }
+        // Second pass: apply everything in one edit session, which repairs
+        // what the edits actually changed. Removing an unread definition or a
+        // phi is an instruction edit, and folding a branch to one of its own
+        // arms only removes an edge, with the phi operands it orphans pruned:
+        // none of it needs the function reconstructed, which reads a
+        // transformed function's versions back through its rename groups and
+        // is not faithful to one.
+        let mut count: usize = 0;
+        let result = ssa.edit(SsaEditOptions::new(), |editor| {
+            for (block_idx, phi_idx) in &tainted_phis {
+                editor.remove_phi(*block_idx, *phi_idx)?;
+                count = count.saturating_add(1);
             }
+            for (block_idx, instr_idx, action) in &actions {
+                match action {
+                    InstrAction::Nop => editor.nop_instruction(*block_idx, *instr_idx)?,
+                    InstrAction::Jump(target) => {
+                        editor.fold_terminator_pruning_phis(
+                            *block_idx,
+                            SsaOp::Jump { target: *target },
+                        )?;
+                    }
+                }
+                count = count.saturating_add(1);
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            // Restored or recorded by the session; reported as no change so the
+            // caller's transaction keeps the function it had.
+            return 0;
         }
 
         count
     }
 }
 
-impl SsaPass<CilTarget, CompilerContext> for NeutralizationPass<'_> {
+impl FunctionPass<CilTarget> for NeutralizationPass<'_> {
     fn name(&self) -> &'static str {
         "neutralization"
     }
@@ -381,22 +439,32 @@ impl SsaPass<CilTarget, CompilerContext> for NeutralizationPass<'_> {
         "Removes instructions referencing removed protection infrastructure"
     }
 
-    fn run_on_method(
-        &self,
-        ssa: &mut SsaFunction,
-        method: &MethodRef,
-        host: &CompilerContext,
-    ) -> analyssa::Result<bool> {
-        let method_token = method.0;
-        let neutralized = self.neutralize_method(ssa);
+    /// Folding a branch to one arm removes an edge.
+    fn modification_scope(&self) -> ModificationScope {
+        ModificationScope::CfgModifying
+    }
+
+    /// The rewrite runs in an edit session that repairs what it changed.
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
+    fn run(&self, ssa: &mut SsaFunction, env: &PassEnv<'_, CilTarget>) -> analyssa::Result<bool> {
+        let neutralized = self.neutralize_method(ssa, env.context().budget());
 
         if neutralized > 0 {
-            host.events
-                .record(EventKind::InstructionRemoved)
-                .method(method_token)
-                .message(format!(
+            // Pushed rather than built through the fluent recorder: an
+            // environment hands a pass the sink as a trait object, so the pass
+            // does not depend on which sink a host chose.
+            env.events().push(Event {
+                kind: EventKind::InstructionRemoved,
+                method: Some(*env.method()),
+                location: None,
+                message: format!(
                     "Neutralized {neutralized} instructions referencing removed tokens"
-                ));
+                ),
+                pass: Some(FunctionPass::name(self).to_string()),
+            });
         }
 
         Ok(neutralized > 0)
@@ -409,7 +477,8 @@ mod tests {
 
     use crate::{
         analysis::{
-            ConstValue, MethodRef, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId,
+            CallData, Callee, ConstValue, MethodRef, SsaBlock, SsaFunction, SsaInstruction, SsaOp,
+            SsaType, SsaVarId, WorkBudget,
         },
         deobfuscation::passes::NeutralizationPass,
         metadata::token::Token,
@@ -430,7 +499,11 @@ mod tests {
         //   v0 = const 42
         //   v1 = call method_token()  <- references method_token
         //   v2 = add v0, v1            <- depends on v1, should be tainted
-        //   ret v2
+        //   ret v0                     <- returns the untainted constant
+        //
+        // The return takes `v0` rather than `v2` so that the tainted chain has
+        // no surviving reader. A `ret` is never rewritten, so returning `v2`
+        // would keep the whole chain alive - which is its own test below.
         let mut b0 = SsaBlock::new(0);
 
         b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
@@ -442,11 +515,9 @@ mod tests {
         let method_ref = MethodRef::new(method_token);
 
         b0.add_instruction(
-            SsaInstruction::synthetic(SsaOp::Call {
-                dest: Some(v1),
-                method: method_ref,
-                args: vec![],
-            })
+            SsaInstruction::synthetic(
+                CallData::new(Some(v1), Callee::Direct(method_ref), vec![]).into(),
+            )
             .with_result_type(SsaType::I32),
         );
 
@@ -457,7 +528,7 @@ mod tests {
             flags: None,
         }));
 
-        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v2) }));
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(v0))));
 
         ssa.add_block(b0);
 
@@ -472,7 +543,7 @@ mod tests {
         removed.insert(method_token);
 
         let pass = NeutralizationPass::new(&removed);
-        let count = pass.neutralize_method(&mut ssa);
+        let count = pass.neutralize_method(&mut ssa, &WorkBudget::DEFAULT);
 
         // Should have neutralized the call and the add (which depends on call result)
         // The const and return should remain (const is independent, return is terminator)
@@ -482,18 +553,54 @@ mod tests {
             count
         );
 
-        // Verify the call was replaced with Nop
+        // The call and the add it fed are gone; the constant the return reads
+        // and the return itself are what is left.
         let block = ssa.block(0).unwrap();
-        let call_instr = &block.instructions()[1];
-        assert!(matches!(call_instr.op(), SsaOp::Nop));
+        let ops: Vec<&SsaOp> = block
+            .instructions()
+            .iter()
+            .map(SsaInstruction::op)
+            .filter(|op| !matches!(op, SsaOp::Nop))
+            .collect();
+        assert!(
+            matches!(ops.as_slice(), [SsaOp::Const { .. }, SsaOp::Return { .. }]),
+            "{ops:?}"
+        );
+    }
 
-        // Verify the add was replaced with Nop
-        let add_instr = &block.instructions()[2];
-        assert!(matches!(add_instr.op(), SsaOp::Nop));
+    /// A `ret` this pass cannot rewrite keeps the value it returns alive.
+    ///
+    /// Only a non-terminator becomes a `Nop` and only a conditional branch
+    /// becomes a `Jump`, so a `ret` always survives. Counting it as removed
+    /// while it stays is what let the definition it reads be NOPed out from
+    /// under it, leaving a method whose reconstruction fails on an undefined
+    /// use - `mkaring_normal.exe` had one reduced to `ret v5` with nothing
+    /// defining `v5`.
+    #[test]
+    fn a_returned_value_survives_neutralization() {
+        let (mut ssa, method_token, _) = create_test_ssa();
 
-        // Verify return is still there (terminators are preserved)
-        let ret_instr = &block.instructions()[3];
-        assert!(matches!(ret_instr.op(), SsaOp::Return { .. }));
+        // Return the tainted value instead of the constant.
+        let v2 = SsaVarId::from_index(2);
+        ssa.block_mut(0)
+            .unwrap()
+            .instruction_mut(3)
+            .unwrap()
+            .set_op(SsaOp::returns(Some(v2)));
+
+        let mut removed = HashSet::new();
+        removed.insert(method_token);
+
+        let count =
+            NeutralizationPass::new(&removed).neutralize_method(&mut ssa, &WorkBudget::DEFAULT);
+
+        assert_eq!(
+            count, 0,
+            "nothing may be removed while a surviving `ret` reads it"
+        );
+        let block = ssa.block(0).unwrap();
+        assert!(matches!(block.instructions()[1].op(), SsaOp::Call(_)));
+        assert!(matches!(block.instructions()[2].op(), SsaOp::Add { .. }));
     }
 
     #[test]
@@ -505,7 +612,7 @@ mod tests {
         removed.insert(field_token);
 
         let pass = NeutralizationPass::new(&removed);
-        let count = pass.neutralize_method(&mut ssa);
+        let count = pass.neutralize_method(&mut ssa, &WorkBudget::DEFAULT);
 
         // Nothing should be neutralized
         assert_eq!(count, 0);

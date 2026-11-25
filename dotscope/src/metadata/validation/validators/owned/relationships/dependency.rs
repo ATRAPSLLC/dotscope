@@ -68,6 +68,8 @@
 //! - [ECMA-335 II.22.37](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - TypeDef table and type dependencies
 //! - [ECMA-335 II.22.38](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - TypeRef table and external dependencies
 
+use std::sync::Arc;
+
 use crate::{
     metadata::validation::{
         context::{OwnedValidationContext, ValidationContext},
@@ -267,6 +269,23 @@ impl OwnedDependencyValidator {
             for (_, method_ref) in type_entry.methods.iter() {
                 if let Some(method_token) = method_ref.token() {
                     if let Some(method) = methods.get(&method_token) {
+                        // Every parameter's type must resolve, whether or not a Param row describes it.
+                        for (index, param) in method.value().signature.params.iter().enumerate() {
+                            if let Some(token) =
+                                context.unresolved_type(|out| param.type_tokens(out))
+                            {
+                                return Err(Error::ValidationOwnedFailed {
+                                    validator: self.name().to_string(),
+                                    message: format!(
+                                        "Method '{}' parameter {} has unresolved type dependency 0x{:08X}",
+                                        method.value().name,
+                                        index,
+                                        token.value()
+                                    ),
+                                });
+                            }
+                        }
+
                         // Validate parameter type dependencies
                         for (index, (_, param)) in method.value().params.iter().enumerate() {
                             if let Some(param_type_ref) = param.base.get() {
@@ -322,7 +341,7 @@ impl OwnedDependencyValidator {
             // Validate inheritance ordering
             if let Some(base_type) = type_entry.base() {
                 // Backstop for a self-referential base reached through some path other than
-                // the TypeDef `extends` column — a synthetic type built by
+                // the TypeDef `extends` column - a synthetic type built by
                 // `typesystem::resolver`, say.
                 //
                 // It does *not* catch the metadata condition. `InheritanceResolver` elides a
@@ -331,31 +350,15 @@ impl OwnedDependencyValidator {
                 // `OwnedCircularityValidator::validate_self_referential_bases` reads the raw
                 // column and is what actually reports that case.
                 //
-                // IMPORTANT: Only flag self-reference if both types are from the same assembly.
-                // Tokens are only unique within an assembly, so we need to check assembly context.
-                // A type is local (from target assembly) if get_external() returns None.
-                // A type is external if get_external() returns Some(...).
-                if base_type.token == type_entry.token {
-                    let type_is_local = type_entry.external().is_none();
-                    let base_is_local = base_type.external().is_none();
-
-                    // Only flag self-reference if both are local (same assembly)
-                    // or both are external from the same source
-                    let is_same_assembly = match (type_is_local, base_is_local) {
-                        (true, true) => true, // Both local to target assembly
-                        // Both external or one local/one external - different assemblies
-                        _ => false,
-                    };
-
-                    if is_same_assembly {
-                        return Err(Error::ValidationOwnedFailed {
-                            validator: self.name().to_string(),
-                            message: format!(
-                                "Type '{}' has self-referential inheritance dependency",
-                                type_entry.name
-                            ),
-                        });
-                    }
+                // The same type, not merely the same token: tokens repeat across assemblies.
+                if Arc::ptr_eq(&base_type, type_entry) {
+                    return Err(Error::ValidationOwnedFailed {
+                        validator: self.name().to_string(),
+                        message: format!(
+                            "Type '{}' has self-referential inheritance dependency",
+                            type_entry.name
+                        ),
+                    });
                 }
 
                 // Validate that base type is loaded/resolvable before derived type
@@ -369,25 +372,16 @@ impl OwnedDependencyValidator {
             // Validate interface implementation ordering
             for (_, entry) in type_entry.interfaces.iter() {
                 if let Some(interface_type) = entry.interface.upgrade() {
-                    // Check for self-referential interface implementation
-                    // Only flag if both types are from the same assembly
-                    if interface_type.token == type_entry.token {
-                        let type_is_local = type_entry.external().is_none();
-                        let interface_is_local = interface_type.external().is_none();
-
-                        let is_same_assembly =
-                            matches!((type_is_local, interface_is_local), (true, true));
-
-                        if is_same_assembly {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Type '{}' has self-referential interface implementation dependency",
-                                    type_entry.name
-                                ),
-
-                            });
-                        }
+                    // Check for self-referential interface implementation: the same type,
+                    // not merely the same token
+                    if Arc::ptr_eq(&interface_type, type_entry) {
+                        return Err(Error::ValidationOwnedFailed {
+                            validator: self.name().to_string(),
+                            message: format!(
+                                "Type '{}' has self-referential interface implementation dependency",
+                                type_entry.name
+                            ),
+                        });
                     }
                 }
             }
@@ -395,24 +389,16 @@ impl OwnedDependencyValidator {
             // Validate nested type ordering
             for (_, nested_ref) in type_entry.nested_types.iter() {
                 if let Some(nested_type) = nested_ref.upgrade() {
-                    // Check for self-referential nested type containment
-                    // Only flag if both types are from the same assembly
-                    if nested_type.token == type_entry.token {
-                        let type_is_local = type_entry.external().is_none();
-                        let nested_is_local = nested_type.external().is_none();
-
-                        let is_same_assembly =
-                            matches!((type_is_local, nested_is_local), (true, true));
-
-                        if is_same_assembly {
-                            return Err(Error::ValidationOwnedFailed {
-                                validator: self.name().to_string(),
-                                message: format!(
-                                    "Type '{}' has self-referential nested type dependency",
-                                    type_entry.name
-                                ),
-                            });
-                        }
+                    // Check for self-referential nested type containment: the same type, not
+                    // merely the same token
+                    if Arc::ptr_eq(&nested_type, type_entry) {
+                        return Err(Error::ValidationOwnedFailed {
+                            validator: self.name().to_string(),
+                            message: format!(
+                                "Type '{}' has self-referential nested type dependency",
+                                type_entry.name
+                            ),
+                        });
                     }
                 }
             }
@@ -451,19 +437,17 @@ impl Default for OwnedDependencyValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::dependency::owned_dependency_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_dependency_validator() -> Result<()> {
         let validator = OwnedDependencyValidator::new();
         let config = ValidationConfig {
@@ -474,7 +458,6 @@ mod tests {
         owned_validator_test(
             owned_dependency_validator_file_factory,
             "OwnedDependencyValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

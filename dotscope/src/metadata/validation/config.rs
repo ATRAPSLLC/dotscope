@@ -30,18 +30,18 @@
 //!
 //! | Field                              | Stage           | Gates                                                                                                                            | Catches                                                                                                                | Cost class                              |
 //! |------------------------------------|-----------------|----------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|-----------------------------------------|
-//! | `enable_raw_validation`            | meta (stage 1)  | enables/disables the entire raw pipeline                                                                                         | n/a — gates the structural/token/constraint validators below                                                           | n/a                                     |
-//! | `enable_owned_validation`          | meta (stage 2)  | enables/disables the entire owned pipeline                                                                                       | n/a — gates the cross-table/semantic/method validators below                                                           | n/a                                     |
+//! | `enable_raw_validation`            | meta (stage 1)  | enables/disables the entire raw pipeline                                                                                         | n/a - gates the structural/token/constraint validators below                                                           | n/a                                     |
+//! | `enable_owned_validation`          | meta (stage 2)  | enables/disables the entire owned pipeline                                                                                       | n/a - gates the cross-table/semantic/method validators below                                                           | n/a                                     |
 //! | `enable_structural_validation`     | raw (1)         | `RawTokenValidator`, `RawTableValidator`, `RawHeapValidator`                                                                     | malformed token format, RID overflow, table-structure breakage, heap offsets out of bounds                             | cheap (linear scan)                     |
 //! | `enable_token_validation`          | raw (1)         | `RawSignatureValidator`                                                                                                          | malformed signature blobs, invalid coded-index tag values                                                              | cheap (linear scan)                     |
 //! | `enable_constraint_validation`     | raw (1) + owned (2) | `RawGenericConstraintValidator`, `RawLayoutConstraintValidator`                                                              | invalid constraint targets, circular constraints, layout overlap violations on `[StructLayout(LayoutKind.Explicit)]`   | cheap–moderate (table walk)             |
 //! | `enable_cross_table_validation`    | owned (2)       | `OwnedCircularityValidator`, `OwnedDependencyValidator`, `OwnedOwnershipValidator`                                               | broken cross-references, circular type hierarchies, orphaned metadata                                                  | moderate (table walk + graph analysis)  |
 //! | `enable_semantic_validation`       | owned (2)       | `OwnedFieldValidator`, `OwnedAccessibilityValidator`, `OwnedTypeDefinitionValidator`, `OwnedTypeCircularityValidator`, `OwnedTypeDependencyValidator`, `OwnedTypeOwnershipValidator`, `OwnedAttributeValidator`, `OwnedSecurityValidator`, `OwnedAssemblyValidator` | ECMA-335 semantic rules: access-modifier breaches, SpecialName violations, abstract/sealed conflicts, naming convention breaches, duplicate fields | moderate–expensive (multi-pass type-system walk) |
 //! | `enable_method_validation`         | owned (2)       | `OwnedMethodValidator`, `OwnedSignatureValidator`                                                                                | concrete types declaring abstract methods, final-override attempts, signature incompatibilities, invalid constructors  | moderate (signature resolution + inheritance walk) |
-//! | `enable_type_system_validation`    | owned (2)       | reserved — currently subsumed by `enable_semantic_validation`                                                                    | n/a until wired                                                                                                        | n/a                                     |
-//! | `enable_field_layout_validation`   | owned (2)       | reserved — currently subsumed by `enable_owned_validation`                                                                       | n/a until wired                                                                                                        | n/a                                     |
+//! | `enable_type_system_validation`    | owned (2)       | reserved - currently subsumed by `enable_semantic_validation`                                                                    | n/a until wired                                                                                                        | n/a                                     |
+//! | `enable_field_layout_validation`   | owned (2)       | reserved - currently subsumed by `enable_owned_validation`                                                                       | n/a until wired                                                                                                        | n/a                                     |
 //! | `max_nesting_depth`                | owned (2)       | nested-type depth ceiling                                                                                                        | over-deep nested-class chains (default `64`; set `0` to disable the check)                                             | cheap (counter)                         |
-//! | `lenient`                          | both stages     | error handling mode                                                                                                              | n/a — when `true`, errors become diagnostics instead of aborting load                                                  | n/a                                     |
+//! | `lenient`                          | both stages     | error handling mode                                                                                                              | n/a - when `true`, errors become diagnostics instead of aborting load                                                  | n/a                                     |
 //!
 //! Two of the fields above (`enable_type_system_validation`,
 //! `enable_field_layout_validation`) are accepted for forward compatibility but
@@ -199,6 +199,12 @@ pub struct ValidationConfig {
     /// This enables validation of resolved, owned data structures
     pub enable_owned_validation: bool,
 
+    /// Require every table the header marks sorted to be in its sort order
+    /// (ECMA-335 §II.22, §II.24.2.6). The runtime binary-searches those
+    /// tables without checking them, so a row out of place is one it silently
+    /// does not find. On in every preset but [`disabled`](Self::disabled).
+    pub enable_sort_order_validation: bool,
+
     /// Enable lenient loading mode for obfuscated/malformed assemblies.
     /// When true, parsing errors are logged to diagnostics instead of aborting.
     /// Default is false (strict mode) - errors will abort loading.
@@ -220,6 +226,7 @@ impl Default for ValidationConfig {
             max_nesting_depth: 64,
             enable_raw_validation: true,
             enable_owned_validation: true,
+            enable_sort_order_validation: true,
             lenient: false,
         }
     }
@@ -234,7 +241,7 @@ impl ValidationConfig {
     /// It does not disable bounds checking: parsers are individually bounds-checked and the
     /// crate denies `panic`, `unwrap_used`, `expect_used`, `indexing_slicing` and
     /// `arithmetic_side_effects`, so a malformed assembly still yields an `Err` rather than a
-    /// panic. What is lost is *semantic* rejection — a file with contradictory metadata is
+    /// panic. What is lost is *semantic* rejection - a file with contradictory metadata is
     /// accepted and analysed as if it were coherent, so anything derived from it (type
     /// hierarchies, signatures, method bodies) may be wrong without any error being reported.
     ///
@@ -284,6 +291,7 @@ impl ValidationConfig {
             max_nesting_depth: 0,
             enable_raw_validation: false,
             enable_owned_validation: false,
+            enable_sort_order_validation: false,
             lenient: false,
         }
     }
@@ -346,6 +354,7 @@ impl ValidationConfig {
             max_nesting_depth: 64,
             enable_raw_validation: true,
             enable_owned_validation: false,
+            enable_sort_order_validation: true,
             lenient: false,
         }
     }
@@ -445,7 +454,8 @@ impl ValidationConfig {
             max_nesting_depth: 64,          // Standard runtime nesting limit
             enable_raw_validation: true,    // Enable raw validation for safety and format integrity
             enable_owned_validation: true,  // Enable owned validation for semantic completeness
-            lenient: false,                 // Strict mode by default
+            enable_sort_order_validation: true,
+            lenient: false, // Strict mode by default
         }
     }
 
@@ -467,7 +477,7 @@ impl ValidationConfig {
     /// Identical in field values to [`comprehensive`](Self::comprehensive) and
     /// [`production`](Self::production). The strict alias exists to call out
     /// that field-layout validation can flag legitimate overlapping fields
-    /// (see note below) — pick this name when that risk is acceptable.
+    /// (see note below) - pick this name when that risk is acceptable.
     ///
     /// # Examples
     ///
@@ -497,6 +507,7 @@ impl ValidationConfig {
             max_nesting_depth: 64,
             enable_raw_validation: true,
             enable_owned_validation: true,
+            enable_sort_order_validation: true,
             lenient: false,
         }
     }
@@ -562,6 +573,7 @@ impl ValidationConfig {
             max_nesting_depth: 64,
             enable_raw_validation: true,
             enable_owned_validation: false,
+            enable_sort_order_validation: true,
             lenient: false,
         }
     }
@@ -616,6 +628,7 @@ impl ValidationConfig {
             max_nesting_depth: 64,
             enable_raw_validation: false,
             enable_owned_validation: true,
+            enable_sort_order_validation: true,
             lenient: false,
         }
     }
@@ -692,6 +705,7 @@ impl ValidationConfig {
             max_nesting_depth: 64,
             enable_raw_validation: true,
             enable_owned_validation: true,
+            enable_sort_order_validation: true,
             lenient: true, // Key difference: continue on errors, collect all diagnostics
         }
     }

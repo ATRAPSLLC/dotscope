@@ -31,6 +31,7 @@ use std::sync::atomic::AtomicU32;
 use crate::metadata::{
     customattributes::CustomAttributeValueList,
     identity::Identity,
+    streams::SharedStr,
     tables::{AssemblyFlags, AssemblyRefHash},
     token::Token,
 };
@@ -92,13 +93,13 @@ pub struct AssemblyRef {
     ///
     /// The assembly name without file extension (e.g., "mscorlib", "System.Core").
     /// This is the primary identifier used during assembly resolution.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Culture string for localized assemblies
     ///
     /// Specifies the culture for satellite assemblies containing localized resources.
     /// `None` indicates a culture-neutral assembly (the common case for most assemblies).
-    pub culture: Option<String>,
+    pub culture: Option<SharedStr>,
 
     /// Major version number (first component of version)
     ///
@@ -142,7 +143,7 @@ pub struct AssemblyRef {
     /// The hash algorithm is typically SHA-1 or MD5, though Microsoft may have extended this.
     pub hash: Option<AssemblyRefHash>,
 
-    // --- AssemblyRefOS table data ---
+    // AssemblyRefOS table data
     /// Operating system platform identifier  
     ///
     /// Specifies the target operating system platform. Uses atomic access for thread safety.
@@ -161,7 +162,7 @@ pub struct AssemblyRef {
     /// Corresponds to entries in the `AssemblyRefOS` table when present.
     pub os_minor_version: AtomicU32,
 
-    // --- AssemblyRefProcessor table data ---
+    // AssemblyRefProcessor table data
     /// Target processor architecture
     ///
     /// Specifies the required processor architecture for the referenced assembly.

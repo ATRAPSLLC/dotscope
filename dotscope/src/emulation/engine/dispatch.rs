@@ -37,7 +37,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```text
 //! let resolver = DispatchResolver::new();
 //! let concrete = resolver.resolve(declared_method, runtime_type, &context);
 //! // concrete == declared_method if no override exists
@@ -52,6 +52,7 @@ use crate::{
     metadata::{
         method::Method,
         signatures::SignatureMethod,
+        tables::{MemberRefSignature, TableId},
         token::Token,
         typesystem::{CilType, CilTypeReference},
     },
@@ -158,9 +159,16 @@ impl DispatchResolver {
             }
         }
 
-        // Resolve the method
+        // Resolve the method: a MemberRef names a method of another assembly (a BCL virtual
+        // or interface method), whose override in the runtime type is found by its name
+        // and signature
         let Ok(method) = context.get_method(declared_method) else {
-            return declared_method;
+            if !declared_method.is_table(TableId::MemberRef) {
+                return declared_method;
+            }
+            let resolved = Self::resolve_member_ref(declared_method, runtime_type, context);
+            self.cache.insert(key, resolved);
+            return resolved;
         };
 
         if !method.is_virtual() {
@@ -180,6 +188,73 @@ impl DispatchResolver {
 
         self.cache.insert(key, resolved);
         resolved
+    }
+
+    /// Resolves a call of a method another assembly declares, named by a MemberRef, to the
+    /// runtime type's implementation of it.
+    ///
+    /// ECMA-335 II.10.3: the runtime type, or the nearest base type that has one, provides
+    /// the method either explicitly, through a MethodImpl naming the MemberRef, or by a
+    /// virtual instance method of the same name and signature. A type that provides neither
+    /// inherits the declared method, and the MemberRef is returned unchanged.
+    fn resolve_member_ref(
+        declared: Token,
+        runtime_type: Token,
+        context: &EmulationContext,
+    ) -> Token {
+        let Some(member_ref) = context.get_member_ref(declared) else {
+            return declared;
+        };
+        let MemberRefSignature::Method(signature) = &member_ref.signature else {
+            return declared;
+        };
+        if !signature.has_this {
+            return declared;
+        }
+        let Some(runtime) = context.assembly().types().resolve(&runtime_type) else {
+            return declared;
+        };
+        Self::find_member_ref_override(0, &runtime, declared, &member_ref.name, signature)
+            .unwrap_or(declared)
+    }
+
+    /// Searches a type and its bases for the implementation of the method the MemberRef
+    /// `member_ref` names: a method whose MethodImpl names it, else a virtual instance method
+    /// named `name` with the parameters of `signature`.
+    fn find_member_ref_override(
+        depth: usize,
+        type_info: &CilType,
+        member_ref: Token,
+        name: &str,
+        signature: &SignatureMethod,
+    ) -> Option<Token> {
+        if depth >= MAX_BASE_WALK_DEPTH {
+            return None;
+        }
+        let methods: Vec<_> = type_info
+            .methods
+            .iter()
+            .filter_map(|(_, method_ref)| method_ref.upgrade())
+            .collect();
+        let explicit = methods.iter().find(|method| {
+            method.overrides.iter().any(|(_, override_ref)| {
+                matches!(override_ref, CilTypeReference::MemberRef(rc) if rc.token == member_ref)
+            })
+        });
+        if let Some(method) = explicit {
+            return Some(method.token);
+        }
+        let implicit = methods.iter().find(|method| {
+            method.is_virtual()
+                && !method.is_static()
+                && method.name == name
+                && method.signature.has_same_parameters(signature)
+        });
+        if let Some(method) = implicit {
+            return Some(method.token);
+        }
+        let base = type_info.base()?;
+        Self::find_member_ref_override(depth.saturating_add(1), &base, member_ref, name, signature)
     }
 
     /// Resolves an interface method call to a concrete implementation.
@@ -248,7 +323,7 @@ impl DispatchResolver {
             };
             if method.name != *method_name
                 || method.is_static()
-                || !signatures_match(&method.signature, &base_method.signature)
+                || !method.signature.has_same_parameters(&base_method.signature)
             {
                 continue;
             }
@@ -318,7 +393,7 @@ impl DispatchResolver {
             };
             if method.is_virtual()
                 && method.name == method_name
-                && signatures_match(&method.signature, &base_method.signature)
+                && method.signature.has_same_parameters(&base_method.signature)
             {
                 return Some(method.token);
             }
@@ -451,30 +526,6 @@ impl Default for DispatchResolver {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Checks if two method signatures are compatible for virtual override purposes.
-///
-/// Two signatures are compatible when they have the same parameter count,
-/// the same generic parameter count, and each positional parameter has
-/// the same base type (`CilFlavor`). Return type is intentionally ignored
-/// per ECMA-335 §II.10.3.2 (covariant returns are not considered here).
-fn signatures_match(candidate: &SignatureMethod, base: &SignatureMethod) -> bool {
-    if candidate.param_count != base.param_count {
-        return false;
-    }
-    if candidate.param_count_generic != base.param_count_generic {
-        return false;
-    }
-    if candidate.params.len() != base.params.len() {
-        return false;
-    }
-    for (cp, bp) in candidate.params.iter().zip(base.params.iter()) {
-        if cp.base != bp.base {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]

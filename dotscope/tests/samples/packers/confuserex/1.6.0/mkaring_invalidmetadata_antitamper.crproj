@@ -1,0 +1,7 @@
+<project outputDir="./protected" baseDir="." seed="dotscope" xmlns="http://confuser.codeplex.com">
+  <rule pattern="true" preset="none" inherit="false">
+    <protection id="invalid metadata" />
+    <protection id="anti tamper" />
+  </rule>
+  <module path="TestApp.exe" />
+</project>

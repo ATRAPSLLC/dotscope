@@ -10,12 +10,14 @@
 //! | Pass | Phase | Description |
 //! |------|-------|-------------|
 //! | [`StringDecryptionPass`] | Simplify | Decrypts AES-256-CBC encrypted strings (requires `legacy-crypto` feature) |
+//! | [`LocalEncodingReversalPass`] | Structure | Carries BitMono's encoded locals plain |
 //! | [`UnmanagedStringReversalPass`] | Simplify | Replaces fake native string method calls with `ldstr` constants |
 
+mod locals;
 #[cfg(feature = "legacy-crypto")]
 mod strings;
-mod unmanaged;
+pub mod unmanaged;
 
 #[cfg(feature = "legacy-crypto")]
 pub use self::strings::StringDecryptionPass;
-pub use self::unmanaged::UnmanagedStringReversalPass;
+pub use self::{locals::LocalEncodingReversalPass, unmanaged::UnmanagedStringReversalPass};

@@ -61,11 +61,7 @@ impl RowWritable for TypeRefRaw {
         sizes: &TableInfoRef,
     ) -> Result<()> {
         // Write resolution scope coded index (2 or 4 bytes)
-        let scope_value = sizes.encode_coded_index(
-            self.resolution_scope.tag,
-            self.resolution_scope.row,
-            CodedIndexType::ResolutionScope,
-        )?;
+        let scope_value = self.resolution_scope.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

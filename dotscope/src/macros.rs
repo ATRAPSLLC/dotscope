@@ -29,31 +29,11 @@
 //!
 //! ## Basic Locking
 //!
-//! ```rust,ignore
-//! use std::sync::{Mutex, RwLock};
-//!
-//! let mutex_data = Mutex::new(42);
-//! let mut data = lock!(mutex_data);
-//! *data = 100;
-//!
-//! let rwlock_data = RwLock::new(String::from("hello"));
-//! let reader = read_lock!(rwlock_data);
-//! println!("Value: {}", *reader);
-//! ```
+//! The `examples::module_2_example` test in this module runs this example.
 //!
 //! ## Functional Style
 //!
-//! ```rust,ignore
-//! use std::sync::{Arc, RwLock};
-//!
-//! let shared_data = Arc::new(RwLock::new(vec![1, 2, 3]));
-//!
-//! // Execute closure with read access
-//! let length = with_read!(shared_data, |vec| vec.len());
-//!
-//! // Execute closure with write access
-//! with_write!(shared_data, |vec| vec.push(4));
-//! ```
+//! The `examples::module_example` test in this module runs this example.
 //!
 //! # Error Handling
 //!
@@ -75,7 +55,7 @@
 //! # Integration
 //!
 //! These macros integrate primarily with:
-//! - [`crate::metadata::loader`] - Metadata loading system for concurrent parsing
+//! - [`CilObject`](crate::CilObject) loading - Metadata loading system for concurrent parsing
 //! - [`crate::metadata::tables`] - Shared access to metadata table structures
 //! - Internal caching systems that require synchronized access to parsed data
 
@@ -89,10 +69,7 @@
 ///
 /// # Usage
 ///
-/// ```rust,ignore
-/// let value = try_hook!(heap.get_string(href));
-/// // `value` is the unwrapped Ok variant
-/// ```
+/// The `examples::try_hook_example` test in this module runs this example.
 macro_rules! try_hook {
     ($expr:expr) => {
         match $expr {
@@ -114,14 +91,7 @@ macro_rules! try_hook {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use std::sync::Mutex;
-///
-/// let shared_data = Mutex::new(42);
-/// let mut data = lock!(shared_data);
-/// *data = 100;
-/// // Lock is automatically released when `data` goes out of scope
-/// ```
+/// The `examples::lock_example` test in this module runs this example.
 macro_rules! lock {
     ($lock:expr) => {
         $lock.lock().expect("Failed to acquire lock")
@@ -139,14 +109,7 @@ macro_rules! lock {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use std::sync::RwLock;
-///
-/// let shared_data = RwLock::new("hello world".to_string());
-/// let data = read_lock!(shared_data);
-/// println!("Data: {}", *data);
-/// // Read lock is automatically released when `data` goes out of scope
-/// ```
+/// The `examples::read_lock_example` test in this module runs this example.
 macro_rules! read_lock {
     ($arc_rwlock:expr) => {
         $arc_rwlock.read().expect("Failed to acquire read lock")
@@ -165,14 +128,7 @@ macro_rules! read_lock {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use std::sync::RwLock;
-///
-/// let shared_data = RwLock::new(vec![1, 2, 3]);
-/// let mut data = write_lock!(shared_data);
-/// data.push(4);
-/// // Write lock is automatically released when `data` goes out of scope
-/// ```
+/// The `examples::write_lock_example` test in this module runs this example.
 macro_rules! write_lock {
     ($arc_rwlock:expr) => {
         $arc_rwlock.write().expect("Failed to acquire write lock")
@@ -195,13 +151,7 @@ macro_rules! write_lock {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use std::sync::{Arc, RwLock};
-///
-/// let shared_data = Arc::new(RwLock::new("Hello".to_string()));
-/// let length = with_read!(shared_data, |data| data.len());
-/// assert_eq!(length, 5);
-/// ```
+/// The `examples::with_read_example` test in this module runs this example.
 macro_rules! with_read {
     ($arc_rwlock:expr, $closure:expr) => {{
         let guard = $arc_rwlock.read().expect("Failed to acquire read lock");
@@ -225,15 +175,7 @@ macro_rules! with_read {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use std::sync::{Arc, RwLock};
-///
-/// let shared_data = Arc::new(RwLock::new(vec![1, 2, 3]));
-/// with_write!(shared_data, |data| data.push(4));
-///
-/// let length = with_read!(shared_data, |data| data.len());
-/// assert_eq!(length, 4);
-/// ```
+/// The `examples::with_write_example` test in this module runs this example.
 macro_rules! with_write {
     ($arc_rwlock:expr, $closure:expr) => {{
         let mut guard = $arc_rwlock.write().expect("Failed to acquire write lock");
@@ -259,17 +201,7 @@ macro_rules! with_write {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use std::collections::HashMap;
-/// use std::sync::{Arc, RwLock};
-///
-/// let mut map = HashMap::new();
-/// map.insert(1, Arc::new(RwLock::new("value".to_string())));
-///
-/// if let Some(guard) = map_get_read!(map, &1) {
-///     println!("Found: {}", *guard);
-/// }
-/// ```
+/// The `examples::map_get_read_example` test in this module runs this example.
 macro_rules! map_get_read {
     ($map:expr, $key:expr) => {{
         $map.get($key).map(|arc_rwlock| read_lock!(arc_rwlock))
@@ -293,18 +225,7 @@ macro_rules! map_get_read {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use std::sync::{Arc, RwLock};
-///
-/// let items = vec![
-///     Arc::new(RwLock::new("first".to_string())),
-///     Arc::new(RwLock::new("second".to_string())),
-/// ];
-///
-/// for_each_read!(items, item, {
-///     println!("Item: {}", *item);
-/// });
-/// ```
+/// The `examples::for_each_read_example` test in this module runs this example.
 macro_rules! for_each_read {
     ($collection:expr, $var:ident, $body:block) => {
         for item in $collection.iter() {
@@ -344,18 +265,7 @@ macro_rules! for_each_read {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
-/// metadata_flags! {
-///     /// ECMA-335 §II.23.1.15 TypeDef attribute flags.
-///     pub struct TypeAttributes(u32);
-/// }
-///
-/// impl TypeAttributes {
-///     pub const PUBLIC: Self = Self(0x0000_0001);
-///     pub const SEALED: Self = Self(0x0000_0100);
-///     // ...
-/// }
-/// ```
+/// The `examples::metadata_flags_example` test in this module runs this example.
 ///
 /// # Design Rationale
 ///
@@ -490,4 +400,157 @@ macro_rules! metadata_flags {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod examples {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, RwLock},
+    };
+
+    use crate::{emulation::PreHookResult, Result};
+
+    #[test]
+    fn module_2_example() -> Result<()> {
+        let mutex_data = Mutex::new(42);
+        *lock!(mutex_data) = 100;
+        assert_eq!(*lock!(mutex_data), 100);
+
+        let rwlock_data = RwLock::new(String::from("hello"));
+        let reader = read_lock!(rwlock_data);
+        assert_eq!(*reader, "hello");
+        Ok(())
+    }
+
+    #[test]
+    fn module_example() -> Result<()> {
+        let shared_data = Arc::new(RwLock::new(vec![1, 2, 3]));
+
+        // Execute closure with read access
+        let length = with_read!(shared_data, |vec: &Vec<i32>| vec.len());
+        assert_eq!(length, 3);
+
+        // Execute closure with write access
+        with_write!(shared_data, |vec: &mut Vec<i32>| vec.push(4));
+        assert_eq!(with_read!(shared_data, |vec: &Vec<i32>| vec.len()), 4);
+        Ok(())
+    }
+
+    /// A hook body: `Ok` unwraps, `Err` ends the hook with `PreHookResult::Error`.
+    fn string_length(value: std::result::Result<&str, String>) -> PreHookResult {
+        let value = try_hook!(value);
+        // `value` is the unwrapped Ok variant
+        PreHookResult::Bypass(Some(crate::emulation::EmValue::I32(
+            i32::try_from(value.len()).unwrap_or(i32::MAX),
+        )))
+    }
+
+    #[test]
+    fn try_hook_example() -> Result<()> {
+        assert!(matches!(
+            string_length(Ok("four")),
+            PreHookResult::Bypass(Some(crate::emulation::EmValue::I32(4)))
+        ));
+        assert!(matches!(
+            string_length(Err("no string".to_string())),
+            PreHookResult::Error(message) if message == "no string"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lock_example() -> Result<()> {
+        let shared_data = Mutex::new(42);
+        let mut data = lock!(shared_data);
+        *data = 100;
+        drop(data);
+        // Lock is automatically released when `data` goes out of scope
+        assert_eq!(*lock!(shared_data), 100);
+        Ok(())
+    }
+
+    #[test]
+    fn read_lock_example() -> Result<()> {
+        let shared_data = RwLock::new("hello world".to_string());
+        let first = read_lock!(shared_data);
+        // Readers share the lock.
+        let second = read_lock!(shared_data);
+        assert_eq!(*first, *second);
+        Ok(())
+    }
+
+    #[test]
+    fn write_lock_example() -> Result<()> {
+        let shared_data = RwLock::new(vec![1, 2, 3]);
+        let mut data = write_lock!(shared_data);
+        data.push(4);
+        drop(data);
+        // Write lock is automatically released when `data` goes out of scope
+        assert_eq!(*read_lock!(shared_data), [1, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn with_read_example() -> Result<()> {
+        let shared_data = Arc::new(RwLock::new("Hello".to_string()));
+        let length = with_read!(shared_data, |data: &String| data.len());
+        assert_eq!(length, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn with_write_example() -> Result<()> {
+        let shared_data = Arc::new(RwLock::new(vec![1, 2, 3]));
+        with_write!(shared_data, |data: &mut Vec<i32>| data.push(4));
+
+        let length = with_read!(shared_data, |data: &Vec<i32>| data.len());
+        assert_eq!(length, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn map_get_read_example() -> Result<()> {
+        let mut map = HashMap::new();
+        map.insert(1, Arc::new(RwLock::new("value".to_string())));
+
+        let guard = map_get_read!(map, &1).expect("key 1 is present");
+        assert_eq!(*guard, "value");
+        assert!(map_get_read!(map, &2).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn for_each_read_example() -> Result<()> {
+        let items = [
+            Arc::new(RwLock::new("first".to_string())),
+            Arc::new(RwLock::new("second".to_string())),
+        ];
+
+        let mut seen = Vec::new();
+        for_each_read!(items, item, {
+            seen.push(item.clone());
+        });
+        assert_eq!(seen, ["first", "second"]);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_flags_example() -> Result<()> {
+        metadata_flags! {
+            /// ECMA-335 §II.23.1.15 TypeDef attribute flags.
+            pub struct TypeAttributes(u32);
+        }
+
+        impl TypeAttributes {
+            pub const PUBLIC: Self = Self(0x0000_0001);
+            pub const SEALED: Self = Self(0x0000_0100);
+            // ...
+        }
+
+        let flags = TypeAttributes::PUBLIC | TypeAttributes::SEALED;
+        assert_eq!(flags.bits(), 0x0101);
+        assert!(flags.contains(TypeAttributes::SEALED));
+        Ok(())
+    }
 }

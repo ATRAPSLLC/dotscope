@@ -20,7 +20,7 @@ use crate::{
 ///
 /// Each event is emitted with its delegate type, name, accessor methods
 /// (`.addon`, `.removeon`, `.fire`, `.other`), and custom attributes.
-pub(super) fn format_events(
+pub fn format_events(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     cil_type: &CilType,
@@ -70,7 +70,7 @@ pub(super) fn format_events(
         }
 
         // .other
-        if let Some(other_ref) = event.fn_on_other.get() {
+        for (_, other_ref) in event.fn_on_other.iter() {
             if let Some(other_method) = other_ref.upgrade() {
                 writeln!(w, "    .other {}", format_method_ref(&other_method, asm))?;
             }

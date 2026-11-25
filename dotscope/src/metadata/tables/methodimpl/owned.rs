@@ -98,12 +98,16 @@ impl MethodImpl {
     ///
     /// Returns an error if updating type system relationships fails (currently infallible).
     pub fn apply(&self) -> Result<()> {
-        self.class.overwrites.push(self.method_body.clone());
+        self.class
+            .overwrites
+            .push_row(self.token, self.method_body.clone());
 
         if let CilTypeReference::MethodDef(method_ref) = &self.method_declaration {
             if let Some(method) = method_ref.upgrade() {
                 if let CilTypeReference::MethodDef(body_method_ref) = &self.method_body {
-                    method.interface_impls.push(body_method_ref.clone());
+                    method
+                        .interface_impls
+                        .push_row(self.token, body_method_ref.clone());
                 }
             }
         }
@@ -111,7 +115,9 @@ impl MethodImpl {
         // Store the declaration on the body method for .override emission
         if let CilTypeReference::MethodDef(body_ref) = &self.method_body {
             if let Some(body_method) = body_ref.upgrade() {
-                body_method.overrides.push(self.method_declaration.clone());
+                body_method
+                    .overrides
+                    .push_row(self.token, self.method_declaration.clone());
             }
         }
 

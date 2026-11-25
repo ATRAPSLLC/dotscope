@@ -35,7 +35,7 @@
 // The crate's trusted computing base is exactly one `unsafe` block, and it carries a targeted
 // `#[allow(unsafe_code)]` with its own SAFETY note:
 //
-// - `cilassembly/writer/output.rs` — `Mmap::map_mut` over the output file.
+// - `cilassembly/writer/output.rs` - `Mmap::map_mut` over the output file.
 //
 // The deny lint does not reach through dependencies, so note the other mapping here: `cowfile`'s
 // `map_copy`, which the primary load path routes its mmap through.
@@ -45,6 +45,10 @@
 // the documented error taxonomy tied to the real one; CI sets `RUSTDOCFLAGS: -Dwarnings` so it
 // is enforced on the doc build too.
 #![deny(rustdoc::broken_intra_doc_links)]
+// A type that public API returns, takes or holds must be importable: a caller can receive it but
+// cannot name it in a signature, a field or a turbofish, and rustdoc does not list it. Each such
+// type is re-exported next to the public API that hands it out.
+#![deny(unnameable_types)]
 
 //! # dotscope
 //!
@@ -101,7 +105,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! dotscope = "0.9"
+//! dotscope = "0.10"
 //! ```
 //!
 //! ### Using the Prelude
@@ -270,16 +274,19 @@
 //! # Development and Testing
 
 #[macro_use]
-pub(crate) mod macros;
+mod macros;
 
 #[macro_use]
-pub(crate) mod error;
-pub(crate) mod file;
-pub(crate) mod utils;
+mod error;
+mod file;
+mod utils;
 
-/// Shared functionality which is used in unit- and integration-tests
-#[cfg(test)]
-pub(crate) mod test;
+/// Test support shared by the unit and integration tests: builders, factories, fixtures,
+/// the sample harness. Unstable and outside the semver surface; integration tests reach it
+/// through the `testkit` feature.
+#[cfg(any(test, feature = "testkit"))]
+#[doc(hidden)]
+pub mod testkit;
 
 /// ILDasm-compatible CIL disassembly formatter.
 ///
@@ -306,6 +313,10 @@ pub(crate) mod test;
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 pub mod formatting;
+
+/// Readers and writers for the binary encodings .NET metadata uses:
+/// endian integers, ECMA-335 compressed integers and blob strings.
+pub mod io;
 
 /// Convenient re-exports of the most commonly used types and traits.
 ///
@@ -457,21 +468,28 @@ pub mod assembly;
 ///
 /// # Usage Example
 ///
-/// ```rust,ignore
-/// use dotscope::analysis::{ControlFlowGraph, SsaConverter};
+/// ```
+/// use dotscope::analysis::{ControlFlowGraph, SsaConverter, TypeContext};
 /// use dotscope::assembly::decode_blocks;
+/// use dotscope::CilObject;
 ///
-/// // Build CFG from method body
-/// let blocks = decode_blocks(data, offset, rva, Some(size))?;
+/// // Build CFG from a method body: `ldarg.0; brtrue.s +1; nop; ret`
+/// let il = [0x02u8, 0x2D, 0x01, 0x00, 0x2A];
+/// let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 /// let cfg = ControlFlowGraph::from_basic_blocks(blocks)?;
 ///
-/// // Convert to SSA form
-/// let ssa = SsaConverter::build(&cfg, num_args, num_locals, resolver)?;
+/// // Convert to SSA form, typed by a method of a real assembly: one argument,
+/// // no locals
+/// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// # let entry = assembly.methods().iter().next().expect("the sample has methods");
+/// let resolver = TypeContext::new(entry.value(), &assembly);
+/// let ssa = SsaConverter::build(&cfg, 1, 0, &resolver, Vec::new())?;
 ///
 /// // Analyze loops
 /// for loop_info in cfg.loops() {
 ///     println!("Loop at block {:?}, depth {}", loop_info.header, loop_info.depth);
 /// }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub mod analysis;
 
@@ -524,16 +542,16 @@ pub mod analysis;
 ///
 /// # Usage Example
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::deobfuscation::{DeobfuscationEngine, EngineConfig};
-/// use dotscope::CilObject;
 ///
-/// let mut assembly = CilObject::from_path(std::path::Path::new("obfuscated.exe"))?;
 /// let config = EngineConfig::default();
 /// let engine = DeobfuscationEngine::new(config);
 ///
-/// let result = engine.process_file(&mut assembly)?;
+/// let (deobfuscated, result) = engine.process_file("obfuscated.exe")?;
 /// println!("{}", result.summary());
+/// println!("{} methods remain", deobfuscated.methods().len());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[cfg(feature = "deobfuscation")]
 pub mod deobfuscation;
@@ -848,13 +866,13 @@ pub mod metadata;
 /// - [`project::CilProject`] - Main multi-assembly container
 /// - [`project::ProjectLoader`] - Builder-style loading API with flexible configuration
 /// - [`project::ProjectResult`] - Unified result type with loading statistics
-/// - `ProjectContext` - Internal coordination for parallel loading (crate-internal)
+/// - [`project::ProjectContext`] - The barriers that coordinate assemblies loading in parallel
 ///
 /// # Examples
 ///
 /// ## New ProjectLoader API (Recommended)
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::project::ProjectLoader;
 ///
 /// // Single assembly loading
@@ -877,11 +895,12 @@ pub mod metadata;
 ///     .build()?;
 ///
 /// println!("Loaded {} assemblies", result.success_count());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// ## Legacy CilProject API
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::project::CilProject;
 /// use dotscope::CilObject;
 /// use std::path::Path;
@@ -889,6 +908,7 @@ pub mod metadata;
 /// let project = CilProject::new();
 /// let assembly = CilObject::from_path(Path::new("MyApp.exe"))?;
 /// project.add_assembly(assembly, true)?;
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub mod project;
 
@@ -908,6 +928,8 @@ pub mod project;
 /// ```
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(feature = "compiler")]
+pub use cilassembly::Savepoint;
 /// Mutable assembly for editing and modification operations.
 ///
 /// `CilAssembly` provides a mutable layer on top of [`CilAssemblyView`] that enables
@@ -939,8 +961,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 pub use cilassembly::{
-    ChangeRefKind, ChangeRefRc, CilAssembly, CleanupRequest, LastWriteWinsResolver,
-    MethodBodyBuilder, MethodBuilder,
+    AssemblyChanges, BlobComposite, ChangeIds, ChangeRef, ChangeRefKind, ChangeRefRc, CilAssembly,
+    CleanupRequest, CompositeImport, Conflict, ConflictResolver, HeapChanges,
+    LastWriteWinsResolver, MethodBodyBuilder, MethodBuilder, Operation, OperationResolution,
+    Resolution, TableModifications, TableOperation,
 };
 /// `dotscope` Error type.
 ///
@@ -959,7 +983,10 @@ pub use cilassembly::{
 ///     Err(e) => println!("Error: {}", e),
 /// }
 /// ```
-pub use error::{Error, HeapKind, MethodLookupError, ParseFailure, ParseStage, StreamKind};
+pub use error::{
+    EmulationError, Error, HeapKind, MethodLookupError, ParseFailure, ParseStage, Referrer,
+    StreamKind,
+};
 /// Raw assembly view for editing and modification operations.
 ///
 /// `CilAssemblyView` provides direct access to .NET assembly metadata structures
@@ -1010,6 +1037,19 @@ pub use error::{Error, HeapKind, MethodLookupError, ParseFailure, ParseStage, St
 pub use metadata::cilassemblyview::CilAssemblyView;
 mod cilassembly;
 
+/// Main entry point for working with .NET assemblies.
+///
+/// See [`crate::metadata::cilobject::CilObject`] for high-level analysis and metadata access.
+///
+/// # Usage Examples
+///
+/// ```rust,no_run
+/// use dotscope::CilObject;
+/// let assembly = CilObject::from_path(std::path::Path::new("tests/samples/WindowsBase.dll"))?;
+/// println!("Found {} methods", assembly.methods().len());
+/// # Ok::<(), dotscope::Error>(())
+/// ```
+pub use file::{debug::debug_type, DebugDirectoryEntry};
 /// Provides access to low-level file and memory parsing utilities.
 ///
 /// The [`crate::Parser`] type is used for decoding CIL bytecode and metadata streams.
@@ -1028,24 +1068,15 @@ pub use file::{
     parser::Parser,
     pe::{
         CoffHeader, DataDirectories, DataDirectory, DataDirectoryType, DosHeader,
-        Export as PeExport, Import as PeImport, Machine, OptionalHeader, Pe, PeCharacteristics,
-        SectionTable, StandardFields, Subsystem, WindowsFields,
+        Export as PeExport, ExportHeader as PeExportHeader, Import as PeImport, Machine,
+        OptionalHeader, Pe, PeCharacteristics, SectionTable, StandardFields, Subsystem,
+        WindowsFields,
     },
+    repair::{repair_pe, RepairAction, RepairResult},
+    sectionmap::{RvaMapping, SectionMap},
     File,
 };
-/// Main entry point for working with .NET assemblies.
-///
-/// See [`crate::metadata::cilobject::CilObject`] for high-level analysis and metadata access.
-///
-/// # Usage Examples
-///
-/// ```rust,no_run
-/// use dotscope::CilObject;
-/// let assembly = CilObject::from_path(std::path::Path::new("tests/samples/WindowsBase.dll"))?;
-/// println!("Found {} methods", assembly.methods().len());
-/// # Ok::<(), dotscope::Error>(())
-/// ```
-pub use metadata::cilobject::CilObject;
+pub use metadata::cilobject::{CilObject, ViewLoadError};
 /// Composable query builders for filtering types and methods.
 ///
 /// `TypeQuery` and `MethodQuery` provide a fluent API for searching and filtering
@@ -1099,8 +1130,8 @@ pub use metadata::query::{MethodQuery, TypeQuery};
 ///
 /// See the [`crate::metadata::streams`] module for comprehensive examples of all heap types and iterators.
 pub use metadata::streams::{
-    Blob, BlobIterator, Guid, GuidIterator, StreamHeader, Strings, StringsIterator, TablesHeader,
-    UserStrings, UserStringsIterator,
+    Blob, BlobIterator, Guid, GuidIterator, StreamHeader, StringEntries, Strings, StringsIterator,
+    TablesHeader, UserStrings, UserStringsIterator,
 };
 /// Configuration for metadata validation during assembly loading.
 ///

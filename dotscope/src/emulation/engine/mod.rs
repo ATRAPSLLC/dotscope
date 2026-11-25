@@ -21,7 +21,7 @@
 //!   unwinding
 //! - [`generics`] - Generic type/method instantiation tracking
 //! - [`interpreter`] - Core instruction interpreter with opcode dispatch
-//! - [`pointer`] - Instruction pointer and position tracking
+//! - [`pointer`](mod@pointer) - Instruction pointer and position tracking
 //! - [`resolution`] - Call and newobj resolution result types
 //! - [`result`] - Step and emulation result types
 //! - [`stats`] - Execution statistics and limit tracking
@@ -38,7 +38,7 @@
 //! ## Interpreter
 //!
 //! - [`Interpreter`] - Core instruction dispatch and execution
-//! - [`CallFrame`] - Method call stack frame
+//! - [`ThreadCallFrame`](crate::emulation::ThreadCallFrame) - Method call stack frame
 //!
 //! ## Error Handling
 //!
@@ -46,26 +46,54 @@
 //!
 //! # Usage Example
 //!
-//! ```rust,ignore
-//! use dotscope::emulation::{Interpreter, EmulationLimits};
+//! ```
+//! use std::sync::{Arc, RwLock};
+//! use dotscope::assembly::decode_stream;
+//! use dotscope::emulation::{EmulationLimits, EmulationThread, Interpreter, StepResult, ThreadId};
+//! use dotscope::metadata::{token::Token, typesystem::PointerSize};
+//! use dotscope::Parser;
+//! # use dotscope::emulation::{
+//! #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+//! #     ThreadContext, VirtualFs,
+//! # };
+//! # let address_space = Arc::new(AddressSpace::new());
+//! # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+//! # let context = Arc::new(ThreadContext::new(
+//! #     Arc::clone(&address_space),
+//! #     Arc::new(RwLock::new(RuntimeState::new())),
+//! #     Arc::new(CaptureContext::new()),
+//! #     Arc::new(EmulationConfig::default()),
+//! #     None,
+//! #     fake_objects,
+//! #     Arc::new(VirtualFs::new()),
+//! # ));
 //!
-//! // Create interpreter with limits
+//! // Create interpreter with limits, and a thread running a method
 //! let limits = EmulationLimits::default();
 //! let mut interpreter = Interpreter::new(limits, address_space, PointerSize::Bit64);
+//! let mut thread = EmulationThread::new(ThreadId::MAIN, context);
+//! thread.start_method(Token::new(0x0600_0001), vec![], vec![], false);
 //!
-//! // Execute instructions
-//! loop {
-//!     match interpreter.step(&mut thread, &instruction)? {
+//! // The method body: `ldc.i4.1; ret`
+//! let il = [0x17, 0x2A];
+//! let instructions = decode_stream(&mut Parser::new(&il), 0x2050)?;
+//!
+//! // Execute instructions one at a time
+//! for instruction in &instructions {
+//!     match interpreter.step(&mut thread, instruction)? {
 //!         StepResult::Continue => continue,
-//!         StepResult::Return { value } => break,
-//!         StepResult::Branch { target } => { /* handle branch */ }
-//!         // ... handle other results
+//!         StepResult::Return { value } => {
+//!             println!("returned {:?}", value);
+//!             break;
+//!         }
+//!         _ => {}
 //!     }
 //! }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
-mod callresolver;
-mod cctors;
+pub mod callresolver;
+pub mod cctors;
 mod context;
 mod controller;
 mod dispatch;
@@ -80,17 +108,18 @@ mod result;
 mod stats;
 mod typeops;
 
-pub use context::{EmulationContext, SyntheticMethodBody};
+pub use context::{EmulationContext, MethodCode, SyntheticMethodBody};
 pub use controller::EmulationController;
 pub use error::{synthetic_exception, EmulationError};
+pub use generics::GenericRegistry;
 pub use interpreter::Interpreter;
 pub use pointer::InstructionPointer;
 pub use result::{EmulationOutcome, StepResult};
-pub use stats::LimitExceeded;
+pub use stats::{ExecutionStats, LimitExceeded};
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::sync::Arc;
 
     use dashmap::DashMap;
 
@@ -106,7 +135,12 @@ mod tests {
         metadata::{token::Token, typesystem::CilFlavor},
         prelude::PointerSize,
         project::ProjectLoader,
-        test::emulation::{create_test_context, create_test_thread},
+        testkit::{
+            emulation::{
+                create_test_context, create_test_thread, emulation_limits, process_builder,
+            },
+            fixture,
+        },
         Result,
     };
 
@@ -131,7 +165,7 @@ mod tests {
 
         // Set up interpreter and thread
         let ctx = create_test_context();
-        let limits = EmulationLimits::default();
+        let limits = emulation_limits();
         let mut interpreter =
             Interpreter::new(limits, Arc::clone(&ctx.address_space), PointerSize::Bit64);
         let mut thread = EmulationThread::new(ThreadId::MAIN, ctx);
@@ -1150,48 +1184,23 @@ mod tests {
         assert_eq!(limits.max_call_depth, 10);
     }
 
-    /// Helper to load crafted_2.exe for testing using ProjectLoader with dependencies.
-    /// Returns None if the assembly cannot be loaded (e.g., missing dependencies).
-    fn load_crafted_2_assembly() -> Option<Arc<crate::CilObject>> {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let assembly_path = Path::new(manifest_dir).join("tests/samples/crafted_2.exe");
-        let mono_deps_path = Path::new(manifest_dir).join("tests/samples/mono_4.8");
-
-        if !assembly_path.exists() {
-            eprintln!("Skipping test: crafted_2.exe not found");
-            return None;
-        }
-
-        if !mono_deps_path.exists() {
-            eprintln!("Skipping test: mono_4.8 dependencies not found");
-            return None;
-        }
-
-        // Use ProjectLoader to load the assembly with its dependencies
-        match ProjectLoader::new()
-            .primary_file(&assembly_path)
-            .and_then(|loader| loader.with_search_path(&mono_deps_path))
+    /// Loads crafted_2.exe with its mono_4.8 dependencies through ProjectLoader.
+    fn load_crafted_2_assembly() -> Arc<crate::CilObject> {
+        ProjectLoader::new()
+            .primary_file(fixture("crafted_2.exe"))
+            .and_then(|loader| loader.with_search_path(fixture("mono_4.8")))
             .map(|loader| loader.auto_discover(true))
             .and_then(|loader| loader.build())
-        {
-            Ok(result) => {
-                // Get the primary assembly from the loaded project
-                // get_primary() already returns Arc<CilObject>
-                result.project.get_primary()
-            }
-            Err(e) => {
-                eprintln!("Skipping test: Failed to load crafted_2.exe: {}", e);
-                None
-            }
-        }
+            .expect("crafted_2.exe loads with its dependencies")
+            .project
+            .get_primary()
+            .expect("the project has its primary assembly")
     }
 
     /// Tests loading a real assembly and using EmulationContext to find methods.
     #[test]
     fn test_real_assembly_method_lookup() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly, Arc::new(DashMap::new()));
 
         // Test finding the Program.Main method
@@ -1229,9 +1238,7 @@ mod tests {
     /// Tests that we can retrieve method metadata from a real assembly.
     #[test]
     fn test_real_assembly_method_metadata() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly, Arc::new(DashMap::new()));
 
         // Find a method with known characteristics
@@ -1259,9 +1266,7 @@ mod tests {
     /// Tests that we can get instructions from a real method.
     #[test]
     fn test_real_assembly_get_instructions() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly, Arc::new(DashMap::new()));
 
         // Find the Main method
@@ -1293,9 +1298,7 @@ mod tests {
     /// Tests type resolution and compatibility checking with real types.
     #[test]
     fn test_real_assembly_type_compatibility() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly, Arc::new(DashMap::new()));
 
         // Find types for compatibility testing
@@ -1322,9 +1325,7 @@ mod tests {
     /// Tests virtual method resolution with a real inheritance hierarchy.
     #[test]
     fn test_real_assembly_virtual_dispatch() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly, Arc::new(DashMap::new()));
 
         // Get base class virtual method
@@ -1354,13 +1355,11 @@ mod tests {
     /// Tests creating an EmulationProcess and preparing to emulate a method.
     #[test]
     fn test_real_assembly_process_setup() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly.clone(), Arc::new(DashMap::new()));
 
         // Create process using ProcessBuilder
-        let process = crate::emulation::ProcessBuilder::new()
+        let process = process_builder()
             .name("test")
             .build()
             .expect("Should build process");
@@ -1395,9 +1394,7 @@ mod tests {
     /// This validates the metadata lookup and instruction decoding works correctly.
     #[test]
     fn test_real_method_il_structure() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly.clone(), Arc::new(DashMap::new()));
 
         // Test Extensions::GetReference IL structure
@@ -1431,9 +1428,7 @@ mod tests {
     /// Test that Person class methods can be found and have expected structure.
     #[test]
     fn test_person_method_structure() {
-        let Some(assembly) = load_crafted_2_assembly() else {
-            return;
-        };
+        let assembly = load_crafted_2_assembly();
         let context = EmulationContext::new(assembly.clone(), Arc::new(DashMap::new()));
 
         // Find Person::get_Age method

@@ -1,24 +1,26 @@
 //! Configuration for the deobfuscation engine.
 //!
 //! This module provides configuration types for controlling the deobfuscation
-//! pipeline, including pass selection, iteration limits, and emulation settings.
+//! pipeline, including pass selection, the work budget, the engine's own
+//! rounds, and emulation settings.
 
 use std::time::Duration;
 
+use analyssa::analysis::{Budget, WorkBudget};
+
 use crate::{
-    deobfuscation::SmartRenameConfig,
+    deobfuscation::UnflattenConfig,
     emulation::{EmulationLimits, TracingConfig},
 };
 
-/// Fixpoint iteration limits.
+/// How many times the engine repeats its own phases: detection, the work
+/// queue and the byte-transform pipeline.
+///
+/// These are the engine's loops around the passes, not a bound on any pass:
+/// the passes, the scheduler that runs them and every analysis they read take
+/// their bounds from [`EngineConfig::budget`].
 #[derive(Debug, Clone)]
 pub struct IterationConfig {
-    /// Maximum iterations for the pass scheduler (default: 20).
-    pub max_ssa_iterations: usize,
-    /// Number of stable iterations before stopping (default: 2).
-    pub stable_iterations: usize,
-    /// Maximum iterations per phase before moving on (default: 10).
-    pub max_phase_iterations: usize,
     /// Maximum number of detection re-scan rounds (default: 2).
     pub max_detection_rounds: usize,
     /// Maximum outer fixpoint iterations for the work queue loop (default: 10).
@@ -34,9 +36,6 @@ pub struct IterationConfig {
 impl Default for IterationConfig {
     fn default() -> Self {
         Self {
-            max_ssa_iterations: 20,
-            stable_iterations: 2,
-            max_phase_iterations: 10,
             max_detection_rounds: 2,
             max_outer_iterations: 10,
             max_pipeline_iterations: 3,
@@ -62,7 +61,7 @@ pub struct PassConfig {
     ///
     /// Every rewrite is gated on a Memory SSA alias proof, so this reaches the
     /// field and array traffic that obfuscators use to keep values out of SSA
-    /// registers — ConfuserEx state fields, array-backed string tables — which
+    /// registers - ConfuserEx state fields, array-backed string tables - which
     /// the register-level passes cannot see through.
     pub memory_optimization: bool,
     /// Enable strength reduction pass (mul->shl, div->shr, rem->and for powers of 2).
@@ -75,18 +74,6 @@ pub struct PassConfig {
     pub inlining: bool,
     /// Maximum instruction count for inlining candidates.
     pub inline_threshold: usize,
-    /// Maximum iterations for dead code elimination fixpoint (default: 20).
-    pub dce_max_iterations: usize,
-    /// Maximum iterations for copy propagation fixpoint (default: 15).
-    pub copy_prop_max_iterations: usize,
-    /// Maximum iterations for constant propagation fixpoint (default: 10).
-    pub const_prop_max_iterations: usize,
-    /// Maximum iterations for block merging fixpoint (default: 50).
-    pub block_merge_max_iterations: usize,
-    /// Maximum iterations for control flow simplification fixpoint (default: 20).
-    pub control_flow_max_iterations: usize,
-    /// Maximum worklist iterations for value range dataflow solver (default: 10000).
-    pub value_range_max_iterations: usize,
 }
 
 impl Default for PassConfig {
@@ -103,12 +90,6 @@ impl Default for PassConfig {
             interprocedural: true,
             inlining: false,
             inline_threshold: 20,
-            dce_max_iterations: 20,
-            copy_prop_max_iterations: 15,
-            const_prop_max_iterations: 10,
-            block_merge_max_iterations: 50,
-            control_flow_max_iterations: 20,
-            value_range_max_iterations: 10_000,
         }
     }
 }
@@ -116,19 +97,30 @@ impl Default for PassConfig {
 /// Emulation engine limits.
 #[derive(Debug, Clone)]
 pub struct EmulationConfig {
-    /// Maximum instructions for emulation per method.
-    pub max_instructions: u64,
-    /// Emulation timeout per method.
+    /// The limits of the template process every emulation forks from.
+    ///
+    /// Warmup (Module.cctor and the techniques' warmup) runs under them whole,
+    /// and each per-method emulation runs under them with its own wall clock,
+    /// [`timeout`](Self::timeout): a fork inherits the template's warmed heap by
+    /// copy-on-write, so every other ceiling has to stay the one the template
+    /// was held to (see [`execution_limits`](Self::execution_limits)).
+    /// [`max_instructions`](EmulationLimits::max_instructions) bounds one
+    /// emulation deterministically. The default allows 1M instructions, a call
+    /// depth of 100 and a 512 MiB heap, and warmup a 60 s clock.
+    pub limits: EmulationLimits,
+    /// Wall-clock limit on one method's emulation; zero for none.
+    ///
+    /// A wall-clock limit makes the result depend on how fast the machine runs: under load
+    /// an emulation stops earlier, and a value it would have decrypted is left encrypted.
+    /// The instruction limit bounds emulation deterministically.
     pub timeout: Duration,
     /// Tracing configuration for emulation debugging.
     pub tracing: Option<TracingConfig>,
-    /// Timeout for template pool warmup (Module.cctor + technique warmup).
-    pub warmup_timeout: Duration,
     /// Number of retry passes for warmup methods with dependency chains.
     pub warmup_retry_passes: usize,
     /// Maximum emulations a single deobfuscation run may perform, or 0 for unlimited.
     ///
-    /// [`max_instructions`](Self::max_instructions) and [`timeout`](Self::timeout) bound one
+    /// The instruction limit and [`timeout`](Self::timeout) bound one
     /// emulation. Neither bounds how many a run performs: the decryption pass emulates once
     /// per distinct call site with constant arguments, and its value cache is keyed on
     /// `(decryptor, args)`, so a loop calling a decryptor with a varying key misses the cache
@@ -137,33 +129,22 @@ pub struct EmulationConfig {
 }
 
 impl EmulationConfig {
-    /// Limits for one per-method emulation.
+    /// Limits for one per-method emulation: the template's
+    /// [`limits`](Self::limits) whole, under the per-method
+    /// [`timeout`](Self::timeout).
     ///
-    /// A template process is warmed up once under [`warmup_timeout`](Self::warmup_timeout),
-    /// which is deliberately generous because warmup executes module and type initialisers.
-    /// Every per-method execution is forked from that template, and is a different job with
-    /// its own budget: [`timeout`](Self::timeout).
-    ///
-    /// Forking shares the emulator's configuration `Arc` by default, so without applying
-    /// these explicitly a per-method execution silently inherits the warmup budget — which is
-    /// what left `timeout` written and never read, and let a single method run under a wall
-    /// clock up to 120x larger than documented.
-    ///
-    /// Only the two per-method fields are overridden; everything else is inherited from
-    /// `base`, which must be the limits of the template being forked
-    /// ([`EmulationProcess::limits`]). Defaulting the remainder instead would silently
-    /// *raise* the call-depth ceiling and *lower* the heap ceiling relative to the template
-    /// the fork inherits its warmed heap from — 1000 and 256 MiB against the 100 and 512 MiB
-    /// the template pool builds with — so a sample whose warmup allocates past 256 MiB would
-    /// fail every per-method decryption on a limit it was never intended to be held to.
-    ///
-    /// [`EmulationProcess::limits`]: crate::emulation::EmulationProcess::limits
+    /// Every per-method execution is forked from the template, and forking
+    /// shares the emulator's configuration `Arc` by default, so without these
+    /// applied explicitly a per-method execution would silently inherit the
+    /// warmup clock. Everything but the clock stays the template's: a fork
+    /// runs on the heap the template warmed, so a ceiling below the template's
+    /// would fail every per-method decryption of a sample whose warmup
+    /// allocated past it.
     #[must_use]
-    pub fn execution_limits(&self, base: &EmulationLimits) -> EmulationLimits {
+    pub fn execution_limits(&self) -> EmulationLimits {
         EmulationLimits {
-            max_instructions: self.max_instructions,
             timeout_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
-            ..base.clone()
+            ..self.limits.clone()
         }
     }
 }
@@ -171,54 +152,17 @@ impl EmulationConfig {
 impl Default for EmulationConfig {
     fn default() -> Self {
         Self {
-            max_instructions: 1_000_000,
+            limits: EmulationLimits {
+                max_instructions: 1_000_000,
+                max_call_depth: 100,
+                max_heap_bytes: 512 * 1024 * 1024,
+                timeout_ms: 60_000,
+                ..EmulationLimits::default()
+            },
             timeout: Duration::from_secs(5),
             tracing: None,
-            warmup_timeout: Duration::from_secs(60),
             warmup_retry_passes: 5,
             max_emulations: 100_000,
-        }
-    }
-}
-
-/// String decryptor heuristic thresholds.
-#[derive(Debug, Clone)]
-pub struct DecryptorHeuristics {
-    /// Maximum instruction count for string decryptor heuristic detection.
-    pub max_instructions: usize,
-    /// Maximum parameter count for string decryptor heuristic detection.
-    pub max_params: usize,
-    /// Minimum score (0-100) for a method to be considered a string decryptor.
-    pub min_score: u32,
-    /// Maximum basic blocks to traverse when resolving decryptor call targets.
-    pub max_resolution_blocks: usize,
-}
-
-impl Default for DecryptorHeuristics {
-    fn default() -> Self {
-        Self {
-            max_instructions: 200,
-            max_params: 3,
-            min_score: 45,
-            max_resolution_blocks: 50,
-        }
-    }
-}
-
-/// CFF unflattening thresholds.
-#[derive(Debug, Clone)]
-pub struct UnflatteningThresholds {
-    /// Maximum BFS depth for back-edge transitive reachability check.
-    pub max_backedge_depth: usize,
-    /// Confidence scoring weights for CFF dispatcher detection.
-    pub confidence_weights: DetectionWeights,
-}
-
-impl Default for UnflatteningThresholds {
-    fn default() -> Self {
-        Self {
-            max_backedge_depth: 10,
-            confidence_weights: DetectionWeights::default(),
         }
     }
 }
@@ -274,11 +218,17 @@ impl Default for DetectionWeights {
 
 /// Configuration for the deobfuscation engine.
 ///
-/// Controls all aspects of the deobfuscation pipeline including iteration limits,
-/// pass selection, emulation parameters, and resolution strategies.
+/// Controls all aspects of the deobfuscation pipeline including the work
+/// budget, the engine's own rounds, pass selection and emulation parameters.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Fixpoint iteration limits.
+    /// How much work the passes, their scheduler and the analyses they read
+    /// may do: every fixpoint's rounds and every analysis's budget.
+    ///
+    /// [`EngineConfig::BUDGET`] by default.
+    pub budget: WorkBudget,
+
+    /// How many times the engine repeats its own phases.
     pub iterations: IterationConfig,
 
     /// SSA optimization pass toggles.
@@ -287,23 +237,9 @@ pub struct EngineConfig {
     /// Emulation engine limits.
     pub emulation: EmulationConfig,
 
-    /// String decryptor heuristic thresholds.
-    pub decryptor_heuristics: DecryptorHeuristics,
-
-    /// CFF unflattening thresholds.
-    pub unflattening: UnflatteningThresholds,
-
-    /// Detection threshold for obfuscator identification (0-100, default: 20).
-    pub detection_threshold: u32,
-
-    /// Target specific obfuscator (bypasses detection).
-    pub target_obfuscator: Option<String>,
-
-    /// Verify semantic preservation after passes (slow).
-    pub verify_semantics: bool,
-
-    /// Resolution strategies to use, in order of preference.
-    pub resolution_strategies: Vec<ResolutionStrategy>,
+    /// CFF unflattening: detection's thresholds and weights. The machine is
+    /// the assembly's, set when detection runs.
+    pub unflattening: UnflattenConfig,
 
     /// NOP threshold for dead method detection in BitMono-style junk analysis.
     pub detection_nop_threshold: usize,
@@ -352,13 +288,6 @@ pub struct CleanupConfig {
     ///
     /// Enable this in aggressive mode for maximum size reduction.
     pub remove_unused_methods: bool,
-
-    /// Optional configuration for LLM-powered smart renaming.
-    ///
-    /// When `Some`, the cascade renamer uses LLM inference for semantic
-    /// identifier names. When `None`, falls back to simple sequential naming.
-    /// Requires the `smart-rename` Cargo feature for the LLM backend.
-    pub smart_rename: Option<SmartRenameConfig>,
 }
 
 impl Default for CleanupConfig {
@@ -371,7 +300,6 @@ impl Default for CleanupConfig {
             remove_artifact_sections: true,
             rename_obfuscated_names: true,
             remove_unused_methods: false, // Off by default - may break reflection/exports
-            smart_rename: None,
         }
     }
 }
@@ -394,7 +322,6 @@ impl CleanupConfig {
             remove_artifact_sections: false,
             rename_obfuscated_names: false,
             remove_unused_methods: false,
-            smart_rename: None,
         }
     }
 
@@ -415,7 +342,6 @@ impl CleanupConfig {
     pub fn aggressive() -> Self {
         Self {
             remove_unused_methods: true,
-            smart_rename: None,
             ..Self::default()
         }
     }
@@ -424,19 +350,11 @@ impl CleanupConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            budget: Self::BUDGET,
             iterations: IterationConfig::default(),
             passes: PassConfig::default(),
             emulation: EmulationConfig::default(),
-            decryptor_heuristics: DecryptorHeuristics::default(),
-            unflattening: UnflatteningThresholds::default(),
-            detection_threshold: 20,
-            target_obfuscator: None,
-            verify_semantics: false,
-            resolution_strategies: vec![
-                ResolutionStrategy::Static,
-                ResolutionStrategy::Pattern,
-                ResolutionStrategy::Emulation,
-            ],
+            unflattening: UnflattenConfig::default(),
             detection_nop_threshold: 50_000,
             cleanup: CleanupConfig::default(),
         }
@@ -444,6 +362,20 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// The work budget the engine runs under: analyssa's, with 20 scheduler
+    /// rounds that stop after 2 that change nothing and 10 a layer, and the
+    /// rewriting passes' rounds - dead code 20, copies 15, constant folding
+    /// 10, block merging 50 and control flow 20.
+    pub const BUDGET: WorkBudget = WorkBudget::DEFAULT
+        .with_limit(Budget::PipelineRounds, 20)
+        .with_limit(Budget::StableRounds, 2)
+        .with_limit(Budget::PhaseRounds, 10)
+        .with_limit(Budget::DeadCodeRounds, 20)
+        .with_limit(Budget::CopyRounds, 15)
+        .with_limit(Budget::FoldRounds, 10)
+        .with_limit(Budget::BlockMergeRounds, 50)
+        .with_limit(Budget::ControlFlowRounds, 20);
+
     /// Creates a new configuration with default settings.
     ///
     /// # Returns
@@ -457,7 +389,7 @@ impl EngineConfig {
     /// Creates a "fast" configuration for quick processing.
     ///
     /// This configuration uses:
-    /// - Fewer iterations (5 max)
+    /// - Fewer scheduler rounds (5 max, stopping after 1 that changes nothing)
     /// - Limited emulation (100k instructions)
     /// - No inlining
     /// - No interprocedural analysis
@@ -467,10 +399,12 @@ impl EngineConfig {
     /// A new `EngineConfig` optimized for speed over thoroughness.
     #[must_use]
     pub fn fast() -> Self {
+        let emulation = EmulationConfig::default();
         Self {
+            budget: Self::BUDGET
+                .with_limit(Budget::PipelineRounds, 5)
+                .with_limit(Budget::StableRounds, 1),
             iterations: IterationConfig {
-                max_ssa_iterations: 5,
-                stable_iterations: 1,
                 max_detection_rounds: 1,
                 ..Default::default()
             },
@@ -480,14 +414,16 @@ impl EngineConfig {
                 ..Default::default()
             },
             emulation: EmulationConfig {
-                max_instructions: 100_000,
+                limits: EmulationLimits {
+                    max_instructions: 100_000,
+                    timeout_ms: 30_000,
+                    ..emulation.limits
+                },
                 timeout: Duration::from_millis(500),
-                warmup_timeout: Duration::from_secs(30),
                 warmup_retry_passes: 2,
                 max_emulations: 10_000,
-                ..Default::default()
+                ..emulation
             },
-            resolution_strategies: vec![ResolutionStrategy::Static, ResolutionStrategy::Pattern],
             ..Self::default()
         }
     }
@@ -495,10 +431,9 @@ impl EngineConfig {
     /// Creates an "aggressive" configuration for maximum deobfuscation.
     ///
     /// This configuration uses:
-    /// - More iterations (50 max)
+    /// - More scheduler rounds (50 max, stopping after 3 that change nothing)
     /// - Extended emulation limits (10M instructions)
     /// - All features enabled including inlining
-    /// - All resolution strategies including symbolic execution
     /// - Aggressive cleanup (removes unused methods after inlining)
     ///
     /// # Returns
@@ -506,10 +441,12 @@ impl EngineConfig {
     /// A new `EngineConfig` optimized for thoroughness over speed.
     #[must_use]
     pub fn aggressive() -> Self {
+        let emulation = EmulationConfig::default();
         Self {
+            budget: Self::BUDGET
+                .with_limit(Budget::PipelineRounds, 50)
+                .with_limit(Budget::StableRounds, 3),
             iterations: IterationConfig {
-                max_ssa_iterations: 50,
-                stable_iterations: 3,
                 max_detection_rounds: 3,
                 ..Default::default()
             },
@@ -520,70 +457,39 @@ impl EngineConfig {
                 ..Default::default()
             },
             emulation: EmulationConfig {
-                max_instructions: 10_000_000,
+                limits: EmulationLimits {
+                    max_instructions: 10_000_000,
+                    timeout_ms: 120_000,
+                    ..emulation.limits
+                },
                 timeout: Duration::from_secs(30),
-                warmup_timeout: Duration::from_secs(120),
                 warmup_retry_passes: 8,
                 max_emulations: 1_000_000,
-                ..Default::default()
+                ..emulation
             },
-            unflattening: UnflatteningThresholds {
+            unflattening: UnflattenConfig {
                 max_backedge_depth: 15,
                 ..Default::default()
             },
-            resolution_strategies: vec![
-                ResolutionStrategy::Static,
-                ResolutionStrategy::Pattern,
-                ResolutionStrategy::Emulation,
-                ResolutionStrategy::Symbolic,
-            ],
             cleanup: CleanupConfig::aggressive(),
             ..Self::default()
         }
     }
 
-    /// Sets the maximum number of iterations.
+    /// Sets the work budget the passes, their scheduler and their analyses
+    /// run under.
     ///
     /// # Arguments
     ///
-    /// * `max` - The maximum number of pass iterations.
+    /// * `budget` - The work budget, normally [`EngineConfig::BUDGET`] with
+    ///   the limits to change.
     ///
     /// # Returns
     ///
     /// The modified configuration (builder pattern).
     #[must_use]
-    pub fn with_max_iterations(mut self, max: usize) -> Self {
-        self.iterations.max_ssa_iterations = max;
-        self
-    }
-
-    /// Sets the detection threshold for obfuscator identification.
-    ///
-    /// # Arguments
-    ///
-    /// * `threshold` - A value from 0-100 representing the confidence threshold.
-    ///
-    /// # Returns
-    ///
-    /// The modified configuration (builder pattern).
-    #[must_use]
-    pub fn with_detection_threshold(mut self, threshold: u32) -> Self {
-        self.detection_threshold = threshold;
-        self
-    }
-
-    /// Targets a specific obfuscator, bypassing automatic detection.
-    ///
-    /// # Arguments
-    ///
-    /// * `obfuscator` - The obfuscator plugin ID to target.
-    ///
-    /// # Returns
-    ///
-    /// The modified configuration (builder pattern).
-    #[must_use]
-    pub fn with_target_obfuscator(mut self, obfuscator: impl Into<String>) -> Self {
-        self.target_obfuscator = Some(obfuscator.into());
+    pub fn with_budget(mut self, budget: WorkBudget) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -591,15 +497,16 @@ impl EngineConfig {
     ///
     /// # Arguments
     ///
-    /// * `max_instructions` - Maximum instructions to execute per emulation.
-    /// * `timeout` - Maximum time to spend on emulation per method.
+    /// * `max_instructions` - Maximum instructions to execute per emulation,
+    ///   warmup's included.
+    /// * `timeout` - Maximum wall-clock time to spend on emulation per method; zero for none.
     ///
     /// # Returns
     ///
     /// The modified configuration (builder pattern).
     #[must_use]
     pub fn with_emulation_limits(mut self, max_instructions: u64, timeout: Duration) -> Self {
-        self.emulation.max_instructions = max_instructions;
+        self.emulation.limits.max_instructions = max_instructions;
         self.emulation.timeout = timeout;
         self
     }
@@ -633,21 +540,6 @@ impl EngineConfig {
     #[must_use]
     pub fn with_interprocedural(mut self, enable: bool) -> Self {
         self.passes.interprocedural = enable;
-        self
-    }
-
-    /// Sets the resolution strategies to use.
-    ///
-    /// # Arguments
-    ///
-    /// * `strategies` - The resolution strategies in order of preference.
-    ///
-    /// # Returns
-    ///
-    /// The modified configuration (builder pattern).
-    #[must_use]
-    pub fn with_strategies(mut self, strategies: Vec<ResolutionStrategy>) -> Self {
-        self.resolution_strategies = strategies;
         self
     }
 
@@ -708,14 +600,14 @@ impl EngineConfig {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time for warmup execution.
+    /// * `timeout` - Maximum wall-clock time for warmup execution; zero for none.
     ///
     /// # Returns
     ///
     /// The modified configuration (builder pattern).
     #[must_use]
     pub fn with_warmup_timeout(mut self, timeout: Duration) -> Self {
-        self.emulation.warmup_timeout = timeout;
+        self.emulation.limits.timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         self
     }
 
@@ -757,66 +649,6 @@ impl EngineConfig {
     }
 }
 
-/// Strategy for resolving unknown values in SSA.
-///
-/// These strategies are tried in order of preference to resolve
-/// unknown values during deobfuscation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ResolutionStrategy {
-    /// Static analysis: constant propagation, dataflow analysis.
-    /// Fast and always safe.
-    Static,
-
-    /// Pattern matching: recognize known obfuscation patterns.
-    /// Fast, targeted at specific obfuscators.
-    Pattern,
-
-    /// Emulation: execute code to get concrete values.
-    /// Powerful but potentially slow or unsafe.
-    Emulation,
-
-    /// Symbolic execution: track constraints without concrete execution.
-    /// Can handle more complex cases but may be expensive.
-    Symbolic,
-}
-
-impl ResolutionStrategy {
-    /// Returns a human-readable name for this strategy.
-    ///
-    /// # Returns
-    ///
-    /// A static string with the strategy's display name.
-    #[must_use]
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Static => "Static Analysis",
-            Self::Pattern => "Pattern Matching",
-            Self::Emulation => "Emulation",
-            Self::Symbolic => "Symbolic Execution",
-        }
-    }
-
-    /// Returns whether this strategy is safe (no side effects).
-    ///
-    /// # Returns
-    ///
-    /// `true` if the strategy cannot cause side effects during execution.
-    #[must_use]
-    pub fn is_safe(&self) -> bool {
-        matches!(self, Self::Static | Self::Pattern | Self::Symbolic)
-    }
-
-    /// Returns whether this strategy requires emulation.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the strategy needs the emulation engine.
-    #[must_use]
-    pub fn requires_emulation(&self) -> bool {
-        matches!(self, Self::Emulation)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,49 +656,61 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = EngineConfig::default();
-        assert_eq!(config.iterations.max_ssa_iterations, 20);
+        assert_eq!(config.budget, EngineConfig::BUDGET);
+        assert_eq!(config.budget.limit(Budget::PipelineRounds), 20);
         assert!(config.passes.string_decryption);
         assert!(config.passes.interprocedural);
         assert!(!config.passes.inlining); // Disabled by default
         assert!(!config.cleanup.remove_unused_methods); // Disabled by default
-        assert_eq!(config.emulation.warmup_timeout, Duration::from_secs(60));
+        assert_eq!(config.emulation.limits.timeout_ms, 60_000);
         assert_eq!(config.emulation.warmup_retry_passes, 5);
         assert_eq!(config.unflattening.max_backedge_depth, 10);
-        assert_eq!(config.decryptor_heuristics.max_resolution_blocks, 50);
         assert_eq!(config.detection_nop_threshold, 50_000);
     }
 
     #[test]
     fn test_fast_config() {
         let config = EngineConfig::fast();
-        assert_eq!(config.iterations.max_ssa_iterations, 5);
+        assert_eq!(config.budget.limit(Budget::PipelineRounds), 5);
+        assert_eq!(config.budget.limit(Budget::StableRounds), 1);
         assert!(!config.passes.interprocedural);
-        assert_eq!(config.resolution_strategies.len(), 2);
-        assert_eq!(config.emulation.warmup_timeout, Duration::from_secs(30));
+        assert_eq!(config.emulation.limits.timeout_ms, 30_000);
+        assert_eq!(config.emulation.limits.max_instructions, 100_000);
         assert_eq!(config.emulation.warmup_retry_passes, 2);
     }
 
     #[test]
     fn test_aggressive_config() {
         let config = EngineConfig::aggressive();
-        assert_eq!(config.iterations.max_ssa_iterations, 50);
+        assert_eq!(config.budget.limit(Budget::PipelineRounds), 50);
+        assert_eq!(config.budget.limit(Budget::StableRounds), 3);
         assert!(config.passes.inlining);
         assert!(config.passes.interprocedural);
-        assert_eq!(config.resolution_strategies.len(), 4);
         assert!(config.cleanup.remove_unused_methods); // Enabled in aggressive mode
-        assert_eq!(config.emulation.warmup_timeout, Duration::from_secs(120));
+        assert_eq!(config.emulation.limits.timeout_ms, 120_000);
         assert_eq!(config.emulation.warmup_retry_passes, 8);
         assert_eq!(config.unflattening.max_backedge_depth, 15);
+    }
+
+    /// A preset changes the limits it names and keeps every other limit of
+    /// the template, so a fast run is not also held to a smaller heap.
+    #[test]
+    fn a_preset_keeps_the_template_limits_it_does_not_name() {
+        let template = EmulationConfig::default().limits;
+        for config in [EngineConfig::fast(), EngineConfig::aggressive()] {
+            let limits = &config.emulation.limits;
+            assert_eq!(limits.max_call_depth, template.max_call_depth);
+            assert_eq!(limits.max_heap_bytes, template.max_heap_bytes);
+            assert_eq!(limits.max_unmanaged_bytes, template.max_unmanaged_bytes);
+        }
     }
 
     #[test]
     fn test_builder_pattern() {
         let config = EngineConfig::new()
-            .with_max_iterations(100)
-            .with_target_obfuscator("confuserex");
+            .with_budget(EngineConfig::BUDGET.with_limit(Budget::PipelineRounds, 100));
 
-        assert_eq!(config.iterations.max_ssa_iterations, 100);
-        assert_eq!(config.target_obfuscator, Some("confuserex".to_string()));
+        assert_eq!(config.budget.limit(Budget::PipelineRounds), 100);
     }
 
     #[test]
@@ -885,21 +729,12 @@ mod tests {
             .with_warmup_retry_passes(10)
             .with_nop_threshold(100_000);
 
-        assert_eq!(config.emulation.warmup_timeout, Duration::from_secs(120));
+        assert_eq!(config.emulation.limits.timeout_ms, 120_000);
         assert_eq!(config.emulation.warmup_retry_passes, 10);
         assert_eq!(config.detection_nop_threshold, 100_000);
     }
 
-    #[test]
-    fn test_resolution_strategy() {
-        assert!(ResolutionStrategy::Static.is_safe());
-        assert!(ResolutionStrategy::Pattern.is_safe());
-        assert!(!ResolutionStrategy::Emulation.is_safe());
-
-        assert!(ResolutionStrategy::Emulation.requires_emulation());
-        assert!(!ResolutionStrategy::Static.requires_emulation());
-    }
-    /// A per-method execution must run under `timeout`, not the template's `warmup_timeout`.
+    /// A per-method execution must run under `timeout`, not the template's warmup clock.
     ///
     /// Forking shares the emulator's configuration `Arc`, so without applying these limits
     /// explicitly the documented per-method budget is written and never read and the method
@@ -907,18 +742,17 @@ mod tests {
     #[test]
     fn execution_limits_use_the_per_method_timeout() {
         let config = EmulationConfig::default();
-        let limits = config.execution_limits(&EmulationLimits::default());
+        let limits = config.execution_limits();
 
         assert_eq!(
             limits.timeout_ms,
             u64::try_from(config.timeout.as_millis()).unwrap()
         );
         assert_ne!(
-            limits.timeout_ms,
-            u64::try_from(config.warmup_timeout.as_millis()).unwrap(),
+            limits.timeout_ms, config.limits.timeout_ms,
             "a per-method execution must not inherit the warmup budget"
         );
-        assert_eq!(limits.max_instructions, config.max_instructions);
+        assert_eq!(limits.max_instructions, config.limits.max_instructions);
     }
 
     /// The `fast()` preset tightens the per-method budget; the derivation must follow the
@@ -926,15 +760,14 @@ mod tests {
     #[test]
     fn execution_limits_follow_the_preset() {
         let fast = EngineConfig::fast();
-        let base = EmulationLimits::default();
 
         assert_eq!(
-            fast.emulation.execution_limits(&base).timeout_ms,
+            fast.emulation.execution_limits().timeout_ms,
             u64::try_from(fast.emulation.timeout.as_millis()).unwrap()
         );
         assert_eq!(
-            fast.emulation.execution_limits(&base).max_instructions,
-            fast.emulation.max_instructions
+            fast.emulation.execution_limits().max_instructions,
+            fast.emulation.limits.max_instructions
         );
     }
 
@@ -948,27 +781,30 @@ mod tests {
     /// had never been held to.
     #[test]
     fn execution_limits_inherit_every_unnamed_field_from_the_template() {
-        let config = EmulationConfig::default();
-        let template = EmulationLimits {
-            max_call_depth: 100,
-            max_heap_bytes: 512 * 1024 * 1024,
-            max_unmanaged_bytes: 7 * 1024 * 1024,
-            ..EmulationLimits::default()
+        let config = EmulationConfig {
+            limits: EmulationLimits {
+                max_unmanaged_bytes: 7 * 1024 * 1024,
+                ..EmulationConfig::default().limits
+            },
+            ..EmulationConfig::default()
         };
 
-        let limits = config.execution_limits(&template);
+        let limits = config.execution_limits();
 
-        assert_eq!(limits.max_call_depth, template.max_call_depth);
-        assert_eq!(limits.max_heap_bytes, template.max_heap_bytes);
-        assert_eq!(limits.max_unmanaged_bytes, template.max_unmanaged_bytes);
+        assert_eq!(limits.max_call_depth, 100);
+        assert_eq!(limits.max_heap_bytes, 512 * 1024 * 1024);
+        assert_eq!(
+            limits.max_unmanaged_bytes,
+            config.limits.max_unmanaged_bytes
+        );
         assert_ne!(
             limits.max_heap_bytes,
             EmulationLimits::default().max_heap_bytes,
             "the template's heap ceiling must survive the derivation"
         );
 
-        // Only the two per-method fields are overridden.
-        assert_eq!(limits.max_instructions, config.max_instructions);
+        // Only the per-method clock is overridden.
+        assert_eq!(limits.max_instructions, config.limits.max_instructions);
         assert_eq!(
             limits.timeout_ms,
             u64::try_from(config.timeout.as_millis()).unwrap()

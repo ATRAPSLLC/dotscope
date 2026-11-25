@@ -8,39 +8,39 @@ use crate::metadata::{token::Token, typesystem::CilPrimitiveKind};
 
 /// Well-known fully qualified type names from the .NET base class library.
 pub mod names {
-    /// `System.Object` — root of the .NET type hierarchy.
+    /// `System.Object` - root of the .NET type hierarchy.
     pub const OBJECT: &str = "System.Object";
-    /// `System.ValueType` — base class for all value types.
+    /// `System.ValueType` - base class for all value types.
     pub const VALUE_TYPE: &str = "System.ValueType";
-    /// `System.Enum` — base class for all enumerations.
+    /// `System.Enum` - base class for all enumerations.
     pub const ENUM: &str = "System.Enum";
-    /// `System.Delegate` — base class for delegates.
+    /// `System.Delegate` - base class for delegates.
     pub const DELEGATE: &str = "System.Delegate";
-    /// `System.MulticastDelegate` — base class for multicast delegates.
+    /// `System.MulticastDelegate` - base class for multicast delegates.
     pub const MULTICAST_DELEGATE: &str = "System.MulticastDelegate";
-    /// `System.String` — the .NET string type.
+    /// `System.String` - the .NET string type.
     pub const STRING: &str = "System.String";
-    /// `System.Void` — represents the void return type.
+    /// `System.Void` - represents the void return type.
     pub const VOID: &str = "System.Void";
-    /// `System.Exception` — base class for all exceptions.
+    /// `System.Exception` - base class for all exceptions.
     pub const EXCEPTION: &str = "System.Exception";
-    /// `System.Type` — runtime type representation.
+    /// `System.Type` - runtime type representation.
     pub const TYPE: &str = "System.Type";
-    /// `System.Array` — base class for all array types.
+    /// `System.Array` - base class for all array types.
     pub const ARRAY: &str = "System.Array";
-    /// `System.Attribute` — base class for custom attributes.
+    /// `System.Attribute` - base class for custom attributes.
     pub const ATTRIBUTE: &str = "System.Attribute";
 }
 
 /// Well-known member names in the .NET type system.
 pub mod members {
-    /// `.cctor` — static class constructor (type initializer).
+    /// `.cctor` - static class constructor (type initializer).
     pub const CCTOR: &str = ".cctor";
-    /// `.ctor` — instance constructor.
+    /// `.ctor` - instance constructor.
     pub const CTOR: &str = ".ctor";
-    /// `<Module>` — the global module type that holds module-level methods and fields.
+    /// `<Module>` - the global module type that holds module-level methods and fields.
     pub const MODULE_TYPE: &str = "<Module>";
-    /// `<PrivateImplementationDetails>` — compiler-generated type for array initializers etc.
+    /// `<PrivateImplementationDetails>` - compiler-generated type for array initializers etc.
     pub const PRIVATE_IMPL: &str = "<PrivateImplementationDetails>";
 }
 

@@ -39,23 +39,23 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use dotscope::cilassembly::{CilAssembly, cleanup::CleanupRequest};
+//! ```no_run
+//! use dotscope::metadata::token::Token;
+//! use dotscope::CilAssembly;
+//! use dotscope::CleanupRequest;
 //!
-//! let mut assembly = CilAssembly::new(view);
+//! let mut assembly = CilAssembly::from_path("protected.exe")?;
 //!
-//! // Build a cleanup request
+//! // Build a cleanup request: the protection's type and its decryptor
 //! let mut request = CleanupRequest::new();
-//! request.add_type(protection_type_token);
-//! request.add_method(decryptor_method_token);
+//! request.add_type(Token::new(0x0200_0002));
+//! request.add_method(Token::new(0x0600_0001));
 //! request.exclude_section(".confuser");
 //!
-//! // Execute cleanup (modifies AssemblyChanges)
-//! let stats = assembly.execute_cleanup(&request)?;
-//! println!("{}", stats);
-//!
-//! // Generate assembly (cleanup is applied)
-//! assembly.write_to_file("output.exe")?;
+//! // Queue the cleanup; it runs once, when the assembly is generated
+//! assembly.add_cleanup(&request);
+//! assembly.to_file("output.exe")?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # What Gets Cleaned Up
@@ -96,6 +96,7 @@
 //! - ManifestResource entries referencing the deleted scope
 //! - File entries no longer referenced by surviving ExportedType/ManifestResource
 
+#[cfg(feature = "deobfuscation")]
 mod analysis;
 mod compaction;
 mod executor;
@@ -106,10 +107,10 @@ mod stats;
 mod utils;
 
 #[cfg(feature = "deobfuscation")]
-pub use analysis::{compute_entry_points, expand_type_tokens, find_unreferenced_types};
-pub(crate) use compaction::mark_unreferenced_heap_entries;
+pub use analysis::{compute_entry_points, expand_type_tokens, find_unreferenced_types, TypeNames};
+pub use compaction::collect_referenced_heap_entries;
 pub use executor::execute_cleanup;
 pub use request::CleanupRequest;
 pub use stats::CleanupStats;
 #[cfg(feature = "deobfuscation")]
-pub(crate) use utils::{extract_local_var_sig_rid, with_method_body};
+pub use utils::{extract_local_var_sig_rid, with_method_body};

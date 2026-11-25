@@ -36,7 +36,7 @@
 //! - [`crate::metadata::tables`] - Core metadata table infrastructure
 //! - [`crate::metadata::streams`] - String and blob heap access
 //! - [`crate::metadata::token`] - Token representation for metadata references
-//! - [`crate::file::io`] - Binary data reading utilities
+//! - [`crate::io`] - Binary data reading utilities
 //!
 //! # References
 //!
@@ -53,7 +53,6 @@ use crate::{
         },
         token::Token,
     },
-    utils::LazyList,
     Result,
 };
 
@@ -174,11 +173,11 @@ impl AssemblyRefRaw {
             rid: self.rid,
             token: self.token,
             offset: self.offset,
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             culture: if self.culture == 0 {
                 None
             } else {
-                Some(strings.get(self.culture as usize)?.to_string())
+                Some(strings.get_shared(self.culture as usize)?)
             },
             major_version: self.major_version,
             minor_version: self.minor_version,
@@ -202,7 +201,7 @@ impl AssemblyRefRaw {
             os_major_version: AtomicU32::new(0),
             os_minor_version: AtomicU32::new(0),
             processor: AtomicU32::new(0),
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         }))
     }
 

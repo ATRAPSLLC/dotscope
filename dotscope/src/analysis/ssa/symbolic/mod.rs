@@ -22,7 +22,7 @@
 //!
 //! The target-agnostic IR + evaluator now live in `analyssa::analysis::symbolic`:
 //!
-//! - [`SymbolicOp`] - Symbolic operation kinds (add, xor, comparison, etc.) — `analyssa::analysis::symbolic::ops`
+//! - [`NumericOp`] - Symbolic operation kinds (add, xor, comparison, etc.) — `analyssa::analysis::symbolic::ops`
 //! - [`SymbolicExpr`] - Symbolic expression tree — `analyssa::analysis::symbolic::expr`
 //! - [`SymbolicEvaluator`] - Builds expressions from SSA operations — `analyssa::analysis::symbolic::evaluator`
 //!
@@ -65,13 +65,13 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use dotscope::analysis::{SymbolicExpr, SymbolicOp, Z3Solver};
+//! ```
+//! use dotscope::analysis::{SymbolicExpr, NumericOp, Z3Solver};
 //!
 //! // Build expression: (state XOR 0x12345678) % 13
 //! let state = SymbolicExpr::named("state");
-//! let xored = SymbolicExpr::binary(SymbolicOp::Xor, state, SymbolicExpr::constant(0x12345678));
-//! let result = SymbolicExpr::binary(SymbolicOp::RemU, xored, SymbolicExpr::constant(13));
+//! let xored = SymbolicExpr::binary(NumericOp::Xor, state, SymbolicExpr::constant_i32(0x12345678));
+//! let result = SymbolicExpr::binary(NumericOp::RemU, xored, SymbolicExpr::constant_i32(13));
 //!
 //! // Use Z3 to find all states that produce case index 5
 //! let solver = Z3Solver::new();
@@ -87,11 +87,14 @@
 //! [`Z3Solver`] and reuse it. The solver uses 32-bit bitvectors (`BV(32)`) for
 //! all computations, matching CIL's `int32` semantics.
 
-// `SymbolicEvaluator`, `SymbolicExpr`, `SymbolicOp` live in
+// `SymbolicEvaluator`, `SymbolicExpr`, `NumericOp` live in
 // `analyssa::analysis::symbolic`. The Z3 binding stays here behind the `z3`
 // feature flag — Z3 is a dotscope-side dependency that analyssa intentionally
 // doesn't take.
-pub use analyssa::analysis::symbolic::{SymbolicEvaluator, SymbolicExpr, SymbolicOp};
+pub use analyssa::{
+    analysis::symbolic::{SymbolicEvaluator, SymbolicExpr},
+    ir::evaluation::NumericOp,
+};
 
 #[cfg(feature = "z3")]
 mod solver;

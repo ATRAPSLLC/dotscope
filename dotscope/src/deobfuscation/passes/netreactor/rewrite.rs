@@ -4,19 +4,19 @@
 //! the original `ManifestResource` rows, the protected user code still
 //! routes through two NR shims:
 //!
-//! - **Lazy init** — `Main` and every protector-injected `.cctor` start
+//! - **Lazy init** - `Main` and every protector-injected `.cctor` start
 //!   with `call <lazy_init>;`. Once the resources are real
 //!   `ManifestResource` rows, the resolver type's runtime registration is
-//!   pure overhead — there is nothing to resolve. We replace the call
+//!   pure overhead - there is nothing to resolve. We replace the call
 //!   with `Nop` so the resolver type can be deleted by the cleanup
 //!   pipeline.
 //!
-//! - **`GetManifestResourceNames` shim** — user code calls
+//! - **`GetManifestResourceNames` shim** - user code calls
 //!   `<resolver>::eBxqprrF8(Assembly) -> string[]` instead of
 //!   `Assembly::GetManifestResourceNames()`. Same arity, same return
-//!   type. We rewrite the `Call` to a `CallVirt` against the BCL
+//!   type. We rewrite the direct call to a virtual call against the BCL
 //!   MemberRef (resolved at construction time from the assembly's import
-//!   table — every NR resources sample already references that
+//!   table - every NR resources sample already references that
 //!   MemberRef inside the resolver type body).
 //!
 //! After both rewrites land the resolver type is unreferenced from user
@@ -27,7 +27,7 @@
 //! # Pipeline Position
 //!
 //! Runs in the **Value** phase, like the other NR-specific shim
-//! folders. Pure intra-method rewrite, no CFG changes —
+//! folders. Pure intra-method rewrite, no CFG changes -
 //! [`ModificationScope::InstructionsOnly`].
 //!
 //! [`netreactor.resources`]: crate::deobfuscation::techniques::netreactor::NetReactorResources
@@ -35,7 +35,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    analysis::{CilTarget, MethodRef, SsaFunction, SsaOp},
+    analysis::{Callee, CilTarget, MethodRef, SsaFunction, SsaOp, SsaOpCilExt},
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
 };
@@ -59,7 +59,7 @@ pub struct ResourceShimRewritePass {
 impl ResourceShimRewritePass {
     /// Builds the pass from detection findings.
     ///
-    /// `shim_method_tokens` is empty when no shims were found — the pass
+    /// `shim_method_tokens` is empty when no shims were found - the pass
     /// still runs but only the lazy-init NOP rewrites apply. Same for an
     /// empty `bcl_get_manifest_resource_names` (zero token): shim
     /// rewrites are skipped, lazy-init NOPs still run.
@@ -98,7 +98,7 @@ impl SsaPass<CilTarget, CompilerContext> for ResourceShimRewritePass {
         ctx: &CompilerContext,
     ) -> analyssa::Result<bool> {
         let method_token = method.0;
-        // Skip work for the resolver's own methods — the cleanup pipeline
+        // Skip work for the resolver's own methods - the cleanup pipeline
         // deletes them wholesale, so rewriting here would be wasted.
         if self.shim_method_tokens.contains(&method_token) || self.lazy_init_token == method_token {
             return Ok(false);
@@ -118,27 +118,25 @@ impl SsaPass<CilTarget, CompilerContext> for ResourceShimRewritePass {
                 let Some(instr) = block.instruction_mut(instr_idx) else {
                     continue;
                 };
-                let new_op = match instr.op() {
-                    SsaOp::Call { dest, method, args }
-                        if self.shim_method_tokens.contains(&method.token())
+                let new_op = match instr.op().method_call() {
+                    Some((token, call))
+                        if self.shim_method_tokens.contains(&token)
                             && self.bcl_get_manifest_resource_names.value() != 0 =>
                     {
                         // Same arity (Assembly arg → instance receiver),
                         // same return type (string[]). The shim's stack
                         // effect matches `callvirt
                         // Assembly::GetManifestResourceNames()`.
-                        let new = SsaOp::CallVirt {
-                            dest: *dest,
-                            method: bcl_target,
-                            args: args.clone(),
-                        };
+                        let new = call
+                            .redirected(Callee::Virtual(bcl_target), call.args.clone())
+                            .into();
                         shim_rewrites = shim_rewrites.saturating_add(1);
                         Some(new)
                     }
-                    SsaOp::Call { dest, method, args }
-                        if method.token() == self.lazy_init_token
-                            && dest.is_none()
-                            && args.is_empty() =>
+                    Some((token, call))
+                        if token == self.lazy_init_token
+                            && call.dest.is_none()
+                            && call.args.is_empty() =>
                     {
                         init_nops = init_nops.saturating_add(1);
                         Some(SsaOp::Nop)
@@ -179,9 +177,8 @@ mod tests {
     use super::*;
     use crate::{
         analysis::{CallGraph, MethodRef, SsaFunctionBuilder, SsaType},
-        compiler::SsaPass,
         deobfuscation::context::AnalysisContext,
-        test::helpers::test_assembly_arc,
+        testkit::{helpers::test_assembly_arc, passes::run_verified},
     };
 
     fn make_ctx() -> AnalysisContext {
@@ -200,7 +197,11 @@ mod tests {
             .build_with(|f| {
                 let arg0 = f.arg(0, SsaType::Object);
                 f.block(0, |b| {
-                    let _ = b.call(MethodRef::new(shim), &[arg0], SsaType::Object);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(shim)),
+                        &[arg0],
+                        SsaType::Object,
+                    );
                     b.ret();
                 });
             })
@@ -208,21 +209,21 @@ mod tests {
 
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl);
         let ctx = make_ctx();
-        let changed = pass
-            .run_on_method(
-                &mut ssa,
-                &MethodRef::from(Token::new(0x06000003)),
-                &ctx.compiler,
-            )
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(Token::new(0x06000003)),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(changed);
         let block = ssa.block(0).unwrap();
-        match block.instructions()[0].op() {
-            SsaOp::CallVirt { method, args, .. } => {
-                assert_eq!(method.token(), bcl);
-                assert_eq!(args.len(), 1);
+        match block.instructions()[0].op().as_call() {
+            Some(call) if matches!(call.callee, Callee::Virtual(_)) => {
+                assert_eq!(call.callee.method().map(MethodRef::token), Some(bcl));
+                assert_eq!(call.args.len(), 1);
             }
-            other => panic!("expected CallVirt, got {other:?}"),
+            other => panic!("expected a virtual call, got {other:?}"),
         }
     }
 
@@ -235,7 +236,7 @@ mod tests {
         let mut ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(lazy_init), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(lazy_init)), &[]);
                     b.ret();
                 });
             })
@@ -243,16 +244,21 @@ mod tests {
 
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl);
         let ctx = make_ctx();
-        let changed = pass
-            .run_on_method(
-                &mut ssa,
-                &MethodRef::from(Token::new(0x06000003)),
-                &ctx.compiler,
-            )
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(Token::new(0x06000003)),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(changed);
+        // The call is gone: the block is its return
         let block = ssa.block(0).unwrap();
-        assert!(matches!(block.instructions()[0].op(), SsaOp::Nop));
+        assert!(
+            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None, .. })),
+            "{:?}",
+            block.instructions()
+        );
     }
 
     #[test]
@@ -264,7 +270,7 @@ mod tests {
         let mut ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(lazy_init), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(lazy_init)), &[]);
                     b.ret();
                 });
             })
@@ -273,9 +279,8 @@ mod tests {
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl);
         let ctx = make_ctx();
         // Running on the lazy_init method itself should NOT touch its body.
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(lazy_init), &ctx.compiler)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut ssa, &MethodRef::from(lazy_init), &ctx.compiler).unwrap();
         assert!(!changed);
     }
 
@@ -289,7 +294,11 @@ mod tests {
             .build_with(|f| {
                 let arg0 = f.arg(0, SsaType::Object);
                 f.block(0, |b| {
-                    let _ = b.call(MethodRef::new(shim), &[arg0], SsaType::Object);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(shim)),
+                        &[arg0],
+                        SsaType::Object,
+                    );
                     b.ret();
                 });
             })
@@ -297,14 +306,14 @@ mod tests {
 
         let pass = ResourceShimRewritePass::new(vec![shim], lazy_init, bcl_unset);
         let ctx = make_ctx();
-        let changed = pass
-            .run_on_method(
-                &mut ssa,
-                &MethodRef::from(Token::new(0x06000003)),
-                &ctx.compiler,
-            )
-            .unwrap();
-        // Shim left intact — fallback is to leave the call alone.
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(Token::new(0x06000003)),
+            &ctx.compiler,
+        )
+        .unwrap();
+        // Shim left intact - fallback is to leave the call alone.
         assert!(!changed);
     }
 }

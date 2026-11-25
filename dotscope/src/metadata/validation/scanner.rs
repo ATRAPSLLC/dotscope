@@ -917,484 +917,459 @@ impl std::fmt::Display for ScannerStatistics {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::metadata::cilassemblyview::CilAssemblyView;
+    use crate::{metadata::cilassemblyview::CilAssemblyView, testkit::fixture};
 
     #[test]
     fn test_reference_scanner_creation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let scanner = ReferenceScanner::from_view(&view);
-            assert!(scanner.is_ok(), "Scanner creation should succeed");
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view);
+        assert!(scanner.is_ok(), "Scanner creation should succeed");
 
-            let scanner = scanner.unwrap();
-            let stats = scanner.statistics();
+        let scanner = scanner.unwrap();
+        let stats = scanner.statistics();
 
-            assert!(stats.total_tokens > 0, "Should have found some tokens");
-            assert!(stats.total_tables > 0, "Should have found some tables");
-        }
+        assert!(stats.total_tokens > 0, "Should have found some tokens");
+        assert!(stats.total_tables > 0, "Should have found some tables");
     }
 
     #[test]
     fn test_token_bounds_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let invalid_token = Token::new(0x02000000); // TypeDef with RID 0
-                assert!(scanner.validate_token_bounds(invalid_token).is_err());
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let invalid_token = Token::new(0x02000000); // TypeDef with RID 0
+        assert!(scanner.validate_token_bounds(invalid_token).is_err());
 
-                if scanner.table_row_count(TableId::TypeDef) > 0 {
-                    let valid_token = Token::new(0x02000001); // TypeDef with RID 1
-                    assert!(scanner.validate_token_bounds(valid_token).is_ok());
-                }
+        if scanner.table_row_count(TableId::TypeDef) > 0 {
+            let valid_token = Token::new(0x02000001); // TypeDef with RID 1
+            assert!(scanner.validate_token_bounds(valid_token).is_ok());
+        }
 
-                let max_rid = scanner.table_row_count(TableId::TypeDef);
-                if max_rid > 0 {
-                    let out_of_bounds_token = Token::new(0x02000000 | (max_rid + 1));
-                    assert!(scanner.validate_token_bounds(out_of_bounds_token).is_err());
-                }
-            }
+        let max_rid = scanner.table_row_count(TableId::TypeDef);
+        if max_rid > 0 {
+            let out_of_bounds_token = Token::new(0x02000000 | (max_rid + 1));
+            assert!(scanner.validate_token_bounds(out_of_bounds_token).is_err());
         }
     }
 
     #[test]
     fn test_heap_size_analysis() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let heap_sizes = scanner.heap_sizes();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let heap_sizes = scanner.heap_sizes();
 
-                if view.strings().is_some() {
-                    assert!(
-                        heap_sizes.strings > 0,
-                        "String heap should have been analyzed"
-                    );
-                }
-            }
+        if view.strings().is_some() {
+            assert!(
+                heap_sizes.strings > 0,
+                "String heap should have been analyzed"
+            );
         }
     }
 
     #[test]
     fn test_scanner_statistics() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let stats = scanner.statistics();
-                let stats_string = stats.to_string();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let stats = scanner.statistics();
+        let stats_string = stats.to_string();
 
-                assert!(stats_string.contains("tokens"));
-                assert!(stats_string.contains("tables"));
-                assert!(stats_string.contains("references"));
-            }
-        }
+        assert!(stats_string.contains("tokens"));
+        assert!(stats_string.contains("tables"));
+        assert!(stats_string.contains("references"));
     }
 
     #[test]
     fn test_reference_analysis_basic_functionality() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let stats = scanner.statistics();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let stats = scanner.statistics();
 
-                // After implementing reference analysis, we should have actual references
-                // WindowsBase.dll is a substantial assembly that should contain many references
-                assert!(
-                    stats.total_references > 0,
-                    "Should find references in WindowsBase.dll"
-                );
+        // After implementing reference analysis, we should have actual references
+        // WindowsBase.dll is a substantial assembly that should contain many references
+        assert!(
+            stats.total_references > 0,
+            "Should find references in WindowsBase.dll"
+        );
 
-                // Test that the reference maps are populated
-                assert!(
-                    !scanner.forward_references.is_empty()
-                        || !scanner.backward_references.is_empty(),
-                    "Reference maps should be populated"
-                );
-            }
-        }
+        // Test that the reference maps are populated
+        assert!(
+            !scanner.forward_references.is_empty() || !scanner.backward_references.is_empty(),
+            "Reference maps should be populated"
+        );
     }
 
     #[test]
     fn test_typedef_inheritance_references() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                // Find TypeDef tokens that should have inheritance relationships
-                let mut _inheritance_found = false;
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        // Find TypeDef tokens that should have inheritance relationships
+        let mut _inheritance_found = false;
 
-                for typedef_token in scanner.valid_tokens.iter() {
-                    if typedef_token.is_table(TableId::TypeDef) {
-                        // TypeDef table
-                        if let Some(references) = scanner.references_from(*typedef_token) {
-                            if !references.is_empty() {
-                                _inheritance_found = true;
+        for typedef_token in scanner.valid_tokens.iter() {
+            if typedef_token.is_table(TableId::TypeDef) {
+                // TypeDef table
+                if let Some(references) = scanner.references_from(*typedef_token) {
+                    if !references.is_empty() {
+                        _inheritance_found = true;
 
-                                // Verify that the referenced tokens are valid
-                                for ref_token in references {
-                                    assert!(
-                                        scanner.token_exists(*ref_token),
-                                        "Referenced token should exist in metadata"
-                                    );
-                                }
-                            }
+                        // Verify that the referenced tokens are valid
+                        for ref_token in references {
+                            assert!(
+                                scanner.token_exists(*ref_token),
+                                "Referenced token should exist in metadata"
+                            );
                         }
                     }
                 }
-
-                // WindowsBase.dll should have at least some types with base types
-                if scanner.table_row_count(TableId::TypeDef) > 0 {
-                    // Note: Not all types have explicit base types (e.g., Object, interfaces)
-                    // so we don't assert inheritance_found, but we do verify the mechanism works
-                }
             }
+        }
+
+        // WindowsBase.dll should have at least some types with base types
+        if scanner.table_row_count(TableId::TypeDef) > 0 {
+            // Note: Not all types have explicit base types (e.g., Object, interfaces)
+            // so we don't assert inheritance_found, but we do verify the mechanism works
         }
     }
 
     #[test]
     fn test_interface_implementation_references() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                // Check InterfaceImpl table entries
-                let interface_impl_count = scanner.table_row_count(TableId::InterfaceImpl);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        // Check InterfaceImpl table entries
+        let interface_impl_count = scanner.table_row_count(TableId::InterfaceImpl);
 
-                if interface_impl_count > 0 {
-                    let mut impl_references_found = false;
+        if interface_impl_count > 0 {
+            let mut impl_references_found = false;
 
-                    // Look for InterfaceImpl tokens (0x09)
-                    for token in scanner.valid_tokens.iter() {
-                        if token.is_table(TableId::InterfaceImpl) {
-                            // InterfaceImpl table
-                            if let Some(references) = scanner.references_from(*token) {
-                                if !references.is_empty() {
-                                    impl_references_found = true;
+            // Look for InterfaceImpl tokens (0x09)
+            for token in scanner.valid_tokens.iter() {
+                if token.is_table(TableId::InterfaceImpl) {
+                    // InterfaceImpl table
+                    if let Some(references) = scanner.references_from(*token) {
+                        if !references.is_empty() {
+                            impl_references_found = true;
 
-                                    // Each InterfaceImpl should reference both class and interface
-                                    assert!(!references.is_empty(),
-                                        "InterfaceImpl should reference at least the implementing class");
+                            // Each InterfaceImpl should reference both class and interface
+                            assert!(
+                                !references.is_empty(),
+                                "InterfaceImpl should reference at least the implementing class"
+                            );
 
-                                    // Verify referenced tokens exist
-                                    for ref_token in references {
-                                        assert!(
-                                            scanner.token_exists(*ref_token),
-                                            "Referenced token should exist in metadata"
-                                        );
-                                    }
-                                }
+                            // Verify referenced tokens exist
+                            for ref_token in references {
+                                assert!(
+                                    scanner.token_exists(*ref_token),
+                                    "Referenced token should exist in metadata"
+                                );
                             }
                         }
                     }
-
-                    assert!(impl_references_found,
-                        "Should find interface implementation references when InterfaceImpl table exists");
                 }
             }
+
+            assert!(
+                impl_references_found,
+                "Should find interface implementation references when InterfaceImpl table exists"
+            );
         }
     }
 
     #[test]
     fn test_memberref_class_references() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let memberref_count = scanner.table_row_count(TableId::MemberRef);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let memberref_count = scanner.table_row_count(TableId::MemberRef);
 
-                if memberref_count > 0 {
-                    let mut memberref_references_found = false;
+        if memberref_count > 0 {
+            let mut memberref_references_found = false;
 
-                    // Look for MemberRef tokens (0x0A)
-                    for token in scanner.valid_tokens.iter() {
-                        if token.is_table(TableId::MemberRef) {
-                            // MemberRef table
-                            if let Some(references) = scanner.references_from(*token) {
-                                if !references.is_empty() {
-                                    memberref_references_found = true;
+            // Look for MemberRef tokens (0x0A)
+            for token in scanner.valid_tokens.iter() {
+                if token.is_table(TableId::MemberRef) {
+                    // MemberRef table
+                    if let Some(references) = scanner.references_from(*token) {
+                        if !references.is_empty() {
+                            memberref_references_found = true;
 
-                                    // Verify referenced tokens exist
-                                    for ref_token in references {
-                                        assert!(
-                                            scanner.token_exists(*ref_token),
-                                            "Referenced token should exist in metadata"
-                                        );
-                                    }
-                                }
+                            // Verify referenced tokens exist
+                            for ref_token in references {
+                                assert!(
+                                    scanner.token_exists(*ref_token),
+                                    "Referenced token should exist in metadata"
+                                );
                             }
                         }
                     }
-
-                    assert!(
-                        memberref_references_found,
-                        "Should find member reference relationships when MemberRef table exists"
-                    );
                 }
             }
+
+            assert!(
+                memberref_references_found,
+                "Should find member reference relationships when MemberRef table exists"
+            );
         }
     }
 
     #[test]
     fn test_customattribute_references() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let attr_count = scanner.table_row_count(TableId::CustomAttribute);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let attr_count = scanner.table_row_count(TableId::CustomAttribute);
 
-                if attr_count > 0 {
-                    let mut attr_references_found = false;
+        if attr_count > 0 {
+            let mut attr_references_found = false;
 
-                    // Look for CustomAttribute tokens (0x0C)
-                    for token in scanner.valid_tokens.iter() {
-                        if token.is_table(TableId::CustomAttribute) {
-                            // CustomAttribute table
-                            if let Some(references) = scanner.references_from(*token) {
-                                if !references.is_empty() {
-                                    attr_references_found = true;
+            // Look for CustomAttribute tokens (0x0C)
+            for token in scanner.valid_tokens.iter() {
+                if token.is_table(TableId::CustomAttribute) {
+                    // CustomAttribute table
+                    if let Some(references) = scanner.references_from(*token) {
+                        if !references.is_empty() {
+                            attr_references_found = true;
 
-                                    // Each CustomAttribute should reference both parent and constructor
-                                    // Verify referenced tokens exist
-                                    for ref_token in references {
-                                        assert!(
-                                            scanner.token_exists(*ref_token),
-                                            "Referenced token should exist in metadata"
-                                        );
-                                    }
-                                }
+                            // Each CustomAttribute should reference both parent and constructor
+                            // Verify referenced tokens exist
+                            for ref_token in references {
+                                assert!(
+                                    scanner.token_exists(*ref_token),
+                                    "Referenced token should exist in metadata"
+                                );
                             }
                         }
                     }
-
-                    assert!(
-                        attr_references_found,
-                        "Should find custom attribute references when CustomAttribute table exists"
-                    );
                 }
             }
+
+            assert!(
+                attr_references_found,
+                "Should find custom attribute references when CustomAttribute table exists"
+            );
         }
     }
 
     #[test]
     fn test_nested_class_references() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let nested_count = scanner.table_row_count(TableId::NestedClass);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let nested_count = scanner.table_row_count(TableId::NestedClass);
 
-                if nested_count > 0 {
-                    let mut nested_references_found = false;
+        if nested_count > 0 {
+            let mut nested_references_found = false;
 
-                    // Look for NestedClass tokens (0x29)
-                    for token in scanner.valid_tokens.iter() {
-                        if token.is_table(TableId::NestedClass) {
-                            // NestedClass table
-                            if let Some(references) = scanner.references_from(*token) {
-                                if !references.is_empty() {
-                                    nested_references_found = true;
+            // Look for NestedClass tokens (0x29)
+            for token in scanner.valid_tokens.iter() {
+                if token.is_table(TableId::NestedClass) {
+                    // NestedClass table
+                    if let Some(references) = scanner.references_from(*token) {
+                        if !references.is_empty() {
+                            nested_references_found = true;
 
-                                    // Each NestedClass should reference both nested and enclosing types
-                                    assert!(
-                                        references.len() >= 2,
-                                        "NestedClass should reference both nested and enclosing types"
-                                    );
+                            // Each NestedClass should reference both nested and enclosing types
+                            assert!(
+                                references.len() >= 2,
+                                "NestedClass should reference both nested and enclosing types"
+                            );
 
-                                    // Verify all references are TypeDef tokens
-                                    for ref_token in references {
-                                        assert!(
-                                            scanner.token_exists(*ref_token),
-                                            "Referenced token should exist in metadata"
-                                        );
-                                        assert!(
-                                            ref_token.is_table(TableId::TypeDef),
-                                            "NestedClass should only reference TypeDef tokens"
-                                        );
-                                    }
-                                }
+                            // Verify all references are TypeDef tokens
+                            for ref_token in references {
+                                assert!(
+                                    scanner.token_exists(*ref_token),
+                                    "Referenced token should exist in metadata"
+                                );
+                                assert!(
+                                    ref_token.is_table(TableId::TypeDef),
+                                    "NestedClass should only reference TypeDef tokens"
+                                );
                             }
                         }
                     }
-
-                    assert!(
-                        nested_references_found,
-                        "Should find nested class references when NestedClass table exists"
-                    );
                 }
             }
+
+            assert!(
+                nested_references_found,
+                "Should find nested class references when NestedClass table exists"
+            );
         }
     }
 
     #[test]
     fn test_generic_parameter_references() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let generic_param_count = scanner.table_row_count(TableId::GenericParam);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let generic_param_count = scanner.table_row_count(TableId::GenericParam);
 
-                if generic_param_count > 0 {
-                    let mut generic_references_found = false;
+        if generic_param_count > 0 {
+            let mut generic_references_found = false;
 
-                    // Look for GenericParam tokens (0x2A)
-                    for token in scanner.valid_tokens.iter() {
-                        if token.is_table(TableId::GenericParam) {
-                            // GenericParam table
-                            if let Some(references) = scanner.references_from(*token) {
-                                if !references.is_empty() {
-                                    generic_references_found = true;
+            // Look for GenericParam tokens (0x2A)
+            for token in scanner.valid_tokens.iter() {
+                if token.is_table(TableId::GenericParam) {
+                    // GenericParam table
+                    if let Some(references) = scanner.references_from(*token) {
+                        if !references.is_empty() {
+                            generic_references_found = true;
 
-                                    // Verify referenced tokens exist
-                                    for ref_token in references {
-                                        assert!(
-                                            scanner.token_exists(*ref_token),
-                                            "Referenced token should exist in metadata"
-                                        );
+                            // Verify referenced tokens exist
+                            for ref_token in references {
+                                assert!(
+                                    scanner.token_exists(*ref_token),
+                                    "Referenced token should exist in metadata"
+                                );
 
-                                        // Generic parameters should reference TypeDef or MethodDef
-                                        assert!(
-                                            ref_token.is_table(TableId::TypeDef)
-                                                || ref_token.is_table(TableId::MethodDef),
-                                            "GenericParam should reference TypeDef or MethodDef"
-                                        );
-                                    }
-                                }
+                                // Generic parameters should reference TypeDef or MethodDef
+                                assert!(
+                                    ref_token.is_table(TableId::TypeDef)
+                                        || ref_token.is_table(TableId::MethodDef),
+                                    "GenericParam should reference TypeDef or MethodDef"
+                                );
                             }
                         }
                     }
-
-                    if generic_param_count > 0 {
-                        // WindowsBase.dll should have generic parameters if the table exists
-                        assert!(generic_references_found,
-                            "Should find generic parameter references when GenericParam table exists");
-                    }
                 }
+            }
+
+            if generic_param_count > 0 {
+                // WindowsBase.dll should have generic parameters if the table exists
+                assert!(
+                    generic_references_found,
+                    "Should find generic parameter references when GenericParam table exists"
+                );
             }
         }
     }
 
     #[test]
     fn test_reference_bidirectionality() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                // Test that forward and backward references are consistent
-                for (to_token, from_tokens) in &scanner.forward_references {
-                    for from_token in from_tokens {
-                        let backward_refs = scanner.references_from(*from_token);
-                        assert!(
-                            backward_refs.is_some_and(|refs| refs.contains(to_token)),
-                            "Forward reference should have corresponding backward reference"
-                        );
-                    }
-                }
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        // Test that forward and backward references are consistent
+        for (to_token, from_tokens) in &scanner.forward_references {
+            for from_token in from_tokens {
+                let backward_refs = scanner.references_from(*from_token);
+                assert!(
+                    backward_refs.is_some_and(|refs| refs.contains(to_token)),
+                    "Forward reference should have corresponding backward reference"
+                );
+            }
+        }
 
-                for (from_token, to_tokens) in &scanner.backward_references {
-                    for to_token in to_tokens {
-                        let forward_refs = scanner.references_to(*to_token);
-                        assert!(
-                            forward_refs.is_some_and(|refs| refs.contains(from_token)),
-                            "Backward reference should have corresponding forward reference"
-                        );
-                    }
-                }
+        for (from_token, to_tokens) in &scanner.backward_references {
+            for to_token in to_tokens {
+                let forward_refs = scanner.references_to(*to_token);
+                assert!(
+                    forward_refs.is_some_and(|refs| refs.contains(from_token)),
+                    "Backward reference should have corresponding forward reference"
+                );
             }
         }
     }
 
     #[test]
     fn test_can_delete_token_functionality() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let stats = scanner.statistics();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let stats = scanner.statistics();
 
-                if stats.total_references > 0 {
-                    // Find a token that is referenced by others (should not be deletable)
-                    let mut found_non_deletable = false;
-                    let mut found_deletable = false;
+        if stats.total_references > 0 {
+            // Find a token that is referenced by others (should not be deletable)
+            let mut found_non_deletable = false;
+            let mut found_deletable = false;
 
-                    for token in scanner.valid_tokens.iter().take(100) {
-                        // Sample first 100 tokens
-                        let can_delete = scanner.can_delete_token(*token);
-                        let has_incoming_refs = scanner.has_references_to(*token);
+            for token in scanner.valid_tokens.iter().take(100) {
+                // Sample first 100 tokens
+                let can_delete = scanner.can_delete_token(*token);
+                let has_incoming_refs = scanner.has_references_to(*token);
 
-                        if has_incoming_refs {
-                            // Token is referenced by others, should not be deletable
-                            assert!(
-                                !can_delete,
-                                "Token with incoming references should not be deletable"
-                            );
-                            found_non_deletable = true;
-                        } else {
-                            // Token has no incoming references, should be deletable
-                            assert!(
-                                can_delete,
-                                "Token with no incoming references should be deletable"
-                            );
-                            found_deletable = true;
-                        }
-                    }
-
-                    // We should find examples of both deletable and non-deletable tokens
-                    // in a substantial assembly like WindowsBase.dll
-                    assert!(found_deletable, "Should find some deletable tokens");
-                    assert!(found_non_deletable, "Should find some non-deletable tokens");
+                if has_incoming_refs {
+                    // Token is referenced by others, should not be deletable
+                    assert!(
+                        !can_delete,
+                        "Token with incoming references should not be deletable"
+                    );
+                    found_non_deletable = true;
+                } else {
+                    // Token has no incoming references, should be deletable
+                    assert!(
+                        can_delete,
+                        "Token with no incoming references should be deletable"
+                    );
+                    found_deletable = true;
                 }
             }
+
+            // We should find examples of both deletable and non-deletable tokens
+            // in a substantial assembly like WindowsBase.dll
+            assert!(found_deletable, "Should find some deletable tokens");
+            assert!(found_non_deletable, "Should find some non-deletable tokens");
         }
     }
 
     #[test]
     fn test_reference_validation_prevents_invalid_references() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(mut scanner) = ReferenceScanner::from_view(&view) {
-                let initial_ref_count = scanner.statistics().total_references;
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let initial_ref_count = scanner.statistics().total_references;
 
-                // Test self-reference prevention
-                let test_token = Token::new(0x02000001);
-                scanner.add_reference(test_token, test_token);
+        // Test self-reference prevention
+        let test_token = Token::new(0x02000001);
+        scanner.add_reference(test_token, test_token);
 
-                // Test null token prevention
-                scanner.add_reference(Token::new(0), test_token);
-                scanner.add_reference(test_token, Token::new(0));
+        // Test null token prevention
+        scanner.add_reference(Token::new(0), test_token);
+        scanner.add_reference(test_token, Token::new(0));
 
-                // Reference count should not have increased
-                let final_ref_count = scanner.statistics().total_references;
-                assert_eq!(
-                    initial_ref_count, final_ref_count,
-                    "Invalid references should be prevented"
-                );
-            }
-        }
+        // Reference count should not have increased
+        let final_ref_count = scanner.statistics().total_references;
+        assert_eq!(
+            initial_ref_count, final_ref_count,
+            "Invalid references should be prevented"
+        );
     }
 
     #[test]
     fn test_comprehensive_reference_coverage() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let stats = scanner.statistics();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let stats = scanner.statistics();
 
-                // WindowsBase.dll should have substantial reference relationships
-                // if our implementation is working correctly
-                println!("Reference analysis results:");
-                println!("  Total tokens: {}", stats.total_tokens);
-                println!("  Total tables: {}", stats.total_tables);
-                println!("  Total references: {}", stats.total_references);
+        // WindowsBase.dll should have substantial reference relationships
+        // if our implementation is working correctly
+        println!("Reference analysis results:");
+        println!("  Total tokens: {}", stats.total_tokens);
+        println!("  Total tables: {}", stats.total_tables);
+        println!("  Total references: {}", stats.total_references);
 
-                // Basic sanity checks
-                assert!(
-                    stats.total_tokens > 1000,
-                    "WindowsBase.dll should have many tokens"
-                );
-                assert!(
-                    stats.total_tables > 10,
-                    "WindowsBase.dll should have many tables"
-                );
+        // Basic sanity checks
+        assert!(
+            stats.total_tokens > 1000,
+            "WindowsBase.dll should have many tokens"
+        );
+        assert!(
+            stats.total_tables > 10,
+            "WindowsBase.dll should have many tables"
+        );
 
-                // After implementing reference analysis, we should have references
-                // The exact number will depend on the assembly, but it should be substantial
-                if stats.total_references == 0 {
-                    println!("Warning: No references found - implementation may need debugging");
-                }
-            }
+        // After implementing reference analysis, we should have references
+        // The exact number will depend on the assembly, but it should be substantial
+        if stats.total_references == 0 {
+            println!("Warning: No references found - implementation may need debugging");
         }
     }
 }

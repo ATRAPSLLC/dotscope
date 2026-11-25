@@ -6,7 +6,7 @@
 //!
 //! # Usage Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::prelude::*;
 //!
 //! # let view = CilAssemblyView::from_path(std::path::Path::new("a.dll")).unwrap();
@@ -15,6 +15,7 @@
 //! let encmap_token = EncMapBuilder::new()
 //!     .original_token(0x06000001)    // MethodDef token before editing
 //!     .build(&mut assembly)?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use crate::{
@@ -44,8 +45,11 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```
 /// use dotscope::prelude::*;
+/// # use std::path::Path;
+/// # let view = CilAssemblyView::from_path(Path::new("tests/samples/crafted_2.exe"))?;
+/// # let mut assembly = CilAssembly::new(view);
 ///
 /// // Map original method token
 /// let method_map = EncMapBuilder::new()
@@ -61,6 +65,7 @@ use crate::{
 /// let field_map = EncMapBuilder::new()
 ///     .original_token(0x04000025)  // Original Field token
 ///     .build(&mut assembly)?;
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct EncMapBuilder {
@@ -162,7 +167,7 @@ impl EncMapBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use dotscope::prelude::*;
     ///
     /// # let view = CilAssemblyView::from_path(std::path::Path::new("a.dll")).unwrap();
@@ -170,6 +175,7 @@ impl EncMapBuilder {
     /// let token = EncMapBuilder::new()
     ///     .original_token(0x06000001)
     ///     .build(&mut assembly)?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {
         let original_token = self.original_token.ok_or_else(|| {
@@ -200,7 +206,7 @@ impl Default for EncMapBuilder {
 mod tests {
     use super::*;
     use crate::{
-        cilassembly::ChangeRefKind, test::factories::table::assemblyref::get_test_assembly,
+        cilassembly::ChangeRefKind, testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

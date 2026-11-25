@@ -439,7 +439,7 @@ mod tests {
             token::Token,
             typesystem::{CilFlavor, PointerSize},
         },
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     fn ctx<'a>(

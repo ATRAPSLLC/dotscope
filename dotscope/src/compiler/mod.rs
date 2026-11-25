@@ -50,6 +50,8 @@
 
 mod codegen;
 mod context;
+#[cfg(test)]
+mod differential;
 mod host;
 mod pass;
 mod passes;
@@ -58,7 +60,7 @@ mod state;
 mod summary;
 
 pub use analyssa::events::{DerivedStats, EventKind, EventListener, NullListener};
-pub use codegen::{CompilationResult, SsaCodeGenerator};
+pub use codegen::{validate_lift, CompilationResult, SsaCodeGenerator};
 pub use context::CompilerContext;
 
 use crate::analysis::CilTarget;
@@ -78,9 +80,10 @@ pub use pass::{
 pub use passes::{
     AlgebraicSimplificationPass, BlockMergingPass, ConstantPropagationPass,
     ControlFlowSimplificationPass, CopyPropagationPass, DeadCodeEliminationPass,
-    DeadMethodEliminationPass, GlobalValueNumberingPass, InliningPass, JumpThreadingPass, LicmPass,
-    LoopCanonicalizationPass, MemoryOptimizationPass, OpaquePredicatePass, PredicateResult,
-    ProxyDevirtualizationPass, ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
+    DeadMethodEliminationPass, ForwardKind, GlobalValueNumberingPass, InliningPass,
+    JumpThreadingPass, LicmPass, LoopCanonicalizationPass, MemoryOptimizationPass,
+    OpaquePredicatePass, PredicateResult, ProxyArgSource, ProxyDevirtualizationPass,
+    ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
 };
 pub use scheduler::PassScheduler;
 pub use state::ProcessingState;

@@ -40,6 +40,10 @@ use crate::{
 };
 
 impl RowWritable for GenericParamRaw {
+    fn sort_key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.owner.encode(sizes)?, self.number)))
+    }
+
     /// Serialize a GenericParam table row to binary format
     ///
     /// Writes the row data according to ECMA-335 §II.22.20 specification:
@@ -81,11 +85,7 @@ impl RowWritable for GenericParamRaw {
         )?;
 
         // Write TypeOrMethodDef coded index for owner
-        let owner_value = sizes.encode_coded_index(
-            self.owner.tag,
-            self.owner.row,
-            CodedIndexType::TypeOrMethodDef,
-        )?;
+        let owner_value = self.owner.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

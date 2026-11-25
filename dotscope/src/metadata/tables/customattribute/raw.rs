@@ -26,17 +26,12 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! # use dotscope::metadata::tables::customattribute::CustomAttributeRaw;
-//! # use dotscope::metadata::streams::Blob;
-//! # fn example(raw: CustomAttributeRaw, blob: &Blob) -> dotscope::Result<()> {
+//! ```text
 //! // Convert to owned representation with resolved references
-//! let owned = raw.to_owned(|coded_index| context.get_ref(coded_index), blob)?;
+//! let owned = raw.to_owned(|coded_index| context.get_ref(coded_index), blob, context.types)?;
 //!
 //! // Apply the custom attribute to its parent element
 //! owned.apply()?;
-//! # Ok(())
-//! # }
 //! ```
 //!
 //! # Error Handling
@@ -71,14 +66,11 @@ use std::sync::Arc;
 
 use crate::{
     metadata::{
-        customattributes::{
-            parse_custom_attribute_blob, parse_custom_attribute_blob_with_registry,
-            CustomAttributeValue,
-        },
+        customattributes::{parse_custom_attribute_blob_with_registry, CustomAttributeValue},
         streams::Blob,
         tables::{
             CodedIndex, CodedIndexType, CustomAttribute, CustomAttributeRc, MemberRefSignature,
-            TableInfoRef, TableRow,
+            Param, TableInfoRef, TableRow,
         },
         token::Token,
         typesystem::{CilTypeReference, TypeRegistry},
@@ -158,6 +150,7 @@ impl CustomAttributeRaw {
     /// * `get_ref` - A closure that resolves coded indexes to [`CilTypeReference`] objects.
     ///   This function should handle all coded index types used by custom attributes.
     /// * `blob` - The blob heap containing the serialized custom attribute value data
+    /// * `type_registry` - The type registry the constructor's parameter types resolve in
     ///
     /// # Returns
     ///
@@ -182,7 +175,7 @@ impl CustomAttributeRaw {
         &self,
         get_ref: F,
         blob: &Blob,
-        type_registry: Option<&Arc<TypeRegistry>>,
+        type_registry: &Arc<TypeRegistry>,
     ) -> Result<CustomAttributeRc>
     where
         F: Fn(&CodedIndex) -> CilTypeReference,
@@ -251,19 +244,15 @@ impl CustomAttributeRaw {
             }
         } else {
             match &constructor_ref {
+                // The fixed arguments follow the constructor's signature, not its Param rows: a
+                // parameter need not have a row (ECMA-335 §22.33), and still takes an argument.
                 CilTypeReference::MethodDef(method_ref) => match method_ref.upgrade() {
-                    Some(constructor) => {
-                        if let Some(registry) = type_registry {
-                            parse_custom_attribute_blob_with_registry(
-                                blob,
-                                self.value,
-                                &constructor.params,
-                                registry,
-                            )?
-                        } else {
-                            parse_custom_attribute_blob(blob, self.value, &constructor.params)?
-                        }
-                    }
+                    Some(constructor) => parse_custom_attribute_blob_with_registry(
+                        blob,
+                        self.value,
+                        &Param::from_signature(&constructor.signature, type_registry)?,
+                        type_registry,
+                    )?,
                     None => CustomAttributeValue {
                         fixed_args: vec![],
                         named_args: vec![],
@@ -272,18 +261,12 @@ impl CustomAttributeRaw {
                     },
                 },
                 CilTypeReference::MemberRef(member_ref) => match &member_ref.signature {
-                    MemberRefSignature::Method(_method_sig) => {
-                        if let Some(registry) = type_registry {
-                            parse_custom_attribute_blob_with_registry(
-                                blob,
-                                self.value,
-                                &member_ref.params,
-                                registry,
-                            )?
-                        } else {
-                            parse_custom_attribute_blob(blob, self.value, &member_ref.params)?
-                        }
-                    }
+                    MemberRefSignature::Method(_) => parse_custom_attribute_blob_with_registry(
+                        blob,
+                        self.value,
+                        &member_ref.params,
+                        type_registry,
+                    )?,
                     MemberRefSignature::Field(_) => CustomAttributeValue {
                         fixed_args: vec![],
                         named_args: vec![],

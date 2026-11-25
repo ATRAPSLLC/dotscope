@@ -40,7 +40,7 @@ use crate::{
 /// Findings from CFF detection.
 ///
 /// Contains the pre-computed dispatcher analysis for each method where CFF
-/// was detected. The [`CffReconstructionPass`](crate::deobfuscation::passes::CffReconstructionPass)
+/// was detected. The [`CffReconstructionPass`]
 /// can consume these directly instead of re-running detection.
 #[derive(Debug)]
 pub struct FlatteningFindings {
@@ -76,14 +76,11 @@ impl Technique for GenericFlattening {
         Detection::new_empty()
     }
 
-    fn detect_ssa(&self, ctx: &AnalysisContext, _assembly: &CilObject) -> Detection {
-        // Detection is the only consumer of these thresholds, so build them from
-        // the engine configuration here rather than defaulting and discarding
-        // what the caller asked for.
+    fn detect_ssa(&self, ctx: &AnalysisContext, assembly: &CilObject) -> Detection {
+        // The engine's configuration, on the machine the assembly computes on.
         let config = UnflattenConfig {
-            max_backedge_depth: ctx.config.unflattening.max_backedge_depth,
-            confidence_weights: ctx.config.unflattening.confidence_weights.clone(),
-            ..UnflattenConfig::default()
+            machine: CilTarget::of(assembly).machine(),
+            ..ctx.config.unflattening.clone()
         };
         let min_confidence = config.min_confidence;
         let mut dispatchers_by_method: HashMap<Token, Vec<Dispatcher>> = HashMap::new();
@@ -162,7 +159,7 @@ impl Technique for GenericFlattening {
 
 #[cfg(test)]
 mod tests {
-    use crate::{deobfuscation::techniques::Technique, test::helpers::load_sample};
+    use crate::{deobfuscation::techniques::Technique, testkit::helpers::load_sample};
 
     /// Verify that IL-level detect() is a no-op (detection is SSA-based).
     ///
@@ -170,7 +167,7 @@ mod tests {
     /// tests and through `engine.detect()` which runs both IL + SSA phases.
     #[test]
     fn test_detect_is_noop() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_controlflow.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/mkaring_controlflow.exe");
         let technique = super::GenericFlattening;
         let detection = technique.detect(&asm);
         assert!(
@@ -181,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
         let technique = super::GenericFlattening;
         let detection = technique.detect(&asm);
         assert!(!detection.is_detected());

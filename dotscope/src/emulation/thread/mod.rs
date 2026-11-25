@@ -29,19 +29,38 @@
 //!
 //! # Usage
 //!
-//! ```ignore
-//! use dotscope::emulation::thread::{EmulationThread, ThreadScheduler, ThreadState};
+//! ```
+//! use dotscope::emulation::EmulationThread;
+//! use dotscope::emulation::ThreadScheduler;
+//! # use std::sync::{Arc, RwLock};
+//! # use dotscope::emulation::{
+//! #     AddressSpace, CaptureContext, EmulationConfig, RuntimeState, SharedFakeObjects,
+//! #     ThreadContext, VirtualFs,
+//! # };
+//! # let address_space = Arc::new(AddressSpace::new());
+//! # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+//! # let context = Arc::new(ThreadContext::new(
+//! #     address_space,
+//! #     Arc::new(RwLock::new(RuntimeState::new())),
+//! #     Arc::new(CaptureContext::new()),
+//! #     Arc::new(EmulationConfig::default()),
+//! #     None,
+//! #     fake_objects,
+//! #     Arc::new(VirtualFs::new()),
+//! # ));
 //!
 //! // Create a scheduler with 1000 instructions per time quantum
 //! let mut scheduler = ThreadScheduler::new(1000);
 //!
 //! // Add the main thread
+//! let main_thread = EmulationThread::main(context);
 //! scheduler.add_main_thread(main_thread);
 //!
 //! // Run until completion or limit reached
 //! while let Some(thread_id) = scheduler.select_next() {
-//!     // Execute instructions for the current thread
-//!     // ...
+//!     // Execute instructions for the current thread: here it returns at once
+//!     println!("running {}", thread_id);
+//!     scheduler.complete_current(None);
 //! }
 //! ```
 //!

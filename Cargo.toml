@@ -18,3 +18,17 @@ opt-level = 3
 [profile.release]
 lto = "fat"
 opt-level = 3
+
+# Test profile: release optimisation with the debug-only invariants switched on.
+#
+# The sample-driven integration tests need opt-level 3 (unoptimised they take hours), but
+# `[profile.release]` turns off debug assertions and overflow checks, so tests run there
+# never see an overflow or a `debug_assert!`. Fat LTO is dropped as well: it buys nothing
+# for a test run and costs a whole-crate link per test binary.
+[profile.ci-test]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug-assertions = true
+overflow-checks = true
+incremental = true

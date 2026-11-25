@@ -1,0 +1,5 @@
+{
+  "Protections": [
+    { "Name": "BitDotNet", "Enabled": true }
+  ]
+}

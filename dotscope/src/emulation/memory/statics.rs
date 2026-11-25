@@ -26,7 +26,7 @@
 //! [`is_type_initialized`](StaticFieldStorage::is_type_initialized) and
 //! [`mark_type_initialized`](StaticFieldStorage::mark_type_initialized).
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use imbl::HashMap as ImHashMap;
 
@@ -93,8 +93,10 @@ pub enum TypeInitState {
 #[derive(Debug)]
 pub struct StaticFieldStorage {
     /// Static fields indexed by field token.
-    /// Uses imbl::HashMap for O(1) fork via structural sharing.
-    fields: RwLock<ImHashMap<Token, EmValue>>,
+    /// Uses imbl::HashMap for O(1) fork via structural sharing. Each value sits behind an
+    /// `Arc`, so the first write after a fork copies the map node it lies in without copying
+    /// the values beside it (a value type's fields among them).
+    fields: RwLock<ImHashMap<Token, Arc<EmValue>>>,
 
     /// Tracks type initialization state using a three-state model.
     /// Uses imbl::HashMap for O(1) fork via structural sharing.
@@ -131,7 +133,7 @@ impl StaticFieldStorage {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "static field storage",
             })?;
-        Ok(fields.get(&field_token).cloned())
+        Ok(fields.get(&field_token).map(|value| EmValue::clone(value)))
     }
 
     /// Sets a static field value.
@@ -153,7 +155,7 @@ impl StaticFieldStorage {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "static field storage",
             })?;
-        fields.insert(field_token, value);
+        fields.insert(field_token, Arc::new(value));
         Ok(())
     }
 
@@ -196,7 +198,7 @@ impl StaticFieldStorage {
             .map_err(|_| EmulationError::LockPoisoned {
                 description: "static field storage",
             })?;
-        Ok(fields.remove(&field_token))
+        Ok(fields.remove(&field_token).map(Arc::unwrap_or_clone))
     }
 
     /// Returns `true` if the type's static constructor has been run or is currently running.

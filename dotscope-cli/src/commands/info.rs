@@ -61,11 +61,15 @@ pub fn run(path: &Path, opts: &GlobalOptions) -> anyhow::Result<()> {
                     .as_ref()
                     .filter(|k| !k.is_empty())
                     .map(|k| format_public_key(k));
-                let cult = asm.culture.as_ref().filter(|c| !c.is_empty()).cloned();
+                let cult = asm
+                    .culture
+                    .as_ref()
+                    .filter(|c| !c.is_empty())
+                    .map(ToString::to_string);
                 let hash_alg = Some(asm.hash_alg_id.to_string());
                 let flags = Some(asm.flags.to_string());
                 (
-                    Some(asm.name.clone()),
+                    Some(asm.name.to_string()),
                     Some(format!(
                         "{}.{}.{}.{}",
                         asm.major_version, asm.minor_version, asm.build_number, asm.revision_number
@@ -79,7 +83,7 @@ pub fn run(path: &Path, opts: &GlobalOptions) -> anyhow::Result<()> {
             None => (None, None, None, None, None, None),
         };
 
-    let module_name = assembly.module().map(|m| m.name.clone());
+    let module_name = assembly.module().map(|m| m.name.to_string());
 
     let file = assembly.file();
     let machine = file.header().machine.to_string();
@@ -101,7 +105,7 @@ pub fn run(path: &Path, opts: &GlobalOptions) -> anyhow::Result<()> {
         .map(|entry| {
             let aref = entry.value();
             AssemblyRefInfo {
-                name: aref.name.clone(),
+                name: aref.name.to_string(),
                 version: format!(
                     "{}.{}.{}.{}",
                     aref.major_version, aref.minor_version, aref.build_number, aref.revision_number

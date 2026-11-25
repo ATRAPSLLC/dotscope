@@ -44,13 +44,13 @@ pub struct SyntheticMethodBody {
 
 /// Context for emulation providing access to assembly metadata.
 ///
-/// The emulation context wraps a [`CilObject`](crate::CilObject) and provides convenient
+/// The emulation context wraps a [`CilObject`] and provides convenient
 /// access to methods, instructions, and strings needed during emulation.
 pub struct EmulationContext {
     /// The loaded assembly.
-    pub(crate) assembly: Arc<CilObject>,
+    pub assembly: Arc<CilObject>,
     /// Synthetic method bodies created by DynamicMethod/ILGenerator.
-    pub(crate) synthetic_methods: Arc<DashMap<Token, SyntheticMethodBody>>,
+    pub synthetic_methods: Arc<DashMap<Token, SyntheticMethodBody>>,
     /// Offset-indexed method bodies, decoded once per method token.
     ///
     /// Shared so that contexts recreated for the same assembly (e.g. per-frame
@@ -58,7 +58,7 @@ pub struct EmulationContext {
     /// Only non-synthetic, non-empty bodies are cached — synthetic bodies can be
     /// mutated at runtime by `ILGenerator`, and an empty body may simply mean the
     /// decoder has not populated blocks yet.
-    pub(crate) code_cache: Arc<DashMap<Token, Arc<MethodCode>>>,
+    pub code_cache: Arc<DashMap<Token, Arc<MethodCode>>>,
 }
 
 impl EmulationContext {

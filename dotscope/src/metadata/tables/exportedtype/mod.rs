@@ -16,12 +16,12 @@
 //!
 //! - **Raw Representation**: [`crate::metadata::tables::exportedtype::raw::ExportedTypeRaw`] - Direct binary table format with unresolved indexes
 //! - **Owned Data**: [`crate::metadata::tables::exportedtype::owned::ExportedType`] - Resolved entries with owned data and cross-references  
-//! - **Loading Infrastructure**: [`crate::metadata::tables::exportedtype::loader::ExportedTypeLoader`] - Processes raw entries during metadata loading
+//! - **Loading Infrastructure**: [`crate::metadata::loader::tables::ExportedTypeLoader`] - Processes raw entries during metadata loading
 //! - **Type Aliases**: Collection types for managing `ExportedType` entries efficiently
 //!
 //! # Integration
 //!
-//! - Raw entries are processed by [`crate::metadata::tables::exportedtype::loader::ExportedTypeLoader`] during metadata loading
+//! - Raw entries are processed by [`crate::metadata::loader::tables::ExportedTypeLoader`] during metadata loading
 //! - Integrates with [`crate::metadata::streams::Strings`] for name resolution
 //! - References [`crate::metadata::tables::file`] and [`crate::metadata::tables::assemblyref`] tables for implementation resolution
 //! # `ExportedType` Table Structure
@@ -53,14 +53,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

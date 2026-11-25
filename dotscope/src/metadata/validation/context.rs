@@ -27,16 +27,14 @@
 //! use dotscope::metadata::validation::{RawValidationContext, ValidationContext, ValidationConfig, ReferenceScanner};
 //! use dotscope::metadata::cilassemblyview::CilAssemblyView;
 //! use std::path::Path;
-//! use rayon::ThreadPoolBuilder;
 //!
 //! # let path = Path::new("assembly.dll");
 //! let view = CilAssemblyView::from_path(&path)?;
 //! let scanner = ReferenceScanner::from_view(&view)?;
 //! let config = ValidationConfig::production();
-//! let thread_pool = ThreadPoolBuilder::new().build().unwrap();
 //!
 //! // Create raw validation context for loading
-//! let context = RawValidationContext::new_for_loading(&view, &scanner, &config, &thread_pool);
+//! let context = RawValidationContext::new_for_loading(&view, &scanner, &config);
 //! assert!(context.is_loading_validation());
 //! # Ok::<(), dotscope::Error>(())
 //! ```
@@ -55,7 +53,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use rayon::ThreadPool;
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -65,7 +62,7 @@ use crate::{
         cilobject::CilObject,
         method::Method,
         token::Token,
-        typesystem::{CilTypeRc, TypeSource},
+        typesystem::{CilTypeRc, TypeRegistry, TypeSource},
         validation::{config::ValidationConfig, scanner::ReferenceScanner},
     },
 };
@@ -156,16 +153,14 @@ pub trait ValidationContext {
 /// use dotscope::metadata::validation::{RawValidationContext, ValidationConfig, ReferenceScanner};
 /// use dotscope::metadata::cilassemblyview::CilAssemblyView;
 /// use std::path::Path;
-/// use rayon::ThreadPoolBuilder;
 ///
 /// # let path = Path::new("assembly.dll");
 /// let view = CilAssemblyView::from_path(&path)?;
 /// let scanner = ReferenceScanner::from_view(&view)?;
 /// let config = ValidationConfig::minimal();
-/// let thread_pool = ThreadPoolBuilder::new().build().unwrap();
 ///
 /// // Create context for loading validation
-/// let context = RawValidationContext::new_for_loading(&view, &scanner, &config, &thread_pool);
+/// let context = RawValidationContext::new_for_loading(&view, &scanner, &config);
 /// assert!(context.is_loading_validation());
 /// # Ok::<(), dotscope::Error>(())
 /// ```
@@ -182,8 +177,6 @@ pub struct RawValidationContext<'a> {
     scanner: &'a ReferenceScanner,
     /// Validation configuration
     config: &'a ValidationConfig,
-    /// Dedicated thread pool for this validation session
-    thread_pool: &'a ThreadPool,
 }
 
 impl<'a> RawValidationContext<'a> {
@@ -208,15 +201,13 @@ impl<'a> RawValidationContext<'a> {
     /// use dotscope::metadata::validation::{RawValidationContext, ValidationConfig, ReferenceScanner};
     /// use dotscope::metadata::cilassemblyview::CilAssemblyView;
     /// use std::path::Path;
-    /// use rayon::ThreadPoolBuilder;
     ///
     /// # let path = Path::new("assembly.dll");
     /// let view = CilAssemblyView::from_path(&path)?;
     /// let scanner = ReferenceScanner::from_view(&view)?;
     /// let config = ValidationConfig::production();
-    /// let thread_pool = ThreadPoolBuilder::new().build().unwrap();
     ///
-    /// let context = RawValidationContext::new_for_loading(&view, &scanner, &config, &thread_pool);
+    /// let context = RawValidationContext::new_for_loading(&view, &scanner, &config);
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
@@ -224,14 +215,12 @@ impl<'a> RawValidationContext<'a> {
         view: &'a CilAssemblyView,
         scanner: &'a ReferenceScanner,
         config: &'a ValidationConfig,
-        thread_pool: &'a ThreadPool,
     ) -> Self {
         Self {
             view,
             changes: None,
             scanner,
             config,
-            thread_pool,
         }
     }
 
@@ -255,14 +244,12 @@ impl<'a> RawValidationContext<'a> {
         changes: &'a AssemblyChanges,
         scanner: &'a ReferenceScanner,
         config: &'a ValidationConfig,
-        thread_pool: &'a ThreadPool,
     ) -> Self {
         Self {
             view,
             changes: Some(changes),
             scanner,
             config,
-            thread_pool,
         }
     }
 
@@ -307,19 +294,6 @@ impl<'a> RawValidationContext<'a> {
     #[must_use]
     pub fn assembly_view(&self) -> &CilAssemblyView {
         self.view
-    }
-
-    /// Returns a reference to the dedicated thread pool for this validation session.
-    ///
-    /// This thread pool should be used for all parallel operations within validators
-    /// to avoid interference with other concurrent validation sessions.
-    ///
-    /// # Returns
-    ///
-    /// Returns a reference to the [`ThreadPool`] for this validation session.
-    #[must_use]
-    pub fn thread_pool(&self) -> &ThreadPool {
-        self.thread_pool
     }
 }
 
@@ -549,8 +523,6 @@ pub struct OwnedValidationContext<'a> {
     config: &'a ValidationConfig,
     /// Lazy cache for expensive computations shared across validators
     cache: ValidationCache,
-    /// Dedicated thread pool for this validation session
-    thread_pool: &'a ThreadPool,
 }
 
 impl<'a> OwnedValidationContext<'a> {
@@ -561,7 +533,6 @@ impl<'a> OwnedValidationContext<'a> {
     /// * `object` - The CilObject containing both raw and resolved metadata
     /// * `scanner` - Shared reference scanner
     /// * `config` - Validation configuration
-    /// * `thread_pool` - Dedicated thread pool for parallel validation
     ///
     /// # Caching
     ///
@@ -571,14 +542,12 @@ impl<'a> OwnedValidationContext<'a> {
         object: &'a CilObject,
         scanner: &'a ReferenceScanner,
         config: &'a ValidationConfig,
-        thread_pool: &'a ThreadPool,
     ) -> Self {
         Self {
             object,
             scanner,
             config,
             cache: ValidationCache::new(),
-            thread_pool,
         }
     }
 
@@ -590,22 +559,43 @@ impl<'a> OwnedValidationContext<'a> {
     pub fn object(&self) -> &CilObject {
         self.object
     }
+}
 
-    /// Returns a reference to the dedicated thread pool for this validation session.
-    ///
-    /// This thread pool should be used for all parallel operations within validators
-    /// to avoid interference with other concurrent validation sessions.
-    ///
-    /// # Returns
-    ///
-    /// Returns a reference to the [`ThreadPool`] for this validation session.
-    #[must_use]
-    pub fn thread_pool(&self) -> &ThreadPool {
-        self.thread_pool
+/// Receives the tokens a signature names, in order, and keeps the first the type system
+/// does not hold ([`OwnedValidationContext::unresolved_type`]).
+pub struct FirstUnresolved<'a> {
+    /// The type system the tokens are looked up in
+    types: &'a TypeRegistry,
+    /// The first token it does not hold, once one arrived
+    found: Option<Token>,
+}
+
+impl Extend<Token> for FirstUnresolved<'_> {
+    fn extend<I: IntoIterator<Item = Token>>(&mut self, tokens: I) {
+        for token in tokens {
+            if self.found.is_none() && self.types.get(&token).is_none() {
+                self.found = Some(token);
+            }
+        }
     }
 }
 
 impl OwnedValidationContext<'_> {
+    /// The first type a signature names that this assembly's type system does not hold: a
+    /// TypeDef, TypeRef or TypeSpec token no loaded row answers. `names` adds the signature's
+    /// tokens (a `type_tokens` method of the signature types), which are checked as they
+    /// arrive: a signature is checked for every method and parameter, and collecting its
+    /// tokens first cost an allocation each.
+    pub fn unresolved_type(&self, names: impl FnOnce(&mut FirstUnresolved<'_>)) -> Option<Token> {
+        let types = self.object.types();
+        let mut first = FirstUnresolved {
+            types: &types,
+            found: None,
+        };
+        names(&mut first);
+        first.found
+    }
+
     /// Get types that belong to the assembly being validated (cached).
     ///
     /// This method returns only the types that should be validated for the current assembly,
@@ -679,14 +669,20 @@ impl OwnedValidationContext<'_> {
     ///
     /// # Usage
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use dotscope::metadata::typesystem::CilTypeRc;
+    /// # use dotscope::metadata::validation::OwnedValidationContext;
+    /// # fn example(context: &OwnedValidationContext<'_>, some_type: CilTypeRc) {
     /// let mapping = context.method_type_mapping();
     /// let type_addr = Arc::as_ptr(&some_type) as usize;
     /// for &method_addr in mapping.get_type_methods(type_addr) {
     ///     if let Some(method) = mapping.get_method(method_addr) {
     ///         // Use method...
+    ///         println!("{}", method.name);
     ///     }
     /// }
+    /// # }
     /// ```
     pub fn method_type_mapping(&self) -> &MethodTypeMapping {
         self.cache
@@ -788,7 +784,6 @@ impl ValidationContext for OwnedValidationContext<'_> {
 
 /// Factory functions for creating validation contexts.
 pub mod factory {
-    use rayon::ThreadPool;
 
     use super::{
         AssemblyChanges, CilAssemblyView, CilObject, OwnedValidationContext, RawValidationContext,
@@ -800,9 +795,8 @@ pub mod factory {
         view: &'a CilAssemblyView,
         scanner: &'a ReferenceScanner,
         config: &'a ValidationConfig,
-        thread_pool: &'a ThreadPool,
     ) -> RawValidationContext<'a> {
-        RawValidationContext::new_for_loading(view, scanner, config, thread_pool)
+        RawValidationContext::new_for_loading(view, scanner, config)
     }
 
     /// Creates a raw validation context for modification validation.
@@ -811,9 +805,8 @@ pub mod factory {
         changes: &'a AssemblyChanges,
         scanner: &'a ReferenceScanner,
         config: &'a ValidationConfig,
-        thread_pool: &'a ThreadPool,
     ) -> RawValidationContext<'a> {
-        RawValidationContext::new_for_modification(view, changes, scanner, config, thread_pool)
+        RawValidationContext::new_for_modification(view, changes, scanner, config)
     }
 
     /// Creates an owned validation context.
@@ -821,82 +814,65 @@ pub mod factory {
         object: &'a CilObject,
         scanner: &'a ReferenceScanner,
         config: &'a ValidationConfig,
-        thread_pool: &'a ThreadPool,
     ) -> OwnedValidationContext<'a> {
-        OwnedValidationContext::new(object, scanner, config, thread_pool)
+        OwnedValidationContext::new(object, scanner, config)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use rayon::ThreadPoolBuilder;
 
     use super::*;
-    use crate::metadata::validation::config::ValidationConfig;
+    use crate::{metadata::validation::config::ValidationConfig, testkit::fixture};
 
     #[test]
     fn test_raw_loading_context() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let scanner = ReferenceScanner::from_view(&view).unwrap();
-            let config = ValidationConfig::minimal();
-            let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).unwrap();
+        let config = ValidationConfig::minimal();
 
-            let context =
-                RawValidationContext::new_for_loading(&view, &scanner, &config, &thread_pool);
+        let context = RawValidationContext::new_for_loading(&view, &scanner, &config);
 
-            assert_eq!(context.validation_stage(), ValidationStage::Raw);
-            assert!(context.is_loading_validation());
-            assert!(!context.is_modification_validation());
-            assert!(context.changes().is_none());
-        }
+        assert_eq!(context.validation_stage(), ValidationStage::Raw);
+        assert!(context.is_loading_validation());
+        assert!(!context.is_modification_validation());
+        assert!(context.changes().is_none());
     }
 
     #[test]
     fn test_raw_modification_context() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let scanner = ReferenceScanner::from_view(&view).unwrap();
-            let config = ValidationConfig::minimal();
-            let changes = AssemblyChanges::new();
-            let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).unwrap();
+        let config = ValidationConfig::minimal();
+        let changes = AssemblyChanges::new();
 
-            let context = RawValidationContext::new_for_modification(
-                &view,
-                &changes,
-                &scanner,
-                &config,
-                &thread_pool,
-            );
+        let context =
+            RawValidationContext::new_for_modification(&view, &changes, &scanner, &config);
 
-            assert_eq!(context.validation_stage(), ValidationStage::Raw);
-            assert!(!context.is_loading_validation());
-            assert!(context.is_modification_validation());
-            assert!(context.changes().is_some());
-        }
+        assert_eq!(context.validation_stage(), ValidationStage::Raw);
+        assert!(!context.is_loading_validation());
+        assert!(context.is_modification_validation());
+        assert!(context.changes().is_some());
     }
 
     #[test]
     fn test_factory_functions() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let scanner = ReferenceScanner::from_view(&view).unwrap();
-            let config = ValidationConfig::minimal();
-            let changes = AssemblyChanges::new();
-            let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).unwrap();
+        let config = ValidationConfig::minimal();
+        let changes = AssemblyChanges::new();
 
-            let loading_context =
-                factory::raw_loading_context(&view, &scanner, &config, &thread_pool);
-            assert_eq!(loading_context.validation_stage(), ValidationStage::Raw);
+        let loading_context = factory::raw_loading_context(&view, &scanner, &config);
+        assert_eq!(loading_context.validation_stage(), ValidationStage::Raw);
 
-            let modification_context =
-                factory::raw_modification_context(&view, &changes, &scanner, &config, &thread_pool);
-            assert_eq!(
-                modification_context.validation_stage(),
-                ValidationStage::Raw
-            );
-        }
+        let modification_context =
+            factory::raw_modification_context(&view, &changes, &scanner, &config);
+        assert_eq!(
+            modification_context.validation_stage(),
+            ValidationStage::Raw
+        );
     }
 }

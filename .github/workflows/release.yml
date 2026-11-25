@@ -12,7 +12,8 @@ env:
 
 jobs:
   # Derive the version from the release tag and hold it against Cargo.toml, so a
-  # mistyped tag fails here rather than shipping under the wrong version.
+  # mistyped tag fails here rather than shipping under the wrong version. A release
+  # whose commit never landed on main fails here too, before anything is built.
   version:
     name: Resolve Version
     runs-on: ubuntu-latest
@@ -24,6 +25,15 @@ jobs:
       uses: actions/checkout@v7
       with:
         ref: ${{ github.event.release.tag_name }}
+        fetch-depth: 0       # merge-base needs real history
+
+    # A GitHub release can be cut from any commit, including one that never
+    # landed on main. Releases are restricted to commits contained in main.
+    - name: Refuse releases not contained in main
+      run: |
+        git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+        git merge-base --is-ancestor "$(git rev-parse HEAD)" refs/remotes/origin/main \
+          || { echo "::error::release commit is not contained in main"; exit 1; }
 
     - name: Resolve and verify version
       id: version
@@ -44,7 +54,9 @@ jobs:
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "Releasing v${VERSION}"
 
-  # Then ensure all tests pass
+  # The same checks as the Linux CI job: formatting, clippy, the oracle test tier
+  # (every test, external tools required), the doc tests, and the build without
+  # default features.
   test:
     name: Pre-Release Tests
     runs-on: ubuntu-latest
@@ -66,6 +78,12 @@ jobs:
       with:
         dotnet-version: '8.0.x'
 
+    - name: Warm up .NET SDK
+      run: |
+        dotnet --info
+        dotnet new console -n warmup -o ${{ runner.temp }}/warmup
+        dotnet build ${{ runner.temp }}/warmup
+
     - name: Install Mono and Z3
       run: |
         sudo apt-get update
@@ -78,18 +96,17 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run clippy
-      run: cargo clippy --all-targets -- -D warnings
-      env:
-        RUSTFLAGS: "-Dwarnings"
+      run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
-    - name: Run tests
-      run: cargo test --release --lib --verbose
+    - name: Run tests (oracle tier)
+      run: make test-oracle
 
     - name: Run doc tests
-      run: cargo test --release --doc
+      # Capped: each doc test links its own binary, and uncapped they exhaust memory.
+      run: cargo test --workspace --release --doc --features z3 -- --test-threads=4
 
-    - name: Check documentation
-      run: cargo doc --no-deps
+    - name: Run tests without default features
+      run: cargo test -p dotscope --no-default-features --profile ci-test --lib --bins --tests
 
   # Build CLI binaries for all platforms and attach them to the release
   build-cli:
@@ -162,7 +179,7 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: [version, test]
+    needs: [version, test, build-cli, verify-docs]
 
     permissions:
       contents: read
@@ -173,16 +190,6 @@ jobs:
       uses: actions/checkout@v7
       with:
         ref: ${{ github.event.release.tag_name }}
-        fetch-depth: 0       # merge-base needs real history
-
-    # A GitHub release can be cut from any commit, including one that never
-    # landed on main. Publishing is restricted to release tags that are
-    # actually contained in main.
-    - name: Refuse releases not contained in main
-      run: |
-        git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-        git merge-base --is-ancestor "$(git rev-parse HEAD)" refs/remotes/origin/main \
-          || { echo "::error::release commit is not contained in main"; exit 1; }
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -202,11 +209,12 @@ jobs:
       env:
         CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-  # Verify documentation builds correctly
+  # Build the documentation the way docs.rs will (every feature, `--cfg docsrs`),
+  # with warnings denied: a broken link fails the release before it publishes.
   verify-docs:
     name: Verify Documentation
     runs-on: ubuntu-latest
-    needs: [version, test]
+    needs: version
 
     steps:
     - name: Checkout code
@@ -220,8 +228,9 @@ jobs:
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Build documentation for docs.rs
-      run: |
-        cargo doc -p dotscope --no-deps --document-private-items
-        echo "Documentation builds successfully"
-        echo "Documentation will be automatically available at https://docs.rs/dotscope after publishing"
+    # docs.rs's cfg, with private items documented as `make doc` does: the docs link internal
+    # items, and those links resolve only there.
+    - name: Build documentation with docs.rs's cfg
+      env:
+        RUSTDOCFLAGS: "--cfg docsrs -Dwarnings"
+      run: cargo doc -p dotscope --all-features --no-deps --document-private-items

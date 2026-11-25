@@ -498,7 +498,7 @@ pub const INSTRUCTIONS: [CilInstruction; INSTRUCTIONS_MAX as usize] = [
         category: InstructionCategory::ControlFlow,
         stack_pops: 0,
         stack_pushes: 0,
-        flow: FlowType::Call,
+        flow: FlowType::MethodJump,
     },
     /* 28 */
     CilInstruction {
@@ -516,7 +516,7 @@ pub const INSTRUCTIONS: [CilInstruction; INSTRUCTIONS_MAX as usize] = [
         category: InstructionCategory::ControlFlow,
         stack_pops: 0,   // Variable - depends on method signature
         stack_pushes: 0, // Variable - depends on method signature
-        flow: FlowType::Call,
+        flow: FlowType::CallIndirect,
     },
     /* 2A */
     CilInstruction {
@@ -2421,11 +2421,11 @@ pub const INSTRUCTIONS_FE: [CilInstruction; INSTRUCTIONS_FE_MAX as usize] = [
         stack_pushes: 0,
         flow: FlowType::Sequential,
     },
-    /* FE 19 */
+    /* FE 19: no.{typecheck|rangecheck|nullcheck}, a flags byte (ECMA-335 III.2.2) */
     CilInstruction {
-        op_type: OperandType::None,
-        instr: "",
-        category: InstructionCategory::Misc,
+        op_type: OperandType::UInt8,
+        instr: "no.",
+        category: InstructionCategory::Prefix,
         stack_pops: 0,
         stack_pushes: 0,
         flow: FlowType::Sequential,

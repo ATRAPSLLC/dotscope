@@ -237,7 +237,7 @@ fn main() -> Result<()> {
             return Ok(());
         };
 
-        match TablesHeader::from(tables_data) {
+        match TablesHeader::from(tables_data, false) {
             Ok(tables_header) => {
                 println!(
                     "Successfully parsed TablesHeader ({} bytes)",

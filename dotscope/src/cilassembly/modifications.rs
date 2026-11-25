@@ -30,23 +30,21 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! use crate::cilassembly::modifications::TableModifications;
-//! use crate::cilassembly::operation::{TableOperation, Operation};
-//! use crate::metadata::tables::TableDataOwned;
+//! ```
+//! use dotscope::{metadata::tables::TableId, CilAssembly};
 //!
-//! // Create sparse modification tracker
-//! let mut modifications = TableModifications::new_sparse(1);
+//! let mut assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
 //!
-//! // Apply operations
-//! // let operation = TableOperation::new(Operation::Insert(1, row_data));
-//! // modifications.apply_operation(operation)?;
+//! // Removing a row records the operation in its table's modifications
+//! assembly.table_row_remove(TableId::TypeRef, 1)?;
 //!
 //! // Check for modifications
-//! if modifications.has_modifications() {
-//!     println!("Table has {} operations", modifications.operation_count());
+//! if let Some(modifications) = assembly.changes().get_table_modifications(TableId::TypeRef) {
+//!     if modifications.has_modifications() {
+//!         println!("Table has {} operations", modifications.operation_count());
+//!     }
 //! }
-//! # Ok::<(), crate::Error>(())
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Thread Safety
@@ -86,23 +84,23 @@ use crate::{
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use crate::cilassembly::modifications::TableModifications;
-/// use crate::cilassembly::operation::{TableOperation, Operation};
-/// use crate::metadata::tables::TableDataOwned;
+/// ```
+/// use dotscope::{metadata::tables::TableId, CilAssembly};
 ///
-/// // Create sparse tracker
-/// let mut modifications = TableModifications::new_sparse(5); // next RID = 5
+/// let mut assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
+/// assembly.table_row_remove(TableId::TypeRef, 1)?;
 ///
-/// // Check if RID exists
-/// if modifications.has_row(3)? {
-///     println!("Row 3 exists");
+/// if let Some(modifications) = assembly
+///     .changes_mut()
+///     .get_table_modifications_mut(TableId::TypeRef)
+/// {
+///     // The removed row no longer exists
+///     assert!(!modifications.has_row(1));
+///
+///     // Consolidate the operations recorded so far
+///     modifications.consolidate_operations();
 /// }
-///
-/// // Apply operations and consolidate
-/// // modifications.apply_operation(operation)?;
-/// modifications.consolidate_operations();
-/// # Ok::<(), crate::Error>(())
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety
@@ -119,8 +117,8 @@ pub enum TableModifications {
     Sparse {
         /// Chronologically ordered operations
         ///
-        /// Operations are stored in the order they were applied, with
-        /// microsecond-precision timestamps for conflict resolution.
+        /// Operations are stored in timestamp order, equal timestamps in the order they
+        /// were applied, for conflict resolution.
         operations: Vec<TableOperation>,
 
         /// Quick lookup for deleted RIDs
@@ -334,6 +332,71 @@ impl TableModifications {
             }
             Self::Replaced(_) => Err(Error::CannotModifyReplacedTable),
         }
+    }
+
+    /// How far the table's sparse changes reach: the number of operations
+    /// recorded and the next row an insert takes, or `None` for a replaced
+    /// table.
+    #[cfg(feature = "compiler")]
+    pub fn extent(&self) -> Option<(usize, u32)> {
+        match self {
+            Self::Sparse {
+                operations,
+                next_rid,
+                ..
+            } => Some((operations.len(), *next_rid)),
+            Self::Replaced(_) => None,
+        }
+    }
+
+    /// The number of rows inserted at `rid` or after, as recorded operations.
+    #[cfg(feature = "compiler")]
+    pub fn inserted_since(&self, rid: u32) -> usize {
+        match self {
+            Self::Sparse { operations, .. } => operations
+                .iter()
+                .filter(
+                    |op| matches!(op.operation, Operation::Insert(inserted, _) if inserted >= rid),
+                )
+                .count(),
+            Self::Replaced(_) => 0,
+        }
+    }
+
+    /// Undoes every insert made since [`Self::extent`] read `extent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, changing nothing, when the table changed in any other
+    /// way since: it was replaced, or a row was updated or deleted, which only
+    /// the operation's own inverse could undo.
+    #[cfg(feature = "compiler")]
+    pub fn rollback_inserts(&mut self, extent: (usize, u32)) -> Result<()> {
+        let (operations_before, rid_before) = extent;
+        let undone = self.inserted_since(rid_before);
+        let Self::Sparse {
+            operations,
+            inserted_rows,
+            change_refs,
+            next_rid,
+            ..
+        } = self
+        else {
+            return Err(Error::ModificationInvalid(
+                "a replaced table cannot be rolled back to its sparse extent".to_string(),
+            ));
+        };
+        if operations.len().saturating_sub(undone) != operations_before {
+            return Err(Error::ModificationInvalid(format!(
+                "table changed by more than inserts since its extent ({operations_before} operations, next row {rid_before})"
+            )));
+        }
+        operations
+            .retain(|op| !matches!(op.operation, Operation::Insert(rid, _) if rid >= rid_before));
+        inserted_rows.retain(|rid| *rid < rid_before);
+        change_refs.retain(|rid, _| *rid < rid_before);
+        *next_rid = rid_before;
+        Ok(())
     }
 
     /// Consolidate operations to remove superseded operations and optimize memory.
@@ -658,6 +721,46 @@ mod tests {
         assert!(mods.has_row(1));
     }
 
+    /// Rows inserted after an extent was read are undone, and the table's
+    /// next row is the one it was then.
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn rollback_undoes_the_inserts_since_the_extent() {
+        let mut mods = TableModifications::new_sparse(3);
+        mods.apply_operation(TableOperation::new(Operation::Insert(3, make_test_row(1))))
+            .unwrap();
+        let extent = mods.extent().unwrap();
+        for rid in 4..6 {
+            mods.apply_operation(TableOperation::new(Operation::Insert(
+                rid,
+                make_test_row(rid),
+            )))
+            .unwrap();
+        }
+        assert_eq!(mods.inserted_since(extent.1), 2);
+        mods.rollback_inserts(extent).unwrap();
+        assert_eq!(mods.extent(), Some(extent));
+        assert!(mods.has_row(3));
+        assert!(!mods.has_row(4));
+        assert_eq!(mods.next_rid().unwrap(), 4);
+    }
+
+    /// A table updated since its extent is refused, unchanged: an update is
+    /// not an insert, and dropping it would lose a change made on purpose.
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn rollback_refuses_a_table_changed_by_more_than_inserts() {
+        let mut mods = TableModifications::new_sparse(3);
+        let extent = mods.extent().unwrap();
+        mods.apply_operation(TableOperation::new(Operation::Insert(3, make_test_row(1))))
+            .unwrap();
+        mods.apply_operation(TableOperation::new(Operation::Update(1, make_test_row(2))))
+            .unwrap();
+        assert!(mods.rollback_inserts(extent).is_err());
+        assert_eq!(mods.operation_count(), 2);
+        assert!(mods.has_row(3));
+    }
+
     #[test]
     fn test_apply_update_operation() {
         // Create with 5 existing rows
@@ -867,8 +970,8 @@ mod tests {
     #[test]
     fn test_same_timestamp_fifo_ordering() {
         // Test that operations with the same timestamp maintain FIFO insertion order.
-        // This is critical for scenarios where Insert is followed by Update on the
-        // same RID within the same microsecond - the Update must come AFTER Insert.
+        // Explicit timestamps (`new_with_timestamp`) can be equal: an Insert followed by an
+        // Update of the same RID at one timestamp must keep the Update after the Insert.
         let mut mods = TableModifications::new_sparse(1);
 
         let fixed_timestamp = 1000u64;
@@ -879,7 +982,7 @@ mod tests {
             fixed_timestamp,
         );
 
-        // Create Update operation with same timestamp (simulates same-microsecond operations)
+        // Create Update operation with the same timestamp
         let update_op = TableOperation::new_with_timestamp(
             Operation::Update(10, make_test_row(200)),
             fixed_timestamp,

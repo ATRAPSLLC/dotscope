@@ -3,7 +3,10 @@
 //! This module defines the [`CallGraphNode`] structure which represents
 //! a method in the call graph along with its metadata and call site information.
 
-use crate::{analysis::callgraph::CallSite, metadata::token::Token};
+use crate::{
+    analysis::callgraph::CallSite,
+    metadata::{streams::SharedStr, token::Token},
+};
 
 /// A node in the call graph representing a method.
 ///
@@ -14,8 +17,8 @@ use crate::{analysis::callgraph::CallSite, metadata::token::Token};
 pub struct CallGraphNode {
     /// The method token uniquely identifying this method in the assembly.
     pub token: Token,
-    /// Method name for display purposes.
-    pub name: String,
+    /// Method name, shared with the method's metadata.
+    pub name: SharedStr,
     /// Full qualified name including type (e.g., "Namespace.Type::Method").
     pub full_name: String,
     /// Full method signature string for disambiguation of overloaded methods.
@@ -58,10 +61,15 @@ impl CallGraphNode {
     /// A new [`CallGraphNode`] instance with the specified properties and
     /// default values for flags and collections.
     #[must_use]
-    pub fn new(token: Token, name: String, full_name: String, signature: String) -> Self {
+    pub fn new(
+        token: Token,
+        name: impl Into<SharedStr>,
+        full_name: String,
+        signature: String,
+    ) -> Self {
         Self {
             token,
-            name,
+            name: name.into(),
             full_name,
             signature,
             is_virtual: false,

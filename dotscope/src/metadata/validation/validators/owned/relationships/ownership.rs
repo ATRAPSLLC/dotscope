@@ -74,7 +74,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     metadata::{
-        tables::{FieldAttributes, TypeAttributes},
+        tables::{FieldAttributes, TableId, TypeAttributes},
         typesystem::CilType,
         validation::{
             context::{OwnedValidationContext, ValidationContext},
@@ -138,7 +138,9 @@ impl OwnedOwnershipValidator {
         let methods = context.object().methods();
 
         for type_entry in context.target_assembly_types() {
-            if type_entry.external().is_some() {
+            // Only a type this module defines owns members; a reference or an instantiation
+            // in the type system has none of its own.
+            if !type_entry.token.is_table(TableId::TypeDef) {
                 continue;
             }
 
@@ -520,19 +522,17 @@ impl Default for OwnedOwnershipValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::ownership::owned_ownership_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_ownership_validator() -> Result<()> {
         let validator = OwnedOwnershipValidator::new();
         let config = ValidationConfig {
@@ -543,7 +543,6 @@ mod tests {
         owned_validator_test(
             owned_ownership_validator_file_factory,
             "OwnedOwnershipValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

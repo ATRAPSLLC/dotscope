@@ -254,6 +254,8 @@ impl<'a> Parser<'a> {
     ///
     /// # Errors
     /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] if position is beyond the data length.
+    /// The end of the data itself is a position, the one a parser that has
+    /// read everything is at.
     ///
     /// # Examples
     ///
@@ -269,7 +271,7 @@ impl<'a> Parser<'a> {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn seek(&mut self, pos: usize) -> Result<()> {
-        if pos >= self.data.len() {
+        if pos > self.data.len() {
             return Err(oob_err());
         }
 
@@ -604,8 +606,9 @@ impl<'a> Parser<'a> {
 
     /// Read a compressed signed integer as defined in ECMA-335 II.23.2.
     ///
-    /// Compressed signed integers use the same variable-length encoding as unsigned integers
-    /// but with the least significant bit indicating the sign and the remaining bits shifted right.
+    /// The encoded bits are the value's two's complement form, 7, 14 or 29 bits
+    /// wide by the length of the encoding, rotated left by one so the sign sits
+    /// in the lowest bit; reading rotates them back and sign-extends.
     ///
     /// # Errors
     /// Returns [`crate::Error::Parse`] carrying [`crate::ParseFailure::OutOfBounds`] if reading would exceed the data length or
@@ -616,35 +619,33 @@ impl<'a> Parser<'a> {
     /// ```rust,no_run
     /// use dotscope::Parser;
     ///
-    /// // Positive number: 10 encoded as 20 (10 << 1 | 0)
-    /// let data = [20];
+    /// // The examples of ECMA-335 II.23.2: 3 is 0x06, -3 is 0x7B.
+    /// let data = [0x06];
     /// let mut parser = Parser::new(&data);
-    /// assert_eq!(parser.read_compressed_int()?, 10);
+    /// assert_eq!(parser.read_compressed_int()?, 3);
     ///
-    /// // Negative number: -5 encoded as 9 ((5-1) << 1 | 1)
-    /// let data = [9];
+    /// let data = [0x7B];
     /// let mut parser = Parser::new(&data);
-    /// assert_eq!(parser.read_compressed_int()?, -5);
+    /// assert_eq!(parser.read_compressed_int()?, -3);
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn read_compressed_int(&mut self) -> Result<i32> {
-        let unsigned = self.read_compressed_uint()?;
-
-        // Convert to signed based on ECMA-335 II.23.2 encoding rules
-        let signed = if (unsigned & 1) == 0 {
-            #[allow(clippy::cast_possible_wrap)]
-            let result = (unsigned >> 1) as i32;
-            result
+        let first_byte = self.peek_byte()?;
+        // The value's top bit and the shift that sign-extends from it, for a
+        // 7, 14 or 29 bit encoding.
+        let (top_bit, shift): (u32, u32) = if (first_byte & 0x80) == 0 {
+            (1 << 6, 25)
+        } else if (first_byte & 0xC0) == 0x80 {
+            (1 << 13, 18)
         } else {
-            #[allow(clippy::cast_possible_wrap)]
-            let half = (unsigned >> 1) as i32;
-            // -(half + 1): reproduces the ECMA-335 negative encoding while
-            // matching the existing release-mode wrapping behaviour for
-            // out-of-range inputs (half == i32::MAX).
-            half.wrapping_add(1).wrapping_neg()
+            (1 << 28, 3)
         };
-
-        Ok(signed)
+        let rotated = self.read_compressed_uint()?;
+        let sign = if rotated & 1 == 0 { 0 } else { top_bit };
+        let twos = (rotated >> 1) | sign;
+        #[allow(clippy::cast_possible_wrap)]
+        let value = ((twos << shift) as i32) >> shift;
+        Ok(value)
     }
 
     /// Read a compressed token as defined in ECMA-335 II.23.2.4 (TypeDefOrRefOrSpecEncoded).
@@ -1162,17 +1163,30 @@ mod tests {
 
     #[test]
     fn test_read_compressed_int() {
-        // Positive small integer: 10 (encoded as 20)
-        let mut parser = Parser::new(&[20]);
-        assert_eq!(parser.read_compressed_int().unwrap(), 10);
-
-        // Negative small integer: -5 (encoded as 9)
-        let mut parser = Parser::new(&[9]);
-        assert_eq!(parser.read_compressed_int().unwrap(), -5);
-
-        // Zero (encoded as 0)
-        let mut parser = Parser::new(&[0]);
-        assert_eq!(parser.read_compressed_int().unwrap(), 0);
+        // The signed examples of ECMA-335 II.23.2, with the ends of each width.
+        let cases: &[(&[u8], i32)] = &[
+            (&[0x00], 0),
+            (&[0x06], 3),
+            (&[0x7B], -3),
+            (&[0x7E], 63),
+            (&[0x7F], -1),
+            (&[0x80, 0x80], 64),
+            (&[0x01], -64),
+            (&[0xBF, 0x7F], -65),
+            (&[0xC0, 0x00, 0x40, 0x00], 8192),
+            (&[0x80, 0x01], -8192),
+            (&[0xDF, 0xFF, 0xFF, 0xFE], 268_435_455),
+            (&[0xC0, 0x00, 0x00, 0x01], -268_435_456),
+        ];
+        for (bytes, expected) in cases {
+            let mut parser = Parser::new(bytes);
+            assert_eq!(
+                parser.read_compressed_int().unwrap(),
+                *expected,
+                "{bytes:02x?}"
+            );
+            assert_eq!(parser.pos(), bytes.len(), "{bytes:02x?}");
+        }
     }
 
     #[test]

@@ -210,7 +210,7 @@ impl Exports {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use dotscope::metadata::exports::Exports;
     /// use dotscope::metadata::token::Token;
     ///
@@ -222,7 +222,7 @@ impl Exports {
     ///     assert_eq!(*entry.key(), token);
     /// } else {
     ///     println!("No exported type found for token {}", token);
-    /// }
+    /// };
     /// ```
     ///
     /// # Thread Safety
@@ -479,7 +479,7 @@ mod tests {
     use super::*;
     use crate::{
         metadata::{identity::AssemblyIdentity, token::Token, typesystem::TypeRegistry},
-        test::{create_cil_type, create_exportedtype},
+        testkit::{create_cil_type, create_exportedtype},
     };
 
     #[test]

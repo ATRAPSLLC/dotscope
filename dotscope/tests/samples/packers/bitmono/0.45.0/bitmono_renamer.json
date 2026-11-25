@@ -1,0 +1,6 @@
+{
+  "Protections": [
+    { "Name": "FullRenamer", "Enabled": true },
+    { "Name": "NoNamespaces", "Enabled": true }
+  ]
+}

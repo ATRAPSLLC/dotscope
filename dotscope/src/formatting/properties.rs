@@ -22,7 +22,7 @@ use crate::{
 ///
 /// Each property is emitted with its type, name, optional default value,
 /// accessor methods (`.get`, `.set`, `.other`), and custom attributes.
-pub(super) fn format_properties(
+pub fn format_properties(
     opts: &FormatterOptions,
     w: &mut dyn Write,
     cil_type: &CilType,
@@ -82,8 +82,8 @@ pub(super) fn format_properties(
             }
         }
 
-        // .other accessor
-        if let Some(other_ref) = prop.fn_other.get() {
+        // .other accessors
+        for (_, other_ref) in prop.fn_other.iter() {
             if let Some(other) = other_ref.upgrade() {
                 writeln!(w, "    .other {}", format_method_ref(&other, asm))?;
             }

@@ -27,7 +27,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::emulation::{TraceWriter, CallTreeBuilder};
 //!
 //! // File-based writer with context prefix
@@ -38,6 +38,7 @@
 //! let writer = TraceWriter::new_memory(10_000, None);
 //! // ... emulation runs ...
 //! let events = writer.take_buffer().unwrap();
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use std::{

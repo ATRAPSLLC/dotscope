@@ -4,13 +4,15 @@
 //! with owned data and resolved heap references. This is the primary data structure
 //! for representing assembly identity and versioning information in a usable form.
 
-use std::sync::OnceLock;
-
-use crate::metadata::{
-    customattributes::CustomAttributeValueList,
-    security::Security,
-    tables::{AssemblyFlags, HashAlgorithmId},
-    token::Token,
+use crate::{
+    metadata::{
+        customattributes::CustomAttributeValueList,
+        security::Security,
+        streams::SharedStr,
+        tables::{AssemblyFlags, HashAlgorithmId},
+        token::Token,
+    },
+    utils::RowList,
 };
 
 /// Represents a .NET CIL assembly with fully resolved metadata and owned data
@@ -105,21 +107,18 @@ pub struct Assembly {
     /// The filename of the assembly without the file extension. For example,
     /// "System.Core" for the System.Core.dll assembly. This is the primary
     /// identifier used for assembly loading and binding.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Localization culture
     ///
     /// Specifies the culture for localized assemblies (e.g., "en-US", "fr-FR").
     /// `None` indicates a culture-neutral assembly that can be used with any culture.
     /// Satellite assemblies typically have specific culture values.
-    pub culture: Option<String>,
+    pub culture: Option<SharedStr>,
 
-    /// Security information for this assembly
-    ///
-    /// Contains declarative security attributes and permissions associated with
-    /// the assembly. Uses [`OnceLock`] for thread-safe lazy initialization since
-    /// security information is not always needed and can be expensive to load.
-    pub security: OnceLock<Security>,
+    /// The assembly's declarative security, a `DeclSecurity` row each, in table order: an
+    /// assembly may request permissions under several actions (minimum, optional, refused).
+    pub security: RowList<Security>,
 
     /// Custom attributes attached to this assembly
     ///

@@ -15,7 +15,7 @@
 //!
 //! - [`crate::metadata::tables::assemblyrefos::raw::AssemblyRefOsRaw`] - Raw table structure with unresolved indexes
 //! - [`crate::metadata::tables::assemblyrefos::owned::AssemblyRefOs`] - Owned variant with resolved references
-//! - [`crate::metadata::tables::assemblyrefos::loader::AssemblyRefOsLoader`] - Internal loader for processing table data
+//! - [`crate::metadata::loader::tables::AssemblyRefOsLoader`] - Internal loader for processing table data
 //! - [`crate::metadata::tables::assemblyrefos::AssemblyRefOsMap`] - Token-based lookup map
 //! - [`crate::metadata::tables::assemblyrefos::AssemblyRefOsList`] - Collection type
 //! - [`crate::metadata::tables::assemblyrefos::AssemblyRefOsRc`] - Reference-counted pointer
@@ -53,14 +53,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

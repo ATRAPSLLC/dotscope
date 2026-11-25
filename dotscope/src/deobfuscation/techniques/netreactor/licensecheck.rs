@@ -19,7 +19,7 @@
 //! after `<Module>::.cctor` is cleaned up the binary still trips on the
 //! license check the first time user code instantiates one of the affected
 //! types (e.g. `reactor_obfuscation` fails in `t8JubRuTexuLxLeNiE..ctor`
-//! post-Stage 1).
+//! once its NecroBit bodies are restored).
 //!
 //! # Detection
 //!
@@ -45,7 +45,7 @@
 //!    [`find_unreferenced_types`] during `build_cleanup_request`.
 //!
 //! [`netreactor.antitrial`]: super::antitrial
-//! [`NeutralizationPass`]: crate::compiler::NeutralizationPass
+//! [`NeutralizationPass`]: crate::deobfuscation::NeutralizationPass
 //! [`find_unreferenced_types`]: crate::cilassembly::find_unreferenced_types
 
 use std::any::Any;
@@ -118,7 +118,7 @@ impl Technique for NetReactorLicenseCheck {
         );
 
         for token in &method_tokens {
-            detection.cleanup_mut().add_method(*token);
+            detection.cleanup_mut().add_protection_method(*token);
         }
 
         detection
@@ -128,25 +128,11 @@ impl Technique for NetReactorLicenseCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::validation::ValidationConfig;
-
-    fn try_load_sample(name: &str) -> Option<CilObject> {
-        let path = format!("tests/samples/packers/netreactor/7.5.0/{name}");
-        if !std::path::Path::new(&path).exists() {
-            eprintln!("Skipping test: sample not found at {path}");
-            return None;
-        }
-        Some(
-            CilObject::from_path_with_validation(&path, ValidationConfig::analysis())
-                .unwrap_or_else(|e| panic!("Failed to load {name}: {e}")),
-        )
-    }
+    use crate::testkit::load_sample;
 
     #[test]
     fn test_detect_positive_obfuscation() {
-        let Some(assembly) = try_load_sample("reactor_obfuscation.exe") else {
-            return;
-        };
+        let assembly = load_sample("packers/netreactor/7.5.0/reactor_obfuscation.exe");
         let detection = NetReactorLicenseCheck.detect(&assembly);
         assert!(
             detection.is_detected(),
@@ -163,9 +149,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_baseline() {
-        let Some(assembly) = try_load_sample("original.exe") else {
-            return;
-        };
+        let assembly = load_sample("packers/netreactor/7.5.0/original.exe");
         let detection = NetReactorLicenseCheck.detect(&assembly);
         assert!(
             !detection.is_detected(),

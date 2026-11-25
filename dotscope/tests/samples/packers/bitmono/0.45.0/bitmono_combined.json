@@ -1,0 +1,8 @@
+{
+  "Protections": [
+    { "Name": "StringsEncryption", "Enabled": true },
+    { "Name": "CallToCalli", "Enabled": true },
+    { "Name": "FullRenamer", "Enabled": true },
+    { "Name": "AntiDebugBreakpoints", "Enabled": true }
+  ]
+}

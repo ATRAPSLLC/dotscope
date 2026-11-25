@@ -7,7 +7,7 @@
 //! # Module Components
 //! - [`crate::metadata::tables::InterfaceImplRaw`] - Raw table structure with unresolved coded indexes
 //! - [`crate::metadata::tables::InterfaceImpl`] - Owned variant with resolved type references and owned data
-//! - [`crate::metadata::tables::interfaceimpl::loader::InterfaceImplLoader`] - Internal loader for processing table entries (crate-private)
+//! - [`crate::metadata::loader::tables::InterfaceImplLoader`] - Internal loader for processing table entries (crate-private)
 //! - Type aliases for collections: [`crate::metadata::tables::InterfaceImplMap`], [`crate::metadata::tables::InterfaceImplList`], [`crate::metadata::tables::InterfaceImplRc`]
 //!
 //! # Table Structure (ECMA-335 §22.23)
@@ -49,14 +49,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

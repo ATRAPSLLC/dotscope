@@ -248,438 +248,418 @@ impl GenericParamConstraintBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
+        testkit::fixture,
     };
 
     #[test]
     fn test_generic_param_constraint_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a basic generic parameter constraint
-            let owner_rid = 1; // GenericParam RID 1
-            let constraint_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // External base class
+        // Create a basic generic parameter constraint
+        let owner_rid = 1; // GenericParam RID 1
+        let constraint_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // External base class
 
-            let constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(owner_rid)
-                .constraint(constraint_type)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(owner_rid)
+            .constraint(constraint_type)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
     }
 
     #[test]
     fn test_generic_param_constraint_builder_base_class() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a base class constraint
-            let generic_param_rid = 1; // GenericParam RID 1
-            let base_class = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::TypeDefOrRef); // Local base class
+        // Create a base class constraint
+        let generic_param_rid = 1; // GenericParam RID 1
+        let base_class = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::TypeDefOrRef); // Local base class
 
-            let constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid)
-                .constraint(base_class)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid)
+            .constraint(base_class)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
     }
 
     #[test]
     fn test_generic_param_constraint_builder_interface() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create an interface constraint
-            let generic_param_rid = 2; // GenericParam RID 2
-            let interface_ref = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef); // External interface
+        // Create an interface constraint
+        let generic_param_rid = 2; // GenericParam RID 2
+        let interface_ref = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef); // External interface
 
-            let constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid)
-                .constraint(interface_ref)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid)
+            .constraint(interface_ref)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
     }
 
     #[test]
     fn test_generic_param_constraint_builder_generic_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a generic type constraint (e.g., IComparable<T>)
-            let generic_param_rid = 3; // GenericParam RID 3
-            let generic_interface =
-                CodedIndex::new(TableId::TypeSpec, 1, CodedIndexType::TypeDefOrRef); // Generic interface instantiation
+        // Create a generic type constraint (e.g., IComparable<T>)
+        let generic_param_rid = 3; // GenericParam RID 3
+        let generic_interface = CodedIndex::new(TableId::TypeSpec, 1, CodedIndexType::TypeDefOrRef); // Generic interface instantiation
 
-            let constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid)
-                .constraint(generic_interface)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid)
+            .constraint(generic_interface)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
     }
 
     #[test]
     fn test_generic_param_constraint_builder_missing_owner() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let constraint_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
+        let constraint_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
 
-            let result = GenericParamConstraintBuilder::new()
-                .constraint(constraint_type)
-                .build(&mut assembly);
+        let result = GenericParamConstraintBuilder::new()
+            .constraint(constraint_type)
+            .build(&mut assembly);
 
-            // Should fail because owner is required
-            assert!(result.is_err());
-        }
+        // Should fail because owner is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_generic_param_constraint_builder_missing_constraint() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let owner_rid = 1; // GenericParam RID 1
+        let owner_rid = 1; // GenericParam RID 1
 
-            let result = GenericParamConstraintBuilder::new()
-                .owner(owner_rid)
-                .build(&mut assembly);
+        let result = GenericParamConstraintBuilder::new()
+            .owner(owner_rid)
+            .build(&mut assembly);
 
-            // Should fail because constraint is required
-            assert!(result.is_err());
-        }
+        // Should fail because constraint is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_generic_param_constraint_builder_zero_owner_rid() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Use RID 0 (invalid)
-            let invalid_owner = 0; // RID 0
-            let constraint_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
+        // Use RID 0 (invalid)
+        let invalid_owner = 0; // RID 0
+        let constraint_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
 
-            let result = GenericParamConstraintBuilder::new()
-                .owner(invalid_owner)
-                .constraint(constraint_type)
-                .build(&mut assembly);
+        let result = GenericParamConstraintBuilder::new()
+            .owner(invalid_owner)
+            .constraint(constraint_type)
+            .build(&mut assembly);
 
-            // Should fail because owner RID cannot be 0
-            assert!(result.is_err());
-        }
+        // Should fail because owner RID cannot be 0
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_generic_param_constraint_builder_invalid_constraint_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let owner_rid = 1; // GenericParam RID 1
-                               // Use a table type that's not valid for TypeDefOrRef
-            let invalid_constraint =
-                CodedIndex::new(TableId::Field, 1, CodedIndexType::TypeDefOrRef); // Field not in TypeDefOrRef
+        let owner_rid = 1; // GenericParam RID 1
+                           // Use a table type that's not valid for TypeDefOrRef
+        let invalid_constraint = CodedIndex::new(TableId::Field, 1, CodedIndexType::TypeDefOrRef); // Field not in TypeDefOrRef
 
-            let result = GenericParamConstraintBuilder::new()
-                .owner(owner_rid)
-                .constraint(invalid_constraint)
-                .build(&mut assembly);
+        let result = GenericParamConstraintBuilder::new()
+            .owner(owner_rid)
+            .constraint(invalid_constraint)
+            .build(&mut assembly);
 
-            // Should fail because constraint type is not valid for TypeDefOrRef
-            assert!(result.is_err());
-        }
+        // Should fail because constraint type is not valid for TypeDefOrRef
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_generic_param_constraint_builder_multiple_constraints() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let generic_param_rid = 1; // GenericParam RID 1
+        let generic_param_rid = 1; // GenericParam RID 1
 
-            // Create multiple constraints for the same parameter
-            let base_class = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::TypeDefOrRef); // Base class constraint
-            let interface1 = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // First interface
-            let interface2 = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef); // Second interface
-            let generic_interface =
-                CodedIndex::new(TableId::TypeSpec, 1, CodedIndexType::TypeDefOrRef); // Generic interface
+        // Create multiple constraints for the same parameter
+        let base_class = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::TypeDefOrRef); // Base class constraint
+        let interface1 = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // First interface
+        let interface2 = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef); // Second interface
+        let generic_interface = CodedIndex::new(TableId::TypeSpec, 1, CodedIndexType::TypeDefOrRef); // Generic interface
 
-            let constraint1_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid)
-                .constraint(base_class)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint1_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid)
+            .constraint(base_class)
+            .build(&mut assembly)
+            .unwrap();
 
-            let constraint2_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid) // Same parameter
-                .constraint(interface1)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint2_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid) // Same parameter
+            .constraint(interface1)
+            .build(&mut assembly)
+            .unwrap();
 
-            let constraint3_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid) // Same parameter
-                .constraint(interface2)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint3_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid) // Same parameter
+            .constraint(interface2)
+            .build(&mut assembly)
+            .unwrap();
 
-            let constraint4_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid) // Same parameter
-                .constraint(generic_interface)
-                .build(&mut assembly)
-                .unwrap();
+        let constraint4_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid) // Same parameter
+            .constraint(generic_interface)
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed and be different references
-            assert!(!std::sync::Arc::ptr_eq(&constraint1_ref, &constraint2_ref));
-            assert!(!std::sync::Arc::ptr_eq(&constraint1_ref, &constraint3_ref));
-            assert!(!std::sync::Arc::ptr_eq(&constraint1_ref, &constraint4_ref));
-            assert!(!std::sync::Arc::ptr_eq(&constraint2_ref, &constraint3_ref));
-            assert!(!std::sync::Arc::ptr_eq(&constraint2_ref, &constraint4_ref));
-            assert!(!std::sync::Arc::ptr_eq(&constraint3_ref, &constraint4_ref));
+        // All should succeed and be different references
+        assert!(!std::sync::Arc::ptr_eq(&constraint1_ref, &constraint2_ref));
+        assert!(!std::sync::Arc::ptr_eq(&constraint1_ref, &constraint3_ref));
+        assert!(!std::sync::Arc::ptr_eq(&constraint1_ref, &constraint4_ref));
+        assert!(!std::sync::Arc::ptr_eq(&constraint2_ref, &constraint3_ref));
+        assert!(!std::sync::Arc::ptr_eq(&constraint2_ref, &constraint4_ref));
+        assert!(!std::sync::Arc::ptr_eq(&constraint3_ref, &constraint4_ref));
 
-            // All should have GenericParamConstraint table kind
-            assert_eq!(
-                constraint1_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                constraint2_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                constraint3_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                constraint4_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-        }
+        // All should have GenericParamConstraint table kind
+        assert_eq!(
+            constraint1_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            constraint2_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            constraint3_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            constraint4_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
     }
 
     #[test]
     fn test_generic_param_constraint_builder_different_parameters() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create constraints for different generic parameters
-            let type_param_rid = 1; // Type-level parameter
-            let method_param_rid = 2; // Method-level parameter
+        // Create constraints for different generic parameters
+        let type_param_rid = 1; // Type-level parameter
+        let method_param_rid = 2; // Method-level parameter
 
-            let type_constraint =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // System.Object
-            let method_constraint =
-                CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef); // IDisposable
+        let type_constraint = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // System.Object
+        let method_constraint = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef); // IDisposable
 
-            let type_const_ref = GenericParamConstraintBuilder::new()
-                .owner(type_param_rid)
-                .constraint(type_constraint)
-                .build(&mut assembly)
-                .unwrap();
+        let type_const_ref = GenericParamConstraintBuilder::new()
+            .owner(type_param_rid)
+            .constraint(type_constraint)
+            .build(&mut assembly)
+            .unwrap();
 
-            let method_const_ref = GenericParamConstraintBuilder::new()
-                .owner(method_param_rid)
-                .constraint(method_constraint)
-                .build(&mut assembly)
-                .unwrap();
+        let method_const_ref = GenericParamConstraintBuilder::new()
+            .owner(method_param_rid)
+            .constraint(method_constraint)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Both should succeed with different references
-            assert!(!std::sync::Arc::ptr_eq(&type_const_ref, &method_const_ref));
-            assert_eq!(
-                type_const_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                method_const_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-        }
+        // Both should succeed with different references
+        assert!(!std::sync::Arc::ptr_eq(&type_const_ref, &method_const_ref));
+        assert_eq!(
+            type_const_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            method_const_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
     }
 
     #[test]
     fn test_generic_param_constraint_builder_all_constraint_types() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let generic_param_rid = 1; // GenericParam RID 1
+        let generic_param_rid = 1; // GenericParam RID 1
 
-            // Test all valid TypeDefOrRef coded index types
+        // Test all valid TypeDefOrRef coded index types
 
-            // TypeDef constraint (local type)
-            let typedef_constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid)
-                .constraint(CodedIndex::new(
-                    TableId::TypeDef,
-                    1,
-                    CodedIndexType::TypeDefOrRef,
-                ))
-                .build(&mut assembly)
-                .unwrap();
+        // TypeDef constraint (local type)
+        let typedef_constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid)
+            .constraint(CodedIndex::new(
+                TableId::TypeDef,
+                1,
+                CodedIndexType::TypeDefOrRef,
+            ))
+            .build(&mut assembly)
+            .unwrap();
 
-            // TypeRef constraint (external type)
-            let typeref_constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid)
-                .constraint(CodedIndex::new(
-                    TableId::TypeRef,
-                    1,
-                    CodedIndexType::TypeDefOrRef,
-                ))
-                .build(&mut assembly)
-                .unwrap();
+        // TypeRef constraint (external type)
+        let typeref_constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid)
+            .constraint(CodedIndex::new(
+                TableId::TypeRef,
+                1,
+                CodedIndexType::TypeDefOrRef,
+            ))
+            .build(&mut assembly)
+            .unwrap();
 
-            // TypeSpec constraint (generic type instantiation)
-            let typespec_constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(generic_param_rid)
-                .constraint(CodedIndex::new(
-                    TableId::TypeSpec,
-                    1,
-                    CodedIndexType::TypeDefOrRef,
-                ))
-                .build(&mut assembly)
-                .unwrap();
+        // TypeSpec constraint (generic type instantiation)
+        let typespec_constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(generic_param_rid)
+            .constraint(CodedIndex::new(
+                TableId::TypeSpec,
+                1,
+                CodedIndexType::TypeDefOrRef,
+            ))
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed and be different references
-            assert!(!std::sync::Arc::ptr_eq(
-                &typedef_constraint_ref,
-                &typeref_constraint_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &typedef_constraint_ref,
-                &typespec_constraint_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &typeref_constraint_ref,
-                &typespec_constraint_ref
-            ));
+        // All should succeed and be different references
+        assert!(!std::sync::Arc::ptr_eq(
+            &typedef_constraint_ref,
+            &typeref_constraint_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &typedef_constraint_ref,
+            &typespec_constraint_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &typeref_constraint_ref,
+            &typespec_constraint_ref
+        ));
 
-            // All should have GenericParamConstraint table kind
-            assert_eq!(
-                typedef_constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                typeref_constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                typespec_constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-        }
+        // All should have GenericParamConstraint table kind
+        assert_eq!(
+            typedef_constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            typeref_constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            typespec_constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
     }
 
     #[test]
     fn test_generic_param_constraint_builder_realistic_scenario() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Realistic scenario: class MyClass<T> where T : BaseClass, IComparable<T>, IDisposable
-            let type_param_rid = 1; // T parameter
+        // Realistic scenario: class MyClass<T> where T : BaseClass, IComparable<T>, IDisposable
+        let type_param_rid = 1; // T parameter
 
-            // Base class constraint: T : BaseClass
-            let base_class_constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(type_param_rid)
-                .constraint(CodedIndex::new(
-                    TableId::TypeDef,
-                    1,
-                    CodedIndexType::TypeDefOrRef,
-                )) // Local BaseClass
-                .build(&mut assembly)
-                .unwrap();
+        // Base class constraint: T : BaseClass
+        let base_class_constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(type_param_rid)
+            .constraint(CodedIndex::new(
+                TableId::TypeDef,
+                1,
+                CodedIndexType::TypeDefOrRef,
+            )) // Local BaseClass
+            .build(&mut assembly)
+            .unwrap();
 
-            // Generic interface constraint: T : IComparable<T>
-            let comparable_constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(type_param_rid)
-                .constraint(CodedIndex::new(
-                    TableId::TypeSpec,
-                    1,
-                    CodedIndexType::TypeDefOrRef,
-                )) // IComparable<T> type spec
-                .build(&mut assembly)
-                .unwrap();
+        // Generic interface constraint: T : IComparable<T>
+        let comparable_constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(type_param_rid)
+            .constraint(CodedIndex::new(
+                TableId::TypeSpec,
+                1,
+                CodedIndexType::TypeDefOrRef,
+            )) // IComparable<T> type spec
+            .build(&mut assembly)
+            .unwrap();
 
-            // Interface constraint: T : IDisposable
-            let disposable_constraint_ref = GenericParamConstraintBuilder::new()
-                .owner(type_param_rid)
-                .constraint(CodedIndex::new(
-                    TableId::TypeRef,
-                    1,
-                    CodedIndexType::TypeDefOrRef,
-                )) // External IDisposable
-                .build(&mut assembly)
-                .unwrap();
+        // Interface constraint: T : IDisposable
+        let disposable_constraint_ref = GenericParamConstraintBuilder::new()
+            .owner(type_param_rid)
+            .constraint(CodedIndex::new(
+                TableId::TypeRef,
+                1,
+                CodedIndexType::TypeDefOrRef,
+            )) // External IDisposable
+            .build(&mut assembly)
+            .unwrap();
 
-            // All constraints should be created successfully
-            assert_eq!(
-                base_class_constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                comparable_constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
-            assert_eq!(
-                disposable_constraint_ref.kind(),
-                ChangeRefKind::TableRow(TableId::GenericParamConstraint)
-            );
+        // All constraints should be created successfully
+        assert_eq!(
+            base_class_constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            comparable_constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
+        assert_eq!(
+            disposable_constraint_ref.kind(),
+            ChangeRefKind::TableRow(TableId::GenericParamConstraint)
+        );
 
-            // All should be different references
-            assert!(!std::sync::Arc::ptr_eq(
-                &base_class_constraint_ref,
-                &comparable_constraint_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &base_class_constraint_ref,
-                &disposable_constraint_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &comparable_constraint_ref,
-                &disposable_constraint_ref
-            ));
-        }
+        // All should be different references
+        assert!(!std::sync::Arc::ptr_eq(
+            &base_class_constraint_ref,
+            &comparable_constraint_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &base_class_constraint_ref,
+            &disposable_constraint_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &comparable_constraint_ref,
+            &disposable_constraint_ref
+        ));
     }
 }

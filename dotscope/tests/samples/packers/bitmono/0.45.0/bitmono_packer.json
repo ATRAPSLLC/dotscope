@@ -1,0 +1,5 @@
+{
+  "Protections": [
+    { "Name": "BitMono", "Enabled": true }
+  ]
+}

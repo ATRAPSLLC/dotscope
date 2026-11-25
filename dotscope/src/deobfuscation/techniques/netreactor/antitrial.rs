@@ -35,14 +35,18 @@
 //! deliberately left for `netreactor.licensecheck` so each artifact is
 //! attributed to the technique that owns it.
 //!
-//! [`NeutralizationPass`]: crate::compiler::NeutralizationPass
+//! [`NeutralizationPass`]: crate::deobfuscation::NeutralizationPass
 //! [`sweep_empty_module_cctor`]: crate::deobfuscation::cleanup
 
-use std::any::Any;
+use std::{any::Any, collections::HashSet};
 
 use crate::{
-    deobfuscation::techniques::{
-        netreactor::helpers, Detection, Evidence, Technique, TechniqueCategory,
+    deobfuscation::{
+        context::AnalysisContext,
+        techniques::{
+            netreactor::{helpers, hooks},
+            Detection, Detections, Evidence, Technique, TechniqueCategory,
+        },
     },
     metadata::token::Token,
     CilObject,
@@ -93,35 +97,48 @@ impl Technique for NetReactorAntiTrial {
         );
 
         for token in &trial_check_tokens {
-            detection.cleanup_mut().add_method(*token);
+            detection.cleanup_mut().add_protection_method(*token);
         }
 
         detection
+    }
+
+    /// Bypasses every trial check in the emulation the pipeline runs (the template's warmup
+    /// and the decryptors), as NecroBit's and the resource decrypter's own emulations do.
+    ///
+    /// The checks compare `DateTime.Now` with the protection date, two weeks either way. The
+    /// emulator cannot know the time the program was protected, and the stamp of a
+    /// deterministic build is a hash, not a date, so an emulated run reaching a check throws
+    /// "This assembly is protected by an unregistered version of Eziriz's .NET Reactor!"
+    /// and stops before the code it was run for.
+    fn initialize(
+        &self,
+        ctx: &AnalysisContext,
+        assembly: &CilObject,
+        _detection: &Detection,
+        _detections: &Detections,
+    ) {
+        let tokens: HashSet<Token> = helpers::find_trial_checks(assembly)
+            .into_iter()
+            .map(|trial| trial.method_token)
+            .collect();
+        if tokens.is_empty() {
+            return;
+        }
+        ctx.register_emulation_hook("netreactor.antitrial", move || {
+            hooks::create_trial_bypass_hook(tokens.clone())
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::validation::ValidationConfig;
-
-    fn try_load_sample(name: &str) -> Option<CilObject> {
-        let path = format!("tests/samples/packers/netreactor/7.5.0/{name}");
-        if !std::path::Path::new(&path).exists() {
-            eprintln!("Skipping test: sample not found at {path}");
-            return None;
-        }
-        Some(
-            CilObject::from_path_with_validation(&path, ValidationConfig::analysis())
-                .unwrap_or_else(|e| panic!("Failed to load {name}: {e}")),
-        )
-    }
+    use crate::testkit::load_sample;
 
     #[test]
     fn test_detect_positive_obfuscation() {
-        let Some(assembly) = try_load_sample("reactor_obfuscation.exe") else {
-            return;
-        };
+        let assembly = load_sample("packers/netreactor/7.5.0/reactor_obfuscation.exe");
         let detection = NetReactorAntiTrial.detect(&assembly);
         assert!(
             detection.is_detected(),
@@ -143,9 +160,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_baseline() {
-        let Some(assembly) = try_load_sample("original.exe") else {
-            return;
-        };
+        let assembly = load_sample("packers/netreactor/7.5.0/original.exe");
         let detection = NetReactorAntiTrial.detect(&assembly);
         assert!(
             !detection.is_detected(),

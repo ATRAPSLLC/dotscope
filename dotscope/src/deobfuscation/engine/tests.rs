@@ -1,11 +1,11 @@
 use crate::{
     analysis::{
-        ConstValue, FieldRef, MethodPurity, MethodRef, ReturnInfo, SsaBlock, SsaFunction,
-        SsaInstruction, SsaOp, SsaType, SsaVarId,
+        AccessQualifiers, Budget, CallData, Callee, ConstValue, FieldRef, MethodPurity, MethodRef,
+        ReturnInfo, SsaBlock, SsaFunction, SsaInstruction, SsaOp, SsaType, SsaVarId,
     },
     compiler::EventLog,
     deobfuscation::{
-        config::{EngineConfig, IterationConfig, PassConfig},
+        config::{EngineConfig, PassConfig},
         engine::DeobfuscationEngine,
         result::DeobfuscationResult,
     },
@@ -23,10 +23,7 @@ fn test_engine_default() {
 #[test]
 fn test_engine_config() {
     let config = EngineConfig {
-        iterations: IterationConfig {
-            max_ssa_iterations: 10,
-            ..Default::default()
-        },
+        budget: EngineConfig::BUDGET.with_limit(Budget::PipelineRounds, 10),
         passes: PassConfig {
             inline_threshold: 30,
             ..Default::default()
@@ -35,7 +32,7 @@ fn test_engine_config() {
     };
 
     let engine = DeobfuscationEngine::new(config);
-    assert_eq!(engine.config.iterations.max_ssa_iterations, 10);
+    assert_eq!(engine.config.budget.limit(Budget::PipelineRounds), 10);
     assert_eq!(engine.config.passes.inline_threshold, 30);
 }
 
@@ -121,7 +118,7 @@ fn test_analyze_return_void() {
     // Create SSA with void return
     let mut ssa: SsaFunction = SsaFunction::new(0, 0);
     let mut block = SsaBlock::new(0);
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     ssa.add_block(block);
 
     let result = ssa.return_info();
@@ -142,9 +139,7 @@ fn test_analyze_return_constant() {
     }));
 
     // Return the constant
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(var),
-    }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(var))));
     ssa.add_block(block);
 
     let result = ssa.return_info();
@@ -178,12 +173,10 @@ fn test_analyze_purity_pure() {
         right: src2,
         flags: None,
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(dest),
-    }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest))));
     ssa.add_block(block);
 
-    let result = ssa.purity();
+    let result = ssa.purity(|_| None);
     assert!(matches!(result, MethodPurity::Pure));
 }
 
@@ -199,11 +192,12 @@ fn test_analyze_purity_impure_store_field() {
         object: obj,
         field: FieldRef::new(Token::new(0x04000001)),
         value: val,
+        access: AccessQualifiers::FLAT,
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     ssa.add_block(block);
 
-    let result = ssa.purity();
+    let result = ssa.purity(|_| None);
     assert!(matches!(result, MethodPurity::Impure));
 }
 
@@ -217,13 +211,14 @@ fn test_analyze_purity_impure_throw() {
     block.add_instruction(SsaInstruction::synthetic(SsaOp::Throw { exception: exc }));
     ssa.add_block(block);
 
-    let result = ssa.purity();
+    let result = ssa.purity(|_| None);
     assert!(matches!(result, MethodPurity::Impure));
 }
 
 #[test]
-fn test_analyze_purity_readonly() {
-    // Create SSA with only field reads
+fn test_analyze_purity_field_read_may_throw() {
+    // A field read writes nothing, but faults on a null object: a call to it
+    // may be inlined, not deleted.
     let mut ssa: SsaFunction = SsaFunction::new(0, 0);
     let mut block = SsaBlock::new(0);
 
@@ -234,16 +229,17 @@ fn test_analyze_purity_readonly() {
             dest,
             object: obj,
             field: FieldRef::new(Token::new(0x04000001)),
+            access: AccessQualifiers::FLAT,
         })
         .with_result_type(SsaType::I32),
     );
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(dest),
-    }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest))));
     ssa.add_block(block);
 
-    let result = ssa.purity();
-    assert!(matches!(result, MethodPurity::ReadOnly));
+    let result = ssa.purity(|_| None);
+    assert!(matches!(result, MethodPurity::MayThrow));
+    assert!(result.can_inline());
+    assert!(!result.can_eliminate_if_unused());
 }
 
 #[test]
@@ -254,19 +250,20 @@ fn test_analyze_purity_unknown_calls() {
 
     let dest = SsaVarId::from_index(0);
     block.add_instruction(
-        SsaInstruction::synthetic(SsaOp::Call {
-            dest: Some(dest),
-            method: MethodRef::new(Token::new(0x06000001)),
-            args: vec![],
-        })
+        SsaInstruction::synthetic(
+            CallData::new(
+                Some(dest),
+                Callee::Direct(MethodRef::new(Token::new(0x06000001))),
+                vec![],
+            )
+            .into(),
+        )
         .with_result_type(SsaType::I32),
     );
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(dest),
-    }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest))));
     ssa.add_block(block);
 
-    let result = ssa.purity();
+    let result = ssa.purity(|_| None);
     assert!(matches!(result, MethodPurity::Unknown));
 }
 
@@ -285,9 +282,7 @@ fn test_detect_string_decryptor_xor() {
         right,
         flags: None,
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(dest),
-    }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(dest))));
     ssa.add_block(block);
 
     let result = DeobfuscationEngine::detect_string_decryptor_pattern(&ssa);
@@ -308,7 +303,7 @@ fn test_detect_string_decryptor_large_method() {
             value: ConstValue::I32(42),
         }));
     }
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     ssa.add_block(block);
 
     // Large methods should not be detected as string decryptors
@@ -357,7 +352,7 @@ fn test_detect_dispatcher_no_switch() {
     // Create SSA without switch
     let mut ssa: SsaFunction = SsaFunction::new(0, 0);
     let mut block = SsaBlock::new(0);
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(None)));
     ssa.add_block(block);
 
     let result = DeobfuscationEngine::detect_dispatcher_pattern(&ssa);
@@ -377,9 +372,7 @@ fn test_compute_method_summary() {
         dest: var,
         value: ConstValue::I32(42),
     }));
-    block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
-        value: Some(var),
-    }));
+    block.add_instruction(SsaInstruction::synthetic(SsaOp::returns(Some(var))));
     ssa.add_block(block);
 
     let token = Token::new(0x06000001);

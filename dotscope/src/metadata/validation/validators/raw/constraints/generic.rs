@@ -518,7 +518,7 @@ mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::raw_constraints_generic::raw_generic_constraint_validator_file_factory,
             validator_test,
         },
@@ -535,7 +535,6 @@ mod tests {
         validator_test(
             raw_generic_constraint_validator_file_factory,
             "RawGenericConstraintValidator",
-            "Parse",
             config,
             |context| validator.validate_raw(context),
         )

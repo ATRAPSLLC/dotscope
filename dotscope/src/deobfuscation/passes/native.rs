@@ -14,21 +14,31 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::deobfuscation::NativeMethodConversionPass;
+//! use dotscope::metadata::token::Token;
+//! use dotscope::{CilAssembly, File};
+//!
+//! let file = File::from_path("mixed.exe")?;
+//! let mut cil_assembly = CilAssembly::from_path("mixed.exe")?;
+//! let native_method_token = Token::new(0x0600_0002);
 //!
 //! let mut converter = NativeMethodConversionPass::new();
 //! converter.register_target(native_method_token);
 //!
-//! let stats = converter.run(&mut cil_assembly, file)?;
+//! let stats = converter.run(&mut cil_assembly, &file)?;
 //! println!("Converted {} methods", stats.converted);
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Limitations
 //!
-//! - Only supports x86/x64 code (not ARM or other architectures)
+//! - Only supports x86 code (not ARM or other architectures); 64-bit stubs decode, but
+//!   their translation is refused and they stay native
 //! - Only supports simple DynCipher-style code patterns
-//! - Methods with unsupported instructions will be skipped
+//! - Methods with an instruction the translation does not model exactly (an unsupported
+//!   instruction, a condition on a flag it cannot know, a value it cannot follow) are
+//!   skipped and keep their native code
 
 use rustc_hash::FxHashSet;
 
@@ -69,19 +79,25 @@ pub struct ConversionStats {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::deobfuscation::NativeMethodConversionPass;
+/// use dotscope::metadata::token::Token;
+/// use dotscope::{CilAssembly, File};
+///
+/// let file = File::from_path("mixed.exe")?;
+/// let mut cil_assembly = CilAssembly::from_path("mixed.exe")?;
 ///
 /// // Create converter and register native methods to convert
 /// let mut converter = NativeMethodConversionPass::new();
-/// converter.register_target(token1);
-/// converter.register_target(token2);
+/// converter.register_target(Token::new(0x0600_0002));
+/// converter.register_target(Token::new(0x0600_0003));
 ///
 /// // Run conversion
-/// let stats = converter.run(&mut cil_assembly, file)?;
+/// let stats = converter.run(&mut cil_assembly, &file)?;
 /// println!("Converted {}/{} methods",
 ///          stats.converted,
 ///          stats.converted + stats.failed);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct NativeMethodConversionPass {
     /// Tokens of native methods to convert.
@@ -225,7 +241,7 @@ impl NativeMethodConversionPass {
     ) -> Result<()> {
         // Step 1: Get the method's RVA and verify it's a native method
         let rid = token.row();
-        // Note: closure needed here — method reference with turbofish breaks downstream type inference
+        // Note: closure needed here - method reference with turbofish breaks downstream type inference
         #[allow(clippy::redundant_closure_for_method_calls)]
         let method_row = assembly
             .view()
@@ -236,7 +252,7 @@ impl NativeMethodConversionPass {
 
         // Verify this is actually a native method
         let impl_code_type = MethodImplCodeType::from_impl_flags(method_row.impl_flags);
-        if !impl_code_type.contains(MethodImplCodeType::NATIVE) {
+        if impl_code_type != MethodImplCodeType::NATIVE {
             return Err(Error::X86Error(format!(
                 "Method 0x{:08x} is not a native method",
                 token.value()
@@ -251,13 +267,7 @@ impl NativeMethodConversionPass {
         }
 
         // Step 2: Get x86 bytes from the RVA
-        let offset = file.rva_to_offset(method_row.rva as usize)?;
-        let x86_bytes = file.data().get(offset..).ok_or_else(|| {
-            Error::X86Error(format!(
-                "Method 0x{:08x}: file offset {offset} out of bounds",
-                token.value()
-            ))
-        })?;
+        let x86_bytes = file.section_bounded(method_row.rva as usize)?;
 
         // Step 3: Detect prologue and adjust bytes if needed
         let (decode_bytes, base_offset) = if self.skip_prologue {

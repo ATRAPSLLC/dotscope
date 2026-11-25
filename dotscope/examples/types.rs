@@ -41,19 +41,19 @@ fn main() -> Result<()> {
 
     let assembly = CilObject::from_path(path)?;
 
-    // === Type Registry Analysis ===
+    // Type Registry Analysis
     print_type_registry_analysis(&assembly);
 
-    // === Generic Type Analysis ===
+    // Generic Type Analysis
     print_generic_analysis(&assembly);
 
-    // === Inheritance Analysis ===
+    // Inheritance Analysis
     print_inheritance_analysis(&assembly);
 
-    // === Interface Analysis ===
+    // Interface Analysis
     print_interface_analysis(&assembly);
 
-    // === Signature Analysis ===
+    // Signature Analysis
     print_signature_analysis(&assembly);
 
     println!("\n✅ Type system analysis completed!");
@@ -206,7 +206,7 @@ fn print_generic_analysis(assembly: &CilObject) {
                         .saturating_add(param_count);
                     if param_count > generic_stats.max_type_parameters {
                         generic_stats.max_type_parameters = param_count;
-                        generic_stats.most_generic_type = type_def.name.clone();
+                        generic_stats.most_generic_type = type_def.name.to_string();
                     }
                 }
             }
@@ -375,7 +375,7 @@ fn print_signature_analysis(assembly: &CilObject) {
 
         if param_count > signature_stats.max_parameters {
             signature_stats.max_parameters = param_count;
-            signature_stats.most_complex_method = method.name.clone();
+            signature_stats.most_complex_method = method.name.to_string();
         }
 
         signature_stats.total_parameters =

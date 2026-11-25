@@ -107,11 +107,11 @@ impl Technique for GenericAntiDebug {
 
 #[cfg(test)]
 mod tests {
-    use crate::{deobfuscation::techniques::Technique, test::helpers::load_sample};
+    use crate::{deobfuscation::techniques::Technique, testkit::helpers::load_sample};
 
     #[test]
     fn test_detect_positive() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_maximum.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/mkaring_maximum.exe");
         let technique = super::GenericAntiDebug;
         let detection = technique.detect(&asm);
         assert!(detection.is_detected());
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
         let technique = super::GenericAntiDebug;
         let detection = technique.detect(&asm);
         assert!(!detection.is_detected());

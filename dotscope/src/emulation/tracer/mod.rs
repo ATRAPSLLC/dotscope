@@ -49,10 +49,13 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::emulation::{
 //!     ProcessBuilder, TracingConfig, TraceFilter, CallTreeBuilder,
 //! };
+//! use dotscope::CilObject;
+//!
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
 //!
 //! // File-based tracing with depth filter
 //! let filter = TraceFilter {
@@ -65,6 +68,7 @@
 //!     .with_tracing(TracingConfig::full_trace("trace.log"))
 //!     .with_trace_listener(Box::new(CallTreeBuilder::new()))
 //!     .build()?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 mod calltree;

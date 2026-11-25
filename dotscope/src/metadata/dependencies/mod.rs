@@ -106,7 +106,7 @@ mod tests {
     use super::*;
     use crate::{
         metadata::{dependencies::DependencyType, identity::AssemblyVersion},
-        test::helpers::dependencies::{
+        testkit::helpers::dependencies::{
             create_test_assembly_ref, create_test_dependency, create_test_identity,
         },
     };

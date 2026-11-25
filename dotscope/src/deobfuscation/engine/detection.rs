@@ -22,7 +22,7 @@ impl DeobfuscationEngine {
     /// * `ctx` - The analysis context for registering hooks, warmup methods, etc.
     /// * `assembly` - The assembly for metadata lookups.
     /// * `detections` - Detection results with findings for each technique.
-    pub(crate) fn initialize_techniques(
+    pub fn initialize_techniques(
         &self,
         ctx: &AnalysisContext,
         assembly: &CilObject,
@@ -49,8 +49,8 @@ impl DeobfuscationEngine {
     /// Initializes detected techniques and creates their SSA passes in a single traversal.
     ///
     /// For each detected technique with an SSA phase (in dependency order):
-    /// 1. Calls [`Technique::initialize`] if not already initialized
-    /// 2. Calls [`Technique::create_pass`] if pass not already created
+    /// 1. Calls [`Technique::initialize`](crate::deobfuscation::Technique::initialize) if not already initialized
+    /// 2. Calls [`Technique::create_pass`](crate::deobfuscation::Technique::create_pass) if pass not already created
     ///
     /// This merges the previously separate `initialize_techniques()` and
     /// `create_technique_passes()` to avoid redundant `sorted_techniques()` traversals.
@@ -61,7 +61,7 @@ impl DeobfuscationEngine {
     /// * `assembly` - The assembly (shared reference for initialization and pass construction).
     /// * `detections` - Detection results with findings for each technique.
     /// * `scheduler` - The pass scheduler to add technique passes to.
-    pub(crate) fn initialize_and_create_passes(
+    pub fn initialize_and_create_passes(
         &self,
         ctx: &AnalysisContext,
         assembly: &Arc<CilObject>,
@@ -108,7 +108,7 @@ impl DeobfuscationEngine {
     /// # Arguments
     ///
     /// * `ctx` - The analysis context containing dispatcher and decryptor token sets.
-    pub(crate) fn configure_no_inline(&self, ctx: &AnalysisContext) {
+    pub fn configure_no_inline(&self, ctx: &AnalysisContext) {
         for token in ctx.dispatchers.iter() {
             ctx.compiler.no_inline.insert(*token);
         }
@@ -120,12 +120,12 @@ impl DeobfuscationEngine {
     /// Returns `true` if any technique has registered emulation requirements.
     ///
     /// Checks for decryptors, warmup methods, emulation hooks, or state machine
-    /// providers — any of which indicate that passes will need emulation.
+    /// providers - any of which indicate that passes will need emulation.
     ///
     /// # Arguments
     ///
     /// * `ctx` - The analysis context to inspect for emulation requirements.
-    pub(crate) fn needs_emulation(ctx: &AnalysisContext) -> bool {
+    pub fn needs_emulation(ctx: &AnalysisContext) -> bool {
         ctx.decryptors.has_decryptors()
             || ctx.has_warmup_methods()
             || ctx.has_emulation_hooks()

@@ -217,7 +217,6 @@ impl PropertyBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
@@ -226,185 +225,178 @@ mod tests {
             cilassemblyview::CilAssemblyView,
             tables::{PropertyAttributes, TableId},
         },
+        testkit::fixture,
     };
 
     #[test]
     fn test_property_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a property signature for System.String (PROPERTY + ELEMENT_TYPE_STRING)
-            let string_property_sig = &[0x08, 0x0E];
+        // Create a property signature for System.String (PROPERTY + ELEMENT_TYPE_STRING)
+        let string_property_sig = &[0x08, 0x0E];
 
-            let ref_ = PropertyBuilder::new()
-                .name("TestProperty")
-                .flags(PropertyAttributes::ZERO)
-                .signature(string_property_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = PropertyBuilder::new()
+            .name("TestProperty")
+            .flags(PropertyAttributes::ZERO)
+            .signature(string_property_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly - only check kind, not token value
-            // (tokens are resolved at write time, not at creation time)
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
-        }
+        // Verify reference is created correctly - only check kind, not token value
+        // (tokens are resolved at write time, not at creation time)
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
     }
 
     #[test]
     fn test_property_builder_with_special_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create an int32 property signature (PROPERTY + ELEMENT_TYPE_I4)
-            let int32_property_sig = &[0x08, 0x08];
+        // Create an int32 property signature (PROPERTY + ELEMENT_TYPE_I4)
+        let int32_property_sig = &[0x08, 0x08];
 
-            // Create a property with special naming (like an indexer)
-            let ref_ = PropertyBuilder::new()
-                .name("Item")
-                .flags(PropertyAttributes::SPECIAL_NAME)
-                .signature(int32_property_sig)
-                .build(&mut assembly)
-                .unwrap();
+        // Create a property with special naming (like an indexer)
+        let ref_ = PropertyBuilder::new()
+            .name("Item")
+            .flags(PropertyAttributes::SPECIAL_NAME)
+            .signature(int32_property_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
-            let token = ref_.placeholder_token().unwrap();
-            assert_eq!(token.value() & 0xFF000000, 0x17000000);
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
+        let token = ref_.placeholder_token().unwrap();
+        assert_eq!(token.value() & 0xFF000000, 0x17000000);
     }
 
     #[test]
     fn test_property_builder_indexer_signature() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create an indexer signature: PROPERTY + HASTHIS + 1 param + string return + int32 param
-            let indexer_sig = &[0x28, 0x01, 0x0E, 0x08]; // PROPERTY|HASTHIS, 1 param, string, int32
+        // Create an indexer signature: PROPERTY + HASTHIS + 1 param + string return + int32 param
+        let indexer_sig = &[0x28, 0x01, 0x0E, 0x08]; // PROPERTY|HASTHIS, 1 param, string, int32
 
-            let ref_ = PropertyBuilder::new()
-                .name("Item")
-                .flags(PropertyAttributes::SPECIAL_NAME)
-                .signature(indexer_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = PropertyBuilder::new()
+            .name("Item")
+            .flags(PropertyAttributes::SPECIAL_NAME)
+            .signature(indexer_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
     }
 
     #[test]
     fn test_property_builder_with_default() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a boolean property signature (PROPERTY + ELEMENT_TYPE_BOOLEAN)
-            let bool_property_sig = &[0x08, 0x02];
+        // Create a boolean property signature (PROPERTY + ELEMENT_TYPE_BOOLEAN)
+        let bool_property_sig = &[0x08, 0x02];
 
-            // Create a property with default value
-            let ref_ = PropertyBuilder::new()
-                .name("DefaultProperty")
-                .flags(PropertyAttributes::HAS_DEFAULT)
-                .signature(bool_property_sig)
-                .build(&mut assembly)
-                .unwrap();
+        // Create a property with default value
+        let ref_ = PropertyBuilder::new()
+            .name("DefaultProperty")
+            .flags(PropertyAttributes::HAS_DEFAULT)
+            .signature(bool_property_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Property));
     }
 
     #[test]
     fn test_property_builder_missing_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = PropertyBuilder::new()
-                .flags(PropertyAttributes::ZERO)
-                .signature(&[0x08, 0x08])
-                .build(&mut assembly);
+        let result = PropertyBuilder::new()
+            .flags(PropertyAttributes::ZERO)
+            .signature(&[0x08, 0x08])
+            .build(&mut assembly);
 
-            // Should fail because name is required
-            assert!(result.is_err());
-        }
+        // Should fail because name is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_property_builder_missing_flags() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = PropertyBuilder::new()
-                .name("TestProperty")
-                .signature(&[0x08, 0x08])
-                .build(&mut assembly);
+        let result = PropertyBuilder::new()
+            .name("TestProperty")
+            .signature(&[0x08, 0x08])
+            .build(&mut assembly);
 
-            // Should fail because flags are required
-            assert!(result.is_err());
-        }
+        // Should fail because flags are required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_property_builder_missing_signature() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = PropertyBuilder::new()
-                .name("TestProperty")
-                .flags(PropertyAttributes::ZERO)
-                .build(&mut assembly);
+        let result = PropertyBuilder::new()
+            .name("TestProperty")
+            .flags(PropertyAttributes::ZERO)
+            .build(&mut assembly);
 
-            // Should fail because signature is required
-            assert!(result.is_err());
-        }
+        // Should fail because signature is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_property_builder_multiple_properties() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let string_sig = &[0x08, 0x0E]; // PROPERTY + string
-            let int_sig = &[0x08, 0x08]; // PROPERTY + int32
+        let string_sig = &[0x08, 0x0E]; // PROPERTY + string
+        let int_sig = &[0x08, 0x08]; // PROPERTY + int32
 
-            // Create multiple properties
-            let ref1 = PropertyBuilder::new()
-                .name("Property1")
-                .flags(PropertyAttributes::ZERO)
-                .signature(string_sig)
-                .build(&mut assembly)
-                .unwrap();
+        // Create multiple properties
+        let ref1 = PropertyBuilder::new()
+            .name("Property1")
+            .flags(PropertyAttributes::ZERO)
+            .signature(string_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            let ref2 = PropertyBuilder::new()
-                .name("Property2")
-                .flags(PropertyAttributes::SPECIAL_NAME)
-                .signature(int_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref2 = PropertyBuilder::new()
+            .name("Property2")
+            .flags(PropertyAttributes::SPECIAL_NAME)
+            .signature(int_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            let ref3 = PropertyBuilder::new()
-                .name("Property3")
-                .flags(PropertyAttributes::HAS_DEFAULT)
-                .signature(string_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref3 = PropertyBuilder::new()
+            .name("Property3")
+            .flags(PropertyAttributes::HAS_DEFAULT)
+            .signature(string_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed and be different references
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
-            assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
+        // All should succeed and be different references
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
+        assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
 
-            // All should have Property table kind
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::Property));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::Property));
-            assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::Property));
-        }
+        // All should have Property table kind
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::Property));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::Property));
+        assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::Property));
     }
 }

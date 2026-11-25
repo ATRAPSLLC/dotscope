@@ -310,12 +310,12 @@ mod tests {
             obfuscar::strings::{is_obfuscar_helper_type, ObfuscarStringFindings, ObfuscarStrings},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive_obfuscar_strings_only() {
-        let asm = load_sample("tests/samples/packers/obfuscar/2.2.50/obfuscar_strings_only.exe");
+        let asm = load_sample("packers/obfuscar/2.2.50/obfuscar_strings_only.exe");
 
         let technique = ObfuscarStrings;
         let detection = technique.detect(&asm);
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_confuserex_original() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = ObfuscarStrings;
         let detection = technique.detect(&asm);

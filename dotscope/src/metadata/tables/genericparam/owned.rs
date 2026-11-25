@@ -31,10 +31,12 @@ use std::{
 use crate::{
     metadata::{
         customattributes::CustomAttributeValueList,
+        streams::SharedStr,
         tables::GenericParamAttributes,
         token::Token,
-        typesystem::{CilTypeRefList, CilTypeReference},
+        typesystem::{CilTypeRef, CilTypeReference},
     },
+    utils::RowList,
     Result,
 };
 
@@ -144,13 +146,13 @@ pub struct GenericParam {
     /// that type arguments must satisfy.
     ///
     /// [`CilTypeReference`]: crate::metadata::typesystem::CilTypeReference
-    pub constraints: CilTypeRefList,
+    pub constraints: RowList<CilTypeRef>,
 
     /// The name of the generic parameter.
     ///
     /// The parameter name as it appears in source code and metadata, resolved
     /// from the strings heap. Used for reflection and debugging purposes.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Custom attributes applied to this generic parameter.
     ///
@@ -205,7 +207,7 @@ impl GenericParam {
                         }
 
                         if !already_exists {
-                            generic_params.push(self.clone());
+                            generic_params.push_row(self.token, self.clone());
                         }
                     }
 
@@ -224,7 +226,7 @@ impl GenericParam {
                         }
 
                         if !already_exists {
-                            method.generic_params.push(self.clone());
+                            method.generic_params.push_row(self.token, self.clone());
                         }
                     }
 

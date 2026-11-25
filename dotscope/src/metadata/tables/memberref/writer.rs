@@ -54,11 +54,7 @@ impl RowWritable for MemberRefRaw {
         sizes: &TableInfoRef,
     ) -> Result<()> {
         // Write MemberRefParent coded index
-        let class_value = sizes.encode_coded_index(
-            self.class.tag,
-            self.class.row,
-            CodedIndexType::MemberRefParent,
-        )?;
+        let class_value = self.class.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

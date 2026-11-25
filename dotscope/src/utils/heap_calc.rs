@@ -11,22 +11,7 @@
 //!
 //! # Examples
 //!
-//! ```rust,ignore
-//! use dotscope::utils::heap_calc::calculate_table_row_size;
-//! use dotscope::metadata::tables::TableId;
-//! use dotscope::prelude::*;
-//! use std::path::Path;
-//!
-//! # let view = CilAssemblyView::from_path(Path::new("tests/samples/crafted_2.exe"))?;
-//! let table_info = view.tables().unwrap().table_info();
-//!
-//! let type_def_size = calculate_table_row_size(TableId::TypeDef, &table_info);
-//! let method_def_size = calculate_table_row_size(TableId::MethodDef, &table_info);
-//!
-//! println!("TypeDef row size: {} bytes", type_def_size);
-//! println!("MethodDef row size: {} bytes", method_def_size);
-//! # Ok::<(), dotscope::Error>(())
-//! ```
+//! The `examples::calculate_table_row_size_example` test in this module runs this example.
 
 use crate::{
     dispatch_table_type,
@@ -62,25 +47,7 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::heap_calc::calculate_table_row_size;
-/// use dotscope::metadata::tables::TableId;
-/// use dotscope::prelude::*;
-/// use std::path::Path;
-///
-/// # let view = CilAssemblyView::from_path(Path::new("tests/samples/crafted_2.exe"))?;
-/// let table_info = view.tables().unwrap().table_info();
-///
-/// // Calculate sizes for common table types
-/// let type_def_size = calculate_table_row_size(TableId::TypeDef, &table_info);
-/// let method_def_size = calculate_table_row_size(TableId::MethodDef, &table_info);
-/// let field_def_size = calculate_table_row_size(TableId::FieldDef, &table_info);
-///
-/// println!("TypeDef row size: {} bytes", type_def_size);
-/// println!("MethodDef row size: {} bytes", method_def_size);
-/// println!("FieldDef row size: {} bytes", field_def_size);
-/// # Ok::<(), dotscope::Error>(())
-/// ```
+/// The `examples::calculate_table_row_size_example` test in this module runs this example.
 pub fn calculate_table_row_size(table_id: TableId, table_info: &TableInfoRef) -> u32 {
     dispatch_table_type!(table_id, |RawType| RawType::row_size(table_info))
 }
@@ -94,5 +61,38 @@ mod tests {
     fn test_calculate_table_row_size_compiles() {
         // This test ensures the function compiles and can be called
         // Real tests would require setting up TableInfoRef with actual data
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::{
+        metadata::tables::{FieldRaw, MethodDefRaw, TableId, TypeDefRaw},
+        testkit::fixture,
+        CilAssemblyView, Result,
+    };
+
+    /// crafted_2's heaps and tables are small, so every index is two bytes: a TypeDef row is
+    /// Flags (4) and five two-byte columns, a MethodDef row RVA (4) and five two-byte columns,
+    /// a Field row three two-byte columns (ECMA-335 II.22).
+    #[test]
+    fn calculate_table_row_size_example() -> Result<()> {
+        let view = CilAssemblyView::from_path(fixture("crafted_2.exe"))?;
+        let tables = view.tables().expect("tables");
+        let info = &tables.info;
+
+        assert_eq!(calculate_table_row_size(TableId::TypeDef, info), 14);
+        assert_eq!(calculate_table_row_size(TableId::MethodDef, info), 14);
+        assert_eq!(calculate_table_row_size(TableId::Field, info), 6);
+
+        // The parsed tables agree.
+        assert_eq!(tables.table::<TypeDefRaw>().expect("TypeDef").row_size, 14);
+        assert_eq!(
+            tables.table::<MethodDefRaw>().expect("MethodDef").row_size,
+            14
+        );
+        assert_eq!(tables.table::<FieldRaw>().expect("Field").row_size, 6);
+        Ok(())
     }
 }

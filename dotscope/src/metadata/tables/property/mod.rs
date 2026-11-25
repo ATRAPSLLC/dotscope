@@ -46,17 +46,15 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::metadata::token::Token;
+use crate::{metadata::token::Token, utils::LazyList};
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 
@@ -70,8 +68,9 @@ pub type PropertyMap = SkipMap<Token, PropertyRc>;
 /// A thread-safe vector containing Property entries.
 ///
 /// This concurrent vector provides sequential access to Property entries
-/// while supporting safe concurrent iteration and access from multiple threads.
-pub type PropertyList = Arc<boxcar::Vec<PropertyRc>>;
+/// while supporting safe concurrent iteration and access from multiple threads. A list
+/// allocates its storage on its first push: most types hold none.
+pub type PropertyList = LazyList<PropertyRc>;
 
 /// A reference-counted pointer to a Property entry.
 ///

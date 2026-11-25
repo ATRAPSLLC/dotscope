@@ -12,7 +12,8 @@ tests:
   stage: test
   dependencies: []
   script:
-    - cargo test --release
+    # The full test tier (.cargo/config.toml).
+    - cargo test-full
   parallel:
     matrix:
     - OS: linux

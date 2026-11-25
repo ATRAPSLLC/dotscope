@@ -141,8 +141,10 @@ impl<'a> ReferenceValidator<'a> {
 
     /// Validates reference integrity for a specific token.
     ///
-    /// This method checks that a token's incoming and outgoing references
-    /// are all valid and don't create integrity violations.
+    /// This method checks that the token exists and that every token it references
+    /// exists. Its incoming references need no check: the scanner records them from
+    /// the rows it reads, so each one names a row that exists, and walking them for
+    /// every row that references a popular target was quadratic in its referrers.
     ///
     /// # Arguments
     ///
@@ -171,19 +173,6 @@ impl<'a> ReferenceValidator<'a> {
                         table: TableId::from_token_type(referenced_token.table())
                             .unwrap_or(TableId::Module),
                         rid: referenced_token.row(),
-                    });
-                }
-            }
-        }
-
-        // Validate all incoming references
-        if let Some(incoming_refs) = self.scanner.references_to(token) {
-            for &referencing_token in incoming_refs {
-                if !self.scanner.token_exists(referencing_token) {
-                    return Err(Error::InvalidRid {
-                        table: TableId::from_token_type(referencing_token.table())
-                            .unwrap_or(TableId::Module),
-                        rid: referencing_token.row(),
                     });
                 }
             }
@@ -592,147 +581,131 @@ impl std::fmt::Display for ReferenceStatistics {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::metadata::cilassemblyview::CilAssemblyView;
+    use crate::{metadata::cilassemblyview::CilAssemblyView, testkit::fixture};
 
     #[test]
     fn test_reference_validator_creation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = ReferenceValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = ReferenceValidator::new(&scanner);
 
-                // Test basic functionality
-                let stats = validator.get_reference_statistics();
-                assert!(stats.total_tokens > 0);
-            }
-        }
+        // Test basic functionality
+        let stats = validator.get_reference_statistics();
+        assert!(stats.total_tokens > 0);
     }
 
     #[test]
     fn test_token_reference_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = ReferenceValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = ReferenceValidator::new(&scanner);
 
-                // Test with valid tokens
-                if scanner.table_row_count(TableId::TypeDef) > 0 {
-                    let valid_token = Token::new(0x02000001); // TypeDef with RID 1
-                    let tokens = vec![valid_token];
-                    assert!(validator.validate_token_references(tokens).is_ok());
-                }
-
-                // Test with invalid token
-                let invalid_token = Token::new(0x02000000); // TypeDef with RID 0
-                let invalid_tokens = vec![invalid_token];
-                assert!(validator.validate_token_references(invalid_tokens).is_err());
-            }
+        // Test with valid tokens
+        if scanner.table_row_count(TableId::TypeDef) > 0 {
+            let valid_token = Token::new(0x02000001); // TypeDef with RID 1
+            let tokens = vec![valid_token];
+            assert!(validator.validate_token_references(tokens).is_ok());
         }
+
+        // Test with invalid token
+        let invalid_token = Token::new(0x02000000); // TypeDef with RID 0
+        let invalid_tokens = vec![invalid_token];
+        assert!(validator.validate_token_references(invalid_tokens).is_err());
     }
 
     #[test]
     fn test_deletion_safety_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = ReferenceValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = ReferenceValidator::new(&scanner);
 
-                if scanner.table_row_count(TableId::TypeDef) > 0 {
-                    let token = Token::new(0x02000001); // TypeDef with RID 1
+        if scanner.table_row_count(TableId::TypeDef) > 0 {
+            let token = Token::new(0x02000001); // TypeDef with RID 1
 
-                    // Test deletion safety (result depends on whether token is referenced)
-                    let result = validator.validate_deletion_safety(token);
-                    // Don't assert specific result as it depends on the actual references
-                    // Just verify the method doesn't panic
-                    let _ = result;
-                }
-            }
+            // Test deletion safety (result depends on whether token is referenced)
+            let result = validator.validate_deletion_safety(token);
+            // Don't assert specific result as it depends on the actual references
+            // Just verify the method doesn't panic
+            let _ = result;
         }
     }
 
     #[test]
     fn test_circular_reference_detection() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = ReferenceValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = ReferenceValidator::new(&scanner);
 
-                if scanner.table_row_count(TableId::TypeDef) > 0 {
-                    let token = Token::new(0x02000001); // TypeDef with RID 1
+        if scanner.table_row_count(TableId::TypeDef) > 0 {
+            let token = Token::new(0x02000001); // TypeDef with RID 1
 
-                    // Test circular reference detection
-                    let has_circular = validator.has_circular_references(token);
-                    // Don't assert specific result as it depends on the actual metadata
-                    // Just verify the method completes without error
-                    let _ = has_circular;
-                }
-            }
+            // Test circular reference detection
+            let has_circular = validator.has_circular_references(token);
+            // Don't assert specific result as it depends on the actual metadata
+            // Just verify the method completes without error
+            let _ = has_circular;
         }
     }
 
     #[test]
     fn test_parent_child_relationship_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = ReferenceValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = ReferenceValidator::new(&scanner);
 
-                if scanner.table_row_count(TableId::TypeDef) >= 2 {
-                    let parent_token = Token::new(0x02000001); // TypeDef with RID 1
-                    let child_token = Token::new(0x02000002); // TypeDef with RID 2
+        if scanner.table_row_count(TableId::TypeDef) >= 2 {
+            let parent_token = Token::new(0x02000001); // TypeDef with RID 1
+            let child_token = Token::new(0x02000002); // TypeDef with RID 2
 
-                    // Test basic parent-child validation
-                    let result =
-                        validator.validate_parent_child_relationship(parent_token, child_token);
-                    // Should pass basic validation (both tokens exist, not self-referential)
-                    assert!(result.is_ok());
+            // Test basic parent-child validation
+            let result = validator.validate_parent_child_relationship(parent_token, child_token);
+            // Should pass basic validation (both tokens exist, not self-referential)
+            assert!(result.is_ok());
 
-                    // Test self-referential relationship (should fail)
-                    let self_ref_result =
-                        validator.validate_parent_child_relationship(parent_token, parent_token);
-                    assert!(self_ref_result.is_err());
-                }
-            }
+            // Test self-referential relationship (should fail)
+            let self_ref_result =
+                validator.validate_parent_child_relationship(parent_token, parent_token);
+            assert!(self_ref_result.is_err());
         }
     }
 
     #[test]
     fn test_reference_analysis() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = ReferenceValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = ReferenceValidator::new(&scanner);
 
-                let analysis = validator.analyze_reference_patterns();
-                assert!(analysis.total_tokens > 0);
+        let analysis = validator.analyze_reference_patterns();
+        assert!(analysis.total_tokens > 0);
 
-                let stats = validator.get_reference_statistics();
-                let stats_string = stats.to_string();
-                assert!(stats_string.contains("tokens"));
-                assert!(stats_string.contains("references"));
-            }
-        }
+        let stats = validator.get_reference_statistics();
+        let stats_string = stats.to_string();
+        assert!(stats_string.contains("tokens"));
+        assert!(stats_string.contains("references"));
     }
 
     #[test]
     fn test_forward_reference_validation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(scanner) = ReferenceScanner::from_view(&view) {
-                let validator = ReferenceValidator::new(&scanner);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let scanner = ReferenceScanner::from_view(&view).expect("the reference scanner builds");
+        let validator = ReferenceValidator::new(&scanner);
 
-                if scanner.table_row_count(TableId::TypeDef) > 0 {
-                    let token = Token::new(0x02000001); // TypeDef with RID 1
+        if scanner.table_row_count(TableId::TypeDef) > 0 {
+            let token = Token::new(0x02000001); // TypeDef with RID 1
 
-                    // Test forward reference validation
-                    let result = validator.validate_forward_references(token);
-                    // Should pass if all references point to existing tokens
-                    assert!(result.is_ok());
-                }
-            }
+            // Test forward reference validation
+            let result = validator.validate_forward_references(token);
+            // Should pass if all references point to existing tokens
+            assert!(result.is_ok());
         }
     }
 }

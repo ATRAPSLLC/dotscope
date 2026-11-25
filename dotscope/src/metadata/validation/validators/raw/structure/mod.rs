@@ -59,10 +59,12 @@
 
 mod heap;
 mod signature;
+mod sortorder;
 mod table;
 mod token;
 
 pub use heap::RawHeapValidator;
 pub use signature::RawSignatureValidator;
+pub use sortorder::RawSortOrderValidator;
 pub use table::RawTableValidator;
 pub use token::RawTokenValidator;

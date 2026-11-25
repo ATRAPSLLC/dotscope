@@ -41,19 +41,19 @@ fn main() -> Result<()> {
 
     let assembly = CilObject::from_path(path)?;
 
-    // === Metadata Tables Analysis ===
+    // Metadata Tables Analysis
     print_metadata_tables(&assembly);
 
-    // === String and Blob Heap Analysis ===
+    // String and Blob Heap Analysis
     print_heap_analysis(&assembly);
 
-    // === Type System Deep Dive ===
+    // Type System Deep Dive
     print_type_system_analysis(&assembly);
 
-    // === Custom Attributes Analysis ===
+    // Custom Attributes Analysis
     print_custom_attributes_analysis(&assembly);
 
-    // === Assembly Dependencies ===
+    // Assembly Dependencies
     print_dependency_analysis(&assembly);
 
     println!("\n✅ Metadata exploration completed!");
@@ -243,7 +243,7 @@ fn print_type_system_analysis(assembly: &CilObject) {
         let namespace = if type_def.namespace.is_empty() {
             "<global>".to_string()
         } else {
-            type_def.namespace.clone()
+            type_def.namespace.to_string()
         };
 
         let entry = namespace_stats.entry(namespace).or_insert(0usize);
@@ -456,7 +456,7 @@ fn print_dependency_analysis(assembly: &CilObject) {
                         println!("       PublicKey: {} bytes", key.len());
                     }
                     dotscope::metadata::identity::Identity::Token(token) => {
-                        println!("       Token: 0x{token:016X}");
+                        println!("       Token: {}", hex::encode(token));
                     }
                     dotscope::metadata::identity::Identity::EcmaKey(key) => {
                         println!("       EcmaKey: {} bytes", key.len());

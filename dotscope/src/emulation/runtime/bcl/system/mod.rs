@@ -7,7 +7,7 @@
 //!
 //! | Module | .NET Type(s) | Description |
 //! |--------|-------------|-------------|
-//! | [`array`] | `System.Array`, `System.Buffer` | Array manipulation and block copy operations |
+//! | [`array`](mod@array) | `System.Array`, `System.Buffer` | Array manipulation and block copy operations |
 //! | [`bitconverter`] | `System.BitConverter` | Primitive-to-byte and byte-to-primitive conversions |
 //! | [`convert`] | `System.Convert` | Type conversions and Base64 encoding/decoding |
 //! | [`enums`] | `System.Enum` | Enum parsing, formatting, and value inspection |

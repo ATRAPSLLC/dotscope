@@ -167,153 +167,146 @@ impl TypeRefBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
         prelude::CodedIndexType,
+        testkit::fixture,
     };
 
     #[test]
     fn test_typeref_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let mscorlib_ref =
-                CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
-            let ref_ = TypeRefBuilder::new()
-                .name("String")
-                .namespace("System")
-                .resolution_scope(mscorlib_ref)
-                .build(&mut assembly)
-                .unwrap();
+        let mscorlib_ref =
+            CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
+        let ref_ = TypeRefBuilder::new()
+            .name("String")
+            .namespace("System")
+            .resolution_scope(mscorlib_ref)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref_ is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
-        }
+        // Verify ref_ is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
     }
 
     #[test]
     fn test_typeref_builder_system_object() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Manually specify the core library reference
-            let mscorlib_ref =
-                CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
-            let ref_ = TypeRefBuilder::new()
-                .name("Object")
-                .namespace("System")
-                .resolution_scope(mscorlib_ref)
-                .build(&mut assembly)
-                .unwrap();
+        // Manually specify the core library reference
+        let mscorlib_ref =
+            CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
+        let ref_ = TypeRefBuilder::new()
+            .name("Object")
+            .namespace("System")
+            .resolution_scope(mscorlib_ref)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref_ is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
-        }
+        // Verify ref_ is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
     }
 
     #[test]
     fn test_typeref_builder_system_value_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Manually specify the core library reference
-            let mscorlib_ref =
-                CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
-            let ref_ = TypeRefBuilder::new()
-                .name("ValueType")
-                .namespace("System")
-                .resolution_scope(mscorlib_ref)
-                .build(&mut assembly)
-                .unwrap();
+        // Manually specify the core library reference
+        let mscorlib_ref =
+            CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
+        let ref_ = TypeRefBuilder::new()
+            .name("ValueType")
+            .namespace("System")
+            .resolution_scope(mscorlib_ref)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref_ is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
-        }
+        // Verify ref_ is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
     }
 
     #[test]
     fn test_typeref_builder_from_mscorlib() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Manually specify the core library reference
-            let mscorlib_ref =
-                CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
-            let ref_ = TypeRefBuilder::new()
-                .name("Int32")
-                .namespace("System")
-                .resolution_scope(mscorlib_ref)
-                .build(&mut assembly)
-                .unwrap();
+        // Manually specify the core library reference
+        let mscorlib_ref =
+            CodedIndex::new(TableId::AssemblyRef, 1, CodedIndexType::ResolutionScope);
+        let ref_ = TypeRefBuilder::new()
+            .name("Int32")
+            .namespace("System")
+            .resolution_scope(mscorlib_ref)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref_ is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
-        }
+        // Verify ref_ is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
     }
 
     #[test]
     fn test_typeref_builder_missing_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = TypeRefBuilder::new()
-                .namespace("System")
-                .resolution_scope(CodedIndex::new(
-                    TableId::AssemblyRef,
-                    1,
-                    CodedIndexType::ResolutionScope,
-                ))
-                .build(&mut assembly);
+        let result = TypeRefBuilder::new()
+            .namespace("System")
+            .resolution_scope(CodedIndex::new(
+                TableId::AssemblyRef,
+                1,
+                CodedIndexType::ResolutionScope,
+            ))
+            .build(&mut assembly);
 
-            // Should fail because name is required
-            assert!(result.is_err());
-        }
+        // Should fail because name is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_typeref_builder_missing_resolution_scope() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = TypeRefBuilder::new()
-                .name("String")
-                .namespace("System")
-                .build(&mut assembly);
+        let result = TypeRefBuilder::new()
+            .name("String")
+            .namespace("System")
+            .build(&mut assembly);
 
-            // Should fail because resolution_scope is required
-            assert!(result.is_err());
-        }
+        // Should fail because resolution_scope is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_typeref_builder_global_namespace() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeRefBuilder::new()
-                .name("GlobalType")
-                .namespace("") // Empty namespace = global
-                .resolution_scope(CodedIndex::new(
-                    TableId::AssemblyRef,
-                    1,
-                    CodedIndexType::ResolutionScope,
-                ))
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = TypeRefBuilder::new()
+            .name("GlobalType")
+            .namespace("") // Empty namespace = global
+            .resolution_scope(CodedIndex::new(
+                TableId::AssemblyRef,
+                1,
+                CodedIndexType::ResolutionScope,
+            ))
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref_ is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
-        }
+        // Verify ref_ is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeRef));
     }
 }

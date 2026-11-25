@@ -550,6 +550,9 @@ fn assembly_get_manifest_resource_stream_pre(
     let Some(resource) = resource else {
         return PreHookResult::Bypass(Some(EmValue::Null));
     };
+    thread
+        .capture()
+        .record_resource_read(resource.token, thread.current_method());
 
     // Get the resource data
     let Some(data) = resources.get_data(&resource) else {
@@ -642,7 +645,7 @@ mod tests {
     use super::*;
     use crate::{
         emulation::runtime::hook::HookManager, metadata::typesystem::PointerSize,
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     #[test]

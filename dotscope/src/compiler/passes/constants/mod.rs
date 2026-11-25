@@ -33,124 +33,30 @@
 //! v5 = 0           // absorbing element
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use analyssa::BitSet;
+use analyssa::{
+    analysis::{Budget, Machine, Rounds},
+    events::{Event, EventListener},
+    ir::function::SsaEditOptions,
+    passes::utils::resolve_chains,
+    target::Target,
+    BitSet, PointerSize,
+};
 
 use crate::{
     analysis::{
-        conv_op_for_target, simplify_op, CilTarget, CmpKind, ConstValue, ConstValueCilExt,
-        ConstantPropagation, EhCfg, MethodRef, SccpResult, SimplifyResult, SsaEvaluator,
-        SsaFunction, SsaOp, SsaType, SsaVarId,
+        simplify_op, CallResolver, Callee, CilTarget, ConstValue, ConstValueCilExt,
+        ConstantPropagation, LoopAnalyzer, MethodPurity, MethodRef, SccpResult, SimplifyResult,
+        SsaCfg, SsaEvaluator, SsaFunction, SsaOp, SsaType, SsaVarId,
     },
     compiler::{
         pass::{ModificationScope, SsaPass},
         CompilerContext, EventKind, EventLog,
     },
-    metadata::{tables::TableId, token::Token, typesystem::PointerSize},
+    metadata::{tables::TableId, token::Token},
     CilObject,
 };
-
-/// Checks whether `token` resolves to a method whose declaring type name contains `type_name`.
-///
-/// Handles both `MethodDef` (table 0x06) and `MemberRef` (table 0x0A) tokens. A duplicate of
-/// `deobfuscation::utils::is_method_on_type` exists here so that the `compiler` feature does
-/// not depend on the `deobfuscation` feature being enabled.
-fn is_method_on_type(assembly: &CilObject, token: Token, type_name: &str) -> bool {
-    match token.table() {
-        0x06 => assembly
-            .method(&token)
-            .ok()
-            .and_then(|m| m.declaring_type_rc())
-            .is_some_and(|ty| ty.name.contains(type_name)),
-        0x0A => assembly
-            .refs_members()
-            .get(&token)
-            .and_then(|entry| entry.value().declaredby.fullname())
-            .is_some_and(|name| name.contains(type_name)),
-        _ => false,
-    }
-}
-
-/// An integer constant reduced to its CIL stack width and raw bit pattern.
-///
-/// Folding an operation whose meaning depends on operand width and signedness — `rem`/`rem.un`
-/// and `div`/`div.un` — cannot go through a single `as_i64` accessor. `as_i64` sign-extends,
-/// so reinterpreting its result as unsigned turns `rem.un` of `I32(-1)` into
-/// `0xFFFF_FFFF_FFFF_FFFF % r` rather than the `0xFFFF_FFFF % r` CIL specifies. `as_u64` is
-/// no better here: it refuses negative values outright, so it cannot express the
-/// reinterpretation at all.
-///
-/// Per ECMA-335 III.1.1 the stack holds `int32` and `int64`; anything narrower is widened to
-/// `int32` when loaded. This mirrors that: sub-word constants become 32-bit, and the bit
-/// pattern is kept unsigned so each operation can choose how to read it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IntOperand {
-    /// A 32-bit stack value, as raw bits.
-    W32(u32),
-    /// A 64-bit stack value, as raw bits.
-    W64(u64),
-}
-
-impl IntOperand {
-    /// Classifies an integer constant, or `None` for non-integer constants.
-    ///
-    /// `NativeInt`/`NativeUInt` are deliberately excluded rather than assumed 64-bit: their
-    /// width is the target's pointer size, so folding them here would bake a host assumption
-    /// into the output.
-    fn from_const(value: &ConstValue) -> Option<Self> {
-        #[allow(clippy::cast_sign_loss)]
-        Some(match value {
-            ConstValue::I8(v) => Self::W32(i32::from(*v) as u32),
-            ConstValue::I16(v) => Self::W32(i32::from(*v) as u32),
-            ConstValue::I32(v) => Self::W32(*v as u32),
-            ConstValue::U8(v) => Self::W32(u32::from(*v)),
-            ConstValue::U16(v) => Self::W32(u32::from(*v)),
-            ConstValue::U32(v) => Self::W32(*v),
-            ConstValue::I64(v) => Self::W64(*v as u64),
-            ConstValue::U64(v) => Self::W64(*v),
-            ConstValue::True => Self::W32(1),
-            ConstValue::False => Self::W32(0),
-            _ => return None,
-        })
-    }
-}
-
-/// Folds `rem`/`rem.un` over two constant operands, or `None` when it must not be folded.
-///
-/// Returns `None` — leaving the instruction in place — when:
-///
-/// - the divisor is zero, since the operation raises `DivideByZeroException` at runtime;
-/// - the division overflows (`i32::MIN % -1`), which raises `OverflowException`;
-/// - the operands have different widths, which is unverifiable IL. Inventing a promotion
-///   would mean choosing sign- or zero-extension on the crate's behalf and folding an input
-///   the runtime would reject.
-///
-/// The result keeps the operand width, so a 64-bit remainder stays [`ConstValue::I64`].
-/// Narrowing it to `I32` — as a single `ConstValue::I32(result as i32)` does — is worse than a
-/// wrong number: codegen then emits `ldc.i4` where the stack type requires `ldc.i8`, which is
-/// a verification failure rather than a miscomputation.
-fn fold_rem(left: IntOperand, right: IntOperand, unsigned: bool) -> Option<ConstValue> {
-    #[allow(clippy::cast_possible_wrap)]
-    match (left, right) {
-        (IntOperand::W32(l), IntOperand::W32(r)) => {
-            if unsigned {
-                Some(ConstValue::I32(l.checked_rem(r)? as i32))
-            } else {
-                Some(ConstValue::I32((l as i32).checked_rem(r as i32)?))
-            }
-        }
-        (IntOperand::W64(l), IntOperand::W64(r)) => {
-            if unsigned {
-                Some(ConstValue::I64(l.checked_rem(r)? as i64))
-            } else {
-                Some(ConstValue::I64((l as i64).checked_rem(r as i64)?))
-            }
-        }
-        // Mixed widths: see above.
-        _ => None,
-    }
-}
 
 /// Result of checking an algebraic identity.
 ///
@@ -221,33 +127,22 @@ enum StringFoldOp {
     SubstringRange,
     /// `String.Replace(String, String)` — instance, args = [this, old, new].
     Replace,
-    /// `String.ToLower()` — instance, args = [this].
+    /// `String.ToLower()` — instance, args = \[this\].
     ToLower,
-    /// `String.ToUpper()` — instance, args = [this].
+    /// `String.ToUpper()` — instance, args = \[this\].
     ToUpper,
 }
 
 /// Constant propagation and folding pass.
 ///
 /// This pass combines the SCCP analysis with additional optimizations
-/// for identity operations, absorbing elements, and type conversions.
-pub struct ConstantPropagationPass {
-    /// Maximum fixpoint iterations before stopping.
-    max_iterations: usize,
-}
+/// for identity operations, absorbing elements, and type conversions, folded
+/// as many rounds as the host's
+/// [`Budget::FoldRounds`] allows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConstantPropagationPass;
 
 impl ConstantPropagationPass {
-    /// Creates a new constant propagation pass.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_iterations` - Maximum fixpoint iterations for the internal optimization
-    ///   loop (SCCP + algebraic simplification). The default config value is 10.
-    #[must_use]
-    pub fn new(max_iterations: usize) -> Self {
-        Self { max_iterations }
-    }
-
     /// Runs the constant propagation pass on an SSA function.
     ///
     /// This uses the existing SCCP analysis and applies additional optimizations.
@@ -257,8 +152,9 @@ impl ConstantPropagationPass {
     /// * `ssa` - The SSA function to analyze and transform.
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
-    /// * `ptr_size` - Pointer size for the target architecture.
-    /// * `max_iterations` - Maximum fixpoint iterations for the optimization loop.
+    /// * `machine` - The machine the method computes on.
+    /// * `rounds` - The folding rounds the host's budget allows, which this
+    ///   takes until a round folds nothing new.
     ///
     /// # Returns
     ///
@@ -267,13 +163,14 @@ impl ConstantPropagationPass {
         ssa: &mut SsaFunction,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
-        max_iterations: usize,
+        machine: Machine,
+        rounds: &mut Rounds,
         assembly: &CilObject,
-    ) -> BTreeMap<SsaVarId, ConstValue> {
+        resolver: &CallResolver,
+    ) -> analyssa::Result<BTreeMap<SsaVarId, ConstValue>> {
         let block_count = ssa.block_count();
         if block_count == 0 {
-            return BTreeMap::new();
+            return Ok(BTreeMap::new());
         }
 
         // Recompute use tracking before SCCP analysis.
@@ -287,8 +184,8 @@ impl ConstantPropagationPass {
         // exception-aware view: over terminator edges alone a handler block is
         // unreachable, and every value defined in one would be left Top and
         // folded as if it were a constant nobody wrote.
-        let cfg = EhCfg::from_ssa(ssa);
-        let mut sccp = ConstantPropagation::new(ptr_size);
+        let cfg = SsaCfg::from_ssa(ssa);
+        let mut sccp = ConstantPropagation::new(machine);
         let mut sccp_result = sccp.analyze(ssa, &cfg);
 
         // Collect constants from SCCP result
@@ -309,12 +206,13 @@ impl ConstantPropagationPass {
             method_token,
             changes,
             assembly,
-            ptr_size,
+            resolver,
+            machine,
         );
         if constants.len() > pre_fold_count {
             ssa.recompute_uses();
-            let cfg = EhCfg::from_ssa(ssa);
-            let mut sccp2 = ConstantPropagation::new(ptr_size);
+            let cfg = SsaCfg::from_ssa(ssa);
+            let mut sccp2 = ConstantPropagation::new(machine);
             let sccp_result2 = sccp2.analyze(ssa, &cfg);
             for (var, c) in sccp_result2.constants() {
                 constants.entry(var).or_insert_with(|| c.clone());
@@ -324,40 +222,60 @@ impl ConstantPropagationPass {
         }
 
         // Apply additional optimizations iteratively
-        for _ in 0..max_iterations {
+        while rounds.next_round() {
             let prev_count = constants.len();
 
             // Run identity and absorbing element optimizations
-            Self::optimize_algebraic_identities(ssa, &mut constants, method_token, changes);
+            Self::optimize_algebraic_identities(
+                ssa,
+                &mut constants,
+                method_token,
+                changes,
+                machine.ptr_size,
+            );
 
             // Run involutory operation simplification (--x=x, ~~x=x)
             Self::simplify_involutory_ops(ssa, method_token, changes);
 
             // Run conversion folding
-            Self::fold_conversions(ssa, &mut constants, method_token, changes, ptr_size);
+            Self::fold_conversions(ssa, &mut constants, method_token, changes, machine);
 
             // Eliminate redundant conversions
             Self::eliminate_redundant_conversions(ssa, method_token, changes);
 
             // Run overflow-checked operation folding
-            Self::fold_overflow_checked_ops(ssa, &mut constants, method_token, changes, ptr_size);
+            Self::fold_overflow_checked_ops(ssa, &mut constants, method_token, changes, machine);
 
             // Run string operation folding (Concat, Substring, Replace, etc.)
             Self::fold_string_operations(ssa, &mut constants, method_token, changes, assembly);
 
             // If no new constants discovered, we're done
             if constants.len() == prev_count {
-                break;
+                rounds.settle();
             }
         }
 
         // Apply all constant folding transformations
-        Self::apply_constant_folding(ssa, &constants, &sccp_result, method_token, changes);
+        Self::apply_constant_folding(
+            ssa,
+            &constants,
+            &sccp_result,
+            method_token,
+            changes,
+            machine.ptr_size,
+        );
 
         // Apply control flow simplifications
-        Self::simplify_control_flow(ssa, &constants, &sccp_result, method_token, changes);
+        Self::simplify_control_flow(
+            ssa,
+            &constants,
+            &sccp_result,
+            method_token,
+            changes,
+            machine,
+        )?;
 
-        constants
+        Ok(constants)
     }
 
     /// Optimizes algebraic identity operations and absorbing elements.
@@ -375,11 +293,13 @@ impl ConstantPropagationPass {
     /// * `constants` - Map of known constants (updated with new discoveries).
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
+    /// * `ptr_size` - The pointer width native constants are read at.
     fn optimize_algebraic_identities(
         ssa: &mut SsaFunction,
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
+        ptr_size: PointerSize,
     ) {
         let mut transformations: Vec<(usize, usize, AlgebraicResult)> = Vec::new();
 
@@ -405,6 +325,15 @@ impl ConstantPropagationPass {
 
         // Apply the transformations
         for (block_idx, instr_idx, result) in transformations {
+            // The constant each result writes, in its destination's type.
+            let held = match &result {
+                AlgebraicResult::Constant { dest, value } => {
+                    Self::held_by(ssa, *dest, value, ptr_size)
+                }
+                AlgebraicResult::Copy { dest, src } => constants
+                    .get(src)
+                    .and_then(|value| Self::held_by(ssa, *dest, value, ptr_size)),
+            };
             if let Some(block) = ssa.block_mut(block_idx) {
                 let Some(instr) = block.instructions_mut().get_mut(instr_idx) else {
                     continue;
@@ -414,6 +343,9 @@ impl ConstantPropagationPass {
                 match result {
                     AlgebraicResult::Constant { dest, value } => {
                         constants.insert(dest, value.clone());
+                        let Some(value) = held else {
+                            continue;
+                        };
                         instr.set_op(SsaOp::Const {
                             dest,
                             value: value.clone(),
@@ -425,8 +357,10 @@ impl ConstantPropagationPass {
                     }
                     AlgebraicResult::Copy { dest, src } => {
                         // If src is a known constant, propagate it
-                        if let Some(value) = constants.get(&src).cloned() {
-                            constants.insert(dest, value.clone());
+                        if let Some(value) = held {
+                            if let Some(known) = constants.get(&src).cloned() {
+                                constants.insert(dest, known);
+                            }
                             instr.set_op(SsaOp::Const {
                                 dest,
                                 value: value.clone(),
@@ -482,7 +416,7 @@ impl ConstantPropagationPass {
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) {
         let mut new_constants: Vec<(SsaVarId, ConstValue, usize, usize)> = Vec::new();
 
@@ -498,7 +432,7 @@ impl ConstantPropagationPass {
                 } = instr.op()
                 {
                     if let Some(operand_val) = constants.get(operand) {
-                        let ptr_bytes = ptr_size.bytes() as u32;
+                        let ptr_bytes = machine.ptr_size.bytes() as u32;
                         let result = if *overflow_check {
                             operand_val.convert_to_checked(target, *unsigned, ptr_bytes)
                         } else {
@@ -541,13 +475,11 @@ impl ConstantPropagationPass {
     /// 1. **Duplicate conversions**: `conv.i4(conv.i4(x))` → `conv.i4(x)`
     ///    When the same conversion is applied twice, the outer one is redundant.
     ///
-    /// 2. **Unnecessary conversions**: `conv.i4(x)` where x is already i32 → `x`
-    ///    When converting to a type the value already has.
+    /// 2. **Unnecessary conversions**: `conv.i4(x)` where the conversion leaves `x`'s value as
+    ///    it is ([`Self::conversion_is_copy`]).
     ///
-    /// 3. **Widening chain simplification**: `conv.i8(conv.i4(x))` → `conv.i8(x)`
-    ///    For unsigned widening conversions, the intermediate conversion can be skipped.
-    ///    Only applied when the intermediate conversion is lossless and the unsigned flag
-    ///    is consistent.
+    /// 3. **Widening chain simplification**: `conv.i8(conv.i4(x))` → `conv.i8(x)` where one
+    ///    conversion computes what the two do ([`Self::widening_chain_reading`]).
     ///
     /// Note: Narrowing conversions and lossy float conversions (`conv.r8(conv.r4(x))`)
     /// are NOT optimized as they may change semantics.
@@ -645,12 +577,11 @@ impl ConstantPropagationPass {
                         // We check the SOURCE type of the inner conversion to determine
                         // if the inner conversion is narrowing.
                         if let Some(source_var) = ssa.variable(inner_conv.operand) {
-                            let source_type = source_var.var_type();
-                            if Self::is_safe_widening_chain(
-                                source_type,
+                            if let Some(unsigned) = Self::widening_chain_reading(
+                                source_var.var_type(),
                                 &inner_conv.target,
-                                target,
                                 inner_conv.unsigned,
+                                target,
                                 *unsigned,
                             ) {
                                 transformations.push(ConvTransform::ReplaceOperand {
@@ -659,7 +590,7 @@ impl ConstantPropagationPass {
                                     dest: *dest,
                                     new_operand: inner_conv.operand,
                                     target: target.clone(),
-                                    unsigned: *unsigned,
+                                    unsigned,
                                     reason: "widening chain",
                                 });
                                 continue;
@@ -669,7 +600,7 @@ impl ConstantPropagationPass {
 
                     // Pattern 2: Unnecessary conversion - check if operand already has target type
                     if let Some(var) = ssa.variable(*operand) {
-                        if Self::types_match(var.var_type(), target) {
+                        if Self::conversion_is_copy(var.var_type(), target) {
                             transformations.push(ConvTransform::ReplaceWithCopy {
                                 block_idx,
                                 instr_idx,
@@ -699,10 +630,11 @@ impl ConstantPropagationPass {
                         if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
                             let old_op_str = format!("{}", instr.op());
 
-                            instr.set_op(conv_op_for_target(
+                            instr.set_op(SsaOp::conversion_between(
                                 dest,
                                 new_operand,
                                 target.clone(),
+                                None,
                                 unsigned,
                                 false,
                             ));
@@ -740,103 +672,116 @@ impl ConstantPropagationPass {
         }
     }
 
-    /// Checks if two types match for the purpose of conversion elimination.
-    ///
-    /// This is conservative - types must match exactly or be equivalent on the stack.
-    fn types_match(var_type: &SsaType, target: &SsaType) -> bool {
-        if var_type == target {
-            return true;
-        }
-
-        // Check stack type equivalence - CIL promotes small integers to I32
-        // So if converting to I32 and var is already I8/I16/U8/U16, it's unnecessary
-        matches!(
-            (var_type, target),
-            // Small integers (I8, U8, I16, U16, Bool, Char) are already I32 on the stack
-            // U32 is treated as I32 on stack (bidirectional)
-            // I64 and U64 are interchangeable for bit patterns
-            // Native int types are interchangeable
-            (
-                SsaType::I8
-                    | SsaType::U8
-                    | SsaType::I16
-                    | SsaType::U16
-                    | SsaType::Bool
-                    | SsaType::Char
-                    | SsaType::U32,
-                SsaType::I32
-            ) | (SsaType::I32, SsaType::U32)
-                | (SsaType::U64, SsaType::I64)
-                | (SsaType::I64, SsaType::U64)
-                | (SsaType::NativeInt, SsaType::NativeUInt)
-                | (SsaType::NativeUInt, SsaType::NativeInt)
-        )
+    /// `value` as the constant `dest` holds: an integer stated in `dest`'s own type, as a copy
+    /// of a fitting `int32` into a `byte` slot holds a byte, which code generation loads at
+    /// the type's width. `None` where that type does not hold the value, and there is no
+    /// constant of `dest` to write; any other value as it is.
+    fn held_by(
+        ssa: &SsaFunction,
+        dest: SsaVarId,
+        value: &ConstValue,
+        ptr_size: PointerSize,
+    ) -> Option<ConstValue> {
+        let Some(ty) = ssa
+            .variable(dest)
+            .map(|variable| variable.var_type().clone())
+            .filter(|ty| CilTarget::is_integer(ty) && CilTarget::bit_width(ty).is_some())
+        else {
+            return Some(value.clone());
+        };
+        let Some((bits, _)) = value.integer_pattern(ptr_size) else {
+            return Some(value.clone());
+        };
+        let held = ConstValue::from_bits_of_type(bits, &ty)?;
+        let same = held.as_i64().is_some() && held.as_i64() == value.as_i64()
+            || held.integer_pattern(ptr_size) == value.integer_pattern(ptr_size);
+        same.then_some(held)
     }
 
-    /// Determines if a widening conversion chain can be safely simplified.
+    /// The width a fixed-width integer type holds and whether it is unsigned: how the IR
+    /// reads a value of it.
+    fn integer_layout(ty: &SsaType) -> Option<(u32, bool)> {
+        Some(match ty {
+            SsaType::I8 => (8, false),
+            SsaType::U8 | SsaType::Bool => (8, true),
+            SsaType::I16 => (16, false),
+            SsaType::U16 | SsaType::Char => (16, true),
+            SsaType::I32 => (32, false),
+            SsaType::U32 => (32, true),
+            SsaType::I64 => (64, false),
+            SsaType::U64 => (64, true),
+            _ => return None,
+        })
+    }
+
+    /// Whether the integer conversion of a value of type `source` to `target` is a copy of it:
+    /// a reinterpretation of one width the evaluation stack holds alike, or one between the
+    /// two native integers.
     ///
-    /// For `conv.T2(conv.T1(x))` to become `conv.T2(x)`:
-    /// - The inner conversion (source → T1) must NOT be narrowing (truncating)
-    /// - T1 must be smaller than or equal to T2 (outer must be widening)
-    /// - The signedness must be consistent or the conversion must be truly lossless
-    /// - Float conversions are NOT simplified (conv.r8(conv.r4(x)) loses precision)
-    fn is_safe_widening_chain(
-        source_type: &SsaType,
+    /// A conversion that changes the width is never a copy, whichever way it reads its
+    /// operand: an operation reads every operand at its type's own width, so a copy of an
+    /// `int8` into an `int32` would hand an 8-bit value to every reader of a 32-bit one. The
+    /// widening the evaluation stack makes of a narrow value is stated by the lift as the
+    /// conversion it is, and stays one.
+    ///
+    /// Nor is a reinterpretation of a narrow value under the other signedness: the bits are
+    /// the same, but the stack holds a `char` 0xFFFF zero-extended and an `int16` -1
+    /// sign-extended, so the conversion is the `conv.i2` that makes one the other. `int32`
+    /// and `uint32`, like `int64` and `uint64`, are one stack value.
+    fn conversion_is_copy(source: &SsaType, target: &SsaType) -> bool {
+        if source == target {
+            return true;
+        }
+        match (Self::integer_layout(source), Self::integer_layout(target)) {
+            (Some((source_bits, source_unsigned)), Some((target_bits, target_unsigned))) => {
+                source_bits == target_bits
+                    && (source_bits >= 32 || source_unsigned == target_unsigned)
+            }
+            _ => matches!(
+                (source, target),
+                (SsaType::NativeInt, SsaType::NativeUInt)
+                    | (SsaType::NativeUInt, SsaType::NativeInt)
+            ),
+        }
+    }
+
+    /// The reading (`unsigned` or not) of the one conversion of `x` to `outer_target` that
+    /// computes what `outer(inner(x))` does, when there is one: `inner` converts `x`, of type
+    /// `source`, to `inner_target`, reading it unsigned when `inner_unsigned` says so, and
+    /// `outer` converts that to `outer_target`, reading it as `outer_unsigned` says.
+    ///
+    /// Each conversion reads its operand at the operand's own type and extends it as its flag
+    /// says. Only a chain of two widenings is considered: a truncation in it cannot be
+    /// skipped, and float and native conversions are left alone.
+    ///
+    /// - An `inner` of the source's own width only restates its type: the bits are `x`'s, and
+    ///   `outer` reads them as it would read `x`.
+    /// - Two extensions of one kind are one: zero then zero, sign then sign.
+    /// - A zero-extension leaves the sign bit of the wider value clear, so any extension after
+    ///   it is a zero-extension too.
+    /// - A sign-extension and then a zero-extension is no single conversion: an `int16` -1 is
+    ///   `0xFFFFFFFF` as an `int32` and `0x00000000FFFFFFFF` as a `uint64` from it, but
+    ///   `0x000000000000FFFF` zero-extended from its own 16 bits.
+    fn widening_chain_reading(
+        source: &SsaType,
         inner_target: &SsaType,
-        outer_target: &SsaType,
         inner_unsigned: bool,
+        outer_target: &SsaType,
         outer_unsigned: bool,
-    ) -> bool {
-        // Don't optimize float conversions - they can lose precision
-        if source_type.is_float() || inner_target.is_float() || outer_target.is_float() {
-            return false;
+    ) -> Option<bool> {
+        let (source_bits, _) = Self::integer_layout(source)?;
+        let (inner_bits, _) = Self::integer_layout(inner_target)?;
+        let (outer_bits, _) = Self::integer_layout(outer_target)?;
+        if source_bits > inner_bits || inner_bits >= outer_bits {
+            return None;
         }
-
-        // Get sizes of all types
-        let source_size = source_type.size_bytes();
-        let inner_size = inner_target.size_bytes();
-        let outer_size = outer_target.size_bytes();
-
-        // All must have known sizes
-        let (Some(source_size), Some(inner_size), Some(outer_size)) =
-            (source_size, inner_size, outer_size)
-        else {
-            return false; // Native types - be conservative
-        };
-
-        // Inner conversion must NOT be narrowing (source must be <= inner target)
-        // If source > inner_target, the inner conversion truncates and we can't skip it
-        if source_size > inner_size {
-            return false;
+        if source_bits == inner_bits {
+            Some(outer_unsigned)
+        } else if inner_unsigned || inner_unsigned == outer_unsigned {
+            Some(inner_unsigned)
+        } else {
+            None
         }
-
-        // Outer conversion must be widening (inner smaller than outer)
-        if inner_size >= outer_size {
-            return false;
-        }
-
-        // For widening conversions, signedness matters:
-        // - unsigned widening is always safe (zero extension)
-        // - signed to signed widening is safe (sign extension)
-        // - signed to unsigned widening can change the value (e.g., -1 as i8 -> u32 = 255, not 0xFFFFFFFF)
-
-        // If both have the same unsigned flag, it's safe
-        if inner_unsigned == outer_unsigned {
-            return true;
-        }
-
-        // If inner is unsigned and outer is signed, it's safe (zero-extend then reinterpret)
-        // e.g., conv.i8(conv.u4(x)) - zero extends then treats as signed, same as conv.i8.u(x)
-        if inner_unsigned && !outer_unsigned {
-            return true;
-        }
-
-        // If inner is signed and outer is unsigned:
-        // conv.u8(conv.i4(x)) vs conv.u8(x)
-        // If x is negative, conv.i4 sign-extends, then conv.u8 reinterprets
-        // But conv.u8(x) would just zero-extend or truncate
-        // This can differ, so don't optimize
-        false
     }
 
     /// Folds overflow-checked arithmetic operations when result doesn't overflow.
@@ -853,14 +798,13 @@ impl ConstantPropagationPass {
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) {
         let mut new_constants: Vec<(SsaVarId, ConstValue, usize, usize)> = Vec::new();
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let Some((dest, value)) =
-                    Self::check_overflow_op(instr.op(), constants, ptr_size)
+                if let Some((dest, value)) = Self::check_overflow_op(instr.op(), constants, machine)
                 {
                     new_constants.push((dest, value, block_idx, instr_idx));
                 }
@@ -870,6 +814,9 @@ impl ConstantPropagationPass {
         // Apply the transformations
         for (dest, value, block_idx, instr_idx) in new_constants {
             constants.insert(dest, value.clone());
+            let Some(value) = Self::held_by(ssa, dest, &value, machine.ptr_size) else {
+                continue;
+            };
 
             if let Some(block) = ssa.block_mut(block_idx) {
                 if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
@@ -906,7 +853,7 @@ impl ConstantPropagationPass {
     fn check_overflow_op(
         op: &SsaOp,
         constants: &BTreeMap<SsaVarId, ConstValue>,
-        ptr_size: PointerSize,
+        machine: Machine,
     ) -> Option<(SsaVarId, ConstValue)> {
         // No `x * 0 == 0` short-circuit for `MulOvf`: a multiply by zero cannot overflow, so
         // `mul_checked` already folds it. The short-circuit that used to sit here returned the
@@ -922,7 +869,7 @@ impl ConstantPropagationPass {
                 ..
             } => {
                 let (l, r) = (constants.get(left)?, constants.get(right)?);
-                (dest, l.add_checked(r, *unsigned, ptr_size))
+                (dest, l.add_checked(r, *unsigned, machine.ptr_size))
             }
 
             SsaOp::SubOvf {
@@ -933,7 +880,7 @@ impl ConstantPropagationPass {
                 ..
             } => {
                 let (l, r) = (constants.get(left)?, constants.get(right)?);
-                (dest, l.sub_checked(r, *unsigned, ptr_size))
+                (dest, l.sub_checked(r, *unsigned, machine.ptr_size))
             }
 
             SsaOp::MulOvf {
@@ -944,7 +891,7 @@ impl ConstantPropagationPass {
                 ..
             } => {
                 let (l, r) = (constants.get(left)?, constants.get(right)?);
-                (dest, l.mul_checked(r, *unsigned, ptr_size))
+                (dest, l.mul_checked(r, *unsigned, machine.ptr_size))
             }
 
             _ => return None,
@@ -965,20 +912,27 @@ impl ConstantPropagationPass {
         method_token: Token,
         changes: &mut EventLog,
         assembly: &CilObject,
-        ptr_size: PointerSize,
+        resolver: &CallResolver,
+        machine: Machine,
     ) {
         let mut replacements: Vec<(usize, usize, SsaVarId, ConstValue)> = Vec::new();
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let (dest, callee_token, args) = match instr.op() {
-                    SsaOp::Call {
-                        dest: Some(dest),
-                        method,
-                        args,
-                    } => (*dest, method.token(), args),
-                    _ => continue,
+                let Some(call) = instr.op().as_named_call() else {
+                    continue;
                 };
+                let (Some(dest), Some(method)) = (call.dest, call.callee.method()) else {
+                    continue;
+                };
+                let (callee_token, args) = (method.token(), &call.args);
+                // A `callvirt` runs the body it names only where nothing in the
+                // assembly overrides that method - C# emits one for every
+                // instance call, virtual or not.
+                let is_virtual = !matches!(call.callee, Callee::Direct(_));
+                if is_virtual && resolver.is_polymorphic(callee_token) {
+                    continue;
+                }
 
                 // Only handle MethodDef tokens (same-assembly methods)
                 if !callee_token.is_table(TableId::MethodDef) {
@@ -1002,10 +956,14 @@ impl ConstantPropagationPass {
                 let Some(concrete_args) = concrete_args else {
                     continue;
                 };
+                // ...and on a receiver that is not null, where it throws instead.
+                if is_virtual && matches!(concrete_args.first(), Some(ConstValue::Null)) {
+                    continue;
+                }
 
                 // Try to evaluate the callee
                 let Some(result) =
-                    Self::evaluate_pure_call(assembly, callee_token, &concrete_args, ptr_size)
+                    Self::evaluate_pure_call(assembly, callee_token, &concrete_args, machine)
                 else {
                     continue;
                 };
@@ -1016,6 +974,9 @@ impl ConstantPropagationPass {
 
         for (block_idx, instr_idx, dest, value) in replacements {
             constants.insert(dest, value.clone());
+            let Some(value) = Self::held_by(ssa, dest, &value, machine.ptr_size) else {
+                continue;
+            };
             if let Some(block) = ssa.block_mut(block_idx) {
                 if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
                     instr.set_op(SsaOp::Const { dest, value });
@@ -1035,59 +996,54 @@ impl ConstantPropagationPass {
         // because SCCP doesn't visit exception handler blocks, so constants from
         // folded x86 calls wouldn't otherwise reach the switch variable.
         if !constants.is_empty() {
-            Self::propagate_folded_arithmetic(ssa, constants, method_token, changes);
+            Self::propagate_folded_arithmetic(ssa, constants, method_token, changes, machine);
         }
     }
 
-    /// Propagates known constants through arithmetic operations.
+    /// Propagates known constants through remainders.
     ///
-    /// After folding pure calls, some operations (like `rem.un`) may have both
-    /// operands as constants but haven't been folded yet (SCCP ran before the calls
-    /// were folded). This pass finds and folds such operations.
+    /// After folding pure calls, a `rem` (the `rem.un` of a flattened switch
+    /// dispatch) may have both operands constant and not yet be folded. Each
+    /// is folded as SCCP folds it ([`Machine::evaluate`]), so the remainder
+    /// keeps its operands' width and signedness, and a divisor of zero or
+    /// `MIN % -1` stays in place for the runtime to raise.
     fn propagate_folded_arithmetic(
         ssa: &mut SsaFunction,
         constants: &mut BTreeMap<SsaVarId, ConstValue>,
         method_token: Token,
         changes: &mut EventLog,
+        machine: Machine,
     ) {
         let mut new_constants: Vec<(usize, usize, SsaVarId, ConstValue)> = Vec::new();
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::Rem {
-                    dest,
-                    left,
-                    right,
-                    unsigned,
-                    ..
-                } = instr.op()
+                let op = instr.op();
+                let SsaOp::Rem { dest, .. } = op else {
+                    continue;
+                };
+                let known = |var: SsaVarId| {
+                    constants
+                        .get(&var)
+                        .or_else(|| match ssa.get_definition(var) {
+                            Some(SsaOp::Const { value, .. }) => Some(value),
+                            _ => None,
+                        })
+                        .cloned()
+                };
+                if let Some(value) =
+                    machine.evaluate(op, op.dest().and_then(|dest| ssa.bit_width(dest)), known)
                 {
-                    let lval = constants
-                        .get(left)
-                        .or_else(|| match ssa.get_definition(*left) {
-                            Some(SsaOp::Const { value, .. }) => Some(value),
-                            _ => None,
-                        })
-                        .and_then(IntOperand::from_const);
-                    let rval = constants
-                        .get(right)
-                        .or_else(|| match ssa.get_definition(*right) {
-                            Some(SsaOp::Const { value, .. }) => Some(value),
-                            _ => None,
-                        })
-                        .and_then(IntOperand::from_const);
-
-                    if let (Some(l), Some(r)) = (lval, rval) {
-                        if let Some(value) = fold_rem(l, r, *unsigned) {
-                            new_constants.push((block_idx, instr_idx, *dest, value));
-                        }
-                    }
+                    new_constants.push((block_idx, instr_idx, *dest, value));
                 }
             }
         }
 
         for (block_idx, instr_idx, dest, value) in new_constants {
             constants.insert(dest, value.clone());
+            let Some(value) = Self::held_by(ssa, dest, &value, machine.ptr_size) else {
+                continue;
+            };
             if let Some(block) = ssa.block_mut(block_idx) {
                 if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
                     instr.set_op(SsaOp::Const { dest, value });
@@ -1111,12 +1067,48 @@ impl ConstantPropagationPass {
         assembly: &CilObject,
         callee_token: Token,
         args: &[ConstValue],
-        ptr_size: PointerSize,
+        machine: Machine,
     ) -> Option<ConstValue> {
         let method = assembly.method(&callee_token).ok()?;
         let callee_ssa = method.ssa(assembly).ok()?;
+        Self::evaluate_pure_function(&callee_ssa, args, machine)
+    }
 
-        let mut eval = SsaEvaluator::new(&callee_ssa, ptr_size);
+    /// Evaluates `callee` over concrete arguments, when replacing a call to it
+    /// with the result loses nothing.
+    ///
+    /// A call is its result only when computing the result is all it does. The
+    /// evaluator steps over a store to a field or a static - it computes values,
+    /// it does not model memory - so a callee that writes one and returns a
+    /// function of its arguments evaluates cleanly, and folding the call would
+    /// delete the write. Only a callee whose purity is proven is evaluated: one
+    /// that writes nothing, calls nothing and throws nothing, and at most reads.
+    ///
+    /// # Arguments
+    ///
+    /// * `callee` - The called method's SSA.
+    /// * `args` - The call's arguments, all known.
+    /// * `machine` - The machine the method computes on.
+    ///
+    /// # Returns
+    ///
+    /// The value the call returns, or `None` when the callee is not proven pure
+    /// or its evaluation does not complete to a return.
+    fn evaluate_pure_function(
+        callee_ssa: &SsaFunction,
+        args: &[ConstValue],
+        machine: Machine,
+    ) -> Option<ConstValue> {
+        // A callee that may raise is evaluated too: a run that raises does not
+        // complete to a return, and is not folded.
+        if !matches!(
+            callee_ssa.purity(|_| None),
+            MethodPurity::Pure | MethodPurity::ReadOnly | MethodPurity::MayThrow
+        ) {
+            return None;
+        }
+
+        let mut eval = SsaEvaluator::new(callee_ssa, machine);
         for (var, value) in callee_ssa.argument_variables().zip(args) {
             eval.set_concrete(var.id(), value.clone());
         }
@@ -1132,6 +1124,7 @@ impl ConstantPropagationPass {
         for instr in last_block.instructions() {
             if let SsaOp::Return {
                 value: Some(ret_var),
+                ..
             } = instr.op()
             {
                 return eval.get_concrete(*ret_var).cloned();
@@ -1143,7 +1136,7 @@ impl ConstantPropagationPass {
 
     /// Folds string method calls with constant arguments into `DecryptedString` constants.
     ///
-    /// Scans all `Call`/`CallVirt` instructions for recognized `System.String` methods
+    /// Scans all calls naming their method for recognized `System.String` methods
     /// (Concat, Substring, Replace, ToLower, ToUpper) where every argument resolves to
     /// a known string constant. Matching calls are replaced with `SsaOp::Const` holding
     /// the folded `ConstValue::DecryptedString`.
@@ -1166,19 +1159,10 @@ impl ConstantPropagationPass {
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let folded = match instr.op() {
-                    SsaOp::Call {
-                        dest: Some(dest),
-                        method,
-                        args,
-                    }
-                    | SsaOp::CallVirt {
-                        dest: Some(dest),
-                        method,
-                        args,
-                    } => Self::try_fold_string_call(*dest, method, args, constants, assembly),
-                    _ => None,
-                };
+                let folded = instr.op().as_named_call().and_then(|call| {
+                    let (dest, method) = (call.dest?, call.callee.method()?);
+                    Self::try_fold_string_call(dest, method, &call.args, constants, assembly)
+                });
                 if let Some((dest, value)) = folded {
                     new_constants.push((dest, value, block_idx, instr_idx));
                 }
@@ -1227,7 +1211,10 @@ impl ConstantPropagationPass {
         assembly: &CilObject,
     ) -> Option<StringFoldOp> {
         let token = method.token();
-        if !is_method_on_type(assembly, token, "String") {
+        // Exactly `System.String`: a substring match would fold a user's
+        // `StringHelper.Concat` as if it concatenated.
+        let declaring = assembly.resolve_method_declaring_type(token);
+        if declaring.as_deref() != Some("System.String") {
             return None;
         }
         let name = assembly.resolve_method_name(token)?;
@@ -1345,6 +1332,7 @@ impl ConstantPropagationPass {
     /// * `sccp_result` - The SCCP analysis results.
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
+    /// * `ptr_size` - The pointer width native constants are read at.
     #[allow(clippy::cast_possible_truncation)]
     fn apply_constant_folding(
         ssa: &mut SsaFunction,
@@ -1352,7 +1340,15 @@ impl ConstantPropagationPass {
         sccp_result: &SccpResult,
         method_token: Token,
         changes: &mut EventLog,
+        ptr_size: PointerSize,
     ) {
+        // Each known value in the type of the variable that holds it.
+        let held: BTreeMap<SsaVarId, ConstValue> = constants
+            .iter()
+            .filter_map(|(dest, value)| {
+                Self::held_by(ssa, *dest, value, ptr_size).map(|held| (*dest, held))
+            })
+            .collect();
         for block_idx in 0..ssa.block_count() {
             if !sccp_result.is_block_executable(block_idx) {
                 continue;
@@ -1368,7 +1364,7 @@ impl ConstantPropagationPass {
 
                     // Check if this instruction's result is a known constant
                     if let Some(dest) = op.dest() {
-                        if let Some(value) = constants.get(&dest) {
+                        if let Some(value) = held.get(&dest) {
                             // Skip DecryptedArray: arrays are mutable reference types.
                             // Propagating them materializes a fresh array at each use
                             // site, breaking in-place modifications (e.g., XOR loops
@@ -1548,13 +1544,27 @@ impl ConstantPropagationPass {
             });
         }
 
-        // Step 4: Apply transforms
-        for t in transforms {
+        // Step 4: Apply transforms.
+        //
+        // The even chains are substitutions, and one chain's innermost operand
+        // can be another's outermost result: `a = neg(neg x)` feeding
+        // `b = not(not a)` gives `(a -> x)` and `(b -> a)`. Applied one at a
+        // time the second writes `a` back into use after its definition is
+        // gone, so they are resolved together, and an odd chain's surviving
+        // operation reads the resolved operand too.
+        let substitutions: Vec<(SsaVarId, SsaVarId)> = transforms
+            .iter()
+            .filter(|t| t.chain_length % 2 == 0)
+            .map(|t| (t.outermost_dest, t.innermost_operand))
+            .collect();
+        let resolved = resolve_chains(&substitutions);
+        let resolve = |var: SsaVarId| resolved.get(&var).copied().unwrap_or(var);
+
+        for t in &transforms {
             let op_name = if t.is_neg { "neg" } else { "not" };
 
             if t.chain_length % 2 == 0 {
                 // Even chain: all cancel out, result = innermost_operand
-                ssa.replace_uses_including_phis(t.outermost_dest, t.innermost_operand);
                 for &(b, i) in &t.instructions_to_nop {
                     ssa.replace_instruction_op(b, i, SsaOp::Nop);
                 }
@@ -1563,23 +1573,26 @@ impl ConstantPropagationPass {
                     .at(method_token, t.outermost_location.1)
                     .message(format!(
                         "{} → {} ({op_name}^{}(x))",
-                        t.outermost_dest, t.innermost_operand, t.chain_length
+                        t.outermost_dest,
+                        resolve(t.outermost_dest),
+                        t.chain_length
                     ));
             } else {
                 // Odd chain: one operation remains, rewrite outermost to use innermost_operand
+                let operand = resolve(t.innermost_operand);
                 let (b, i) = t.outermost_location;
                 if let Some(block) = ssa.block_mut(b) {
                     if let Some(instr) = block.instructions_mut().get_mut(i) {
                         if t.is_neg {
                             instr.set_op(SsaOp::Neg {
                                 dest: t.outermost_dest,
-                                operand: t.innermost_operand,
+                                operand,
                                 flags: None,
                             });
                         } else {
                             instr.set_op(SsaOp::Not {
                                 dest: t.outermost_dest,
-                                operand: t.innermost_operand,
+                                operand,
                                 flags: None,
                             });
                         }
@@ -1595,68 +1608,44 @@ impl ConstantPropagationPass {
                     .record(EventKind::ConstantFolded)
                     .at(method_token, t.outermost_location.1)
                     .message(format!(
-                        "{} = {op_name}({}) ({op_name}^{}(x))",
-                        t.outermost_dest, t.innermost_operand, t.chain_length
+                        "{} = {op_name}({operand}) ({op_name}^{}(x))",
+                        t.outermost_dest, t.chain_length
                     ));
             }
         }
+        ssa.replace_uses_resolved(&substitutions);
     }
 
-    /// Checks if a block is a loop header by detecting back-edges.
+    /// The header block of every natural loop in `ssa`.
     ///
-    /// A block is a loop header if any block with a higher index targets it,
-    /// indicating a back-edge in the CFG. Switch folding must be skipped for
-    /// loop headers because the switch value (which appears constant on the
-    /// initial iteration) may take different values on subsequent iterations
-    /// via the PHI at the loop header.
-    fn is_loop_header(ssa: &SsaFunction, block_idx: usize) -> bool {
-        // Check the block itself for self-targeting terminators (self-loops).
-        // After jump threading, a switch case that originally targeted a
-        // trampoline may be threaded to the switch block itself. These
-        // self-loops won't be caught by the higher-index scan below.
-        if let Some(block) = ssa.block(block_idx) {
-            if let Some(op) = block.control_terminator() {
-                let self_targets = match op {
-                    SsaOp::Switch {
-                        targets, default, ..
-                    } => targets.contains(&block_idx) || *default == block_idx,
-                    _ => false,
-                };
-                if self_targets {
-                    return true;
-                }
-            }
-        }
-
-        // Check for back-edges from blocks with higher indices.
-        for bi in block_idx.saturating_add(1)..ssa.block_count() {
-            if let Some(block) = ssa.block(bi) {
-                if let Some(op) = block.control_terminator() {
-                    let targets_block = match op {
-                        SsaOp::Jump { target } => *target == block_idx,
-                        SsaOp::Leave { target } => *target == block_idx,
-                        SsaOp::Branch {
-                            true_target,
-                            false_target,
-                            ..
-                        } => *true_target == block_idx || *false_target == block_idx,
-                        SsaOp::BranchCmp {
-                            true_target,
-                            false_target,
-                            ..
-                        } => *true_target == block_idx || *false_target == block_idx,
-                        SsaOp::Switch {
-                            targets, default, ..
-                        } => targets.contains(&block_idx) || *default == block_idx,
-                        _ => false,
-                    };
-                    if targets_block {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+    /// Switch folding has to be skipped at a loop header: the switch value can
+    /// be constant on the entry edge and something else on the back edge, and
+    /// folding it to the entry value makes every other case unreachable. That is
+    /// what a control-flow-flattening dispatcher is, so getting this wrong
+    /// deletes the body of the loop rather than one arm of a branch.
+    ///
+    /// Which blocks are headers is asked of the dominator tree, through
+    /// [`LoopAnalyzer`], because a back edge is a dominance relation and nothing
+    /// else. This used to test whether any *higher-indexed* block branched to
+    /// the block, taking block order as a proxy for the edge direction. It reads
+    /// a back edge only when the latch happens to be numbered after the header,
+    /// which is a property of how the blocks were laid out rather than of the
+    /// loop. A JIEJIE.NET dispatcher reached through a one-instruction
+    /// trampoline - `b21 -> b1 -> b2`, where the trampoline `b1` is numbered
+    /// before the dispatcher `b2` it jumps to - has a loop the test cannot see,
+    /// and `DemoEmbeddedResources` lost its whole trailing `foreach` to a switch
+    /// folded on the entry state.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssa` - The function whose loops to find.
+    fn loop_headers(ssa: &SsaFunction) -> BTreeSet<usize> {
+        LoopAnalyzer::new(ssa)
+            .analyze()
+            .loops()
+            .iter()
+            .map(|loop_info| loop_info.header.index())
+            .collect()
     }
 
     /// Simplifies control flow based on constant conditions.
@@ -1670,13 +1659,21 @@ impl ConstantPropagationPass {
     /// * `sccp_result` - The SCCP analysis results.
     /// * `method_token` - The method token for change tracking.
     /// * `changes` - The change set to record modifications.
+    /// * `machine` - The machine the method computes on.
     fn simplify_control_flow(
         ssa: &mut SsaFunction,
         constants: &BTreeMap<SsaVarId, ConstValue>,
         sccp_result: &SccpResult,
         method_token: Token,
         changes: &mut EventLog,
-    ) {
+        machine: Machine,
+    ) -> analyssa::Result<()> {
+        // One dominator-tree walk answers for every block, and the answer has
+        // to be taken before the first rewrite: folding a terminator changes
+        // the edges the next block's answer would be computed from.
+        let loop_headers = Self::loop_headers(ssa);
+
+        let mut folds: Vec<(usize, SsaOp, usize)> = Vec::new();
         for block_idx in 0..ssa.block_count() {
             if !sccp_result.is_block_executable(block_idx) {
                 continue;
@@ -1707,11 +1704,7 @@ impl ConstantPropagationPass {
                             targets,
                             default,
                         } => {
-                            // Skip simplification for preserved dispatch variables
-                            // These control input-dependent control flow that must be preserved
-                            if ssa.is_preserved_dispatch_var(*value) {
-                                None
-                            } else if Self::is_loop_header(ssa, block_idx) {
+                            if loop_headers.contains(&block_idx) {
                                 // Don't fold switches at loop headers. A switch whose
                                 // value is constant on the initial iteration may take
                                 // different values on subsequent iterations (via the
@@ -1746,12 +1739,13 @@ impl ConstantPropagationPass {
                             if let (Some(left_val), Some(right_val)) =
                                 (constants.get(left), constants.get(right))
                             {
-                                let result = if *unsigned {
-                                    Self::eval_cmp_unsigned(*cmp, left_val, right_val)
-                                } else {
-                                    Self::eval_cmp_signed(*cmp, left_val, right_val)
-                                };
-                                if let Some(is_true) = result {
+                                if let Some(is_true) = SsaEvaluator::evaluate_comparison(
+                                    left_val,
+                                    right_val,
+                                    *cmp,
+                                    *unsigned,
+                                    machine.ptr_size,
+                                ) {
                                     let target = if is_true { *true_target } else { *false_target };
                                     Some((SsaOp::Jump { target }, target))
                                 } else {
@@ -1770,49 +1764,28 @@ impl ConstantPropagationPass {
                 None
             };
 
-            // Second pass: apply the simplification with mutable borrow
             if let Some((new_op, target)) = simplification {
-                if let Some(block) = ssa.block_mut(block_idx) {
-                    if let Some(last_instr) = block.instructions_mut().last_mut() {
-                        last_instr.set_op(new_op);
-                        changes
-                            .record(EventKind::BranchSimplified)
-                            .at(method_token, block_idx)
-                            .message(format!("simplified to unconditional branch to {target}"));
-                    }
-                }
+                folds.push((block_idx, new_op, target));
             }
         }
-    }
-
-    /// Evaluate a signed comparison between two constant values.
-    fn eval_cmp_signed(cmp: CmpKind, left: &ConstValue, right: &ConstValue) -> Option<bool> {
-        // Get both values as i64 for signed comparison
-        let l = left.as_i64()?;
-        let r = right.as_i64()?;
-        Some(match cmp {
-            CmpKind::Eq => l == r,
-            CmpKind::Ne => l != r,
-            CmpKind::Lt => l < r,
-            CmpKind::Le => l <= r,
-            CmpKind::Gt => l > r,
-            CmpKind::Ge => l >= r,
-        })
-    }
-
-    /// Evaluate an unsigned comparison between two constant values.
-    fn eval_cmp_unsigned(cmp: CmpKind, left: &ConstValue, right: &ConstValue) -> Option<bool> {
-        // Get both values as u64 for unsigned comparison
-        let l = left.as_u64()?;
-        let r = right.as_u64()?;
-        Some(match cmp {
-            CmpKind::Eq => l == r,
-            CmpKind::Ne => l != r,
-            CmpKind::Lt => l < r,
-            CmpKind::Le => l <= r,
-            CmpKind::Gt => l > r,
-            CmpKind::Ge => l >= r,
-        })
+        if folds.is_empty() {
+            return Ok(());
+        }
+        // A folded branch drops the edges it no longer takes, and with them the operands their
+        // targets' phis held for this block.
+        ssa.edit(SsaEditOptions::new(), |editor| {
+            for (block_idx, new_op, _) in &folds {
+                editor.fold_terminator_pruning_phis(*block_idx, new_op.clone())?;
+            }
+            Ok(())
+        })?;
+        for (block_idx, _, target) in folds {
+            changes
+                .record(EventKind::BranchSimplified)
+                .at(method_token, block_idx)
+                .message(format!("simplified to unconditional branch to {target}"));
+        }
+        Ok(())
     }
 }
 
@@ -1840,21 +1813,37 @@ impl SsaPass<CilTarget, CompilerContext> for ConstantPropagationPass {
             .ok_or_else(|| analyssa::Error::new("ConstantPropagationPass requires an assembly"))?;
         let method_token = method.0;
         let mut changes = EventLog::new();
-        let ptr_size = PointerSize::from_is_64bit(assembly.file().pe().is_64bit);
+        let machine = host.machine();
 
         // Run constant propagation and transformation
+        let mut rounds = Rounds::new(Budget::FoldRounds, host.budget().limit(Budget::FoldRounds));
         let constants = Self::run_constant_propagation(
             ssa,
             method_token,
             &mut changes,
-            ptr_size,
-            self.max_iterations,
+            machine,
+            &mut rounds,
             &assembly,
-        );
+            host.call_graph.resolver(),
+        )?;
+        // Reported to the host, not with the changes: running out of rounds is
+        // no change of the function's.
+        if let Some(exhaustion) = rounds.exhausted() {
+            host.events.push(Event::exhausted(Some(method), exhaustion));
+        }
 
-        // Cache the constants we found for other passes
+        // Record what was proved, on the values it was proved about.
+        //
+        // Written into the function this pass is holding, not through the host:
+        // the host would look up *its* copy of the method, and a pass is handed
+        // the function precisely because that copy is not the one being
+        // transformed. Recording here also means the facts are rolled back with
+        // the function if this pass group is, rather than outliving the IR they
+        // describe.
         for (var, value) in &constants {
-            host.add_known_value(method_token, *var, value.clone());
+            if let Some(variable) = ssa.variable_mut(*var) {
+                variable.facts_mut().set_known_value(value.clone());
+            }
         }
 
         let changed = !changes.is_empty();

@@ -259,13 +259,12 @@ mod tests {
             jiejienet::typeofs::{JiejieNetTypeOf, TypeOfFindings},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive_controlflow() {
-        let asm =
-            load_sample("tests/samples/packers/jiejie/source/jiejie_controlflow_no_rename.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_controlflow_no_rename.exe");
         let technique = JiejieNetTypeOf;
         let detection = technique.detect(&asm);
 
@@ -280,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_strings_only() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/jiejie_strings_only.exe");
+        let asm = load_sample("packers/jiejie/source/jiejie_strings_only.exe");
         let technique = JiejieNetTypeOf;
         let detection = technique.detect(&asm);
 
@@ -292,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative_original() {
-        let asm = load_sample("tests/samples/packers/jiejie/source/original.exe");
+        let asm = load_sample("packers/jiejie/source/original.exe");
         let technique = JiejieNetTypeOf;
         let detection = technique.detect(&asm);
 

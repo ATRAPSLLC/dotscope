@@ -22,7 +22,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```text
 //! let registry = GenericRegistry::new();
 //!
 //! let list_int = registry.get_or_create_type(list_token, vec![int_token]);
@@ -67,9 +67,9 @@ use crate::{
 /// allocation, so all synthetic tokens in the `0xF100_xxxx` range are
 /// globally unique within a single emulation process.
 pub struct GenericRegistry {
-    /// (open_type_token, [type_arg_tokens]) → instantiated type token
+    /// (open_type_token, \[type_arg_tokens\]) → instantiated type token
     type_instantiations: DashMap<(Token, Vec<Token>), Token>,
-    /// (open_method_token, [type_arg_tokens]) → instantiated method token
+    /// (open_method_token, \[type_arg_tokens\]) → instantiated method token
     method_instantiations: DashMap<(Token, Vec<Token>), Token>,
     /// Reverse lookup: instantiated token → (open token, args)
     reverse_lookup: DashMap<Token, (Token, Vec<Token>)>,

@@ -23,10 +23,12 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! use crate::cilassembly::changes::AssemblyChanges;
+//! ```
+//! use dotscope::CilAssembly;
 //!
-//! let mut changes = AssemblyChanges::new();
+//! let mut assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
+//! assembly.string_add("added")?;
+//! let changes = assembly.changes();
 //!
 //! // Check if any changes have been made
 //! if changes.has_changes() {
@@ -36,15 +38,32 @@
 //! // Get modification statistics
 //! let table_count = changes.modified_table_count();
 //! let string_count = changes.string_additions_count();
-//! # Ok::<(), crate::Error>(())
+//! assert_eq!(string_count, 1);
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "compiler")]
+use std::collections::HashSet;
 
 use crate::{
-    cilassembly::{operation::Operation, ChangeRef, HeapChanges, TableModifications},
+    cilassembly::{
+        changes::BlobComposite, operation::Operation, ChangeIds, ChangeRef, HeapChanges,
+        TableModifications,
+    },
     metadata::{exports::UnifiedExportContainer, imports::UnifiedImportContainer, tables::TableId},
 };
+#[cfg(feature = "compiler")]
+use crate::{Error, Result};
+
+/// The first placeholder RVA a new method body is stored under. A MethodDef row's RVA at or
+/// above it names a body in [`AssemblyChanges`], which the writer lays out; one below it is
+/// the RVA of a body in the input file, wherever in the file that is.
+pub const METHOD_BODY_PLACEHOLDER_BASE: u32 = 0xF000_0000;
+
+/// The first placeholder RVA new field data is stored under, below
+/// [`METHOD_BODY_PLACEHOLDER_BASE`].
+pub const FIELD_DATA_PLACEHOLDER_BASE: u32 = 0xE000_0000;
 
 /// Internal structure for tracking all modifications to an assembly.
 ///
@@ -62,17 +81,18 @@ use crate::{
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use crate::cilassembly::changes::AssemblyChanges;
+/// ```
+/// use dotscope::CilAssembly;
 ///
-/// let changes = AssemblyChanges::new();
+/// let assembly = CilAssembly::from_path("tests/samples/crafted_2.exe")?;
+/// let changes = assembly.changes();
 ///
 /// // Check modification status
 /// if changes.has_changes() {
 ///     let table_count = changes.modified_table_count();
 ///     println!("Modified {} tables", table_count);
 /// }
-/// # Ok::<(), crate::Error>(())
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety
@@ -112,20 +132,20 @@ pub struct AssemblyChanges {
     /// are typically Unicode string literals used by IL instructions.
     pub userstring_heap_changes: HeapChanges<String>,
 
-    /// Referenced string heap offsets for substring remapping.
-    ///
-    /// When heap compaction is enabled, this stores all string offsets that are
-    /// actually referenced by metadata tables. This is needed because .NET allows
-    /// "substring references" - pointing to any offset within a string entry.
-    /// During streaming, these offsets are used to build proper remappings for
-    /// substring references when strings shift positions.
-    pub referenced_string_offsets: HashSet<u32>,
+    /// The ids the assembly's changes take: its heaps' and its new rows'
+    pub change_ids: ChangeIds,
+
+    /// The appended blobs whose content names other blobs, by the change id of their
+    /// placeholder blob: the writer encodes each once the blobs it names have offsets
+    pub blob_composites: HashMap<u64, BlobComposite>,
 
     /// Native import/export containers for PE import/export tables
     ///
     /// Contains unified containers that manage user modifications to native imports/exports.
     /// These always exist but start empty, following pure copy-on-write semantics.
     pub native_imports: UnifiedImportContainer,
+    /// Native export container for the PE export table, which starts empty like
+    /// [`Self::native_imports`].
     pub native_exports: UnifiedExportContainer,
 
     /// Method body storage for new and modified method implementations
@@ -163,6 +183,31 @@ pub struct AssemblyChanges {
     /// will be resolved to real RVAs during PE writing based on actual section layout.
     /// Uses a different range than method bodies to avoid conflicts.
     pub next_field_placeholder: u32,
+
+    /// Every ChangeRef by its id, built for one write and dropped after it: the writer looks
+    /// up each placeholder it resolves, and the changes cannot move while it writes. `None`
+    /// outside a write, where [`Self::lookup_by_placeholder`] scans the change sets instead.
+    placeholder_index: Option<HashMap<u64, super::ChangeRefRc>>,
+}
+
+/// How far every change set reached at one moment, which
+/// [`AssemblyChanges::rollback_to`] returns to.
+///
+/// Additions only: the rollback undoes inserted rows, appended heap entries
+/// and stored data, and refuses a table changed in any other way.
+#[cfg(feature = "compiler")]
+#[derive(Debug, Clone)]
+pub struct Savepoint {
+    /// Each changed table's extent; `None` for a replaced table.
+    tables: HashMap<TableId, Option<(usize, u32)>>,
+    /// Items appended to the #Strings, #Blob, #GUID and #US heaps.
+    heaps: [usize; 4],
+    /// The next method body placeholder.
+    next_method_placeholder: u32,
+    /// The next field data placeholder.
+    next_field_placeholder: u32,
+    /// Bytes of managed resource data.
+    resource_data: usize,
 }
 
 impl AssemblyChanges {
@@ -170,20 +215,23 @@ impl AssemblyChanges {
     ///
     /// Initializes all heap change trackers and table change maps to empty state.
     pub fn new() -> Self {
+        let change_ids = ChangeIds::new();
         Self {
             table_changes: HashMap::new(),
-            string_heap_changes: HeapChanges::new_strings(),
-            blob_heap_changes: HeapChanges::new_blobs(),
-            guid_heap_changes: HeapChanges::new_guids(),
-            userstring_heap_changes: HeapChanges::new_userstrings(),
-            referenced_string_offsets: HashSet::new(),
+            string_heap_changes: HeapChanges::new_strings(change_ids.clone()),
+            blob_heap_changes: HeapChanges::new_blobs(change_ids.clone()),
+            guid_heap_changes: HeapChanges::new_guids(change_ids.clone()),
+            userstring_heap_changes: HeapChanges::new_userstrings(change_ids.clone()),
+            change_ids,
+            blob_composites: HashMap::new(),
             native_imports: UnifiedImportContainer::new(),
             native_exports: UnifiedExportContainer::new(),
             method_bodies: HashMap::new(),
-            next_method_placeholder: 0xF000_0000, // Start placeholders at high address range
+            next_method_placeholder: METHOD_BODY_PLACEHOLDER_BASE,
             resource_data: Vec::new(),
             field_data: HashMap::new(),
-            next_field_placeholder: 0xE000_0000, // Different range than method bodies
+            next_field_placeholder: FIELD_DATA_PLACEHOLDER_BASE,
+            placeholder_index: None,
         }
     }
 
@@ -196,7 +244,8 @@ impl AssemblyChanges {
 
     /// Returns true if any changes have been made to the assembly.
     ///
-    /// This checks if any table changes exist or if any heap has changes (additions, modifications, or removals).
+    /// This checks if any table changes exist, if any heap has changes (additions, modifications, or removals),
+    /// and whether method bodies, field data or resource data were stored.
     /// Native containers are checked for emptiness since they always exist but start empty.
     pub fn has_changes(&self) -> bool {
         !self.table_changes.is_empty()
@@ -207,6 +256,8 @@ impl AssemblyChanges {
             || !self.native_imports.is_empty()
             || !self.native_exports.is_empty()
             || !self.resource_data.is_empty()
+            || !self.method_bodies.is_empty()
+            || !self.field_data.is_empty()
     }
 
     /// Returns the number of tables that have been modified.
@@ -388,10 +439,45 @@ impl AssemblyChanges {
         })
     }
 
+    /// Indexes every ChangeRef by its id for the write about to run, so that each placeholder
+    /// the writer resolves is one lookup instead of a scan of every change set: the scan made
+    /// a write quadratic in the rows and heap entries a deobfuscation adds.
+    ///
+    /// The index holds exactly what [`Self::lookup_by_placeholder`] scans (the appended
+    /// entries of the four heaps and the ChangeRefs of every table), and stays right only
+    /// while the changes do not move: [`Self::drop_placeholder_index`] removes it when the
+    /// write ends.
+    pub fn index_placeholders(&mut self) {
+        let mut index = HashMap::new();
+        let heaps = self
+            .string_heap_changes
+            .appended_iter()
+            .map(|(_, change_ref)| change_ref)
+            .chain(self.blob_heap_changes.appended_iter().map(|(_, r)| r))
+            .chain(self.guid_heap_changes.appended_iter().map(|(_, r)| r))
+            .chain(self.userstring_heap_changes.appended_iter().map(|(_, r)| r));
+        let tables = self
+            .table_changes
+            .values()
+            .flat_map(|mods| mods.change_refs().map(|(_, change_ref)| change_ref));
+        for change_ref in heaps.chain(tables) {
+            index
+                .entry(change_ref.id())
+                .or_insert_with(|| change_ref.clone());
+        }
+        self.placeholder_index = Some(index);
+    }
+
+    /// Drops the index [`Self::index_placeholders`] built for a write.
+    pub fn drop_placeholder_index(&mut self) {
+        self.placeholder_index = None;
+    }
+
     /// Looks up a ChangeRef by its placeholder value.
     ///
     /// This searches through all heap and table changes to find the ChangeRef
-    /// that corresponds to the given placeholder.
+    /// that corresponds to the given placeholder: during a write through the index the
+    /// writer built for it, otherwise by scanning the change sets.
     ///
     /// # Arguments
     ///
@@ -406,6 +492,9 @@ impl AssemblyChanges {
         }
 
         let id = ChangeRef::id_from_placeholder(placeholder)?;
+        if let Some(index) = &self.placeholder_index {
+            return index.get(&id);
+        }
 
         // Search heap changes
         for (_, change_ref) in self.string_heap_changes.appended_iter() {
@@ -439,6 +528,87 @@ impl AssemblyChanges {
         }
 
         None
+    }
+
+    /// Where every change set stands now; see [`Savepoint`].
+    #[cfg(feature = "compiler")]
+    pub fn savepoint(&self) -> Savepoint {
+        Savepoint {
+            tables: self
+                .table_changes
+                .iter()
+                .map(|(table, changes)| (*table, changes.extent()))
+                .collect(),
+            heaps: [
+                self.string_heap_changes.additions_count(),
+                self.blob_heap_changes.additions_count(),
+                self.guid_heap_changes.additions_count(),
+                self.userstring_heap_changes.additions_count(),
+            ],
+            next_method_placeholder: self.next_method_placeholder,
+            next_field_placeholder: self.next_field_placeholder,
+            resource_data: self.resource_data.len(),
+        }
+    }
+
+    /// Undoes every addition made since `savepoint` was taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a table changed since in a way other than
+    /// inserted rows, which a rollback cannot undo. Nothing is rolled back
+    /// then.
+    #[cfg(feature = "compiler")]
+    pub fn rollback_to(&mut self, savepoint: &Savepoint) -> Result<()> {
+        // Checked before anything changes, so a refusal leaves every set as
+        // it was.
+        for (table, changes) in &self.table_changes {
+            let unchanged = match savepoint.tables.get(table) {
+                Some(Some(extent)) => changes.extent().is_some_and(|(operations, _)| {
+                    let inserted = changes.inserted_since(extent.1);
+                    operations.saturating_sub(inserted) == extent.0
+                }),
+                Some(None) => changes.extent().is_none(),
+                None => changes
+                    .extent()
+                    .is_some_and(|(operations, _)| changes.inserted_since(0) == operations),
+            };
+            if !unchanged {
+                return Err(Error::ModificationInvalid(format!(
+                    "table {table:?} changed by more than inserted rows since the savepoint"
+                )));
+            }
+        }
+        let mut emptied = Vec::new();
+        for (table, changes) in &mut self.table_changes {
+            match savepoint.tables.get(table) {
+                Some(Some(extent)) => changes.rollback_inserts(*extent)?,
+                Some(None) => {}
+                None => emptied.push(*table),
+            }
+        }
+        for table in emptied {
+            self.table_changes.remove(&table);
+        }
+        let [strings, blobs, guids, userstrings] = savepoint.heaps;
+        self.string_heap_changes.truncate_appended(strings);
+        self.blob_heap_changes.truncate_appended(blobs);
+        let appended: HashSet<u64> = self
+            .blob_heap_changes
+            .appended_iter()
+            .map(|(_, change_ref)| change_ref.id())
+            .collect();
+        self.blob_composites.retain(|id, _| appended.contains(id));
+        self.guid_heap_changes.truncate_appended(guids);
+        self.userstring_heap_changes.truncate_appended(userstrings);
+        self.method_bodies
+            .retain(|placeholder, _| *placeholder < savepoint.next_method_placeholder);
+        self.next_method_placeholder = savepoint.next_method_placeholder;
+        self.field_data
+            .retain(|placeholder, _| *placeholder < savepoint.next_field_placeholder);
+        self.next_field_placeholder = savepoint.next_field_placeholder;
+        self.resource_data.truncate(savepoint.resource_data);
+        Ok(())
     }
 
     /// Stores a method body and allocates a placeholder RVA for it.
@@ -550,7 +720,7 @@ impl AssemblyChanges {
     ///
     /// True if this RVA is a placeholder managed by the method body system.
     pub fn is_method_body_placeholder(&self, rva: u32) -> bool {
-        rva >= 0xF000_0000 && self.method_bodies.contains_key(&rva)
+        rva >= METHOD_BODY_PLACEHOLDER_BASE && self.method_bodies.contains_key(&rva)
     }
 
     /// Stores resource data in the CLR resources section and returns its offset.
@@ -688,7 +858,8 @@ impl AssemblyChanges {
     ///
     /// True if this RVA is a field data placeholder managed by this system.
     pub fn is_field_data_placeholder(&self, rva: u32) -> bool {
-        (0xE000_0000..0xF000_0000).contains(&rva) && self.field_data.contains_key(&rva)
+        (FIELD_DATA_PLACEHOLDER_BASE..METHOD_BODY_PLACEHOLDER_BASE).contains(&rva)
+            && self.field_data.contains_key(&rva)
     }
 
     /// Returns true if there is any field data to write.
@@ -706,7 +877,92 @@ impl Default for AssemblyChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cilassembly::HeapChanges;
+    #[cfg(feature = "compiler")]
+    use crate::{
+        cilassembly::{HeapChanges, TableOperation},
+        metadata::{
+            tables::{TableDataOwned, TypeSpecRaw},
+            token::Token,
+        },
+    };
+
+    /// A rollback takes back every addition since the savepoint - rows, heap
+    /// entries, stored data - and removes a table first changed since.
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn rollback_returns_every_change_set_to_the_savepoint() {
+        let mut changes = AssemblyChanges::empty();
+        changes.string_heap_changes.append("kept".to_string());
+        let savepoint = changes.savepoint();
+
+        changes.string_heap_changes.append("dropped".to_string());
+        changes.blob_heap_changes.append(vec![1, 2, 3]);
+        changes
+            .userstring_heap_changes
+            .append("dropped".to_string());
+        let field = changes.store_field_data(vec![0; 4]);
+        let body = changes.store_method_body(vec![0x2A]);
+        let mut table = TableModifications::new_sparse(1);
+        table
+            .apply_operation(TableOperation::new(Operation::Insert(
+                1,
+                TableDataOwned::TypeSpec(TypeSpecRaw {
+                    rid: 0,
+                    token: Token::new(0),
+                    offset: 0,
+                    signature: 0,
+                }),
+            )))
+            .unwrap();
+        changes.table_changes.insert(TableId::TypeSpec, table);
+
+        changes.rollback_to(&savepoint).unwrap();
+        assert_eq!(changes.string_heap_changes.additions_count(), 1);
+        assert_eq!(changes.blob_heap_changes.additions_count(), 0);
+        assert_eq!(changes.userstring_heap_changes.additions_count(), 0);
+        assert!(!changes.field_data.contains_key(&field));
+        assert!(!changes.method_bodies.contains_key(&body));
+        assert_eq!(changes.store_field_data(vec![1]), field);
+        assert!(changes.table_changes.is_empty());
+    }
+
+    /// A table updated since the savepoint is refused before anything is
+    /// rolled back.
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn rollback_refuses_without_changing_anything() {
+        let mut changes = AssemblyChanges::empty();
+        let mut table = TableModifications::new_sparse(3);
+        let savepoint_table = table.clone();
+        changes
+            .table_changes
+            .insert(TableId::TypeSpec, savepoint_table);
+        let savepoint = changes.savepoint();
+
+        changes.blob_heap_changes.append(vec![1]);
+        table
+            .apply_operation(TableOperation::new(Operation::Update(
+                1,
+                TableDataOwned::TypeSpec(TypeSpecRaw {
+                    rid: 1,
+                    token: Token::new(0x1B00_0001),
+                    offset: 0,
+                    signature: 0,
+                }),
+            )))
+            .unwrap();
+        changes.table_changes.insert(TableId::TypeSpec, table);
+
+        assert!(changes.rollback_to(&savepoint).is_err());
+        assert_eq!(changes.blob_heap_changes.additions_count(), 1);
+        assert_eq!(
+            changes
+                .table_changes
+                .get(&TableId::TypeSpec)
+                .map(TableModifications::operation_count),
+            Some(1)
+        );
+    }
 
     #[test]
     fn test_assembly_changes_empty() {
@@ -728,19 +984,19 @@ mod tests {
         assert_eq!(userstring_size, 0);
 
         // Add some string heap changes
-        let mut string_changes = HeapChanges::new_strings();
+        let mut string_changes = HeapChanges::new_strings(ChangeIds::new());
         let _ = string_changes.append("Hello".to_string()); // 5 + 1 = 6 bytes
         let _ = string_changes.append("World".to_string()); // 5 + 1 = 6 bytes
         changes.string_heap_changes = string_changes;
 
         // Add some blob heap changes
-        let mut blob_changes = HeapChanges::new_blobs();
+        let mut blob_changes = HeapChanges::new_blobs(ChangeIds::new());
         let _ = blob_changes.append(vec![1, 2, 3]); // 1 + 3 = 4 bytes (length < 128)
         let _ = blob_changes.append(vec![4, 5, 6, 7, 8]); // 1 + 5 = 6 bytes
         changes.blob_heap_changes = blob_changes;
 
         // Add some GUID heap changes
-        let mut guid_changes = HeapChanges::new_guids();
+        let mut guid_changes = HeapChanges::new_guids(ChangeIds::new());
         let _ = guid_changes.append([1; 16]); // 16 bytes
         let _ = guid_changes.append([2; 16]); // 16 bytes
         changes.guid_heap_changes = guid_changes;

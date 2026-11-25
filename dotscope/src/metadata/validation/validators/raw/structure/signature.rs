@@ -26,7 +26,6 @@
 //! - [`RawSignatureValidator::validate_signature_blob_integrity`] - Core blob format validation with calling convention checking
 //! - [`RawSignatureValidator::validate_calling_convention`] - Calling convention byte validation
 //! - [`RawSignatureValidator::validate_compressed_integer`] - Compressed integer format validation
-//! - [`RawSignatureValidator::validate_blob_bounds`] - Blob boundary and size validation
 //!
 //! # Usage Examples
 //!
@@ -228,8 +227,6 @@ impl RawSignatureValidator {
             Self::validate_compressed_integer(rest, blob_index)?;
         }
 
-        Self::validate_blob_bounds(blob_data, blob_index)?;
-
         Ok(())
     }
 
@@ -374,35 +371,6 @@ impl RawSignatureValidator {
             })
         }
     }
-
-    /// Validates blob boundary constraints and structural integrity.
-    ///
-    /// Performs basic structural validation to ensure the blob data is
-    /// consistent and does not contain obvious corruption indicators.
-    ///
-    /// # Arguments
-    ///
-    /// * `blob_data` - The blob data to validate
-    /// * `blob_index` - Blob index for error reporting
-    ///
-    /// # Returns
-    ///
-    /// Returns validation error for structural inconsistencies.
-    fn validate_blob_bounds(blob_data: &[u8], blob_index: u32) -> Result<()> {
-        if blob_data.len() > 65536 {
-            return Err(Error::ValidationRawFailed {
-                validator: "RawSignatureValidator".to_string(),
-                message: format!(
-                    "Signature blob {} exceeds maximum reasonable size ({})",
-                    blob_index,
-                    blob_data.len()
-                ),
-            });
-        }
-
-        // ToDo: Additional bounds checking can be added here for specific signature format constraints
-        Ok(())
-    }
 }
 
 impl RawValidator for RawSignatureValidator {
@@ -442,31 +410,16 @@ impl RawValidator for RawSignatureValidator {
             return Ok(());
         };
 
+        // A MethodDef's signature is a method signature: a field signature (0x06) there is
+        // invalid, and an index past the heap is reported, not skipped.
         if let Some(table) = tables.table::<MethodDefRaw>() {
             for method in table {
                 let method = method?;
-                if let Some(blob_heap) = assembly_view.blobs() {
-                    if let Ok(blob_data) = blob_heap.get(method.signature as usize) {
-                        if let Some(&calling_convention) = blob_data.first() {
-                            let signature_kind = match calling_convention {
-                                0x06 => SignatureKind::Field,
-                                _ => SignatureKind::Method,
-                            };
-
-                            Self::validate_signature_blob_integrity(
-                                assembly_view,
-                                method.signature,
-                                signature_kind,
-                            )?;
-                        }
-                    }
-                } else {
-                    Self::validate_signature_blob_integrity(
-                        assembly_view,
-                        method.signature,
-                        SignatureKind::Method,
-                    )?;
-                }
+                Self::validate_signature_blob_integrity(
+                    assembly_view,
+                    method.signature,
+                    SignatureKind::Method,
+                )?;
             }
         }
 
@@ -591,7 +544,7 @@ mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{factories::validation::raw_structure_signature::*, validator_test},
+        testkit::{factories::validation::raw_structure_signature::*, validator_test},
         Result,
     };
 
@@ -606,7 +559,6 @@ mod tests {
         validator_test(
             raw_signature_validator_file_factory,
             "RawSignatureValidator",
-            "ValidationRawFailed",
             config,
             |context| validator.validate_raw(context),
         )

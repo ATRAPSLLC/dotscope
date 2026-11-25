@@ -467,8 +467,8 @@ fn list_sort_pre(_ctx: &HookContext<'_>, _thread: &mut EmulationThread) -> PreHo
 fn list_add_range_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHookResult {
     if let Some(EmValue::ObjectRef(list_ref)) = ctx.this {
         if let Some(EmValue::ObjectRef(source_ref)) = ctx.args.first() {
-            let source_obj = try_hook!(thread.heap().get(*source_ref));
-            let source_elements: Vec<EmValue> = match source_obj {
+            let source_obj = try_hook!(thread.heap().get_shared(*source_ref));
+            let source_elements: Vec<EmValue> = match &*source_obj {
                 HeapObject::Array { elements, .. } => elements.clone(),
                 HeapObject::List { elements } => elements.clone(),
                 _ => Vec::new(),
@@ -655,7 +655,7 @@ mod tests {
     use crate::{
         emulation::runtime::hook::HookManager,
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     fn ctx<'a>(method: &'a str, this: Option<&'a EmValue>, args: &'a [EmValue]) -> HookContext<'a> {

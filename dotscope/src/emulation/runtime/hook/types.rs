@@ -107,7 +107,7 @@ impl Default for HookPriority {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::emulation::{HookContext, PreHookResult, EmulationThread};
 ///
 /// fn my_pre_hook(ctx: &HookContext, thread: &mut EmulationThread) -> PreHookResult {
@@ -164,9 +164,10 @@ pub struct HookContext<'a> {
     /// `None` if type information could not be resolved.
     pub param_types: Option<&'a [CilFlavor]>,
 
-    /// Return type if available.
+    /// Return type if available: [`CilFlavor::Void`] for a void method.
     ///
-    /// `None` if type information could not be resolved or the method returns void.
+    /// `None` only if the signature could not be read, so a matcher expecting `Void` matches
+    /// a void method rather than every method whose signature is unknown.
     pub return_type: Option<CilFlavor>,
 
     /// Target pointer size for native int/uint types.
@@ -292,7 +293,7 @@ impl<'a> HookContext<'a> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::emulation::{PreHookResult, EmValue};
 ///
 /// // Continue to let the original method run
@@ -469,7 +470,7 @@ impl PreHookResult {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::emulation::{PostHookResult, EmValue};
 ///
 /// // Keep the original return value unchanged
@@ -507,7 +508,7 @@ pub enum PostHookResult {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::emulation::{PreHookFn, PreHookResult};
 /// use std::sync::Arc;
 ///
@@ -530,7 +531,7 @@ pub type PreHookFn =
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::emulation::{PostHookFn, PostHookResult};
 /// use std::sync::Arc;
 ///
@@ -553,10 +554,31 @@ pub type PostHookFn = Arc<
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::emulation::{HookManager, HookOutcome, EmValue};
+/// ```
+/// use dotscope::emulation::{HookContext, HookManager, HookOutcome};
+/// use dotscope::metadata::{token::Token, typesystem::PointerSize};
+/// # use std::sync::{Arc, RwLock};
+/// # use dotscope::emulation::{
+/// #     AddressSpace, CaptureContext, EmulationConfig, EmulationThread, RuntimeState,
+/// #     SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+/// # };
+/// # let address_space = Arc::new(AddressSpace::new());
+/// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+/// # let context = Arc::new(ThreadContext::new(
+/// #     address_space,
+/// #     Arc::new(RwLock::new(RuntimeState::new())),
+/// #     Arc::new(CaptureContext::new()),
+/// #     Arc::new(EmulationConfig::default()),
+/// #     None,
+/// #     fake_objects,
+/// #     Arc::new(VirtualFs::new()),
+/// # ));
+/// # let mut thread = EmulationThread::new(ThreadId::MAIN, context);
+/// # let manager = HookManager::new();
+/// # let context =
+/// #     HookContext::new(Token::new(0x0A00_0001), "System", "String", "Concat", PointerSize::Bit64);
 ///
-/// let outcome = manager.execute(...)?;
+/// let outcome = manager.execute(&context, &mut thread, |_thread| None)?;
 /// match outcome {
 ///     HookOutcome::NoMatch => {
 ///         // No hook matched - execute method normally
@@ -564,7 +586,14 @@ pub type PostHookFn = Arc<
 ///     HookOutcome::Handled(value) => {
 ///         // Hook handled the call, use this return value
 ///     }
+///     HookOutcome::ReflectionInvoke { .. } => {
+///         // Hook resolved a reflection call: redirect to the invoked method
+///     }
+///     HookOutcome::ThrewException { .. } => {
+///         // Hook threw a CLR exception: route it to the handlers
+///     }
 /// }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// [`HookManager::execute`]: crate::emulation::runtime::HookManager::execute

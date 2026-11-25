@@ -53,7 +53,7 @@ impl DeobfuscationEngine {
 
     /// Runs technique detection on an assembly (IL-level and SSA-level).
     ///
-    /// This is a detection-only API — no transforms are applied. It runs both
+    /// This is a detection-only API - no transforms are applied. It runs both
     /// IL-level [`Technique::detect`](crate::deobfuscation::techniques::Technique::detect)
     /// and SSA-level [`Technique::detect_ssa`](crate::deobfuscation::techniques::Technique::detect_ssa)
     /// on each technique, catching patterns that require cross-block def-use
@@ -266,7 +266,7 @@ impl DeobfuscationEngine {
 
         // Build context and insert SSA before detection so detect_ssa can analyze it
         let call_graph = Arc::new(CallGraph::new());
-        let ctx = AnalysisContext::new(call_graph);
+        let ctx = AnalysisContext::with_config(call_graph, self.config.clone());
         let ssa_owned = std::mem::replace(ssa, SsaFunction::new(0, 0));
         ctx.ssa_functions.insert(method_token, ssa_owned);
         ctx.add_entry_point(method_token);

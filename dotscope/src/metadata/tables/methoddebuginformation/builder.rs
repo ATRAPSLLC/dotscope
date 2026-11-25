@@ -96,6 +96,8 @@ pub struct MethodDebugInformationBuilder {
     document: Option<u32>,
     /// Sequence points blob data
     sequence_points: Option<Vec<u8>>,
+    /// Sequence points to encode at build, once the document is known
+    parsed_sequence_points: Option<SequencePoints>,
 }
 
 impl Default for MethodDebugInformationBuilder {
@@ -121,6 +123,7 @@ impl MethodDebugInformationBuilder {
         Self {
             document: None,
             sequence_points: None,
+            parsed_sequence_points: None,
         }
     }
 
@@ -168,6 +171,7 @@ impl MethodDebugInformationBuilder {
     #[must_use]
     pub fn sequence_points(mut self, data: Vec<u8>) -> Self {
         self.sequence_points = Some(data);
+        self.parsed_sequence_points = None;
         self
     }
 
@@ -182,16 +186,22 @@ impl MethodDebugInformationBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// # use dotscope::prelude::*;
     /// # use dotscope::metadata::sequencepoints::SequencePoints;
     /// # let points = SequencePoints::default();
     /// let builder = MethodDebugInformationBuilder::new()
     ///     .sequence_points_parsed(points);
     /// ```
+    ///
+    /// The points are encoded when the entry is built, against the document set
+    /// with [`document`](Self::document): the blob's header names the first
+    /// point's document only when the method has none. [`build`](Self::build)
+    /// fails when they cannot be encoded (see [`SequencePoints::to_bytes`]).
     #[must_use]
-    pub fn sequence_points_parsed(mut self, points: &SequencePoints) -> Self {
-        self.sequence_points = Some(points.to_bytes());
+    pub fn sequence_points_parsed(mut self, points: SequencePoints) -> Self {
+        self.parsed_sequence_points = Some(points);
+        self.sequence_points = None;
         self
     }
 
@@ -217,7 +227,7 @@ impl MethodDebugInformationBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// # use dotscope::prelude::*;
     /// # use std::path::Path;
     /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
@@ -228,13 +238,17 @@ impl MethodDebugInformationBuilder {
     ///     .sequence_points(vec![0x01, 0x02, 0x03])
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created MethodDebugInformation with token: {}", debug_token);
+    /// println!("Created MethodDebugInformation with token: {:?}", debug_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {
         let document_index = self.document.unwrap_or(0);
 
-        let sequence_points_index = if let Some(data) = self.sequence_points {
+        let encoded = match &self.parsed_sequence_points {
+            Some(points) => Some(points.to_bytes(document_index)?),
+            None => self.sequence_points,
+        };
+        let sequence_points_index = if let Some(data) = encoded {
             if data.is_empty() {
                 0
             } else {
@@ -263,8 +277,9 @@ impl MethodDebugInformationBuilder {
 mod tests {
     use super::*;
     use crate::{
-        cilassembly::ChangeRefKind, metadata::tables::TableId,
-        test::factories::table::assemblyref::get_test_assembly,
+        cilassembly::ChangeRefKind,
+        metadata::{sequencepoints::SequencePoint, tables::TableId},
+        testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]
@@ -282,6 +297,30 @@ mod tests {
             ChangeRefKind::TableRow(TableId::MethodDebugInformation)
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_method_debug_information_builder_encodes_parsed_points_against_its_document(
+    ) -> Result<()> {
+        let points = SequencePoints {
+            local_signature: 0,
+            points: vec![SequencePoint::new(0, 3, 1, 3, 9).unwrap()],
+        };
+
+        // With a document the points are in it.
+        let mut assembly = get_test_assembly()?;
+        MethodDebugInformationBuilder::new()
+            .document(1)
+            .sequence_points_parsed(points.clone())
+            .build(&mut assembly)?;
+
+        // Without one, a point must name its own.
+        let mut assembly = get_test_assembly()?;
+        assert!(MethodDebugInformationBuilder::new()
+            .sequence_points_parsed(points)
+            .build(&mut assembly)
+            .is_err());
         Ok(())
     }
 

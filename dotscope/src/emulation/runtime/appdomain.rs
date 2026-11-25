@@ -32,26 +32,7 @@
 //!
 //! ## Basic Usage
 //!
-//! ```ignore
-//! use dotscope::emulation::runtime::{AppDomainState, LoadedAssemblyInfo, RuntimeTypeInfo};
-//! use dotscope::metadata::token::Token;
-//!
-//! let mut domain = AppDomainState::new();
-//!
-//! // Register an assembly
-//! domain.register_assembly(LoadedAssemblyInfo {
-//!     name: "MyAssembly".to_string(),
-//!     token: Token::new(0x20000001),
-//!     full_name: Some("MyAssembly, Version=1.0.0.0".to_string()),
-//!     location: Some("/path/to/assembly.dll".to_string()),
-//!     loaded_from_bytes: false,
-//! });
-//!
-//! // Query the assembly
-//! if let Some(info) = domain.get_assembly("MyAssembly") {
-//!     println!("Loaded: {}", info.name);
-//! }
-//! ```
+//! The `examples::module_example` test in this module runs this example.
 //!
 //! # Use Cases
 //!
@@ -96,8 +77,9 @@ use crate::{emulation::HeapRef, metadata::token::Token, CilObject};
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use dotscope::emulation::runtime::AppDomainState;
+/// ```
+/// use dotscope::emulation::AppDomainState;
+/// use dotscope::metadata::token::Token;
 ///
 /// let mut domain = AppDomainState::new();
 ///
@@ -148,7 +130,7 @@ pub struct AppDomainState {
     ///
     /// Each entry is a fully parsed [`CilObject`] that can be used for
     /// metadata resolution and instruction fetching. The index into this
-    /// vector is stored in [`ThreadCallFrame::assembly_index`] to track
+    /// vector is stored in [`ThreadCallFrame::assembly_index`](crate::emulation::ThreadCallFrame::assembly_index) to track
     /// which assembly a frame belongs to.
     loaded_cilobjects: Vec<Arc<CilObject>>,
 }
@@ -175,8 +157,8 @@ impl std::fmt::Debug for AppDomainState {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use dotscope::emulation::runtime::LoadedAssemblyInfo;
+/// ```no_run
+/// use dotscope::emulation::LoadedAssemblyInfo;
 /// use dotscope::metadata::token::Token;
 ///
 /// let info = LoadedAssemblyInfo {
@@ -226,8 +208,8 @@ impl AppDomainState {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// use dotscope::emulation::runtime::AppDomainState;
+    /// ```no_run
+    /// use dotscope::emulation::AppDomainState;
     ///
     /// let domain = AppDomainState::new();
     /// assert!(domain.executing_assembly().is_none());
@@ -248,8 +230,9 @@ impl AppDomainState {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// use dotscope::emulation::runtime::{AppDomainState, LoadedAssemblyInfo};
+    /// ```no_run
+    /// use dotscope::emulation::AppDomainState;
+    /// use dotscope::emulation::LoadedAssemblyInfo;
     /// use dotscope::metadata::token::Token;
     ///
     /// let mut domain = AppDomainState::new();
@@ -285,7 +268,8 @@ impl AppDomainState {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
+    /// # let domain = dotscope::emulation::AppDomainState::new();
     /// for assembly in domain.loaded_assemblies() {
     ///     println!("Loaded: {}", assembly.name);
     /// }
@@ -363,7 +347,10 @@ impl AppDomainState {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::emulation::{AppDomainState, HeapRef};
+    ///
+    /// let mut domain = AppDomainState::new();
     /// let ref1 = domain.intern_string("hello".to_string(), HeapRef::new(1));
     /// let ref2 = domain.intern_string("hello".to_string(), HeapRef::new(2));
     /// assert_eq!(ref1, ref2); // Same reference returned
@@ -510,6 +497,7 @@ impl AppDomainState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::fixture;
 
     #[test]
     fn test_app_domain_creation() {
@@ -519,8 +507,7 @@ mod tests {
 
     /// Loads the smallest sample available; only its identity as a parsed assembly matters.
     fn sample_assembly() -> Arc<CilObject> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         Arc::new(CilObject::from_path(&path).expect("sample assembly must load"))
     }
 
@@ -618,5 +605,35 @@ mod tests {
 
         domain.set_executing_assembly(Token::new(0x20000001));
         assert_eq!(domain.executing_assembly(), Some(Token::new(0x20000001)));
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::{metadata::token::Token, Result};
+
+    /// A registered assembly is found again by its name.
+    #[test]
+    fn module_example() -> Result<()> {
+        let mut domain = AppDomainState::new();
+
+        // Register an assembly
+        domain.register_assembly(LoadedAssemblyInfo {
+            name: "MyAssembly".to_string(),
+            token: Token::new(0x20000001),
+            full_name: Some("MyAssembly, Version=1.0.0.0".to_string()),
+            location: Some("/path/to/assembly.dll".to_string()),
+            loaded_from_bytes: false,
+        });
+
+        // Query the assembly
+        let info = domain.get_assembly("MyAssembly").expect("registered");
+        assert_eq!(
+            info.full_name.as_deref(),
+            Some("MyAssembly, Version=1.0.0.0")
+        );
+        assert!(domain.get_assembly("Other").is_none());
+        Ok(())
     }
 }

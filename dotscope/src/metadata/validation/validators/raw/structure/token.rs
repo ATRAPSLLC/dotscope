@@ -77,9 +77,11 @@ use crate::{
     dispatch_table_type,
     metadata::{
         tables::{
-            CodedIndex, ConstantRaw, CustomAttributeRaw, DeclSecurityRaw, FieldMarshalRaw,
-            GenericParamConstraintRaw, GenericParamRaw, InterfaceImplRaw, MemberRefRaw,
-            MetadataTable, MethodImplRaw, MethodSpecRaw, NestedClassRaw, TableId, TypeDefRaw,
+            CodedIndex, ConstantRaw, CustomAttributeRaw, CustomDebugInformationRaw,
+            DeclSecurityRaw, EventRaw, ExportedTypeRaw, FieldMarshalRaw, GenericParamConstraintRaw,
+            GenericParamRaw, ImplMapRaw, InterfaceImplRaw, ManifestResourceRaw, MemberRefRaw,
+            MetadataTable, MethodImplRaw, MethodSemanticsRaw, MethodSpecRaw, NestedClassRaw,
+            TableId, TypeDefRaw, TypeRefRaw,
         },
         token::Token,
         validation::{
@@ -686,6 +688,60 @@ impl RawTokenValidator {
         Ok(())
     }
 
+    /// Reports a coded index whose stored tag names no table.
+    fn check_coded_index_tag(coded_index: &CodedIndex) -> Result<()> {
+        match coded_index.unassigned_tag {
+            Some(stored) => Err(Error::InvalidToken {
+                token: coded_index.token,
+                message: format!(
+                    "{:?} coded index stores 0x{stored:X}, whose tag names no table (the runtime reads it as a null reference)",
+                    coded_index.ci_type
+                ),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Checks every coded-index column of every table for a tag that names no table.
+    ///
+    /// The CLR reads such an index as a null reference, so the reference checks that
+    /// follow would report it only as a reference to row 0; this runs first, over every
+    /// coded-index column, so that the report names what the file holds.
+    fn validate_coded_index_tags(context: &RawValidationContext) -> Result<()> {
+        let Some(tables) = context.assembly_view().tables() else {
+            return Ok(());
+        };
+        macro_rules! check_tags {
+            ($raw:ty: $($column:ident),+) => {
+                if let Some(table) = tables.table::<$raw>() {
+                    for row in table {
+                        let row = row?;
+                        $(Self::check_coded_index_tag(&row.$column)?;)+
+                    }
+                }
+            };
+        }
+        check_tags!(TypeDefRaw: extends);
+        check_tags!(TypeRefRaw: resolution_scope);
+        check_tags!(InterfaceImplRaw: interface);
+        check_tags!(MemberRefRaw: class);
+        check_tags!(ConstantRaw: parent);
+        check_tags!(CustomAttributeRaw: parent, constructor);
+        check_tags!(FieldMarshalRaw: parent);
+        check_tags!(DeclSecurityRaw: parent);
+        check_tags!(EventRaw: event_type);
+        check_tags!(MethodSemanticsRaw: association);
+        check_tags!(MethodImplRaw: method_body, method_declaration);
+        check_tags!(ImplMapRaw: member_forwarded);
+        check_tags!(ExportedTypeRaw: implementation);
+        check_tags!(ManifestResourceRaw: implementation);
+        check_tags!(GenericParamRaw: owner);
+        check_tags!(MethodSpecRaw: method);
+        check_tags!(GenericParamConstraintRaw: constraint);
+        check_tags!(CustomDebugInformationRaw: parent);
+        Ok(())
+    }
+
     /// Generic helper method to validate any coded index field.
     ///
     /// This method replaces the repetitive validation logic found in table-specific methods
@@ -717,6 +773,7 @@ impl RawTokenValidator {
 
 impl RawValidator for RawTokenValidator {
     fn validate_raw(&self, context: &RawValidationContext) -> Result<()> {
+        Self::validate_coded_index_tags(context)?;
         Self::validate_token_references(context)?;
         Self::validate_rid_bounds(context)?;
         Self::validate_coded_indexes(context)?;
@@ -752,11 +809,10 @@ mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::raw_structure_token::*, get_testfile_wb, validator_test,
             TestAssembly,
         },
-        Error,
     };
 
     /// Comprehensive test for RawTokenValidator using the centralized test harness.
@@ -811,7 +867,6 @@ mod tests {
         validator_test(
             raw_token_validator_file_factory,
             "RawTokenValidator",
-            "InvalidRid",
             ValidationConfig {
                 enable_structural_validation: true,
                 enable_cross_table_validation: true,
@@ -829,16 +884,13 @@ mod tests {
         let validator = RawTokenValidator::new();
 
         fn clean_only_factory() -> Result<Vec<TestAssembly>> {
-            let Some(clean_testfile) = get_testfile_wb() else {
-                return Err(Error::Other("WindowsBase.dll not available".to_string()));
-            };
-            Ok(vec![TestAssembly::new(&clean_testfile, true)])
+            let clean_testfile = get_testfile_wb();
+            Ok(vec![TestAssembly::new(&clean_testfile)])
         }
 
         let result_disabled = validator_test(
             clean_only_factory,
             "RawTokenValidator",
-            "InvalidRid",
             ValidationConfig {
                 enable_structural_validation: false,
                 ..Default::default()
@@ -860,7 +912,6 @@ mod tests {
         let result_enabled = validator_test(
             clean_only_factory,
             "RawTokenValidator",
-            "InvalidRid",
             ValidationConfig {
                 enable_structural_validation: true,
                 ..Default::default()

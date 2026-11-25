@@ -109,8 +109,7 @@ pub fn parse(asm: &CilObject) -> Option<VtFixupContext> {
     }
 
     let file = asm.file();
-    let offset = file.rva_to_offset(rva as usize).ok()?;
-    let data = file.data_slice(offset, size as usize).ok()?;
+    let data = file.rva_slice(rva as usize, size as usize).ok()?;
 
     // Each VTableFixup directory entry is 8 bytes: rva(u32) + count(u16) + flags(u16)
     let num_entries = (size as usize) / 8;
@@ -128,29 +127,27 @@ pub fn parse(asm: &CilObject) -> Option<VtFixupContext> {
 
         // Read method tokens at the entry's RVA
         let mut tokens = Vec::with_capacity(count as usize);
-        if let Ok(tok_offset) = file.rva_to_offset(entry_rva as usize) {
-            let tok_data_len = (count as usize).saturating_mul(slot_size);
-            if let Ok(tok_data) = file.data_slice(tok_offset, tok_data_len) {
-                for j in 0..count as usize {
-                    let Some(slot_base) = j.checked_mul(slot_size) else {
-                        break;
-                    };
-                    let token = if slot_size == 8 {
-                        // 64-bit slot: read u64, truncate to u32 (high 32 bits are padding)
-                        slot_base
-                            .checked_add(8)
-                            .and_then(|end| tok_data.get(slot_base..end))
-                            .and_then(|s| <[u8; 8]>::try_from(s).ok())
-                            .map_or(0u32, |b| u64::from_le_bytes(b) as u32)
-                    } else {
-                        slot_base
-                            .checked_add(4)
-                            .and_then(|end| tok_data.get(slot_base..end))
-                            .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                            .map_or(0u32, u32::from_le_bytes)
-                    };
-                    tokens.push(token);
-                }
+        let tok_data_len = (count as usize).saturating_mul(slot_size);
+        if let Ok(tok_data) = file.rva_slice(entry_rva as usize, tok_data_len) {
+            for j in 0..count as usize {
+                let Some(slot_base) = j.checked_mul(slot_size) else {
+                    break;
+                };
+                let token = if slot_size == 8 {
+                    // 64-bit slot: read u64, truncate to u32 (high 32 bits are padding)
+                    slot_base
+                        .checked_add(8)
+                        .and_then(|end| tok_data.get(slot_base..end))
+                        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                        .map_or(0u32, |b| u64::from_le_bytes(b) as u32)
+                } else {
+                    slot_base
+                        .checked_add(4)
+                        .and_then(|end| tok_data.get(slot_base..end))
+                        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                        .map_or(0u32, u32::from_le_bytes)
+                };
+                tokens.push(token);
             }
         }
 

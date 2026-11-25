@@ -362,12 +362,12 @@ impl Default for MethodSemanticsBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, path::PathBuf};
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::{cilassemblyview::CilAssemblyView, tables::MethodSemanticsAttributes},
+        testkit::fixture,
     };
 
     #[test]
@@ -388,242 +388,231 @@ mod tests {
 
     #[test]
     fn test_property_getter_semantic() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            let semantic_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::GETTER)
-                .method(1)
-                .association_from_property(1)
-                .build(&mut assembly)?;
+        let semantic_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::GETTER)
+            .method(1)
+            .association_from_property(1)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                semantic_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-        }
+        assert_eq!(
+            semantic_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
         Ok(())
     }
 
     #[test]
     fn test_property_setter_semantic() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            let semantic_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::SETTER)
-                .method(2)
-                .association_from_property(1)
-                .build(&mut assembly)?;
+        let semantic_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::SETTER)
+            .method(2)
+            .association_from_property(1)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                semantic_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-        }
+        assert_eq!(
+            semantic_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
         Ok(())
     }
 
     #[test]
     fn test_event_add_semantic() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            let semantic_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::ADD_ON)
-                .method(3)
-                .association_from_event(1)
-                .build(&mut assembly)?;
+        let semantic_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::ADD_ON)
+            .method(3)
+            .association_from_event(1)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                semantic_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-        }
+        assert_eq!(
+            semantic_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
         Ok(())
     }
 
     #[test]
     fn test_event_remove_semantic() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            let semantic_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::REMOVE_ON)
-                .method(4)
-                .association_from_event(1)
-                .build(&mut assembly)?;
+        let semantic_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::REMOVE_ON)
+            .method(4)
+            .association_from_event(1)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                semantic_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-        }
+        assert_eq!(
+            semantic_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
         Ok(())
     }
 
     #[test]
     fn test_event_fire_semantic() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            let semantic_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::FIRE)
-                .method(5)
-                .association_from_event(1)
-                .build(&mut assembly)?;
+        let semantic_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::FIRE)
+            .method(5)
+            .association_from_event(1)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                semantic_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-        }
+        assert_eq!(
+            semantic_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
         Ok(())
     }
 
     #[test]
     fn test_combined_semantics() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            let semantic_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::GETTER | MethodSemanticsAttributes::OTHER)
-                .method(6)
-                .association_from_property(2)
-                .build(&mut assembly)?;
+        let semantic_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::GETTER | MethodSemanticsAttributes::OTHER)
+            .method(6)
+            .association_from_property(2)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                semantic_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-        }
+        assert_eq!(
+            semantic_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
         Ok(())
     }
 
     #[test]
     fn test_association_with_row_index() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            // Test using direct row index (not a placeholder)
-            let semantic_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::GETTER)
-                .method(7)
-                .association_from_property(1)
-                .build(&mut assembly)?;
+        // Test using direct row index (not a placeholder)
+        let semantic_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::GETTER)
+            .method(7)
+            .association_from_property(1)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                semantic_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-        }
+        assert_eq!(
+            semantic_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
         Ok(())
     }
 
     #[test]
     fn test_multiple_method_semantics() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path)?;
+        let mut assembly = CilAssembly::new(view);
 
-            // Create multiple semantic relationships for the same property
-            let getter_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::GETTER)
-                .method(1)
-                .association_from_property(1)
-                .build(&mut assembly)?;
+        // Create multiple semantic relationships for the same property
+        let getter_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::GETTER)
+            .method(1)
+            .association_from_property(1)
+            .build(&mut assembly)?;
 
-            let setter_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::SETTER)
-                .method(2)
-                .association_from_property(1)
-                .build(&mut assembly)?;
+        let setter_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::SETTER)
+            .method(2)
+            .association_from_property(1)
+            .build(&mut assembly)?;
 
-            let other_ref = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::OTHER)
-                .method(3)
-                .association_from_property(1)
-                .build(&mut assembly)?;
+        let other_ref = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::OTHER)
+            .method(3)
+            .association_from_property(1)
+            .build(&mut assembly)?;
 
-            assert_eq!(
-                getter_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-            assert_eq!(
-                setter_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-            assert_eq!(
-                other_ref.kind(),
-                ChangeRefKind::TableRow(TableId::MethodSemantics)
-            );
-            assert!(!std::sync::Arc::ptr_eq(&getter_ref, &setter_ref));
-            assert!(!std::sync::Arc::ptr_eq(&setter_ref, &other_ref));
-        }
+        assert_eq!(
+            getter_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
+        assert_eq!(
+            setter_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
+        assert_eq!(
+            other_ref.kind(),
+            ChangeRefKind::TableRow(TableId::MethodSemantics)
+        );
+        assert!(!std::sync::Arc::ptr_eq(&getter_ref, &setter_ref));
+        assert!(!std::sync::Arc::ptr_eq(&setter_ref, &other_ref));
         Ok(())
     }
 
     #[test]
     fn test_build_without_semantics_fails() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = MethodSemanticsBuilder::new()
-                .method(1)
-                .association_from_property(1)
-                .build(&mut assembly);
+        let result = MethodSemanticsBuilder::new()
+            .method(1)
+            .association_from_property(1)
+            .build(&mut assembly);
 
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("semantics field is required"));
-        }
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("semantics field is required"));
     }
 
     #[test]
     fn test_build_without_method_fails() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::GETTER)
-                .association_from_property(1)
-                .build(&mut assembly);
+        let result = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::GETTER)
+            .association_from_property(1)
+            .build(&mut assembly);
 
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("method field is required"));
-        }
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("method field is required"));
     }
 
     #[test]
     fn test_build_without_association_fails() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = MethodSemanticsBuilder::new()
-                .semantics(MethodSemanticsAttributes::GETTER)
-                .method(1)
-                .build(&mut assembly);
+        let result = MethodSemanticsBuilder::new()
+            .semantics(MethodSemanticsAttributes::GETTER)
+            .method(1)
+            .build(&mut assembly);
 
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("association field is required"));
-        }
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("association field is required"));
     }
 }

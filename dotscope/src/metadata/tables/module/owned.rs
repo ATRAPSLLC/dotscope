@@ -4,7 +4,7 @@
 //! references and owned data structures for efficient runtime access.
 
 use crate::metadata::{
-    customattributes::CustomAttributeValueList, imports::ImportRc, token::Token,
+    customattributes::CustomAttributeValueList, imports::ImportRc, streams::SharedStr, token::Token,
 };
 
 /// Owned representation of a Module table entry with resolved references.
@@ -57,7 +57,7 @@ pub struct Module {
     ///
     /// Human-readable string identifying the module, resolved from the string heap.
     /// Typically matches the assembly file name without extension.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Module Version Identifier (Mvid) GUID.
     ///

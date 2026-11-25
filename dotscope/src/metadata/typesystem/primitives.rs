@@ -780,7 +780,7 @@ impl CilPrimitiveKind {
     /// Returns a stable `&'static str` identifier for this primitive kind.
     ///
     /// The strings follow ILAsm / ECMA-335 §I.8.2.2 conventions and are part
-    /// of the stable public API — safe to persist (file, database, log line)
+    /// of the stable public API - safe to persist (file, database, log line)
     /// and to parse. Pointer-sized integers and the structural kinds use the
     /// short ILAsm names rather than the C# / `System.*` aliases:
     ///

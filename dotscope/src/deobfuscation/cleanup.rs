@@ -13,60 +13,49 @@
 //!
 //! Obfuscator-specific modules should:
 //! 1. Detect what tokens need to be removed (types, methods, fields)
-//! 2. Create a [`CleanupRequest`](crate::cilassembly::CleanupRequest) with those tokens
+//! 2. Create a [`CleanupRequest`] with those tokens
 //! 3. Call [`execute_cleanup`] to perform the cleanup
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use dotscope::cilassembly::CleanupRequest;
-//! use dotscope::deobfuscation::cleanup::execute_cleanup;
-//! use dotscope::deobfuscation::DerivedStats;
-//!
-//! let mut request = CleanupRequest::new();
-//! request.add_type(some_type_token);
-//! request.add_method(some_method_token);
-//! request.add_field(some_field_token);
-//!
-//! let assembly = execute_cleanup(assembly, Some(request), &ctx)?;
-//! // Statistics are derived from the event log
-//! let stats = DerivedStats::from_log(&ctx.events);
-//! println!("{}", stats.summary());
-//! ```
+//! The `examples::module_example` test in this module runs this example.
 
-use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
+    analysis::{SsaOpCilExt, SsaVarId, TypeContext, VariableOrigin},
+    assembly::Operand,
     cilassembly::{
-        compute_entry_points, find_unreferenced_types, CilAssembly, CleanupRequest, GeneratorConfig,
+        compute_entry_points, expand_type_tokens, find_unreferenced_types, CleanupRequest,
+        GeneratorConfig, TypeNames,
     },
     compiler::{EventKind, ProxyDevirtualizationPass},
     deobfuscation::{
         context::AnalysisContext,
         engine::DeobfuscationEngine,
-        renamer,
+        renamer, repairs,
         techniques::{Detections, Technique, TechniqueCapability},
     },
     metadata::{
-        tables::{
-            skip_unreadable, AssemblyRaw, FieldRaw, ModuleRaw, NestedClassRaw, TableDataOwned,
-            TableId, TypeDefRaw,
-        },
-        token::Token,
-        typesystem::wellknown,
-        validation::ValidationConfig,
+        tables::TableId, token::Token, typesystem::wellknown, validation::ValidationConfig,
     },
     CilObject, Result,
 };
+
+/// The message of the [`EventKind::ArtifactRemoved`] event for a method that goes because a
+/// pass inlined every call to it (folded a constant it returns, forwarded a stub, dropped a
+/// call to a method that does nothing): a method of the program whose code now lives in its
+/// callers, rather than one of the protection's. Default cleanup removes these too.
+pub const INLINED_METHOD_REMOVED: &str = "Removing method: every call to it was inlined";
 
 /// Returns the registered decryptors that still have call sites in the
 /// post-pass call graph.
 ///
 /// Decryption rewrites a call site into the constant it produced, so a
 /// decryptor nothing calls any more has been fully reversed and its
-/// infrastructure can go. One that is still called has not been reversed —
+/// infrastructure can go. One that is still called has not been reversed -
 /// whether because emulation failed, or because the call site was never
-/// reached — and neither it nor the type that owns it may be deleted.
+/// reached - and neither it nor the type that owns it may be deleted.
 ///
 /// Generic decryptors are invoked through `MethodSpec` tokens rather than the
 /// `MethodDef` directly, so each callee is resolved back to its base decryptor.
@@ -94,7 +83,7 @@ fn decryptors_still_called(
 /// 5. Adds neutralized tokens as cascade candidates
 /// 6. Sweeps empty module methods
 ///
-/// The resulting request is complete — it can be used for both neutralization
+/// The resulting request is complete - it can be used for both neutralization
 /// (to know which tokens to neutralize) and final cleanup (to perform deletions).
 ///
 /// # Arguments
@@ -104,7 +93,7 @@ fn decryptors_still_called(
 /// * `detections` - The detection results from all techniques.
 /// * `assembly` - The assembly being deobfuscated.
 /// * `ssa_call_graph` - The SSA-derived call graph (caller → callees).
-pub(crate) fn build_cleanup_request(
+pub fn build_cleanup_request(
     engine: &DeobfuscationEngine,
     ctx: &AnalysisContext,
     detections: &Detections,
@@ -116,7 +105,7 @@ pub(crate) fn build_cleanup_request(
 
     // Byte transforms that were detected but did not succeed.
     //
-    // A byte transform rewrites the assembly before SSA is built — decrypting
+    // A byte transform rewrites the assembly before SSA is built - decrypting
     // method bodies, unpacking resources. When one fails, the assembly still
     // holds the protected form, but every technique's cleanup request was
     // already filled during detection on the assumption it would not. Merging
@@ -149,7 +138,7 @@ pub(crate) fn build_cleanup_request(
 
         // Whatever the technique was meant to restore is still in its protected
         // form. Such a method carries no calls, so nothing it references looks
-        // reachable — see the suppression of type-level deletion below — and it
+        // reachable - see the suppression of type-level deletion below - and it
         // is itself real code that must survive for later analysis.
         let Some(detection) = detections.get(tech.id()) else {
             continue;
@@ -175,7 +164,7 @@ pub(crate) fn build_cleanup_request(
         };
         if let Some(tech_cleanup) = tech.cleanup(detection) {
             // A technique builds its cleanup request from detection findings
-            // alone — it cannot see whether the transformation it implies
+            // alone - it cannot see whether the transformation it implies
             // actually succeeded. Merging it unconditionally deletes the
             // decryptor, its owning infrastructure type and the encrypted data
             // even when not a single call site was reversed, leaving live call
@@ -205,7 +194,7 @@ pub(crate) fn build_cleanup_request(
     // Protect decryptors that anything still calls, and remove the rest.
     // A successful decryption rewrites its call site to the decrypted constant,
     // so a decryptor with no remaining callers has been fully reversed and is
-    // safe to delete. One that is still called has not been — deleting it would
+    // safe to delete. One that is still called has not been - deleting it would
     // leave those call sites referencing a method that no longer exists.
     for token in ctx.decryptors.registered_tokens() {
         if still_called.contains(&token) {
@@ -236,7 +225,7 @@ pub(crate) fn build_cleanup_request(
     //
     // Skipped entirely when a byte transform failed. The analysis decides a type
     // is unreferenced by asking the call graph who names it, and a method whose
-    // body is still encrypted contributes no edges at all — neither the SSA
+    // body is still encrypted contributes no edges at all - neither the SSA
     // graph, which never converted it, nor the static graph, which was built
     // from the same stub. Almost every non-public type then looks unrooted and
     // the assembly is gutted rather than cleaned. Protection cannot save it
@@ -279,7 +268,295 @@ pub(crate) fn build_cleanup_request(
     // Detect empty module methods and add to cleanup request.
     sweep_empty_module_cctor(assembly, &mut request, ctx);
 
+    // Rows whose removal repairs an ECMA-335 violation are proposed here, so that the
+    // retraction below keeps those surviving code still names; the repair renames or
+    // otherwise repairs what is kept.
+    repairs::propose_removals(assembly, &mut request);
+
+    // Last, and over everything the producers above decided: withdraw whatever
+    // surviving code still names.
+    retract_referenced_removals(
+        assembly,
+        &mut request,
+        ssa_call_graph,
+        ctx,
+        &BTreeSet::new(),
+    );
+
     request
+}
+
+/// Maps every method and field token to the type that declares it.
+fn build_member_owner_map(assembly: &CilObject) -> HashMap<Token, Token> {
+    let mut owner = HashMap::new();
+    for type_entry in assembly.types().iter() {
+        let type_token = *type_entry.key();
+        if !type_token.is_table(TableId::TypeDef) {
+            continue;
+        }
+        let cil_type = type_entry.value();
+        for method in cil_type.methods() {
+            owner.insert(method.token, type_token);
+        }
+        for (_, field) in cil_type.fields.iter() {
+            owner.insert(field.token, type_token);
+        }
+    }
+    owner
+}
+
+/// Every token that code surviving this request still names.
+///
+/// A converted method answers for itself: [`referenced_tokens`] is the same
+/// question neutralization asks of each instruction, so the two agree by
+/// construction rather than by a rule written twice. A method that ships its
+/// original body - one that never converted (an encrypted body, a native one,
+/// one that failed to decode) or whose regenerated code was refused - answers
+/// by that body: every token its IL names, and through the static call graph
+/// what it calls.
+///
+/// [`referenced_tokens`]: crate::analysis::SsaOpCilExt::referenced_tokens
+fn tokens_named_by_survivors(
+    assembly: &CilObject,
+    removed: &HashSet<Token>,
+    request: &CleanupRequest,
+    ssa_call_graph: &BTreeMap<Token, BTreeSet<Token>>,
+    ctx: &AnalysisContext,
+    kept_original: &BTreeSet<Token>,
+) -> BTreeSet<Token> {
+    let mut named = BTreeSet::new();
+
+    // A token names a row of this assembly, and through a MemberRef or MethodSpec the method
+    // or field of this assembly it stands for: a generic method's instantiation, a member of
+    // a generic type.
+    let resolver = assembly.resolver();
+    let naming = |token: Token| {
+        std::iter::once(token)
+            .chain(resolver.resolve_method(token))
+            .chain(resolver.resolve_field(token))
+    };
+
+    // A converted method's call to a protection method is what neutralization
+    // strips, so it does not keep the method. A method that never converted
+    // cannot be rewritten, and still does.
+    for entry in ctx.ssa_functions.iter() {
+        if removed.contains(entry.key()) || kept_original.contains(entry.key()) {
+            continue;
+        }
+        for (_, _, instr) in entry.value().iter_instructions() {
+            for token in instr.op().referenced_tokens().flat_map(naming) {
+                if removed.contains(&token) && !request.strips_call_sites(token) {
+                    named.insert(token);
+                }
+            }
+        }
+    }
+
+    let ships_original =
+        |method: &Token| kept_original.contains(method) || !ctx.ssa_functions.contains_key(method);
+    for (caller, callees) in ssa_call_graph {
+        if removed.contains(caller) || !ships_original(caller) {
+            continue;
+        }
+        for callee in callees {
+            if removed.contains(callee) {
+                named.insert(*callee);
+            }
+        }
+    }
+
+    // The original body names more than its calls: the fields it loads, the
+    // types it casts to, the generic methods its MethodSpecs instantiate.
+    for entry in assembly.methods().iter() {
+        let method = *entry.key();
+        if removed.contains(&method) || !ships_original(&method) {
+            continue;
+        }
+        let Some(blocks) = entry.value().blocks.get() else {
+            continue;
+        };
+        for instr in blocks.iter().flat_map(|block| block.instructions.iter()) {
+            let Operand::Token(token) = instr.operand else {
+                continue;
+            };
+            for token in naming(token) {
+                if removed.contains(&token) {
+                    named.insert(token);
+                }
+            }
+        }
+    }
+
+    named
+}
+
+/// The virtual methods of surviving types that the request removes.
+///
+/// A virtual method is reached through a slot, not by name: callers dispatch
+/// through the base method or the interface, and no call names the override.
+/// So a call graph shows it without callers, and removing it strips the slot
+/// its type fills - a concrete type left with an abstract slot, or a derived
+/// type silently falling back to its base's behaviour. The runtime refuses the
+/// first ("invalid vtable method slot"); the second changes what the program
+/// does. While its type survives, the method's slot names it.
+fn slots_of_survivors(
+    assembly: &CilObject,
+    removed: &HashSet<Token>,
+    owner_of: &HashMap<Token, Token>,
+) -> Vec<Token> {
+    removed
+        .iter()
+        .filter(|token| token.is_table(TableId::MethodDef))
+        .filter(|token| {
+            owner_of
+                .get(token)
+                .is_some_and(|owner| !removed.contains(owner))
+        })
+        .filter(|token| {
+            assembly
+                .methods()
+                .get(token)
+                .is_some_and(|entry| entry.value().is_virtual())
+        })
+        .copied()
+        .collect()
+}
+
+/// Records the types each method's local variables are declared with.
+///
+/// A regenerated body declares a local for each variable its code still defines
+/// or reads, of the variable's type or, for one of the method's own locals, its
+/// original declaration. A variable the passes left without a definition or a
+/// read declares nothing: the SSA keeps it until canonicalization, and a type
+/// only such variables carry (a protection's state the decryption removed) is
+/// named by nothing. A body that never converted keeps the signature it was
+/// read with.
+fn add_local_type_names(assembly: &CilObject, ctx: &AnalysisContext, names: &mut TypeNames) {
+    for entry in assembly.methods().iter() {
+        let token = *entry.key();
+        if let Some(ssa) = ctx.ssa_functions.get(&token) {
+            let live: HashSet<SsaVarId> = ssa
+                .blocks()
+                .iter()
+                .flat_map(|block| block.defined_variables().chain(block.used_variables()))
+                .collect();
+            let original = ssa.original_local_types().unwrap_or_default();
+            for var in ssa.variables() {
+                if !live.contains(&var.id()) {
+                    continue;
+                }
+                names.add_signature(Some(token), &var.var_type().to_type_signature());
+                if let VariableOrigin::Local(idx) = var.origin() {
+                    if let Some(local) = original.get(usize::from(idx)) {
+                        names.add_signature(Some(token), &local.base);
+                    }
+                }
+            }
+        } else {
+            let method = entry.value();
+            let locals = TypeContext::new(method, assembly).local_type_signatures();
+            for local in locals.unwrap_or_default() {
+                names.add_signature(Some(token), &local.base);
+            }
+        }
+    }
+}
+
+/// Withdraws every removal that surviving code still names.
+///
+/// Each producer above decides in isolation, from the snapshot of deletions
+/// that existed when it ran, and none of them sees the finished request. They
+/// also disagree about what makes a method dead: three consult the call graph
+/// for live callers, `remove_dispensable_types` asks only whether proxy
+/// devirtualization ever inlined the method - which it records after inlining
+/// a single call site, not the last one.
+///
+/// The property that has to hold is not any one producer's, and it is what both
+/// consumers of the request depend on: **no surviving code names a token the
+/// request removes**. Cleanup deletes the row and leaves the surviving body
+/// pointing at nothing. Neutralization reads the same request and NOPs every
+/// instruction that names it, which for a proxy the method forwards all of its
+/// calls through is the entire method body.
+///
+/// So this runs last and retracts, in a fixpoint: withdrawing a type resurrects
+/// its methods, and their bodies name tokens of their own that no producer had
+/// to account for while the type was going away.
+///
+/// `kept_original` names converted methods that ship their original body
+/// anyway, because their regenerated code was refused: their IL answers for
+/// them, as it does for a method that never converted. The engine runs this
+/// again after code generation with that set.
+pub fn retract_referenced_removals(
+    assembly: &CilObject,
+    request: &mut CleanupRequest,
+    ssa_call_graph: &BTreeMap<Token, BTreeSet<Token>>,
+    ctx: &AnalysisContext,
+    kept_original: &BTreeSet<Token>,
+) {
+    let owner_of = build_member_owner_map(assembly);
+    // What names which type does not change while this runs; only which of
+    // the naming rows survive does.
+    let mut names = TypeNames::of_metadata(assembly);
+    add_local_type_names(assembly, ctx, &mut names);
+
+    loop {
+        let removed = expand_type_tokens(request, assembly);
+        if removed.is_empty() {
+            return;
+        }
+
+        // Surviving metadata names types without any instruction mentioning
+        // them: signatures, base types, interfaces, locals. Which rows survive
+        // is asked again each round, because a withdrawn type brings its
+        // members back.
+        let mut named = tokens_named_by_survivors(
+            assembly,
+            &removed,
+            request,
+            ssa_call_graph,
+            ctx,
+            kept_original,
+        );
+        named.extend(
+            names
+                .named_by_survivors(&removed)
+                .filter(|t| removed.contains(t)),
+        );
+        named.extend(slots_of_survivors(assembly, &removed, &owner_of));
+        if named.is_empty() {
+            return;
+        }
+
+        // A token is in the removal set either on its own account or because
+        // its declaring type is going; withdrawing the member alone would not
+        // save it in the second case.
+        let mut withdrawn = 0usize;
+        for token in named {
+            let directly = request.withdraw(token);
+            let by_owner = owner_of
+                .get(&token)
+                .copied()
+                .is_some_and(|owner| request.withdraw(owner));
+            if directly || by_owner {
+                withdrawn = withdrawn.saturating_add(1);
+                log::warn!(
+                    "Keeping {} ({}): surviving code or metadata still names it",
+                    token,
+                    assembly
+                        .resolve_method_name(token)
+                        .as_deref()
+                        .unwrap_or("non-method"),
+                );
+            }
+        }
+
+        // Nothing left to retract means the remaining references are to tokens
+        // the request does not own - an orphan cascade decision, not one made
+        // here - and another round would not change the set.
+        if withdrawn == 0 {
+            return;
+        }
+    }
 }
 
 /// Executes cleanup with a complete request.
@@ -320,15 +597,15 @@ pub fn execute_cleanup(
 
     // Nothing to do.
     //
-    // Metadata repairs (`repair_*` below) must run even when the request is
-    // empty — some samples (notably .NET Reactor's SuppressIldasm) have no
+    // Metadata repairs (`repairs::REPAIRS`) must run even when the request is
+    // empty - some samples (notably .NET Reactor's SuppressIldasm) have no
     // technique-driven deletions but still carry ECMA-335 violations that
-    // break strict-mode reload. `needs_metadata_repair` short-circuits the
+    // break strict-mode reload. `repairs::needs_repair` short-circuits the
     // exit when any of those violations are present.
     if !request.has_deletions()
         && request.excluded_sections().is_empty()
         && !rename_obfuscated
-        && !needs_metadata_repair(&assembly)
+        && !repairs::needs_repair(&assembly)
     {
         return Ok(assembly);
     }
@@ -362,54 +639,24 @@ pub fn execute_cleanup(
     // Log individual removals before consuming the assembly
     log_cleanup_request(&request, &assembly, ctx);
 
-    // Collect rename entries while CilObject is still alive (before consumption).
-    // The smart renamer needs CilObject-level APIs (types(), resolver(), member_ref())
-    // for metadata queries — these aren't available on CilAssembly.
+    // Collect rename entries from the original metadata, before the conversion below
+    // consumes the CilObject.
     let rename_entries = if rename_obfuscated {
-        Some(renamer::renames_collect(
-            &assembly,
-            ctx.config.cleanup.smart_rename.as_ref(),
-        )?)
+        Some(renamer::renames_collect(&assembly)?)
     } else {
         None
     };
 
-    // Convert directly — no reparsing needed (consumes CilObject)
+    // Convert directly - no reparsing needed (consumes CilObject)
     let mut cil_assembly = assembly.into_assembly();
-
-    // Repair metadata anomalies injected by obfuscators.
-    // ECMA-335 §22.2: Assembly table shall contain zero or one row.
-    // Some obfuscators inject duplicate rows to confuse tooling.
-    repair_duplicate_assembly_rows(&mut cil_assembly, ctx);
-
-    // ECMA-335 §22.30: Module table shall contain exactly one row.
-    // .NET Reactor's SuppressIldasm injects a duplicate Module row to
-    // break parsers and the schema validator.
-    repair_duplicate_module_rows(&mut cil_assembly, ctx);
-
-    // ECMA-335 §22.30: Module row 1's `EncId` and `EncBaseId` are GUID
-    // heap indices that must be 0 (no value) or point inside the heap.
-    // .NET Reactor's SuppressIldasm sets them to 0xFFFF to break loaders
-    // that don't bounds-check the lookup.
-    repair_invalid_module_guids(&mut cil_assembly, ctx);
-
-    // ECMA-335 §22.37: TypeDef names must be unique within (name, namespace, enclosingClass).
-    // Some obfuscators inject duplicate nested types (e.g., multiple <>c closures).
-    // Empty duplicates are removed directly; non-empty ones are added to the cleanup request.
-    let duplicate_types = repair_duplicate_typedef_rows(&mut cil_assembly, ctx);
-
-    // ECMA-335 §22.15: Global fields (<Module>) must have CompilerControlled, Private, or Public access.
-    // Some obfuscators set invalid access flags (e.g., Assembly/Family) on <Module> fields.
-    repair_global_field_visibility(&mut cil_assembly, ctx);
 
     // Clone excluded sections before moving request
     let excluded_sections: HashSet<String> = request.excluded_sections().clone();
 
-    // Add non-empty duplicate types to cleanup request for deletion
+    // Repair the ECMA-335 violations obfuscators plant in metadata; a repair may hand rows
+    // to the cleanup executor through the request.
     let mut request = request;
-    for token in duplicate_types {
-        request.add_type(token);
-    }
+    repairs::apply_repairs(&mut cil_assembly, &mut request, ctx);
 
     // Add cleanup request (the actual cleanup is executed during generation)
     cil_assembly.add_cleanup(&request);
@@ -456,12 +703,17 @@ fn log_cleanup_request(request: &CleanupRequest, assembly: &CilObject, ctx: &Ana
         }
     }
 
-    // Log method removals
+    // Log method removals, saying when the method goes because every call to it was inlined:
+    // that is a method of the program, not of the protection
     for method_token in request.methods() {
         ctx.events
             .record(EventKind::ArtifactRemoved)
             .method(*method_token)
-            .message("Removing method");
+            .message(if ctx.was_inlined(*method_token) {
+                INLINED_METHOD_REMOVED
+            } else {
+                "Removing method"
+            });
     }
 
     // Log field removals
@@ -478,400 +730,6 @@ fn log_cleanup_request(request: &CleanupRequest, assembly: &CilObject, ctx: &Ana
             .message(format!(
                 "Removing custom attribute 0x{:08X}",
                 attr_token.value()
-            ));
-    }
-}
-
-/// Repairs duplicate Assembly table rows injected by obfuscators.
-///
-/// ECMA-335 §22.2 requires the Assembly table to contain at most 1 row.
-/// Some obfuscators inject extra rows to confuse decompilers and analysis tools.
-/// This removes any rows beyond the first, keeping the original assembly identity.
-fn repair_duplicate_assembly_rows(cil_assembly: &mut CilAssembly, ctx: &AnalysisContext) {
-    let row_count = cil_assembly.original_table_row_count(TableId::Assembly);
-    if row_count <= 1 {
-        return;
-    }
-
-    // Remove duplicate rows (keep RID 1, remove RID 2..N)
-    let duplicates = row_count.saturating_sub(1);
-    for rid in (2..=row_count).rev() {
-        if let Err(e) = cil_assembly.table_row_remove(TableId::Assembly, rid) {
-            log::warn!("Failed to remove duplicate Assembly row {rid}: {e}");
-        }
-    }
-
-    log::info!(
-        "Repaired Assembly table: removed {duplicates} duplicate row(s) (ECMA-335 §22.2 violation)"
-    );
-    ctx.events
-        .record(EventKind::ArtifactRemoved)
-        .message(format!(
-            "Repaired Assembly table: removed {duplicates} duplicate row(s)"
-        ));
-}
-
-/// Repairs duplicate Module table rows injected by obfuscators.
-///
-/// ECMA-335 §22.30 requires the Module table to contain exactly one row.
-/// .NET Reactor's SuppressIldasm protection injects a second row to break
-/// parsers and our `SchemaValidator` (`shared/schema.rs:135`). Removes any
-/// rows beyond the first, keeping the original module identity.
-fn repair_duplicate_module_rows(cil_assembly: &mut CilAssembly, ctx: &AnalysisContext) {
-    let row_count = cil_assembly.original_table_row_count(TableId::Module);
-    if row_count <= 1 {
-        return;
-    }
-
-    let duplicates = row_count.saturating_sub(1);
-    for rid in (2..=row_count).rev() {
-        if let Err(e) = cil_assembly.table_row_remove(TableId::Module, rid) {
-            log::warn!("Failed to remove duplicate Module row {rid}: {e}");
-        }
-    }
-
-    log::info!(
-        "Repaired Module table: removed {duplicates} duplicate row(s) (ECMA-335 §22.30 violation)"
-    );
-    ctx.events
-        .record(EventKind::ArtifactRemoved)
-        .message(format!(
-            "Repaired Module table: removed {duplicates} duplicate row(s)"
-        ));
-}
-
-/// Repairs out-of-bounds GUID indices on Module row 1.
-///
-/// ECMA-335 §22.30: `EncId` / `EncBaseId` are `#GUID` heap indices that must
-/// be 0 (no value) or point inside the heap. .NET Reactor's SuppressIldasm
-/// injects `0xFFFF` to crash strict loaders that look the indices up
-/// without bounds checking — dotscope's loader fails at
-/// `streams/guid.rs:505` with `Out of Bounds`, which then blocks the
-/// roundtrip reload.
-///
-/// Clamps any out-of-bounds value back to 0 (the standard "no value"
-/// sentinel). The user-visible Mvid is left untouched.
-fn repair_invalid_module_guids(cil_assembly: &mut CilAssembly, ctx: &AnalysisContext) {
-    let guid_count: u32 = cil_assembly
-        .view()
-        .guids()
-        .map_or(0, |g| (g.data().len() / 16) as u32);
-
-    let Some(tables) = cil_assembly.view().tables() else {
-        return;
-    };
-    let Some(module_table) = tables.table::<ModuleRaw>() else {
-        return;
-    };
-    let Some(row) = module_table.get(1).ok().flatten() else {
-        return;
-    };
-
-    let bad_encid = row.encid != 0 && row.encid > guid_count;
-    let bad_encbaseid = row.encbaseid != 0 && row.encbaseid > guid_count;
-
-    if !bad_encid && !bad_encbaseid {
-        return;
-    }
-
-    let original_encid = row.encid;
-    let original_encbaseid = row.encbaseid;
-    let fixed = ModuleRaw {
-        rid: row.rid,
-        token: row.token,
-        offset: row.offset,
-        generation: row.generation,
-        name: row.name,
-        mvid: row.mvid,
-        encid: if bad_encid { 0 } else { row.encid },
-        encbaseid: if bad_encbaseid { 0 } else { row.encbaseid },
-    };
-
-    if let Err(e) = cil_assembly.table_row_update(TableId::Module, 1, TableDataOwned::Module(fixed))
-    {
-        log::warn!("Failed to repair Module row 1 GUID indices: {e}");
-        return;
-    }
-
-    log::info!(
-        "Repaired Module row 1 GUIDs: encid {original_encid} → 0 ({}), encbaseid {original_encbaseid} → 0 ({}); heap has {guid_count} GUID(s)",
-        if bad_encid { "fixed" } else { "kept" },
-        if bad_encbaseid { "fixed" } else { "kept" },
-    );
-    ctx.events
-        .record(EventKind::ArtifactRemoved)
-        .message(format!(
-            "Repaired Module row 1: cleared out-of-bounds ENC GUID indices \
-             (encid={original_encid}, encbaseid={original_encbaseid})"
-        ));
-}
-
-/// Returns `true` if the assembly carries any ECMA-335 metadata-table
-/// violation that the `repair_*` functions know how to fix.
-///
-/// Used by [`execute_cleanup`] to bypass its early-exit when a cleanup
-/// request is otherwise empty: a sample with only metadata corruption
-/// (e.g. .NET Reactor's SuppressIldasm) needs cleanup to actually run.
-///
-/// Currently checks:
-/// - Duplicate `Module` rows (`row_count > 1`).
-/// - Duplicate `Assembly` rows (`row_count > 1`).
-/// - Module row 1's `EncId` / `EncBaseId` pointing outside the `#GUID`
-///   heap.
-///
-/// All other repairs in this module either run only when there is a
-/// pre-existing reason for cleanup (e.g. duplicate TypeDefs piggyback on
-/// the technique-driven deletions that already trigger cleanup) or are
-/// triggered explicitly by techniques.
-fn needs_metadata_repair(assembly: &CilObject) -> bool {
-    let Some(tables) = assembly.tables() else {
-        return false;
-    };
-
-    if let Some(t) = tables.table::<ModuleRaw>() {
-        if t.row_count > 1 {
-            return true;
-        }
-        if let Some(row) = t.get(1).ok().flatten() {
-            let guid_count: u32 = assembly.guids().map_or(0, |g| (g.data().len() / 16) as u32);
-            if (row.encid != 0 && row.encid > guid_count)
-                || (row.encbaseid != 0 && row.encbaseid > guid_count)
-            {
-                return true;
-            }
-        }
-    }
-
-    if let Some(t) = tables.table::<AssemblyRaw>() {
-        if t.row_count > 1 {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Detects duplicate TypeDef rows with the same (name, namespace, enclosingClass) tuple.
-///
-/// ECMA-335 §22.37 rule 1: No two rows shall have the same combination of
-/// TypeName, TypeNamespace, and enclosing class. Some obfuscators (e.g., BitMono)
-/// inject duplicate nested types like `<>c` which cause peverify failures.
-///
-/// Strategy:
-/// - Empty duplicates (no methods, no fields) are removed outright along with
-///   their NestedClass entries.
-/// - Non-empty duplicates are returned as tokens to be added to the cleanup
-///   request for deletion during the normal cleanup phase.
-fn repair_duplicate_typedef_rows(
-    cil_assembly: &mut CilAssembly,
-    ctx: &AnalysisContext,
-) -> Vec<Token> {
-    let Some(tables) = cil_assembly.view().tables() else {
-        return Vec::new();
-    };
-    let Some(strings) = cil_assembly.view().strings() else {
-        return Vec::new();
-    };
-
-    // Build a NestedClass map: nested_type_rid → (enclosing_type_rid, nestedclass_rid)
-    let nested_class_entries: Vec<(u32, u32, u32)> = tables
-        .table::<NestedClassRaw>()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(skip_unreadable)
-                .map(|r| (r.nested_class, r.enclosing_class, r.rid))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let nested_class_map: HashMap<u32, u32> = nested_class_entries
-        .iter()
-        .map(|&(nested, enclosing, _)| (nested, enclosing))
-        .collect();
-
-    // Collect TypeDef rows to check for duplicates and emptiness
-    let typedef_rows: Vec<TypeDefRaw> = tables
-        .table::<TypeDefRaw>()
-        .map(|t| t.into_iter().filter_map(skip_unreadable).collect())
-        .unwrap_or_default();
-
-    let method_count = cil_assembly.original_table_row_count(TableId::MethodDef);
-    let field_count = cil_assembly.original_table_row_count(TableId::Field);
-
-    // Scan for duplicates based on (name, namespace, enclosing_class)
-    let mut seen: HashMap<(String, String, u32), u32> = HashMap::new();
-    let mut duplicates_to_remove: Vec<u32> = Vec::new();
-    let mut duplicates_for_cleanup: Vec<Token> = Vec::new();
-
-    for row in &typedef_rows {
-        let name = strings
-            .get(row.type_name as usize)
-            .unwrap_or_default()
-            .to_string();
-        let namespace = strings
-            .get(row.type_namespace as usize)
-            .unwrap_or_default()
-            .to_string();
-        let enclosing = nested_class_map.get(&row.rid).copied().unwrap_or(0);
-
-        let key = (name, namespace, enclosing);
-        if let Entry::Vacant(entry) = seen.entry(key) {
-            entry.insert(row.rid);
-        } else {
-            // Check if the duplicate has methods or fields
-            let method_start = row.method_list;
-            let next_rid = row.rid.saturating_add(1);
-            let method_end = typedef_rows
-                .iter()
-                .find(|t| t.rid == next_rid)
-                .map(|t| t.method_list)
-                .unwrap_or_else(|| method_count.saturating_add(1));
-            let field_start = row.field_list;
-            let field_end = typedef_rows
-                .iter()
-                .find(|t| t.rid == next_rid)
-                .map(|t| t.field_list)
-                .unwrap_or_else(|| field_count.saturating_add(1));
-
-            let has_methods = method_end > method_start;
-            let has_fields = field_end > field_start;
-
-            if !has_methods && !has_fields {
-                // Empty duplicate — safe to remove directly
-                duplicates_to_remove.push(row.rid);
-            } else {
-                // Non-empty duplicate — schedule for cleanup deletion
-                duplicates_for_cleanup.push(Token::from_parts(TableId::TypeDef, row.rid));
-            }
-        }
-    }
-
-    if duplicates_to_remove.is_empty() && duplicates_for_cleanup.is_empty() {
-        return Vec::new();
-    }
-
-    let removed_count = duplicates_to_remove.len();
-    let cleanup_count = duplicates_for_cleanup.len();
-
-    // Remove empty duplicates directly
-    if !duplicates_to_remove.is_empty() {
-        let dup_set: HashSet<u32> = duplicates_to_remove.iter().copied().collect();
-
-        // Remove corresponding NestedClass entries first
-        for &(nested, _, nc_rid) in &nested_class_entries {
-            if dup_set.contains(&nested) {
-                if let Err(e) = cil_assembly.table_row_remove(TableId::NestedClass, nc_rid) {
-                    log::warn!("Failed to remove NestedClass row {nc_rid}: {e}");
-                }
-            }
-        }
-
-        // Remove duplicate TypeDef rows (in reverse order)
-        for rid in duplicates_to_remove.iter().rev() {
-            if let Err(e) = cil_assembly.table_row_remove(TableId::TypeDef, *rid) {
-                log::warn!("Failed to remove duplicate TypeDef row {rid}: {e}");
-            }
-        }
-    }
-
-    let total = removed_count.saturating_add(cleanup_count);
-    log::info!(
-        "Repaired TypeDef table: {removed_count} removed, {cleanup_count} scheduled for cleanup ({total} total duplicates, ECMA-335 §22.37)"
-    );
-    ctx.events
-        .record(EventKind::ArtifactRemoved)
-        .message(format!(
-            "Repaired TypeDef table: {removed_count} removed, {cleanup_count} scheduled for cleanup ({total} duplicates)"
-        ));
-
-    duplicates_for_cleanup
-}
-
-/// Repairs invalid field visibility on `<Module>` global fields.
-///
-/// ECMA-335 §22.15 rule 4: Fields owned by `<Module>` (global fields) must have
-/// accessibility `CompilerControlled` (0), `Private` (1), or `Public` (6).
-/// Some obfuscators set invalid values like `Assembly` (3) or `Family` (4).
-///
-/// This corrects any invalid access to `Private` (1), which is the most
-/// restrictive valid option and unlikely to break anything.
-fn repair_global_field_visibility(cil_assembly: &mut CilAssembly, ctx: &AnalysisContext) {
-    // Collected in a first pass so the read borrow of the view is released before the writes
-    // below take `cil_assembly` mutably.
-    let pending: Vec<(u32, FieldRaw)> = {
-        let Some(tables) = cil_assembly.view().tables() else {
-            return;
-        };
-        let Some(typedefs) = tables.table::<TypeDefRaw>() else {
-            return;
-        };
-
-        // Find <Module> type (always RID 1) and its field range.
-        //
-        // Fetched by RID rather than by position in a collected `Vec`: `skip_unreadable`
-        // drops unparseable rows, so in a damaged assembly — exactly what this function
-        // exists to repair — position stops tracking RID and `<Module>` would be read from
-        // whatever type happened to survive first. `MetadataTable::get` derives each row's
-        // offset from its RID, so one unreadable row cannot displace any other.
-        let Some(module_type) = typedefs.get(1).ok().flatten() else {
-            return;
-        };
-        let field_start = module_type.field_list;
-        let field_end = match typedefs.get(2) {
-            Ok(Some(next)) => next.field_list,
-            // Only one type, or TypeDef RID 2 is unreadable: fall back to the whole table.
-            _ => cil_assembly
-                .original_table_row_count(TableId::Field)
-                .saturating_add(1),
-        };
-
-        if field_start >= field_end {
-            return;
-        }
-
-        let Some(fields_table) = tables.table::<FieldRaw>() else {
-            return;
-        };
-
-        (field_start..field_end)
-            .filter_map(|rid| {
-                // Same reason as above, and it matters more here: the repaired row is written
-                // back under this `rid`, so reading the wrong row would copy one field's flags
-                // onto a different field.
-                let field = fields_table.get(rid).ok().flatten()?;
-                let access = field.flags & 0x0007; // FieldAccessMask per ECMA-335 §II.23.1.5
-
-                // Valid for global fields: CompilerControlled(0), Private(1), Public(6).
-                if matches!(access, 0x0000 | 0x0001 | 0x0006) {
-                    return None;
-                }
-
-                let mut fixed = field;
-                fixed.flags = (fixed.flags & !0x0007) | 0x0001; // Set to Private
-                Some((rid, fixed))
-            })
-            .collect()
-    };
-
-    let mut repaired: usize = 0;
-    for (rid, fixed) in pending {
-        if let Err(e) =
-            cil_assembly.table_row_update(TableId::Field, rid, TableDataOwned::Field(fixed))
-        {
-            log::warn!("Failed to repair <Module> field {rid} visibility: {e}");
-        } else {
-            repaired = repaired.saturating_add(1);
-        }
-    }
-
-    if repaired > 0 {
-        log::info!(
-            "Repaired {repaired} <Module> field(s) with invalid visibility (ECMA-335 §22.15)"
-        );
-        ctx.events
-            .record(EventKind::ArtifactRemoved)
-            .message(format!(
-                "Repaired {repaired} <Module> field(s) with invalid visibility"
             ));
     }
 }
@@ -930,16 +788,16 @@ fn sweep_dead_module_methods(
                 !c.is_empty() && c.iter().all(|caller| deleted_methods.contains(caller))
             });
 
-            // Methods with NO callers in the SSA graph are conservatively kept —
+            // Methods with NO callers in the SSA graph are conservatively kept -
             // the SSA call graph only covers successfully-converted methods, so
             // "no callers" may mean the caller wasn't converted to SSA.
             // Exception: if the method was inlined by the proxy devirtualization
             // pass, "no callers" means ALL call sites were replaced with direct
-            // calls — the method is truly dead, not just missing from the graph.
+            // calls - the method is truly dead, not just missing from the graph.
             let inlined_and_unreferenced = !has_callers && ctx.was_inlined(method.token);
 
             if method.is_cctor() {
-                // .cctor is invoked by the runtime, not via IL — it has
+                // .cctor is invoked by the runtime, not via IL - it has
                 // no callers. Instead check callees: if ALL its callees
                 // are already deleted, the .cctor is pure infrastructure.
                 if let Some(callees) = ssa_call_graph.get(&method.token) {
@@ -1112,7 +970,7 @@ fn remove_dispensable_types(
         // - inlined (proxy devirtualization replaced all call sites)
         // - dead (global DCE found no callers)
         // - a .cctor (runtime-invoked, but only exists to initialize
-        //   the above — dispensable when all other methods are gone)
+        //   the above - dispensable when all other methods are gone)
         let all_dispensable = methods
             .iter()
             .all(|(m, is_cctor)| *is_cctor || ctx.was_inlined(*m) || ctx.is_dead(*m));
@@ -1139,7 +997,7 @@ fn remove_dispensable_types(
 /// invoked by the runtime on first type access, not via explicit IL calls.
 /// Non-`.cctor` methods are only deleted if they are known dead (not called
 /// by any surviving method). This prevents deleting junk methods that are
-/// still referenced — deleting them would shift RIDs and create dangling
+/// still referenced - deleting them would shift RIDs and create dangling
 /// call targets in the callers.
 fn sweep_empty_module_cctor(
     assembly: &CilObject,
@@ -1191,7 +1049,7 @@ fn sweep_empty_module_cctor(
 ///
 /// `Some(CleanupRequest)` with settings derived from the config, or `None`
 /// if all cleanup options are disabled.
-pub(crate) fn create_cleanup_request(ctx: &AnalysisContext) -> Option<CleanupRequest> {
+pub fn create_cleanup_request(ctx: &AnalysisContext) -> Option<CleanupRequest> {
     let cleanup_config = &ctx.config.cleanup;
     if !cleanup_config.any_enabled() {
         return None;
@@ -1205,11 +1063,252 @@ pub(crate) fn create_cleanup_request(ctx: &AnalysisContext) -> Option<CleanupReq
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use super::*;
     use crate::{
+        analysis::{CallGraph, SsaFunction, SsaOp, SsaVariable},
         cilassembly::CleanupRequest,
         deobfuscation::utils::{is_obfuscated_name, is_special_name},
-        metadata::token::Token,
+        metadata::{signatures::TypeSignature, token::Token},
+        testkit::helpers::{load_sample, test_assembly_arc},
     };
+
+    /// A virtual method of `crafted_2` with a body, and the type declaring it,
+    /// chosen so that nothing else in the sample names the type.
+    fn an_override() -> (Token, Token) {
+        let assembly = test_assembly_arc();
+        let owner_of = build_member_owner_map(&assembly);
+        let candidates: Vec<(Token, Token)> = assembly
+            .methods()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .filter(|method| method.is_virtual() && !method.is_abstract())
+            .filter_map(|method| {
+                owner_of
+                    .get(&method.token)
+                    .map(|&owner| (method.token, owner))
+            })
+            .collect();
+        let names = TypeNames::of_metadata(&assembly);
+        candidates
+            .into_iter()
+            .find(|&(_, owner)| {
+                let mut request = CleanupRequest::new();
+                request.add_type(owner);
+                let removed = expand_type_tokens(&request, &assembly);
+                let named = names
+                    .named_by_survivors(&removed)
+                    .any(|named| named == owner);
+                !named
+            })
+            .expect("the sample overrides a method in a type nothing else names")
+    }
+
+    #[test]
+    fn a_surviving_type_keeps_the_methods_filling_its_slots() {
+        let assembly = test_assembly_arc();
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        let (method, _) = an_override();
+
+        // Nothing calls it by name, which is how a removal pass sees any
+        // override: callers dispatch through the slot.
+        let mut request = CleanupRequest::new();
+        request.add_method(method);
+        retract_referenced_removals(
+            &assembly,
+            &mut request,
+            &BTreeMap::new(),
+            &ctx,
+            &BTreeSet::new(),
+        );
+
+        assert!(
+            !request.methods().any(|&token| token == method),
+            "{method:?} left its type's slot empty"
+        );
+    }
+
+    #[test]
+    fn a_converted_caller_keeps_the_generic_method_its_method_spec_instantiates() {
+        // ConfuserEx's type scrambler: SayHello calls `BuildMessage<string>` through a
+        // MethodSpec, and names BuildMessage only through it.
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_typescramble.exe");
+        let say_hello = Token::new(0x0600_0007);
+        let build_message = Token::new(0x0600_0009);
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        let ssa = assembly
+            .method(&say_hello)
+            .and_then(|method| method.ssa(&assembly))
+            .expect("SayHello converts");
+        ctx.ssa_functions.insert(say_hello, ssa);
+
+        let mut request = CleanupRequest::new();
+        request.add_method(build_message);
+        retract_referenced_removals(
+            &assembly,
+            &mut request,
+            &BTreeMap::new(),
+            &ctx,
+            &BTreeSet::new(),
+        );
+
+        assert!(
+            !request.methods().any(|&token| token == build_message),
+            "BuildMessage removed while SayHello calls it"
+        );
+    }
+
+    #[test]
+    fn a_converted_method_keeps_the_field_a_member_ref_names() {
+        // WindowsBase reads fields of its own generic types through MemberRefs.
+        let assembly = load_sample("WindowsBase.dll");
+        let resolver = assembly.resolver();
+        let (method, field) = assembly
+            .methods()
+            .iter()
+            .find_map(|entry| {
+                let method = entry.value();
+                let field = method.instructions().find_map(|instr| {
+                    instr
+                        .get_token_operand()
+                        .filter(|token| token.is_table(TableId::MemberRef))
+                        .and_then(|token| resolver.resolve_field(token))
+                })?;
+                let ssa = method.ssa(&assembly).ok()?;
+                Some(((method.token, ssa), field))
+            })
+            .expect("a method reading a local field through a MemberRef");
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        ctx.ssa_functions.insert(method.0, method.1);
+
+        let mut request = CleanupRequest::new();
+        request.add_field(field);
+        retract_referenced_removals(
+            &assembly,
+            &mut request,
+            &BTreeMap::new(),
+            &ctx,
+            &BTreeSet::new(),
+        );
+
+        assert!(
+            !request.fields().any(|&token| token == field),
+            "{field} removed while {} reads it",
+            method.0
+        );
+    }
+
+    #[test]
+    fn a_converted_method_names_the_local_types_its_code_still_uses() {
+        // ConfuserEx's CFG-mode constants: methods keep their decryption state in a local of
+        // a value type with `uint Next(byte, uint)`. Once the decryption removes every use of
+        // that state, the regenerated body declares no such local, though the SSA still lists
+        // the variables and the original declaration.
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_constants_cfg.exe");
+        let context_type = assembly
+            .types()
+            .iter()
+            .find(|entry| {
+                entry.value().methods().any(|method| {
+                    let signature = &method.signature;
+                    signature.return_type.base == TypeSignature::U4
+                        && signature.params.len() == 2
+                        && signature.params[0].base == TypeSignature::U1
+                        && signature.params[1].base == TypeSignature::U4
+                })
+            })
+            .map(|entry| *entry.key())
+            .expect("the CFG-mode state type");
+        let names_context = |var: &SsaVariable| {
+            let mut named = HashSet::new();
+            var.var_type().to_type_signature().type_tokens(&mut named);
+            named.contains(&context_type)
+        };
+        let (method, mut ssa) = assembly
+            .methods()
+            .iter()
+            .filter(|entry| {
+                entry.value().declaring_type_rc().map(|t| t.token) != Some(context_type)
+            })
+            .find_map(|entry| {
+                let ssa = entry.value().ssa(&assembly).ok()?;
+                ssa.variables()
+                    .iter()
+                    .any(names_context)
+                    .then_some((*entry.key(), ssa))
+            })
+            .expect("a method keeping its decryption state in a local");
+        let others: HashSet<Token> = assembly
+            .methods()
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|&token| token != method)
+            .collect();
+        let named_by_method = |ssa: SsaFunction| {
+            let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+            ctx.ssa_functions.insert(method, ssa);
+            let mut names = TypeNames::default();
+            add_local_type_names(&assembly, &ctx, &mut names);
+            let named = names
+                .named_by_survivors(&others)
+                .any(|named| named == context_type);
+            named
+        };
+        assert!(named_by_method(ssa.clone()), "the state's local is in use");
+
+        // What the decryption leaves: nothing defines or reads a value of the state's type
+        let state: HashSet<SsaVarId> = ssa
+            .variables()
+            .iter()
+            .filter(|var| names_context(var))
+            .map(SsaVariable::id)
+            .collect();
+        for block_idx in 0..ssa.block_count() {
+            let Some(block) = ssa.block_mut(block_idx) else {
+                continue;
+            };
+            block
+                .phi_nodes_mut()
+                .retain(|phi| !state.contains(&phi.result()));
+            for instr in block.instructions_mut() {
+                let touches = instr.def().is_some_and(|def| state.contains(&def))
+                    || instr.uses().iter().any(|used| state.contains(used));
+                if touches {
+                    instr.set_op(SsaOp::Nop);
+                }
+            }
+        }
+        assert!(
+            !named_by_method(ssa),
+            "a local nothing uses names {context_type:?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_type_takes_its_overrides_with_it() {
+        let assembly = test_assembly_arc();
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        let (method, owner) = an_override();
+
+        let mut request = CleanupRequest::new();
+        request.add_type(owner);
+        request.add_method(method);
+        retract_referenced_removals(
+            &assembly,
+            &mut request,
+            &BTreeMap::new(),
+            &ctx,
+            &BTreeSet::new(),
+        );
+
+        let removed = expand_type_tokens(&request, &assembly);
+        assert!(removed.contains(&owner), "nothing names {owner:?}");
+        assert!(
+            removed.contains(&method),
+            "{method:?} was kept although {owner:?} goes"
+        );
+    }
 
     #[test]
     fn test_cleanup_request_builder() {
@@ -1272,5 +1371,54 @@ mod tests {
         assert!(is_special_name("set_Item"));
         assert!(is_special_name("add_Click"));
         assert!(is_special_name("remove_Changed"));
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        analysis::CallGraph,
+        compiler::DerivedStats,
+        metadata::tables::{CustomAttributeRaw, TableId},
+        testkit::fixture,
+        CleanupRequest, Result,
+    };
+
+    fn attribute_count(assembly: &CilObject) -> u32 {
+        assembly
+            .tables()
+            .map_or(0, |tables| tables.table_row_count(TableId::CustomAttribute))
+    }
+
+    /// Removing an assembly-level attribute: the output has one attribute fewer, and the event
+    /// log the statistics derive from records the removal.
+    #[test]
+    fn module_example() -> Result<()> {
+        let assembly = CilObject::from_path(fixture("packers/confuserex/1.6.0/original.exe"))?;
+        let before = attribute_count(&assembly);
+        let attribute = assembly
+            .tables()
+            .and_then(|tables| tables.table::<CustomAttributeRaw>())
+            .and_then(|table| {
+                table
+                    .iter()
+                    .filter_map(std::result::Result::ok)
+                    .find(|row| row.parent.token.is_table(TableId::Assembly))
+            })
+            .expect("an assembly-level attribute")
+            .token;
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+
+        let mut request = CleanupRequest::new();
+        request.add_attribute(attribute);
+        let assembly = execute_cleanup(assembly, Some(request), &ctx)?;
+
+        assert_eq!(attribute_count(&assembly), before - 1);
+        // Statistics are derived from the event log
+        assert!(DerivedStats::from_log(&ctx.events).artifacts_removed >= 1);
+        Ok(())
     }
 }

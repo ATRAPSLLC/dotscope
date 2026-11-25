@@ -10,7 +10,7 @@
 //!
 //! - **Raw Representation**: [`EventPtrRaw`] - Direct binary table format with unresolved indexes
 //! - **Owned Data**: [`EventPtr`] - Resolved entries with owned data and direct event references
-//! - **Loading Infrastructure**: [`EventPtrLoader`] - Processes raw entries during metadata loading
+//! - **Loading Infrastructure**: [`EventPtrLoader`](crate::metadata::loader::tables::EventPtrLoader) - Processes raw entries during metadata loading
 //! - **Type Aliases**: Collection types for managing `EventPtr` entries efficiently
 //!
 //! # `EventPtr` Table Structure
@@ -45,14 +45,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

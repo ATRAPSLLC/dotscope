@@ -8,7 +8,7 @@
 use crate::{
     formatting::helpers::{
         assembly_scoped_name, format_method_call_sig, format_type_sig, format_typespec_from_blob,
-        quote_identifier,
+        quote_identifier, user_string_literal,
     },
     metadata::{
         method::Method,
@@ -24,7 +24,7 @@ use crate::{
 /// Handles MethodDef (0x06), MemberRef (0x0A), TypeRef/TypeDef (0x01/0x02),
 /// Field (0x04), TypeSpec (0x1B), MethodSpec (0x2B), StandAloneSig (0x11),
 /// and UserString (0x70) tokens.
-pub(super) fn resolve_token(assembly: &CilObject, token: Token) -> Option<String> {
+pub fn resolve_token(assembly: &CilObject, token: Token) -> Option<String> {
     match token.table() {
         0x06 => {
             // MethodDef — full ILAsm method signature
@@ -98,24 +98,7 @@ pub(super) fn resolve_token(assembly: &CilObject, token: Token) -> Option<String
             assembly
                 .userstrings()
                 .and_then(|us| us.get(token.row() as usize).ok())
-                .map(|s| {
-                    let s = s.to_string_lossy();
-                    let mut escaped = String::with_capacity(s.len().saturating_add(2));
-                    escaped.push('"');
-                    for ch in s.chars() {
-                        match ch {
-                            '"' => escaped.push_str("\\\""),
-                            '\\' => escaped.push_str("\\\\"),
-                            '\n' => escaped.push_str("\\n"),
-                            '\r' => escaped.push_str("\\r"),
-                            '\t' => escaped.push_str("\\t"),
-                            '\0' => escaped.push_str("\\0"),
-                            c => escaped.push(c),
-                        }
-                    }
-                    escaped.push('"');
-                    escaped
-                })
+                .map(|s| user_string_literal(s.as_slice()))
         }
         _ => None,
     }
@@ -204,8 +187,8 @@ fn format_methodspec(assembly: &CilObject, token: &Token) -> Option<String> {
 /// Resolve a declaring type reference to an assembly-scoped name.
 ///
 /// For TypeSpec references, prefers the raw signature blob which preserves generic
-/// instantiation details and nested type paths (e.g. `List`1/Enumerator<T>`).
-pub(super) fn resolve_declaring_type(declaredby: &CilTypeReference, asm: &CilObject) -> String {
+/// instantiation details and nested type paths (e.g. `` List`1/Enumerator<T> ``).
+pub fn resolve_declaring_type(declaredby: &CilTypeReference, asm: &CilObject) -> String {
     match declaredby {
         CilTypeReference::TypeSpec(r) => {
             // Try blob-based formatting first — it preserves generic args and nested paths
@@ -227,9 +210,15 @@ pub(super) fn resolve_declaring_type(declaredby: &CilTypeReference, asm: &CilObj
                 asm.types()
                     .get(&token)
                     .map(|t| assembly_scoped_name(&t, asm))
-                    .unwrap_or_else(|| declaredby.fullname().unwrap_or_else(|| "[?]".to_string()))
+                    .unwrap_or_else(|| {
+                        declaredby
+                            .fullname()
+                            .map_or_else(|| "[?]".to_string(), |name| name.to_string())
+                    })
             } else {
-                declaredby.fullname().unwrap_or_else(|| "[?]".to_string())
+                declaredby
+                    .fullname()
+                    .map_or_else(|| "[?]".to_string(), |name| name.to_string())
             }
         }
     }

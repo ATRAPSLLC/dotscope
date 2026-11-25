@@ -97,8 +97,8 @@ use crate::{
 ///
 /// # Usage Patterns
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::tables::methoddebuginformation::raw::MethodDebugInformationRaw;
+/// ```no_run
+/// use dotscope::metadata::tables::MethodDebugInformationRaw;
 /// use dotscope::metadata::streams::Blob;
 ///
 /// # fn process_debug_entry(raw_entry: &MethodDebugInformationRaw, blobs: &Blob) -> dotscope::Result<()> {
@@ -117,6 +117,7 @@ use crate::{
 /// let owned = raw_entry.to_owned(blobs)?;
 /// # Ok(())
 /// # }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety
@@ -173,14 +174,15 @@ impl MethodDebugInformationRaw {
     /// - `sequence_points`: Resolved to `Option<Vec<u8>>` (None if index is 0)
     ///
     /// # Examples
-    /// ```rust,ignore
+    /// ```no_run
     /// # use dotscope::metadata::tables::MethodDebugInformationRaw;
-    /// # use dotscope::metadata::streams::{Strings, Blob, Guid};
-    /// # fn example(raw: &MethodDebugInformationRaw, strings: &Strings, blobs: &Blob, guids: &Guid) -> dotscope::Result<()> {
-    /// let method_debug_info = raw.to_owned(strings, blobs, guids)?;
+    /// # use dotscope::metadata::streams::Blob;
+    /// # fn example(raw: &MethodDebugInformationRaw, blobs: &Blob) -> dotscope::Result<()> {
+    /// let method_debug_info = raw.to_owned(blobs)?;
     /// println!("Method debug info: {:?}", method_debug_info.document);
     /// # Ok(())
     /// # }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     ///
     /// # Errors
@@ -188,11 +190,12 @@ impl MethodDebugInformationRaw {
     /// Returns an error if the blob heap index for sequence points is invalid or cannot be resolved.
     pub fn to_owned(&self, blobs: &Blob) -> Result<MethodDebugInformationRc> {
         let sequence_points = if self.sequence_points == 0 {
+            None
+        } else {
             Some(parse_sequence_points(
                 blobs.get(self.sequence_points as usize)?,
+                self.document,
             )?)
-        } else {
-            None
         };
 
         // ToDo: Resolve document index to actual Document entry if needed

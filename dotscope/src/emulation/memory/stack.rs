@@ -15,11 +15,11 @@
 //! # Overflow Protection
 //!
 //! The stack has a configurable maximum depth to prevent runaway execution from
-//! consuming excessive memory. Exceeding this limit returns [`EmulationError::StackOverflow`](crate::emulation::EmulationError::StackOverflow).
+//! consuming excessive memory. Exceeding this limit returns [`EmulationError::StackOverflow`].
 //!
 //! # Type-Checked Operations
 //!
-//! While [`push`](EvaluationStack::push) accepts any [`EmValue`](crate::emulation::EmValue),
+//! While [`push`](EvaluationStack::push) accepts any [`EmValue`],
 //! type-checked pop methods like [`pop_i32`](EvaluationStack::pop_i32) ensure
 //! type safety at runtime.
 

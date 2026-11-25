@@ -12,12 +12,15 @@
 //!
 //! The module uses iced-x86 for decoding and provides a simplified instruction
 //! representation focused on the operations commonly used in obfuscator stubs.
+//! Decoding handles 32- and 64-bit code; the translation to SSA
+//! ([`X86ToSsaTranslator`]) models 32-bit code exactly and refuses the rest, so a
+//! caller keeps the native code wherever the lift would not compute the same values.
 //!
 //! # Components
 //!
 //! - [`types`] - Simplified x86 instruction types ([`X86Instruction`], [`X86Register`], etc.)
 //! - [`decoder`] - Decoding using iced-x86 ([`x86_decode_all`], [`x86_detect_prologue`])
-//! - [`cfg`] - Control flow graph construction ([`X86Function`])
+//! - [`cfg`](mod@cfg) - Control flow graph construction ([`X86Function`])
 //!
 //! # Decoding Strategies
 //!
@@ -62,16 +65,20 @@
 //!
 //! # Traversal-Based Example
 //!
-//! ```rust,ignore
+//! ```
 //! use dotscope::analysis::{x86_decode_traversal, X86Function};
 //!
+//! // push ebp; mov ebp, esp; xor eax, eax; pop ebp; ret
+//! let bytes = [0x55, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3];
+//!
 //! // Decode using control-flow following (more robust)
-//! let result = x86_decode_traversal(bytes, 32, 0x1000, 0)?;
+//! let result = x86_decode_traversal(&bytes, 32, 0x1000, 0)?;
 //! println!("Decoded {} instructions", result.instructions.len());
 //! println!("Has indirect jumps: {}", result.has_indirect_control_flow);
 //!
 //! // Build CFG
 //! let cfg = X86Function::new(&result.instructions, 32, 0x1000);
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Supported Instructions
@@ -115,16 +122,21 @@
 //!
 //! The [`ssa`] module provides translation from x86 CFG to SSA form:
 //!
-//! ```rust,ignore
+//! ```
 //! use dotscope::analysis::{x86_decode_all, X86Function, X86ToSsaTranslator};
 //!
+//! // A stub is entered with nothing in its registers, so it writes each before
+//! // reading it: mov eax, 5; add eax, 3; ret
+//! let bytes = [0xB8, 0x05, 0x00, 0x00, 0x00, 0x83, 0xC0, 0x03, 0xC3];
+//!
 //! // Decode and build CFG
-//! let instructions = x86_decode_all(bytes, 32, 0x1000)?;
+//! let instructions = x86_decode_all(&bytes, 32, 0x1000)?;
 //! let cfg = X86Function::new(&instructions, 32, 0x1000);
 //!
 //! // Translate to SSA
 //! let translator = X86ToSsaTranslator::new(&cfg);
 //! let ssa_function = translator.translate()?;
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! The translator handles:
@@ -146,6 +158,7 @@ pub use decoder::{
     x86_detect_prologue, x86_native_body_size, X86TraversalDecodeResult,
 };
 // Re-export SSA translation types
+pub use flags::{is_signed_condition, is_unsigned_condition, is_zero_flag_only};
 pub use ssa::X86ToSsaTranslator;
 pub use types::{
     X86Condition, X86DecodedInstruction, X86EdgeKind, X86EpilogueInfo, X86Instruction, X86Memory,
@@ -154,15 +167,12 @@ pub use types::{
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        analysis::{
-            x86::{
-                x86_decode_all, x86_detect_prologue, X86Function, X86Instruction, X86Operand,
-                X86PrologueKind, X86Register, X86ToSsaTranslator,
-            },
-            ConstValue, SsaEvaluator, SsaOp,
+    use crate::analysis::{
+        x86::{
+            x86_decode_all, x86_detect_prologue, X86Function, X86Instruction, X86Operand,
+            X86PrologueKind, X86Register, X86ToSsaTranslator,
         },
-        metadata::typesystem::PointerSize,
+        CilTarget, ConstValue, SsaEvaluator, SsaOp,
     };
 
     /// Test the full pipeline: decode -> build CFG
@@ -321,7 +331,7 @@ mod tests {
             .expect("no argument variable");
         let arg_id = arg_var.id();
 
-        let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit32);
+        let mut eval = SsaEvaluator::new(&ssa, CilTarget::x86().machine());
         eval.set_concrete(arg_id, ConstValue::I32(input));
         let trace = eval.execute(0, None, 50);
         assert!(trace.is_complete(), "evaluation did not complete");
@@ -331,6 +341,7 @@ mod tests {
         for instr in block.instructions() {
             if let SsaOp::Return {
                 value: Some(ret_var),
+                ..
             } = instr.op()
             {
                 return eval
@@ -366,13 +377,13 @@ mod tests {
         let block = ssa.block(0).unwrap();
         let last = block.instructions().last().expect("no instructions");
         assert!(
-            matches!(last.op(), SsaOp::Return { value: Some(_) }),
+            matches!(last.op(), SsaOp::Return { value: Some(_), .. }),
             "expected Return with value, got {:?}",
             last.op()
         );
     }
 
-    // --- mkaring_constants_x86.exe stubs ---
+    // mkaring_constants_x86.exe stubs
 
     #[test]
     fn test_confuserex_constants_x86_stub1() {
@@ -432,7 +443,7 @@ mod tests {
         assert_ne!(r1, r3);
     }
 
-    // --- mkaring_controlflow_x86.exe stubs ---
+    // mkaring_controlflow_x86.exe stubs
 
     #[test]
     fn test_confuserex_controlflow_x86_stub1() {
@@ -467,7 +478,7 @@ mod tests {
         assert_eq!(r, expected);
     }
 
-    // --- mkaring_constants_x86_controlflow.exe stubs ---
+    // mkaring_constants_x86_controlflow.exe stubs
 
     #[test]
     fn test_confuserex_constants_x86_cf_stub4() {
@@ -503,7 +514,7 @@ mod tests {
         assert_eq!(r, expected);
     }
 
-    // --- mkaring_constants_x86_controlflow_x86.exe stubs ---
+    // mkaring_constants_x86_controlflow_x86.exe stubs
 
     #[test]
     fn test_confuserex_identity_stub() {

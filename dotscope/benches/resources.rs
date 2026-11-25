@@ -1,19 +1,24 @@
 //! Benchmarks for owned vs. zero-copy parsing of standalone `.resources` files.
 
+// A benchmark whose work fails must fail, not time the failure.
+#![allow(clippy::expect_used)]
+
 extern crate dotscope;
 
-use std::{fs, hint::black_box, path::PathBuf};
+use std::{fs, hint::black_box};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use dotscope::metadata::resources::{parse_dotnet_resource, parse_dotnet_resource_ref};
+use dotscope::{
+    metadata::resources::{parse_dotnet_resource, parse_dotnet_resource_ref},
+    testkit::fixture,
+};
 
 /// Benchmark parsing from standalone .resources file (WindowsBase resources)
 ///
 /// This benchmark compares the performance of owned vs zero-copy resource parsing
 /// using a real .NET resources file extracted from WindowsBase.dll.
 fn bench_parse_resources_file(c: &mut Criterion) {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/samples/WB_FxResources.WindowsBase.SR.resources.bin");
+    let path = fixture("WB_FxResources.WindowsBase.SR.resources.bin");
 
     let Ok(data) = fs::read(&path) else {
         eprintln!(
@@ -36,7 +41,7 @@ fn bench_parse_resources_file(c: &mut Criterion) {
     group.bench_function("parse_dotnet_resource", |b| {
         b.iter(|| {
             let parsed = parse_dotnet_resource(black_box(&data));
-            black_box(parsed.ok());
+            black_box(parsed.expect("the benchmarked work succeeds on its input"));
         });
     });
     group.finish();
@@ -47,7 +52,7 @@ fn bench_parse_resources_file(c: &mut Criterion) {
     group.bench_function("parse_dotnet_resource_ref", |b| {
         b.iter(|| {
             let parsed = parse_dotnet_resource_ref(black_box(&data));
-            black_box(parsed.ok());
+            black_box(parsed.expect("the benchmarked work succeeds on its input"));
         });
     });
     group.finish();

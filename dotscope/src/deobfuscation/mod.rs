@@ -73,19 +73,19 @@
 //!
 //! Each protection technique is a self-contained module implementing:
 //!
-//! - [`Technique`](crate::deobfuscation::Technique) — unified trait: `detect()`, `byte_transform()`, `ssa_phase()`, `detect_ssa()`, etc.
+//! - [`Technique`](crate::deobfuscation::Technique) - unified trait: `detect()`, `byte_transform()`, `ssa_phase()`, `detect_ssa()`, etc.
 //!
 //! ## Pass System
 //!
 //! SSA-based transformation passes ([`crate::compiler::SsaPass`]):
 //!
-//! - [`crate::compiler::PassScheduler`] — Manages pass execution order and fixpoint iteration
-//! - [`crate::compiler::EventLog`] — Tracks changes made by passes
-//! - [`AnalysisContext`](crate::deobfuscation::AnalysisContext) — Shared interprocedural analysis data
+//! - [`crate::compiler::PassScheduler`] - Manages pass execution order and fixpoint iteration
+//! - [`crate::compiler::EventLog`] - Tracks changes made by passes
+//! - [`AnalysisContext`](crate::deobfuscation::AnalysisContext) - Shared interprocedural analysis data
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::deobfuscation::{DeobfuscationEngine, EngineConfig};
 //!
 //! let config = EngineConfig::default();
@@ -93,6 +93,7 @@
 //!
 //! let (deobfuscated, result) = engine.process_file("obfuscated.dll")?;
 //! println!("{}", result.summary());
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 mod cleanup;
@@ -103,52 +104,56 @@ mod engine;
 mod passes;
 mod processcell;
 mod renamer;
+mod repairs;
 mod result;
 mod statemachine;
 mod techniques;
 mod template;
-pub(crate) mod utils;
+mod utils;
 mod workqueue;
 
-// Public API — used by CLI, tests, examples, and external consumers
+// Public API - used by CLI, tests, examples, and external consumers
+pub use cleanup::INLINED_METHOD_REMOVED;
 pub use config::{
-    CleanupConfig, DecryptorHeuristics, DetectionWeights, EmulationConfig, EngineConfig,
-    IterationConfig, PassConfig, UnflatteningThresholds,
+    CleanupConfig, DetectionWeights, EmulationConfig, EngineConfig, IterationConfig, PassConfig,
 };
 pub use context::{AnalysisContext, HookFactory};
 pub use decryptors::{CacheKey, DecryptedCall, DecryptorContext, FailedCall, FailureReason};
-pub use engine::DeobfuscationEngine;
+pub use engine::{DeobfuscationEngine, GeneratedCode};
 pub use passes::{
-    CffReconstructionPass, DecryptionPass, DelegateProxyResolutionPass, DelegateTypeInfo,
-    NativeMethodConversionPass, NeutralizationPass, OpaqueFieldPredicatePass, UnflattenConfig,
+    unflatten, CffDetector, CffPattern, CffReconstructionPass, ConversionStats, DecryptionPass,
+    DelegateProxyResolutionPass, DelegateTypeInfo, Dispatcher, DispatcherInfo, EntryCondition,
+    EntryPoint, IndexPattern, Location, NativeMethodConversionPass, NeutralizationPass,
+    OpaqueFieldPredicatePass, StateTransform, StateVarRef, StateVariable, UnflattenConfig,
 };
 // Crate-internal re-exports (only items that are actually imported via this path)
-pub(crate) use processcell::ProcessCell;
-pub use renamer::SmartRenameConfig;
+use processcell::ProcessCell;
 pub use result::DeobfuscationResult;
-pub(crate) use statemachine::{
-    CfgInfo, StateMachineCallSite, StateMachineProvider, StateMachineSemantics, StateMachineState,
-    StateSlotOperation, StateUpdateCall,
+pub use statemachine::{
+    CfgInfo, SsaOpKind, StateMachineCallSite, StateMachineProvider, StateMachineSemantics,
+    StateMachineState, StateSlotOperation, StateUpdateCall,
 };
 pub use techniques::{
     AttributionResult, Detection, Detections, Evidence, ObfuscatorMatcher, ObfuscatorSignature,
-    Technique, TechniqueCategory, TechniqueRegistry, TechniqueResult, WorkingAssembly,
+    Technique, TechniqueCapability, TechniqueCategory, TechniqueRegistry, TechniqueResult,
+    WorkingAssembly,
 };
-pub(crate) use template::EmulationTemplatePool;
+pub use template::EmulationTemplatePool;
+pub use workqueue::{DrainedWorkItems, WorkItem, WorkQueue};
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        deobfuscation::{DeobfuscationEngine, EngineConfig},
         metadata::validation::ValidationConfig,
+        testkit::{engine, fixture},
         CilObject,
     };
 
     #[test]
     fn test_process_file_api() -> crate::Result<()> {
-        let path = "tests/samples/packers/confuserex/1.6.0/original.exe";
+        let path = fixture("packers/confuserex/1.6.0/original.exe");
 
-        let engine = DeobfuscationEngine::new(EngineConfig::default());
+        let engine = engine();
         let (deobfuscated, result) = engine.process_file(path)?;
 
         assert!(deobfuscated.module().is_some());
@@ -160,11 +165,11 @@ mod tests {
 
     #[test]
     fn test_process_assembly_api() -> crate::Result<()> {
-        let path = "tests/samples/packers/confuserex/1.6.0/original.exe";
+        let path = fixture("packers/confuserex/1.6.0/original.exe");
 
         let assembly = CilObject::from_path_with_validation(path, ValidationConfig::analysis())?;
 
-        let engine = DeobfuscationEngine::new(EngineConfig::default());
+        let engine = engine();
         let (deobfuscated, result) = engine.process_assembly(assembly)?;
 
         assert!(deobfuscated.module().is_some());
@@ -175,10 +180,10 @@ mod tests {
 
     #[test]
     fn test_process_bytes_api() -> crate::Result<()> {
-        let path = "tests/samples/packers/confuserex/1.6.0/original.exe";
+        let path = fixture("packers/confuserex/1.6.0/original.exe");
         let bytes = std::fs::read(path)?;
 
-        let engine = DeobfuscationEngine::new(EngineConfig::default());
+        let engine = engine();
         let (deobfuscated, result) = engine.process_bytes(bytes)?;
 
         assert!(deobfuscated.module().is_some());

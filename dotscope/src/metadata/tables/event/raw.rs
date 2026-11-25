@@ -29,7 +29,7 @@ use crate::{
         token::Token,
         typesystem::TypeRegistry,
     },
-    utils::LazyList,
+    utils::RowList,
     Result,
 };
 
@@ -115,7 +115,7 @@ impl EventRaw {
             token: self.token,
             offset: self.offset,
             flags: EventAttributes::new(self.flags),
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             event_type: match types.get(&self.event_type.token) {
                 Some(parent) => parent.into(),
                 None => {
@@ -126,10 +126,10 @@ impl EventRaw {
                 }
             },
             fn_on_add: OnceLock::new(),
-            fn_on_other: OnceLock::new(),
+            fn_on_other: RowList::new(),
             fn_on_raise: OnceLock::new(),
             fn_on_remove: OnceLock::new(),
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         }))
     }
 

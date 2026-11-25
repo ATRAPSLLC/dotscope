@@ -257,22 +257,16 @@
 //!
 //! ## Iterator Error Behavior
 //!
-//! Stream iterators have two error handling strategies, chosen based on data characteristics:
+//! An iterator stops only where the heap's own structure ends, never at an entry it cannot
+//! decode, so nothing after a malformed entry goes unseen:
 //!
-//! | Iterator | Strategy | Rationale |
-//! |----------|----------|-----------|
-//! | `StringsIterator` | Fail-fast | Null-terminated strings have clear boundaries |
-//! | `BlobIterator` | Fail-fast | Length prefixes define exact extents |
-//! | `GuidIterator` | Fail-fast | Fixed 16-byte entries have rigid structure |
-//! | `UserStringsIterator` | Best-effort recovery | Complex format may have recoverable corruption |
-//!
-//! **Fail-fast iterators** return `None` immediately on encountering malformed data,
-//! terminating iteration. This is appropriate when data corruption affects parsing
-//! of subsequent entries.
-//!
-//! **Best-effort iterators** attempt to skip over corrupted entries (with bounded
-//! retry limits) to continue yielding valid data. This is useful for forensic
-//! analysis of partially corrupted assemblies.
+//! | Iterator | Entries | Ends |
+//! |----------|---------|------|
+//! | `StringEntries` | every entry, as bytes | at the end of the heap |
+//! | `StringsIterator` | the entries that are valid UTF-8 | at the end of the heap |
+//! | `UserStringsIterator` | the entries that hold a string | where a length is unreadable or overruns the heap |
+//! | `BlobIterator` | every entry | where a length is unreadable or overruns the heap |
+//! | `GuidIterator` | every 16-byte entry | at the last whole entry |
 //!
 //! ## Common Error Scenarios
 //! - Corrupted or truncated stream data
@@ -324,6 +318,8 @@
 //! - **ECMA-335 II.24.2.6**: `#US` heap format and UTF-16 encoding
 //! - **ECMA-335 II.22**: Metadata table definitions and relationships
 
+use crate::{HeapKind, ParseFailure, Result};
+
 /// Stream header parsing and validation for ECMA-335 metadata directory.
 ///
 /// Provides [`crate::metadata::streams::streamheader::StreamHeader`] for parsing stream directory entries, validating
@@ -336,7 +332,21 @@ pub use streamheader::StreamHeader;
 /// Provides [`crate::metadata::streams::strings::Strings`] and [`crate::metadata::streams::strings::StringsIterator`] for accessing null-terminated
 /// UTF-8 strings used for type names, member names, and other identifiers.
 mod strings;
-pub use strings::{Strings, StringsIterator};
+pub use strings::{StringEntries, Strings, StringsIterator};
+
+/// The string type of metadata names, shared by every row that names one `#Strings` entry.
+///
+/// Provides [`crate::metadata::streams::SharedStr`], which reads as a `str` and costs a row
+/// the same whatever its name's length.
+mod sharedstr;
+pub use sharedstr::{Run, SharedStr};
+
+/// The byte type of blob values a metadata row keeps, a view of a shared copy of `#Blob`.
+///
+/// Provides [`crate::metadata::streams::SharedBytes`], which reads as a `[u8]` and costs a row
+/// the same whatever its blob's length.
+mod sharedbytes;
+pub use sharedbytes::SharedBytes;
 
 /// UTF-16 user string heap (`#US`) implementation.
 ///
@@ -350,7 +360,7 @@ pub use userstrings::{UserStrings, UserStringsIterator};
 /// Provides [`crate::metadata::streams::tablesheader::TablesHeader`] for parsing compressed and uncompressed
 /// metadata table headers, schemas, and row count information.
 mod tablesheader;
-pub use tablesheader::TablesHeader;
+pub use tablesheader::{TableSummary, TablesHeader};
 
 /// 128-bit GUID array (`#GUID`) implementation.
 ///
@@ -365,3 +375,36 @@ pub use guid::{Guid, GuidIterator};
 /// binary data including signatures, custom attributes, and constants.
 mod blob;
 pub use blob::{Blob, BlobIterator};
+
+/// The Portable PDB `#Pdb` stream: the PDB's identity, entry point, and the row counts of the
+/// assembly tables its tables reference.
+mod pdb;
+pub use pdb::PdbStream;
+
+/// The empty entry a sentinel heap holds at index 0.
+static EMPTY_HEAP: [u8; 1] = [0];
+
+/// Returns the bytes a `#Strings`, `#US` or `#Blob` heap reads from.
+///
+/// ECMA-335 II.24.2.2 to II.24.2.4 place the empty entry at index 0 of a heap that has
+/// entries. A stream of no bytes has none, and a table row may still hold index 0 for an
+/// absent value (Mono's `ilasm` writes a zero-length `#US` for an assembly with no string
+/// literal and a zero-length `#Blob` for one with no method), so it reads as the sentinel
+/// alone: index 0 is the empty value, any other index is out of bounds, and every reader of
+/// the heap, its size included, sees one consistent heap.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Parse`] carrying [`ParseFailure::HeapCorrupt`] if the heap holds
+/// bytes and the first is not 0.
+fn sentinel_heap(data: &[u8], heap: HeapKind) -> Result<&[u8]> {
+    match data.first() {
+        None => Ok(&EMPTY_HEAP),
+        Some(0) => Ok(data),
+        Some(_) => Err(ParseFailure::HeapCorrupt {
+            heap,
+            reason: "first byte must be 0 (the sentinel of its empty entry)".into(),
+        }
+        .into()),
+    }
+}

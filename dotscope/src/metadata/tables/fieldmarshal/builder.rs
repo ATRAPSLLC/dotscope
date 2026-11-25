@@ -74,9 +74,9 @@ use crate::{
 /// // Marshal a field as a fixed-size ANSI character array
 /// let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal); // Character array field
 /// let fixed_array_descriptor = vec![
-///     NATIVE_TYPE::ARRAY,
-///     0x04, // Array element type (I1 - signed byte)
-///     0x20, 0x00, 0x00, 0x00, // Array size (32 elements, little-endian)
+///     NATIVE_TYPE::FIXEDARRAY,
+///     0x20,           // 32 elements (a compressed integer)
+///     NATIVE_TYPE::I1, // of signed bytes
 /// ];
 ///
 /// let array_marshal = FieldMarshalBuilder::new()
@@ -237,26 +237,16 @@ impl FieldMarshalBuilder {
         self.simple_native_type(NATIVE_TYPE::LPSTR)
     }
 
-    /// Sets fixed-size array marshaling.
-    ///
-    /// This convenience method configures marshaling for fixed-size arrays with
-    /// specified element type and count. The array is marshaled in-place within
-    /// the containing structure.
-    ///
-    /// # Arguments
-    ///
-    /// * `element_type` - The native type of array elements
-    /// * `size` - The number of elements in the array
+    /// Sets fixed-size array marshaling (`ByValArray`): `size` elements of the native type
+    /// `element_type` (a [`NATIVE_TYPE`] byte), marshaled in place within the containing
+    /// structure.
     ///
     /// # Returns
     ///
     /// Self for method chaining.
     #[must_use]
-    pub fn fixed_array(mut self, element_type: u8, size: u32) -> Self {
-        let mut descriptor = vec![NATIVE_TYPE::ARRAY, element_type];
-        descriptor.extend_from_slice(&size.to_le_bytes());
-        self.native_type = Some(descriptor);
-        self
+    pub fn fixed_array(self, element_type: u8, size: u32) -> Self {
+        self.fixed_array_typed(Some(element_type), size)
     }
 
     /// Sets COM interface marshaling.
@@ -292,9 +282,15 @@ impl FieldMarshalBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::metadata::marshalling::NativeType;
+    /// ```no_run
+    /// use dotscope::metadata::marshalling::{NativeType, NATIVE_TYPE};
     /// use dotscope::metadata::tables::FieldMarshalBuilder;
+    /// # use dotscope::prelude::*;
+    /// # use std::path::Path;
+    /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
+    /// # let mut assembly = CilAssembly::new(view);
+    /// # let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+    /// # let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
     ///
     /// // Unicode string with size parameter
     /// let marshal = FieldMarshalBuilder::new()
@@ -306,17 +302,18 @@ impl FieldMarshalBuilder {
     /// let array_marshal = FieldMarshalBuilder::new()
     ///     .parent(field_ref)
     ///     .native_type_spec(NativeType::Array {
-    ///         element_type: Box::new(NativeType::I4),
+    ///         element_type: NATIVE_TYPE::I4,
     ///         num_param: Some(1),
     ///         num_element: Some(10),
+    ///         flags: None,
     ///     })
     ///     .build(&mut assembly)?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn native_type_spec(mut self, native_type: NativeType) -> Self {
         let info = MarshallingInfo {
             primary_type: native_type,
-            additional_types: vec![],
         };
 
         match encode_marshalling_descriptor(&info) {
@@ -347,9 +344,15 @@ impl FieldMarshalBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use dotscope::metadata::marshalling::{NativeType, MarshallingInfo};
     /// use dotscope::metadata::tables::FieldMarshalBuilder;
+    /// # use dotscope::prelude::*;
+    /// # use std::path::Path;
+    /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
+    /// # let mut assembly = CilAssembly::new(view);
+    /// # let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+    /// # let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
     ///
     /// let complex_info = MarshallingInfo {
     ///     primary_type: NativeType::CustomMarshaler {
@@ -358,13 +361,13 @@ impl FieldMarshalBuilder {
     ///         cookie: "size=dynamic".to_string(),
     ///         type_reference: "MyAssembly.ArrayMarshaler".to_string(),
     ///     },
-    ///     additional_types: vec![NativeType::I4], // Element type hint
     /// };
     ///
     /// let marshal = FieldMarshalBuilder::new()
     ///     .parent(param_ref)
-    ///     .marshalling_info(complex_info)
+    ///     .marshalling_info(&complex_info)
     ///     .build(&mut assembly)?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn marshalling_info(mut self, info: &MarshallingInfo) -> Self {
@@ -383,17 +386,15 @@ impl FieldMarshalBuilder {
     ///
     /// # Arguments
     ///
-    /// * `ref_type` - Optional type that the pointer references
+    /// * `ref_type` - The native type the pointer references, when given: a [`NATIVE_TYPE`]
+    ///   byte
     ///
     /// # Returns
     ///
     /// Self for method chaining.
     #[must_use]
-    pub fn pointer(self, ref_type: Option<NativeType>) -> Self {
-        let ptr_type = NativeType::Ptr {
-            ref_type: ref_type.map(Box::new),
-        };
-        self.native_type_spec(ptr_type)
+    pub fn pointer(self, ref_type: Option<u8>) -> Self {
+        self.native_type_spec(NativeType::Ptr { ref_type })
     }
 
     /// Sets marshaling for a variable-length array.
@@ -403,7 +404,7 @@ impl FieldMarshalBuilder {
     ///
     /// # Arguments
     ///
-    /// * `element_type` - The type of array elements
+    /// * `element_type` - The native type of the elements: a [`NATIVE_TYPE`] byte
     /// * `size_param` - Optional parameter index for array size
     /// * `element_count` - Optional fixed element count
     ///
@@ -413,14 +414,15 @@ impl FieldMarshalBuilder {
     #[must_use]
     pub fn variable_array(
         self,
-        element_type: NativeType,
+        element_type: u8,
         size_param: Option<u32>,
         element_count: Option<u32>,
     ) -> Self {
         let array_type = NativeType::Array {
-            element_type: Box::new(element_type),
+            element_type,
             num_param: size_param,
             num_element: element_count,
+            flags: None,
         };
         self.native_type_spec(array_type)
     }
@@ -432,19 +434,15 @@ impl FieldMarshalBuilder {
     ///
     /// # Arguments
     ///
-    /// * `element_type` - Optional type of array elements
+    /// * `element_type` - The native type of the elements, when given: a [`NATIVE_TYPE`] byte
     /// * `size` - Number of elements in the array
     ///
     /// # Returns
     ///
     /// Self for method chaining.
     #[must_use]
-    pub fn fixed_array_typed(self, element_type: Option<NativeType>, size: u32) -> Self {
-        let array_type = NativeType::FixedArray {
-            element_type: element_type.map(Box::new),
-            size,
-        };
-        self.native_type_spec(array_type)
+    pub fn fixed_array_typed(self, element_type: Option<u8>, size: u32) -> Self {
+        self.native_type_spec(NativeType::FixedArray { size, element_type })
     }
 
     /// Sets marshaling for a native structure.
@@ -485,7 +483,7 @@ impl FieldMarshalBuilder {
     #[must_use]
     pub fn safe_array(self, variant_type: u16, user_defined_name: Option<String>) -> Self {
         let array_type = NativeType::SafeArray {
-            variant_type,
+            variant_type: Some(variant_type),
             user_defined_name,
         };
         self.native_type_spec(array_type)
@@ -597,678 +595,655 @@ impl FieldMarshalBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
+        testkit::fixture,
     };
 
     #[test]
     fn test_field_marshal_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a basic field marshal entry
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal); // Parameter target
-            let marshal_descriptor = vec![NATIVE_TYPE::I4]; // Simple integer marshaling
+        // Create a basic field marshal entry
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal); // Parameter target
+        let marshal_descriptor = vec![NATIVE_TYPE::I4]; // Simple integer marshaling
 
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                .native_type(&marshal_descriptor)
-                .build(&mut assembly)
-                .unwrap();
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            .native_type(&marshal_descriptor)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_different_parents() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let marshal_descriptor = vec![NATIVE_TYPE::I4];
+        let marshal_descriptor = vec![NATIVE_TYPE::I4];
 
-            // Test Field parent
-            let field_parent = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
-            let field_marshal_ref = FieldMarshalBuilder::new()
-                .parent(field_parent)
-                .native_type(&marshal_descriptor)
-                .build(&mut assembly)
-                .unwrap();
+        // Test Field parent
+        let field_parent = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
+        let field_marshal_ref = FieldMarshalBuilder::new()
+            .parent(field_parent)
+            .native_type(&marshal_descriptor)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Test Param parent
-            let param_parent = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
-            let param_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_parent)
-                .native_type(&marshal_descriptor)
-                .build(&mut assembly)
-                .unwrap();
+        // Test Param parent
+        let param_parent = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_parent)
+            .native_type(&marshal_descriptor)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Both should succeed with correct kind
-            assert_eq!(
-                field_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                param_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert!(!std::sync::Arc::ptr_eq(
-                &field_marshal_ref,
-                &param_marshal_ref
-            ));
-        }
+        // Both should succeed with correct kind
+        assert_eq!(
+            field_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            param_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert!(!std::sync::Arc::ptr_eq(
+            &field_marshal_ref,
+            &param_marshal_ref
+        ));
     }
 
     #[test]
     fn test_field_marshal_builder_different_native_types() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Test various native types
-            let param_refs: Vec<_> = (1..=8)
-                .map(|i| CodedIndex::new(TableId::Param, i, CodedIndexType::HasFieldMarshal))
-                .collect();
+        // Test various native types
+        let param_refs: Vec<_> = (1..=8)
+            .map(|i| CodedIndex::new(TableId::Param, i, CodedIndexType::HasFieldMarshal))
+            .collect();
 
-            // Simple integer types
-            let int_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_refs[0].clone())
-                .simple_native_type(NATIVE_TYPE::I4)
-                .build(&mut assembly)
-                .unwrap();
+        // Simple integer types
+        let int_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_refs[0].clone())
+            .simple_native_type(NATIVE_TYPE::I4)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Unicode string
-            let unicode_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_refs[1].clone())
-                .unicode_string()
-                .build(&mut assembly)
-                .unwrap();
+        // Unicode string
+        let unicode_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_refs[1].clone())
+            .unicode_string()
+            .build(&mut assembly)
+            .unwrap();
 
-            // ANSI string
-            let ansi_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_refs[2].clone())
-                .ansi_string()
-                .build(&mut assembly)
-                .unwrap();
+        // ANSI string
+        let ansi_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_refs[2].clone())
+            .ansi_string()
+            .build(&mut assembly)
+            .unwrap();
 
-            // Fixed array
-            let array_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_refs[3].clone())
-                .fixed_array(NATIVE_TYPE::I1, 32) // 32-byte array
-                .build(&mut assembly)
-                .unwrap();
+        // Fixed array
+        let array_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_refs[3].clone())
+            .fixed_array(NATIVE_TYPE::I1, 32) // 32-byte array
+            .build(&mut assembly)
+            .unwrap();
 
-            // COM interface
-            let interface_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_refs[4].clone())
-                .com_interface()
-                .build(&mut assembly)
-                .unwrap();
+        // COM interface
+        let interface_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_refs[4].clone())
+            .com_interface()
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed with FieldMarshal table kind
-            assert_eq!(
-                int_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                unicode_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                ansi_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                array_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                interface_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
+        // All should succeed with FieldMarshal table kind
+        assert_eq!(
+            int_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            unicode_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            ansi_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            array_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            interface_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
 
-            // All should be different references
-            let refs = [
-                &int_marshal_ref,
-                &unicode_marshal_ref,
-                &ansi_marshal_ref,
-                &array_marshal_ref,
-                &interface_marshal_ref,
-            ];
-            for i in 0..refs.len() {
-                for j in i + 1..refs.len() {
-                    assert!(!std::sync::Arc::ptr_eq(refs[i], refs[j]));
-                }
+        // All should be different references
+        let refs = [
+            &int_marshal_ref,
+            &unicode_marshal_ref,
+            &ansi_marshal_ref,
+            &array_marshal_ref,
+            &interface_marshal_ref,
+        ];
+        for i in 0..refs.len() {
+            for j in i + 1..refs.len() {
+                assert!(!std::sync::Arc::ptr_eq(refs[i], refs[j]));
             }
         }
     }
 
     #[test]
     fn test_field_marshal_builder_complex_descriptors() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
+        let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
 
-            // Complex array descriptor with multiple parameters
-            let complex_array_descriptor = vec![
-                NATIVE_TYPE::ARRAY,
-                NATIVE_TYPE::I4, // Element type
-                0x02,            // Array rank
-                0x10,
-                0x00,
-                0x00,
-                0x00, // Size parameter (16 elements)
-                0x00,
-                0x00,
-                0x00,
-                0x00, // Lower bound
-            ];
+        // Complex array descriptor with multiple parameters
+        let complex_array_descriptor = vec![
+            NATIVE_TYPE::ARRAY,
+            NATIVE_TYPE::I4, // Element type
+            0x02,            // Array rank
+            0x10,
+            0x00,
+            0x00,
+            0x00, // Size parameter (16 elements)
+            0x00,
+            0x00,
+            0x00,
+            0x00, // Lower bound
+        ];
 
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(field_ref)
-                .native_type(&complex_array_descriptor)
-                .build(&mut assembly)
-                .unwrap();
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(field_ref)
+            .native_type(&complex_array_descriptor)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_missing_parent() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let marshal_descriptor = vec![NATIVE_TYPE::I4];
+        let marshal_descriptor = vec![NATIVE_TYPE::I4];
 
-            let result = FieldMarshalBuilder::new()
-                .native_type(&marshal_descriptor)
-                // Missing parent
-                .build(&mut assembly);
+        let result = FieldMarshalBuilder::new()
+            .native_type(&marshal_descriptor)
+            // Missing parent
+            .build(&mut assembly);
 
-            // Should fail because parent is required
-            assert!(result.is_err());
-        }
+        // Should fail because parent is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_marshal_builder_missing_native_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
 
-            let result = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                // Missing native_type
-                .build(&mut assembly);
+        let result = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            // Missing native_type
+            .build(&mut assembly);
 
-            // Should fail because native type is required
-            assert!(result.is_err());
-        }
+        // Should fail because native type is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_marshal_builder_empty_native_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
-            let empty_descriptor = vec![]; // Empty descriptor
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let empty_descriptor = vec![]; // Empty descriptor
 
-            let result = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                .native_type(&empty_descriptor)
-                .build(&mut assembly);
+        let result = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            .native_type(&empty_descriptor)
+            .build(&mut assembly);
 
-            // Should fail because native type cannot be empty
-            assert!(result.is_err());
-        }
+        // Should fail because native type cannot be empty
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_marshal_builder_invalid_parent_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Use a table type that's not valid for HasFieldMarshal
-            let invalid_parent =
-                CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::HasFieldMarshal); // TypeDef not in HasFieldMarshal
-            let marshal_descriptor = vec![NATIVE_TYPE::I4];
+        // Use a table type that's not valid for HasFieldMarshal
+        let invalid_parent = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::HasFieldMarshal); // TypeDef not in HasFieldMarshal
+        let marshal_descriptor = vec![NATIVE_TYPE::I4];
 
-            let result = FieldMarshalBuilder::new()
-                .parent(invalid_parent)
-                .native_type(&marshal_descriptor)
-                .build(&mut assembly);
+        let result = FieldMarshalBuilder::new()
+            .parent(invalid_parent)
+            .native_type(&marshal_descriptor)
+            .build(&mut assembly);
 
-            // Should fail because parent type is not valid for HasFieldMarshal
-            assert!(result.is_err());
-        }
+        // Should fail because parent type is not valid for HasFieldMarshal
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_field_marshal_builder_all_primitive_types() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Test all primitive native types
-            let primitive_types = [
-                NATIVE_TYPE::BOOLEAN,
-                NATIVE_TYPE::I1,
-                NATIVE_TYPE::U1,
-                NATIVE_TYPE::I2,
-                NATIVE_TYPE::U2,
-                NATIVE_TYPE::I4,
-                NATIVE_TYPE::U4,
-                NATIVE_TYPE::I8,
-                NATIVE_TYPE::U8,
-                NATIVE_TYPE::R4,
-                NATIVE_TYPE::R8,
-                NATIVE_TYPE::INT,
-                NATIVE_TYPE::UINT,
-            ];
+        // Test all primitive native types
+        let primitive_types = [
+            NATIVE_TYPE::BOOLEAN,
+            NATIVE_TYPE::I1,
+            NATIVE_TYPE::U1,
+            NATIVE_TYPE::I2,
+            NATIVE_TYPE::U2,
+            NATIVE_TYPE::I4,
+            NATIVE_TYPE::U4,
+            NATIVE_TYPE::I8,
+            NATIVE_TYPE::U8,
+            NATIVE_TYPE::R4,
+            NATIVE_TYPE::R8,
+            NATIVE_TYPE::INT,
+            NATIVE_TYPE::UINT,
+        ];
 
-            for (i, &native_type) in primitive_types.iter().enumerate() {
-                let param_ref = CodedIndex::new(
-                    TableId::Param,
-                    (i + 1) as u32,
-                    CodedIndexType::HasFieldMarshal,
-                );
+        for (i, &native_type) in primitive_types.iter().enumerate() {
+            let param_ref = CodedIndex::new(
+                TableId::Param,
+                (i + 1) as u32,
+                CodedIndexType::HasFieldMarshal,
+            );
 
-                let marshal_ref = FieldMarshalBuilder::new()
-                    .parent(param_ref)
-                    .simple_native_type(native_type)
-                    .build(&mut assembly)
-                    .unwrap();
+            let marshal_ref = FieldMarshalBuilder::new()
+                .parent(param_ref)
+                .simple_native_type(native_type)
+                .build(&mut assembly)
+                .unwrap();
 
-                // All should succeed
-                assert_eq!(
-                    marshal_ref.kind(),
-                    ChangeRefKind::TableRow(TableId::FieldMarshal)
-                );
-            }
+            // All should succeed
+            assert_eq!(
+                marshal_ref.kind(),
+                ChangeRefKind::TableRow(TableId::FieldMarshal)
+            );
         }
     }
 
     #[test]
     fn test_field_marshal_builder_string_types() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Test string marshaling types
-            let param1 = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
-            let param2 = CodedIndex::new(TableId::Param, 2, CodedIndexType::HasFieldMarshal);
-            let param3 = CodedIndex::new(TableId::Param, 3, CodedIndexType::HasFieldMarshal);
-            let param4 = CodedIndex::new(TableId::Param, 4, CodedIndexType::HasFieldMarshal);
+        // Test string marshaling types
+        let param1 = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param2 = CodedIndex::new(TableId::Param, 2, CodedIndexType::HasFieldMarshal);
+        let param3 = CodedIndex::new(TableId::Param, 3, CodedIndexType::HasFieldMarshal);
+        let param4 = CodedIndex::new(TableId::Param, 4, CodedIndexType::HasFieldMarshal);
 
-            // LPSTR (ANSI string)
-            let ansi_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param1)
-                .simple_native_type(NATIVE_TYPE::LPSTR)
-                .build(&mut assembly)
-                .unwrap();
+        // LPSTR (ANSI string)
+        let ansi_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param1)
+            .simple_native_type(NATIVE_TYPE::LPSTR)
+            .build(&mut assembly)
+            .unwrap();
 
-            // LPWSTR (Unicode string)
-            let unicode_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param2)
-                .simple_native_type(NATIVE_TYPE::LPWSTR)
-                .build(&mut assembly)
-                .unwrap();
+        // LPWSTR (Unicode string)
+        let unicode_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param2)
+            .simple_native_type(NATIVE_TYPE::LPWSTR)
+            .build(&mut assembly)
+            .unwrap();
 
-            // BSTR (COM string)
-            let bstr_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param3)
-                .simple_native_type(NATIVE_TYPE::BSTR)
-                .build(&mut assembly)
-                .unwrap();
+        // BSTR (COM string)
+        let bstr_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param3)
+            .simple_native_type(NATIVE_TYPE::BSTR)
+            .build(&mut assembly)
+            .unwrap();
 
-            // BYVALSTR (fixed-length string)
-            let byval_marshal_ref = FieldMarshalBuilder::new()
-                .parent(param4)
-                .simple_native_type(NATIVE_TYPE::BYVALSTR)
-                .build(&mut assembly)
-                .unwrap();
+        // BYVALSTR (fixed-length string)
+        let byval_marshal_ref = FieldMarshalBuilder::new()
+            .parent(param4)
+            .simple_native_type(NATIVE_TYPE::BYVALSTR)
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed
-            assert_eq!(
-                ansi_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                unicode_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                bstr_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                byval_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // All should succeed
+        assert_eq!(
+            ansi_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            unicode_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            bstr_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            byval_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_realistic_pinvoke() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Realistic P/Invoke scenario: Win32 API function
-            // BOOL CreateDirectory(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
+        // Realistic P/Invoke scenario: Win32 API function
+        // BOOL CreateDirectory(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
 
-            // Parameter 1: LPCWSTR (Unicode string path)
-            let path_param = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
-            let path_marshal_ref = FieldMarshalBuilder::new()
-                .parent(path_param)
-                .unicode_string() // LPCWSTR
-                .build(&mut assembly)
-                .unwrap();
+        // Parameter 1: LPCWSTR (Unicode string path)
+        let path_param = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let path_marshal_ref = FieldMarshalBuilder::new()
+            .parent(path_param)
+            .unicode_string() // LPCWSTR
+            .build(&mut assembly)
+            .unwrap();
 
-            // Parameter 2: LPSECURITY_ATTRIBUTES (structure pointer)
-            let security_param =
-                CodedIndex::new(TableId::Param, 2, CodedIndexType::HasFieldMarshal);
-            let security_marshal_ref = FieldMarshalBuilder::new()
-                .parent(security_param)
-                .simple_native_type(NATIVE_TYPE::PTR) // Pointer to struct
-                .build(&mut assembly)
-                .unwrap();
+        // Parameter 2: LPSECURITY_ATTRIBUTES (structure pointer)
+        let security_param = CodedIndex::new(TableId::Param, 2, CodedIndexType::HasFieldMarshal);
+        let security_marshal_ref = FieldMarshalBuilder::new()
+            .parent(security_param)
+            .simple_native_type(NATIVE_TYPE::PTR) // Pointer to struct
+            .build(&mut assembly)
+            .unwrap();
 
-            // Return value: BOOL (32-bit integer)
-            let return_param = CodedIndex::new(TableId::Param, 0, CodedIndexType::HasFieldMarshal); // Return value
-            let return_marshal_ref = FieldMarshalBuilder::new()
-                .parent(return_param)
-                .simple_native_type(NATIVE_TYPE::I4) // 32-bit bool
-                .build(&mut assembly)
-                .unwrap();
+        // Return value: BOOL (32-bit integer)
+        let return_param = CodedIndex::new(TableId::Param, 0, CodedIndexType::HasFieldMarshal); // Return value
+        let return_marshal_ref = FieldMarshalBuilder::new()
+            .parent(return_param)
+            .simple_native_type(NATIVE_TYPE::I4) // 32-bit bool
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed
-            assert_eq!(
-                path_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                security_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                return_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
+        // All should succeed
+        assert_eq!(
+            path_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            security_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            return_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
 
-            // All should be different references
-            assert!(!std::sync::Arc::ptr_eq(
-                &path_marshal_ref,
-                &security_marshal_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &path_marshal_ref,
-                &return_marshal_ref
-            ));
-            assert!(!std::sync::Arc::ptr_eq(
-                &security_marshal_ref,
-                &return_marshal_ref
-            ));
-        }
+        // All should be different references
+        assert!(!std::sync::Arc::ptr_eq(
+            &path_marshal_ref,
+            &security_marshal_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &path_marshal_ref,
+            &return_marshal_ref
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &security_marshal_ref,
+            &return_marshal_ref
+        ));
     }
 
     #[test]
     fn test_field_marshal_builder_struct_fields() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Realistic struct marshaling: POINT structure
-            // struct POINT { LONG x; LONG y; };
+        // Realistic struct marshaling: POINT structure
+        // struct POINT { LONG x; LONG y; };
 
-            let x_field = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
-            let y_field = CodedIndex::new(TableId::Field, 2, CodedIndexType::HasFieldMarshal);
+        let x_field = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
+        let y_field = CodedIndex::new(TableId::Field, 2, CodedIndexType::HasFieldMarshal);
 
-            // X coordinate as 32-bit signed integer
-            let x_marshal_ref = FieldMarshalBuilder::new()
-                .parent(x_field)
-                .simple_native_type(NATIVE_TYPE::I4)
-                .build(&mut assembly)
-                .unwrap();
+        // X coordinate as 32-bit signed integer
+        let x_marshal_ref = FieldMarshalBuilder::new()
+            .parent(x_field)
+            .simple_native_type(NATIVE_TYPE::I4)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Y coordinate as 32-bit signed integer
-            let y_marshal_ref = FieldMarshalBuilder::new()
-                .parent(y_field)
-                .simple_native_type(NATIVE_TYPE::I4)
-                .build(&mut assembly)
-                .unwrap();
+        // Y coordinate as 32-bit signed integer
+        let y_marshal_ref = FieldMarshalBuilder::new()
+            .parent(y_field)
+            .simple_native_type(NATIVE_TYPE::I4)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Both should succeed
-            assert_eq!(
-                x_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert_eq!(
-                y_marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-            assert!(!std::sync::Arc::ptr_eq(&x_marshal_ref, &y_marshal_ref));
-        }
+        // Both should succeed
+        assert_eq!(
+            x_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert_eq!(
+            y_marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
+        assert!(!std::sync::Arc::ptr_eq(&x_marshal_ref, &y_marshal_ref));
     }
 
     #[test]
     fn test_field_marshal_builder_high_level_native_type_spec() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test high-level NativeType specification
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                .native_type_spec(NativeType::LPWStr {
-                    size_param_index: Some(2),
-                })
-                .build(&mut assembly)
-                .unwrap();
+        // Test high-level NativeType specification
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            .native_type_spec(NativeType::LPWStr {
+                size_param_index: Some(2),
+            })
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_variable_array() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
+        let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test variable array marshaling
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(field_ref)
-                .variable_array(NativeType::I4, Some(1), Some(10))
-                .build(&mut assembly)
-                .unwrap();
+        // Test variable array marshaling
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(field_ref)
+            .variable_array(NATIVE_TYPE::I4, Some(1), Some(10))
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_fixed_array_typed() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
+        let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test fixed array marshaling with type specification
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(field_ref)
-                .fixed_array_typed(Some(NativeType::Boolean), 64)
-                .build(&mut assembly)
-                .unwrap();
+        // Test fixed array marshaling with type specification
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(field_ref)
+            .fixed_array_typed(Some(NATIVE_TYPE::BOOLEAN), 64)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_native_struct() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
+        let field_ref = CodedIndex::new(TableId::Field, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test native struct marshaling
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(field_ref)
-                .native_struct(Some(4), Some(128))
-                .build(&mut assembly)
-                .unwrap();
+        // Test native struct marshaling
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(field_ref)
+            .native_struct(Some(4), Some(128))
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_pointer() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test pointer marshaling
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                .pointer(Some(NativeType::I4))
-                .build(&mut assembly)
-                .unwrap();
+        // Test pointer marshaling
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            .pointer(Some(NATIVE_TYPE::I4))
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_custom_marshaler() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test custom marshaler
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                .custom_marshaler(
-                    "12345678-1234-5678-9ABC-DEF012345678",
-                    "NativeType",
-                    "cookie_data",
-                    "MyAssembly.CustomMarshaler",
-                )
-                .build(&mut assembly)
-                .unwrap();
+        // Test custom marshaler
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            .custom_marshaler(
+                "12345678-1234-5678-9ABC-DEF012345678",
+                "NativeType",
+                "cookie_data",
+                "MyAssembly.CustomMarshaler",
+            )
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_safe_array() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test safe array marshaling
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                .safe_array(crate::metadata::marshalling::VARIANT_TYPE::I4, None)
-                .build(&mut assembly)
-                .unwrap();
+        // Test safe array marshaling
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            .safe_array(crate::metadata::marshalling::VARIANT_TYPE::I4, None)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 
     #[test]
     fn test_field_marshal_builder_marshalling_info() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
+        let param_ref = CodedIndex::new(TableId::Param, 1, CodedIndexType::HasFieldMarshal);
 
-            // Test complex marshalling info
-            let info = MarshallingInfo {
-                primary_type: NativeType::LPStr {
-                    size_param_index: Some(1),
-                },
-                additional_types: vec![NativeType::Boolean],
-            };
+        // Test complex marshalling info
+        let info = MarshallingInfo {
+            primary_type: NativeType::LPStr {
+                size_param_index: Some(1),
+            },
+        };
 
-            let marshal_ref = FieldMarshalBuilder::new()
-                .parent(param_ref)
-                .marshalling_info(&info)
-                .build(&mut assembly)
-                .unwrap();
+        let marshal_ref = FieldMarshalBuilder::new()
+            .parent(param_ref)
+            .marshalling_info(&info)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Should succeed
-            assert_eq!(
-                marshal_ref.kind(),
-                ChangeRefKind::TableRow(TableId::FieldMarshal)
-            );
-        }
+        // Should succeed
+        assert_eq!(
+            marshal_ref.kind(),
+            ChangeRefKind::TableRow(TableId::FieldMarshal)
+        );
     }
 }

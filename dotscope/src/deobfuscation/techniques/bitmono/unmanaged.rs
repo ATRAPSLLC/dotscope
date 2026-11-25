@@ -217,11 +217,7 @@ fn extract_native_string(
     let method = assembly.method(&native_token).ok()?;
     let rva = method.rva.filter(|&r| r > 0)?;
 
-    let file = assembly.file();
-    let offset = file.rva_to_offset(rva as usize).ok()?;
-    let data = file.data();
-
-    let native_bytes = data.get(offset..)?;
+    let native_bytes = assembly.file().section_bounded(rva as usize).ok()?;
 
     // Use traversal-based disassembly to find where the code ends.
     // This follows control flow edges (including trampolines, call targets,
@@ -271,7 +267,7 @@ fn extract_native_string(
 mod tests {
     use crate::{
         analysis::x86_native_body_size, deobfuscation::techniques::Technique,
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
@@ -344,8 +340,7 @@ mod tests {
 
     #[test]
     fn test_detect_positive() {
-        let assembly =
-            load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_unmanagedstring.exe");
+        let assembly = load_sample("packers/bitmono/0.39.0/bitmono_unmanagedstring.exe");
 
         let technique = super::BitMonoUnmanaged;
         let detection = technique.detect(&assembly);
@@ -362,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = super::BitMonoUnmanaged;
         let detection = technique.detect(&assembly);

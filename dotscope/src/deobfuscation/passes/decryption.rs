@@ -65,6 +65,7 @@ use std::{
 };
 
 use analyssa::{
+    analysis::Machine,
     graph::{
         algorithms::{compute_dominators, DominatorTree},
         GraphBase, NodeId,
@@ -75,20 +76,20 @@ use rayon::prelude::*;
 
 use crate::{
     analysis::{
-        CilTarget, ConstValue, MethodRef, SsaCfg, SsaFunction, SsaOp, SsaVarId, TypeRef,
-        ValueResolver,
+        CilTarget, ConstValue, InstrId, MethodRef, SsaCfg, SsaFunction, SsaOp, SsaOpCilExt,
+        SsaVarId, TypeRef, ValueResolver, ValueResolverCilExt,
     },
     compiler::{CompilerContext, EventKind, EventLog, ModificationScope, PassCapability, SsaPass},
     deobfuscation::{
         context::AnalysisContext,
         decryptors::{DecryptorContext, FailureReason},
-        CfgInfo, EmulationTemplatePool, StateMachineProvider, StateMachineState, StateUpdateCall,
+        CfgInfo, EmulationTemplatePool, StateMachineCallSite, StateMachineProvider,
+        StateMachineState, StateUpdateCall,
     },
     emulation::{
         EmValue, EmulationError, EmulationOutcome, EmulationProcess, EmulationThread, StepResult,
     },
     metadata::{
-        tables::{skip_unreadable, TypeRefRaw},
         token::Token,
         typesystem::{CilFlavor, CilPrimitive, CilPrimitiveKind, PointerSize},
     },
@@ -101,7 +102,7 @@ use crate::{
 /// evaluate them through emulation, replacing call sites with the decrypted
 /// values (constants, strings, or other types).
 ///
-/// It works in tandem with the [`DecryptorContext`](crate::deobfuscation::DecryptorContext)
+/// It works in tandem with the [`DecryptorContext`]
 /// which is populated during the detection phase by obfuscator-specific and
 /// heuristic detectors.
 ///
@@ -213,7 +214,8 @@ impl DecryptionPass {
     ///
     /// # Arguments
     ///
-    /// * `decryptor` - The resolved decryptor MethodDef token.
+    /// * `call_target` - The token the call names: the decryptor, or for a generic one its
+    ///   instantiation (a MethodSpec), which the emulation and the cache both key on.
     /// * `args` - The constant argument values.
     ///
     /// # Returns
@@ -222,13 +224,15 @@ impl DecryptionPass {
     /// optional failure reason.
     fn try_decrypt_at_call(
         &self,
-        decryptor: Token,
         call_target: Token,
         args: &[ConstValue],
     ) -> (Option<ConstValue>, Option<FailureReason>) {
+        // The cache is keyed by the call target, the instantiation the call names: a generic
+        // decryptor's `Get<int>(5)` and `Get<string>(5)` are one method definition, and keyed
+        // by it the second answered with the first's value.
         if let Some(cached) = self
             .decryptors
-            .with_cached(decryptor, args, ConstValue::clone)
+            .with_cached(call_target, args, ConstValue::clone)
         {
             return (Some(cached), None);
         }
@@ -238,10 +242,68 @@ impl DecryptionPass {
         let (result, failure) = self.emulate_call(call_target, args);
 
         if let Some(ref value) = result {
-            self.decryptors.cache_value(decryptor, args, value.clone());
+            self.decryptors
+                .cache_value(call_target, args, value.clone());
         }
 
         (result, failure)
+    }
+
+    /// The value a decryptor receives for the constant `value`, allocated in `process` where
+    /// it is an object: a user string read from the assembly's `#US` heap, a string or an
+    /// array an earlier decryption produced.
+    ///
+    /// # Errors
+    ///
+    /// Why `process` cannot build the value: a user string the heap does not hold, an array
+    /// whose element type or data does not resolve, a constant with no CIL value.
+    fn argument(
+        process: &EmulationProcess,
+        value: &ConstValue,
+    ) -> std::result::Result<EmValue, String> {
+        let heap = process.address_space();
+        match value {
+            ConstValue::String(offset) => {
+                let text = process
+                    .assembly()
+                    .and_then(|assembly| assembly.userstrings())
+                    .and_then(|strings| strings.get(*offset as usize).ok())
+                    .ok_or_else(|| format!("no user string at 0x{offset:X}"))?
+                    .to_string_lossy();
+                heap.alloc_string(&text)
+                    .map(EmValue::ObjectRef)
+                    .map_err(|e| e.to_string())
+            }
+            ConstValue::DecryptedString(text) => heap
+                .alloc_string(text)
+                .map(EmValue::ObjectRef)
+                .map_err(|e| e.to_string()),
+            ConstValue::DecryptedArray(array) => {
+                let token = array.element_type_ref.token();
+                let flavor = process
+                    .assembly()
+                    .and_then(|assembly| assembly.types().get(&token))
+                    .map(|element| element.flavor().clone())
+                    .ok_or_else(|| format!("array element type {token} does not resolve"))?;
+                let size = array.element_size;
+                if array.data.len().checked_rem(size) != Some(0) {
+                    return Err(format!(
+                        "{} bytes of array data are no whole number of {size}-byte elements",
+                        array.data.len()
+                    ));
+                }
+                let elements = array
+                    .data
+                    .chunks_exact(size)
+                    .map(|bytes| EmValue::from_le_bytes(bytes, &flavor, PointerSize::Bit32))
+                    .collect();
+                heap.managed_heap()
+                    .alloc_array_with_values(flavor, elements)
+                    .map(EmValue::ObjectRef)
+                    .map_err(|e| e.to_string())
+            }
+            other => EmValue::try_from(other).map_err(|e| e.to_string()),
+        }
     }
 
     /// Emulates a call to get the decrypted constant.
@@ -280,26 +342,23 @@ impl DecryptionPass {
             }
         };
 
-        // Convert ConstValue arguments to EmValue.
-        // ConstValue::String holds a #US heap offset — resolve it to an actual
-        // string from the assembly's UserStrings heap and allocate on the
-        // emulation heap so the decryptor receives a proper ObjectRef.
-        let em_args: Vec<EmValue> = args
-            .iter()
-            .map(|cv| match cv {
-                ConstValue::String(us_offset) => {
-                    let resolved = process.assembly().and_then(|asm| {
-                        let us = asm.userstrings()?;
-                        let u16str = us.get(*us_offset as usize).ok()?;
-                        let s = u16str.to_string_lossy();
-                        let href = process.address_space().alloc_string(&s).ok()?;
-                        Some(EmValue::ObjectRef(href))
-                    });
-                    resolved.unwrap_or_else(|| EmValue::from(cv))
+        // A decryptor receives each argument as the value the evaluation stack holds,
+        // objects allocated in the process; one the process cannot build fails the site
+        // rather than reaching the decryptor as something else.
+        let mut em_args = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            match Self::argument(&process, arg) {
+                Ok(value) => em_args.push(value),
+                Err(reason) => {
+                    return (
+                        None,
+                        Some(FailureReason::EmulationFailed(format!(
+                            "argument {index}: {reason}"
+                        ))),
+                    );
                 }
-                _ => EmValue::from(cv),
-            })
-            .collect();
+            }
+        }
 
         // Use thread-safe container to capture the return value
         let captured_value: Arc<Mutex<Option<ConstValue>>> = Arc::new(Mutex::new(None));
@@ -392,28 +451,17 @@ impl DecryptionPass {
     /// type registry and the existing `CilPrimitiveData::clr_full_name()` mapping.
     /// Resolves a `CilFlavor` to a real TypeRef token from the assembly's metadata.
     ///
-    /// Searches the TypeRef table for the .NET type name matching the flavor
+    /// Finds the core library TypeRef for the .NET type matching the flavor
     /// (e.g., `U1` → TypeRef for `System.Byte`). Returns `None` if the assembly
     /// doesn't reference this type.
     fn resolve_flavor_to_typeref(flavor: &CilFlavor, thread: &EmulationThread) -> Option<Token> {
         let kind = CilPrimitiveKind::try_from(flavor.clone()).ok()?;
-        let primitive = CilPrimitive::new(kind);
-        let namespace = primitive.namespace();
-        let name = primitive.name();
-
-        let asm = thread.assembly()?;
-        let tables = asm.tables()?;
-        let strings = asm.strings()?;
-        let type_refs = tables.table::<TypeRefRaw>()?;
-
-        for row in type_refs.iter().filter_map(skip_unreadable) {
-            let row_name = strings.get(row.type_name as usize).ok()?;
-            let row_ns = strings.get(row.type_namespace as usize).ok()?;
-            if row_name == name && row_ns == namespace {
-                return Some(row.token);
-            }
-        }
-        None
+        let fullname = CilPrimitive::new(kind).clr_full_name();
+        thread
+            .assembly()?
+            .types()
+            .get_corelib_typeref(fullname)
+            .map(|ty| ty.token)
     }
 
     /// Converts an EmValue to a ConstValue for decryption purposes.
@@ -426,11 +474,11 @@ impl DecryptionPass {
     /// (e.g., wrong key leading to out-of-bounds array access). Accepting null
     /// would silence actual decryption failures.
     fn emvalue_to_constvalue(em_value: &EmValue, thread: &EmulationThread) -> Option<ConstValue> {
-        // Reject Null — typically means decryption failed (wrong key, OOB access, etc.).
+        // Reject Null - typically means decryption failed (wrong key, OOB access, etc.).
         // Some decryptors may legitimately return null for conditional paths; if this
         // becomes an issue, the caller should distinguish emulation-error from returned-null.
         if matches!(em_value, EmValue::Null) {
-            log::debug!("Decryption: emulation returned Null — treating as failure");
+            log::debug!("Decryption: emulation returned Null - treating as failure");
             return None;
         }
 
@@ -553,8 +601,8 @@ impl DecryptionPass {
         ctx: &CompilerContext,
         assembly: &CilObject,
         provider: &dyn StateMachineProvider,
-        ptr_size: PointerSize,
-    ) -> (bool, EventLog) {
+        machine: Machine,
+    ) -> (bool, EventLog, HashSet<InstrId>) {
         let changes = EventLog::new();
 
         // Clone semantics into Arc for StateMachineState
@@ -563,7 +611,7 @@ impl DecryptionPass {
         // Find all state update calls using the provider
         let state_updates = provider.find_state_updates(ssa);
         if state_updates.is_empty() {
-            return (false, changes);
+            return (false, changes, HashSet::new());
         }
 
         // Build CFG info for path-sensitive analysis
@@ -571,25 +619,25 @@ impl DecryptionPass {
 
         // Find decryptor call sites using the provider's pattern matching.
         // Use all_resolvable_tokens() to include MethodSpec tokens that map to
-        // registered decryptors via MemberRef — these are needed for generic
+        // registered decryptors via MemberRef - these are needed for generic
         // instantiations like Get<int32>() that may use MemberRef indirection.
         let decryptor_tokens = self.decryptors.all_resolvable_tokens();
         let call_sites =
             provider.find_decryptor_call_sites(ssa, &state_updates, &decryptor_tokens, assembly);
 
         if call_sites.is_empty() {
-            return (false, changes);
+            return (false, changes, HashSet::new());
         }
 
         // Find ALL state machine seeds in the method using the provider
         let all_seeds = provider.find_initializations(ssa, ctx, method_token, assembly);
 
         let mut changed = false;
-        let mut failures: Vec<(Token, usize, FailureReason)> = Vec::new();
+        let mut failures: Vec<(Token, Option<InstrId>, FailureReason)> = Vec::new();
 
         // Process each decryptor call independently with its own state machine
         for call_site in &call_sites {
-            let location = call_site.location();
+            let location = call_site.identity();
 
             if self.decryptors.is_already_decrypted(method_token, location) {
                 continue;
@@ -601,10 +649,14 @@ impl DecryptionPass {
                 continue;
             }
 
-            // Find the correct seed for this call site using the provider
-            let seed = provider
-                .find_seed_for_call(&all_seeds, call_site, &cfg_info.as_ref())
-                .unwrap_or(0);
+            // Find the correct seed for this call site using the provider. Without one the
+            // state the decryptor reads is unknown: seed 0 decrypted a wrong value that looked
+            // like a right one.
+            let Some(seed) = provider.find_seed_for_call(&all_seeds, call_site, &cfg_info.as_ref())
+            else {
+                failures.push((call_site.decryptor, location, FailureReason::SeedNotFound));
+                continue;
+            };
 
             // Initialize fresh state machine from seed
             let mut state = StateMachineState::from_seed_u32(seed, Arc::clone(&semantics));
@@ -627,12 +679,12 @@ impl DecryptionPass {
             );
 
             // Construct ValueResolver for this iteration (reborrow ssa as shared)
-            let mut resolver = ValueResolver::new(&*ssa, ptr_size).with_path_aware_fallback();
-            resolver.load_known_values(ctx, method_token);
+            let mut resolver = ValueResolver::new(&*ssa, machine).with_path_aware_fallback();
+            resolver.load_known_values();
 
             // Simulate the relevant state updates in order.
             // If any prior update can't be resolved, the state machine is
-            // desynchronized — skip this call site for now (retriable).
+            // desynchronized - skip this call site for now (retriable).
             let simulation_ok = Self::simulate_state_updates(
                 &mut state,
                 &relevant_updates,
@@ -701,8 +753,7 @@ impl DecryptionPass {
 
             // Decrypt using the computed key
             let args = vec![ConstValue::I32(actual_key)];
-            let (result, failure) =
-                self.try_decrypt_at_call(call_site.decryptor, call_site.call_target, &args);
+            let (result, failure) = self.try_decrypt_at_call(call_site.call_target, &args);
             if let Some(value) = result {
                 self.decryptors.record_success(
                     call_site.decryptor,
@@ -718,7 +769,7 @@ impl DecryptionPass {
                 };
                 changes
                     .record(event_kind)
-                    .at(method_token, location)
+                    .at(method_token, call_site.instr_idx)
                     .message(format!(
                         "decrypted (CFG mode, flag=0x{flag:02X}, inc=0x{increment:08X}): {value}"
                     ));
@@ -756,14 +807,15 @@ impl DecryptionPass {
             );
         }
 
-        // Only clean up state machine instructions when ALL call sites have been
-        // resolved (successfully decrypted or permanently failed). If retriable
-        // failures remain, preserve the state update calls so the next fixpoint
-        // iteration can retry with more constants resolved.
+        // Only clean up state machine instructions when every call site has been
+        // decrypted. A site that failed, for now or for good, stays a call of its
+        // decryptor in the output, and that call reads the state the machine's
+        // initialization and every update before it produce: the state is sequential,
+        // so removing any of them hands it a wrong state at runtime. A retriable failure
+        // also needs them for the next fixpoint iteration's retry.
         let all_resolved = call_sites.iter().all(|cs| {
-            let loc = cs.location();
-            self.decryptors.is_already_decrypted(method_token, loc)
-                || self.decryptors.has_permanent_failure(method_token, loc)
+            self.decryptors
+                .is_already_decrypted(method_token, cs.identity())
         });
 
         if all_resolved {
@@ -791,6 +843,44 @@ impl DecryptionPass {
                 &mut changed,
             );
 
+            // The padding updates whose result nothing but a `pop` reads (ConfuserEx discards
+            // it) advance a state nothing observes any more, and keep the context type alive:
+            // they go with their pops, before the initialization, which a `newobj` context
+            // they read keeps
+            let padding: Vec<&StateUpdateCall> = state_updates
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !feeding_indices.contains(i))
+                .map(|(_, update)| update)
+                .collect();
+            let padding_results: HashSet<SsaVarId> =
+                padding.iter().map(|update| update.dest).collect();
+            let mut sites: Vec<(usize, usize)> = padding
+                .iter()
+                .map(|update| (update.block_idx, update.instr_idx))
+                .collect();
+            for (block_idx, block) in ssa.iter_blocks() {
+                for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                    if let SsaOp::Pop { value } = instr.op() {
+                        if padding_results.contains(value) {
+                            sites.push((block_idx, instr_idx));
+                        }
+                    }
+                }
+            }
+            for (block_idx, instr_idx, op) in ssa.remove_unread_instructions(sites) {
+                changed = true;
+                if !matches!(op, SsaOp::Pop { .. }) {
+                    changes
+                        .record(EventKind::InstructionRemoved)
+                        .at(
+                            method_token,
+                            block_idx.saturating_mul(1000).saturating_add(instr_idx),
+                        )
+                        .message("removed state machine update call nothing reads");
+                }
+            }
+
             // Remove state machine initialization calls (constructor)
             Self::cleanup_state_initialization(
                 ssa,
@@ -801,7 +891,13 @@ impl DecryptionPass {
             );
         }
 
-        (changed, changes)
+        // The call sites this mode answered for, decrypted or failed: the direct mode
+        // that follows leaves them to it
+        let claimed: HashSet<InstrId> = call_sites
+            .iter()
+            .filter_map(StateMachineCallSite::identity)
+            .collect();
+        (changed, changes, claimed)
     }
 
     /// Builds CFG analysis info for a method.
@@ -900,7 +996,10 @@ impl DecryptionPass {
     /// Removes state machine initialization calls (constructor).
     ///
     /// After decryption, the CFGCtx constructor calls are dead code but DCE
-    /// won't remove them since Call ops aren't pure. Replace them with Nop.
+    /// won't remove them since Call ops aren't pure. A value-type constructor
+    /// `call` defines nothing and always goes. A `newobj` defines the context
+    /// object, which a state update the cleanup leaves in place (one feeding
+    /// no decryptor) still reads, so it goes only once nothing reads it.
     fn cleanup_state_initialization(
         ssa: &mut SsaFunction,
         seeds: &[(usize, usize, u32)],
@@ -908,21 +1007,18 @@ impl DecryptionPass {
         changes: &EventLog,
         changed: &mut bool,
     ) {
-        for &(block_idx, instr_idx, _seed) in seeds {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                    // Constructor calls return void, so replace with Nop
-                    instr.set_op(SsaOp::Nop);
-                    *changed = true;
-                    changes
-                        .record(EventKind::InstructionRemoved)
-                        .at(
-                            method_token,
-                            block_idx.saturating_mul(1000).saturating_add(instr_idx),
-                        )
-                        .message("removed state machine initialization call");
-                }
-            }
+        let sites = seeds
+            .iter()
+            .map(|&(block_idx, instr_idx, _seed)| (block_idx, instr_idx));
+        for (block_idx, instr_idx, _) in ssa.remove_unread_instructions(sites) {
+            *changed = true;
+            changes
+                .record(EventKind::InstructionRemoved)
+                .at(
+                    method_token,
+                    block_idx.saturating_mul(1000).saturating_add(instr_idx),
+                )
+                .message("removed state machine initialization call");
         }
     }
 }
@@ -951,7 +1047,7 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
     }
 
     fn finalize(&mut self, _host: &CompilerContext) -> analyssa::Result<()> {
-        // Pool lifecycle is managed by the engine — nothing to release here.
+        // Pool lifecycle is managed by the engine - nothing to release here.
         Ok(())
     }
 
@@ -972,20 +1068,23 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
             return Ok(false);
         }
 
-        let ptr_size = PointerSize::from_is_64bit(assembly.file().pe().is_64bit);
+        let machine = host.machine();
 
         // Track whether any mode made changes
         let mut any_changed = false;
 
+        // Call sites the state machine mode answered for; the direct mode leaves them to it
+        let mut claimed: HashSet<InstrId> = HashSet::new();
+
         // Check if this method uses a state machine (CFG mode) - requires sequential processing
         if let Some(provider) = self.get_statemachine_provider_for_method(method_token) {
-            let (sm_changed, sm_changes) = self.process_state_machine_mode(
+            let (sm_changed, sm_changes, sm_claimed) = self.process_state_machine_mode(
                 ssa,
                 method_token,
                 ctx,
                 assembly,
                 &*provider,
-                ptr_size,
+                machine,
             );
             if sm_changed {
                 any_changed = true;
@@ -993,6 +1092,7 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
             if !sm_changes.is_empty() {
                 ctx.events.merge(&sm_changes);
             }
+            claimed = sm_claimed;
             // Fall through to normal-mode processing to catch any remaining
             // decryptor calls not matched by the CFG XOR pattern. In CFG-mode
             // methods, some calls may have pre-folded arguments that appear as
@@ -1003,30 +1103,50 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
 
         let changes = EventLog::new();
 
-        let mut resolver = ValueResolver::new(&*ssa, ptr_size).with_path_aware_fallback();
-        resolver.load_known_values(ctx, method_token);
+        let mut resolver = ValueResolver::new(&*ssa, machine).with_path_aware_fallback();
+        resolver.load_known_values();
 
         // Phase 1: Collect decryption candidates (sequential)
-        type DecryptionCandidate = (usize, usize, SsaVarId, Token, Token, usize, Vec<ConstValue>);
+        /// `(block, instruction, destination, decryptor, call target, call
+        /// identity, constant arguments)`.
+        ///
+        /// The block and instruction say where to rewrite; the identity is what
+        /// the result is recorded against, and survives the rewrite.
+        type DecryptionCandidate = (
+            usize,
+            usize,
+            SsaVarId,
+            Token,
+            Token,
+            Option<InstrId>,
+            Vec<ConstValue>,
+        );
         let mut candidates: Vec<DecryptionCandidate> = Vec::new();
-        let mut failures: Vec<(Token, usize, FailureReason)> = Vec::new();
+        let mut failures: Vec<(Token, Option<InstrId>, FailureReason)> = Vec::new();
 
         for (block_idx, block) in ssa.iter_blocks() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let (call_target, args, dest) = match instr.op() {
-                    SsaOp::Call { method, args, dest } | SsaOp::CallVirt { method, args, dest } => {
-                        (method.token(), args, *dest)
-                    }
-                    _ => continue,
+                let Some((call_target, call)) = instr.op().method_call() else {
+                    continue;
                 };
-
-                let Some(dest) = dest else { continue };
+                let (args, Some(dest)) = (&call.args, call.dest) else {
+                    continue;
+                };
                 let Some(decryptor) = self.decryptors.resolve_decryptor(call_target) else {
                     continue;
                 };
 
-                let location = block_idx.saturating_mul(1000).saturating_add(instr_idx);
+                // The call's identity, not where it sits: every rewrite above
+                // it renumbers the position, and a block of a thousand
+                // instructions collides with the next block outright.
+                let location = instr.id();
 
+                // A site the state machine mode answered for is its own: its argument is
+                // the state machine's key, which this mode cannot know, and trying it here
+                // recorded a second, misleading failure for one call
+                if location.is_some_and(|id| claimed.contains(&id)) {
+                    continue;
+                }
                 if self.decryptors.is_already_decrypted(method_token, location) {
                     continue;
                 }
@@ -1062,7 +1182,7 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
             .into_par_iter()
             .filter_map(
                 |(block_idx, instr_idx, dest, decryptor, call_target, location, args)| {
-                    let (result, failure) = self.try_decrypt_at_call(decryptor, call_target, &args);
+                    let (result, failure) = self.try_decrypt_at_call(call_target, &args);
 
                     if let Some(value) = result {
                         Some((block_idx, instr_idx, dest, decryptor, location, value))
@@ -1139,18 +1259,87 @@ impl SsaPass<CilTarget, CompilerContext> for DecryptionPass {
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
     use crate::{
         analysis::{
-            CallGraph, ConstValue, MethodRef, SsaFunction, SsaFunctionBuilder, SsaType, SsaVarId,
-            ValueResolver,
+            CallGraph, Callee, ConstValue, DefSite, MethodRef, SsaFunction, SsaFunctionBuilder,
+            SsaOp, SsaType, SsaVarId, ValueResolver, VariableOrigin,
         },
-        compiler::SsaPass,
+        compiler::{EventLog, SsaPass},
         deobfuscation::{
-            context::AnalysisContext, passes::DecryptionPass, DeobfuscationEngine, EngineConfig,
+            context::AnalysisContext, passes::DecryptionPass, statemachine::StateMachineSemantics,
+            DeobfuscationEngine, EngineConfig,
         },
-        metadata::{token::Token, typesystem::PointerSize},
-        test::helpers::test_assembly_arc,
+        metadata::token::Token,
+        testkit::{
+            emulation::process_builder, fixture, helpers::test_assembly_arc, passes::run_verified,
+        },
     };
+
+    /// A decryptor receives each constant as the value the stack holds: strings and arrays as
+    /// objects of the process, handles as `ldtoken` pushes them. Each went in as null, and a
+    /// user string the heap does not hold as its offset.
+    #[test]
+    fn a_decryptor_receives_its_arguments_as_the_stack_holds_them() {
+        let assembly = test_assembly_arc();
+        let process = process_builder()
+            .assembly_arc(Arc::clone(&assembly))
+            .build()
+            .unwrap();
+        let heap = process.address_space().managed_heap();
+        let object = |value: &ConstValue| match DecryptionPass::argument(&process, value) {
+            Ok(EmValue::ObjectRef(object)) => object,
+            other => panic!("{value:?} became {other:?}"),
+        };
+
+        let decrypted = object(&ConstValue::DecryptedString("decrypted".into()));
+        assert_eq!(&*heap.get_string(decrypted).unwrap(), "decrypted");
+
+        let (offset, text) = assembly
+            .userstrings()
+            .and_then(|strings| strings.iter().find(|(offset, _)| *offset != 0))
+            .expect("the sample has a user string");
+        let user = object(&ConstValue::String(u32::try_from(offset).unwrap()));
+        assert_eq!(*heap.get_string(user).unwrap(), *text.to_string_lossy());
+        assert!(
+            DecryptionPass::argument(&process, &ConstValue::String(u32::MAX)).is_err(),
+            "a user string the heap does not hold is no argument"
+        );
+
+        let int32 = assembly
+            .types()
+            .iter()
+            .find(|entry| *entry.value().flavor() == CilFlavor::I4)
+            .map(|entry| *entry.key())
+            .expect("the sample names System.Int32");
+        let array = |data: Vec<u8>| {
+            ConstValue::DecryptedArray(Box::new(DecryptedArrayData {
+                data,
+                element_type_ref: TypeRef::new(int32),
+                element_size: 4,
+            }))
+        };
+        let elements = object(&array(
+            [1_i32, -2].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        ));
+        assert_eq!(
+            heap.get_array_element(elements, 0).unwrap(),
+            EmValue::I32(1)
+        );
+        assert_eq!(
+            heap.get_array_element(elements, 1).unwrap(),
+            EmValue::I32(-2)
+        );
+        assert!(
+            DecryptionPass::argument(&process, &array(vec![0; 5])).is_err(),
+            "five bytes are no whole number of int32s"
+        );
+
+        assert_eq!(
+            DecryptionPass::argument(&process, &ConstValue::Type(TypeRef::new(int32))).unwrap(),
+            EmValue::NativeInt(i64::from(int32.value()))
+        );
+    }
 
     /// Helper to create a minimal analysis context for testing.
     fn create_test_context() -> AnalysisContext {
@@ -1158,6 +1347,60 @@ mod tests {
         let ctx = AnalysisContext::new(call_graph);
         ctx.compiler.set_assembly(test_assembly_arc());
         ctx
+    }
+
+    /// A state machine's `newobj` stays while a state update the cleanup left
+    /// in place still reads the object it creates, and a value-type
+    /// constructor `call`, which defines nothing, goes.
+    #[test]
+    fn test_cleanup_state_initialization_keeps_a_context_still_read() {
+        let ctor = MethodRef::new(Token::new(0x0600_0010));
+        let next = MethodRef::new(Token::new(0x0600_0011));
+        let mut ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    let seed = b.const_i32(0x1234);
+                    let context = b.newobj(ctor, &[seed]);
+                    let flag = b.const_i32(1);
+                    let increment = b.const_i32(2);
+                    let _ = b.call(
+                        Callee::Direct(next),
+                        &[context, flag, increment],
+                        SsaType::I32,
+                    );
+                    let address = b.const_i32(0);
+                    b.call_void(Callee::Direct(ctor), &[address, seed]);
+                    b.ret();
+                });
+            })
+            .unwrap();
+        let position = |ssa: &SsaFunction, wanted: fn(&SsaOp) -> bool| {
+            ssa.block(0)
+                .and_then(|block| block.instructions().iter().position(|i| wanted(i.op())))
+        };
+        let newobj = position(&ssa, |op| matches!(op, SsaOp::NewObj { .. })).unwrap();
+        let ctor_call = position(&ssa, |op| {
+            op.as_call().is_some_and(|call| call.dest.is_none())
+        })
+        .unwrap();
+
+        let changes = EventLog::new();
+        let mut changed = false;
+        DecryptionPass::cleanup_state_initialization(
+            &mut ssa,
+            &[(0, newobj, 0x1234), (0, ctor_call, 0x1234)],
+            Token::new(0x0600_0001),
+            &changes,
+            &mut changed,
+        );
+
+        assert!(changed, "the constructor call is removed");
+        let block = ssa.block(0).unwrap();
+        assert!(
+            matches!(block.instructions()[newobj].op(), SsaOp::NewObj { .. }),
+            "the context object is still read by a state update"
+        );
+        assert!(matches!(block.instructions()[ctor_call].op(), SsaOp::Nop));
     }
 
     #[test]
@@ -1184,9 +1427,13 @@ mod tests {
             .unwrap();
 
         // No decryptors registered, should return false (no changes)
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1211,9 +1458,13 @@ mod tests {
             .unwrap();
 
         // Has decryptors but no calls to them
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1232,16 +1483,20 @@ mod tests {
             .build_with(|f| {
                 f.block(0, |b| {
                     // Call with no destination
-                    b.call_void(MethodRef::new(decryptor_token), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(decryptor_token)), &[]);
                     b.ret();
                 });
             })
             .unwrap();
 
         // Call without destination, can't replace
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1261,16 +1516,24 @@ mod tests {
                 let arg0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
                     // Call with non-constant argument
-                    let _ = b.call(MethodRef::new(decryptor_token), &[arg0], SsaType::I32);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(decryptor_token)),
+                        &[arg0],
+                        SsaType::I32,
+                    );
                     b.ret();
                 });
             })
             .unwrap();
 
         // Argument is not in known_values, should fail
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
 
         // Should have recorded a failure
@@ -1293,15 +1556,23 @@ mod tests {
             .build_with(|f| {
                 f.block(0, |b| {
                     // Call to a different method (not a decryptor)
-                    let _ = b.call(MethodRef::new(other_method), &[], SsaType::I32);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(other_method)),
+                        &[],
+                        SsaType::I32,
+                    );
                     b.ret();
                 });
             })
             .unwrap();
 
-        let changed = pass
-            .run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler)
-            .unwrap();
+        let changed = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        )
+        .unwrap();
         assert!(!changed);
     }
 
@@ -1324,7 +1595,11 @@ mod tests {
                 f.block(0, |b| {
                     let c = b.const_i32(42);
                     // Call via MethodSpec with a destination so we can attempt decryption
-                    let _ = b.call(MethodRef::new(methodspec_token), &[c], SsaType::I32);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(methodspec_token)),
+                        &[c],
+                        SsaType::I32,
+                    );
                     b.ret();
                 });
             })
@@ -1336,7 +1611,12 @@ mod tests {
 
         // This will try to decrypt but fail (no assembly for emulation)
         // The point is that it recognized the MethodSpec as a decryptor call
-        let _ = pass.run_on_method(&mut ssa, &MethodRef::from(method_token), &ctx.compiler);
+        let _ = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        );
 
         // Verify the MethodSpec was resolved to the decryptor and a failure was recorded
         // (failure because there's no assembly to emulate against)
@@ -1345,6 +1625,59 @@ mod tests {
             1,
             "Should record failure for MethodSpec call (recognized but emulation failed)"
         );
+    }
+
+    /// A generic decryptor's results are cached per instantiation: `Get<A>(42)` and
+    /// `Get<B>(42)` are one method definition, and with the cache keyed by it `Get<B>(42)`
+    /// answered `Get<A>(42)`'s value.
+    #[test]
+    fn a_cached_value_answers_only_its_own_instantiation() {
+        let ctx = create_test_context();
+        let decryptor_token = Token::new(0x06000002);
+        let instantiation_a = Token::new(0x2b000001);
+        let instantiation_b = Token::new(0x2b000002);
+        ctx.decryptors.register(decryptor_token);
+        ctx.decryptors
+            .map_methodspec(instantiation_a, decryptor_token);
+        ctx.decryptors
+            .map_methodspec(instantiation_b, decryptor_token);
+        ctx.decryptors
+            .cache_value(instantiation_a, &[ConstValue::I32(42)], ConstValue::I32(7));
+
+        let pass = DecryptionPass::new(&ctx);
+        let method_token = Token::new(0x06000001);
+        let mut ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    let c = b.const_i32(42);
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(instantiation_a)),
+                        &[c],
+                        SsaType::I32,
+                    );
+                    let _ = b.call(
+                        Callee::Direct(MethodRef::new(instantiation_b)),
+                        &[c],
+                        SsaType::I32,
+                    );
+                    b.ret();
+                });
+            })
+            .unwrap();
+        let var_id = ssa.block(0).unwrap().instructions()[0].op().dest().unwrap();
+        ctx.add_known_value(method_token, var_id, ConstValue::I32(42));
+
+        let _ = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        );
+
+        // `Get<A>(42)` answers from the cache; `Get<B>(42)` has no cached value and no
+        // emulator here to compute one
+        assert_eq!(ctx.decryptors.total_decrypted(), 1);
+        assert_eq!(ctx.decryptors.total_failed(), 1);
     }
 
     #[test]
@@ -1356,20 +1689,41 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// A function with `values.len()` locals, each recorded as holding the
+    /// constant given.
+    ///
+    /// The shape a decryptor sees: constant propagation has already proved what
+    /// the arguments are, and recorded it on the values themselves.
+    fn function_with_known(values: &[i32]) -> (SsaFunction, Vec<SsaVarId>) {
+        let mut ssa: SsaFunction = SsaFunction::new(0, values.len());
+        let vars: Vec<SsaVarId> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let var = ssa.create_variable(
+                    VariableOrigin::Local(u16::try_from(index).unwrap_or(u16::MAX)),
+                    0,
+                    DefSite::entry(),
+                    SsaType::I32,
+                );
+                if let Some(variable) = ssa.variable_mut(var) {
+                    variable
+                        .facts_mut()
+                        .set_known_value(ConstValue::I32(*value));
+                }
+                var
+            })
+            .collect();
+        (ssa, vars)
+    }
+
     #[test]
     fn test_get_arg_constants_all_known() {
-        let ctx = create_test_context();
-        let ssa = SsaFunction::new(0, 0);
+        let (ssa, vars) = function_with_known(&[42, 100]);
+        let (var1, var2) = (vars[0], vars[1]);
 
-        let method = Token::new(0x06000001);
-        let var1 = SsaVarId::from_index(0);
-        let var2 = SsaVarId::from_index(1);
-
-        ctx.add_known_value(method, var1, ConstValue::I32(42));
-        ctx.add_known_value(method, var2, ConstValue::I32(100));
-
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
-        resolver.load_known_values(&ctx, method);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
+        resolver.load_known_values();
         let args = vec![var1, var2];
         let result = DecryptionPass::get_arg_constants(&args, &mut resolver);
 
@@ -1382,18 +1736,15 @@ mod tests {
 
     #[test]
     fn test_get_arg_constants_partial() {
-        let ctx = create_test_context();
-        let ssa = SsaFunction::new(0, 0);
+        let (mut ssa, vars) = function_with_known(&[42, 0]);
+        let (var1, var2) = (vars[0], vars[1]);
+        // The second argument is not known.
+        if let Some(variable) = ssa.variable_mut(var2) {
+            variable.facts_mut().clear_known_value();
+        }
 
-        let method = Token::new(0x06000001);
-        let var1 = SsaVarId::from_index(0);
-        let var2 = SsaVarId::from_index(1);
-
-        ctx.add_known_value(method, var1, ConstValue::I32(42));
-        // var2 not set
-
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
-        resolver.load_known_values(&ctx, method);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
+        resolver.load_known_values();
         let args = vec![var1, var2];
         let result = DecryptionPass::get_arg_constants(&args, &mut resolver);
 
@@ -1403,12 +1754,10 @@ mod tests {
 
     #[test]
     fn test_get_arg_constants_empty() {
-        let ctx = create_test_context();
-        let ssa = SsaFunction::new(0, 0);
-        let method = Token::new(0x06000001);
+        let (ssa, _vars) = function_with_known(&[]);
 
-        let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
-        resolver.load_known_values(&ctx, method);
+        let mut resolver = ValueResolver::new(&ssa, CilTarget::x64().machine());
+        resolver.load_known_values();
         let args: Vec<SsaVarId> = vec![];
         let result = DecryptionPass::get_arg_constants(&args, &mut resolver);
         assert!(result.is_some());
@@ -1421,11 +1770,11 @@ mod tests {
     /// which has ConfuserEx constants protection enabled.
     #[test]
     fn test_constants_decryption_integration() {
-        const CONSTANTS_PATH: &str = "tests/samples/packers/confuserex/1.6.0/mkaring_constants.exe";
+        const CONSTANTS_PATH: &str = "packers/confuserex/1.6.0/mkaring_constants.exe";
 
         // Run full deobfuscation pipeline (ConfuserEx is auto-registered)
         let engine = DeobfuscationEngine::new(EngineConfig::default());
-        let result = engine.process_file(CONSTANTS_PATH);
+        let result = engine.process_file(fixture(CONSTANTS_PATH));
 
         match result {
             Ok((_deobfuscated, result)) => {
@@ -1454,5 +1803,192 @@ mod tests {
                 panic!("Deobfuscation should succeed: {:?}", e);
             }
         }
+    }
+
+    /// The `Next` update method and the decryptor of [`state_machine_method`].
+    const NEXT: Token = Token::new(0x0600_0010);
+    const DECRYPTOR: Token = Token::new(0x0600_0002);
+
+    /// A state machine provider over [`state_machine_method`]'s one shape, with `seeds` as
+    /// the initializations it finds.
+    #[derive(Debug)]
+    struct FixedStateMachine {
+        method: Token,
+        seeds: Vec<(usize, usize, u32)>,
+        semantics: StateMachineSemantics,
+    }
+
+    impl StateMachineProvider for FixedStateMachine {
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+
+        fn semantics(&self) -> &StateMachineSemantics {
+            &self.semantics
+        }
+
+        fn applies_to_method(&self, method: Token) -> bool {
+            method == self.method
+        }
+
+        fn methods(&self) -> Vec<Token> {
+            vec![self.method]
+        }
+
+        fn find_initializations(
+            &self,
+            _ssa: &SsaFunction,
+            _ctx: &CompilerContext,
+            _method: Token,
+            _assembly: &CilObject,
+        ) -> Vec<(usize, usize, u32)> {
+            self.seeds.clone()
+        }
+
+        fn find_state_updates(&self, ssa: &SsaFunction) -> Vec<StateUpdateCall> {
+            let block = ssa.block(0).unwrap();
+            block
+                .instructions()
+                .iter()
+                .enumerate()
+                .filter_map(|(instr_idx, instr)| {
+                    let (token, call) = instr.op().method_call()?;
+                    (token == NEXT).then(|| StateUpdateCall {
+                        block_idx: 0,
+                        instr_idx,
+                        dest: call.dest.unwrap(),
+                        flag_var: call.args[0],
+                        increment_var: call.args[1],
+                    })
+                })
+                .collect()
+        }
+
+        fn find_decryptor_call_sites(
+            &self,
+            ssa: &SsaFunction,
+            _state_updates: &[StateUpdateCall],
+            _decryptor_tokens: &HashSet<Token>,
+            _assembly: &CilObject,
+        ) -> Vec<StateMachineCallSite> {
+            let block = ssa.block(0).unwrap();
+            let (instr_idx, instr, call) = block
+                .instructions()
+                .iter()
+                .enumerate()
+                .find_map(|(i, instr)| {
+                    let (token, call) = instr.op().method_call()?;
+                    (token == DECRYPTOR).then_some((i, instr, call))
+                })
+                .unwrap();
+            let Some(SsaOp::Xor { left, right, .. }) = ssa.get_definition(call.args[0]) else {
+                panic!("the key is state ^ encoded");
+            };
+            vec![StateMachineCallSite {
+                block_idx: 0,
+                instr_idx,
+                instr_id: instr.id(),
+                dest: call.dest.unwrap(),
+                decryptor: DECRYPTOR,
+                call_target: DECRYPTOR,
+                state_var: *left,
+                encoded_var: *right,
+                feeding_update_idx: 0,
+            }]
+        }
+    }
+
+    /// `state = Next(1, 2); value = Decryptor(state ^ 5); return`, with a state machine
+    /// provider finding `seeds`; returns the context and the method after the decryption
+    /// pass ran on it. There is no emulator, so a decryption the pass attempts fails for good.
+    fn run_state_machine_method(seeds: Vec<(usize, usize, u32)>) -> (AnalysisContext, SsaFunction) {
+        let ctx = create_test_context();
+        let method_token = Token::new(0x0600_0001);
+        ctx.decryptors.register(DECRYPTOR);
+        ctx.register_statemachine_provider(Arc::new(FixedStateMachine {
+            method: method_token,
+            seeds,
+            semantics: StateMachineSemantics::confuserex_default(),
+        }));
+        let pass = DecryptionPass::new(&ctx);
+        let mut ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    let flag = b.const_i32(1);
+                    let increment = b.const_i32(2);
+                    let state = b.call(
+                        Callee::Direct(MethodRef::new(NEXT)),
+                        &[flag, increment],
+                        SsaType::I32,
+                    );
+                    let encoded = b.const_i32(5);
+                    let key = b.xor(state, encoded);
+                    let value = b.call(
+                        Callee::Direct(MethodRef::new(DECRYPTOR)),
+                        &[key],
+                        SsaType::I32,
+                    );
+                    b.ret_val(value);
+                });
+            })
+            .unwrap();
+        let _ = run_verified(
+            &pass,
+            &mut ssa,
+            &MethodRef::from(method_token),
+            &ctx.compiler,
+        );
+        (ctx, ssa)
+    }
+
+    /// A decryptor call with no state machine initialization found for it is not decrypted:
+    /// the state its decryptor reads is unknown. Seed 0 stood in for it, decrypting a wrong
+    /// value that looked like a right one.
+    #[test]
+    fn a_call_site_without_a_seed_is_not_decrypted() {
+        let (ctx, _) = run_state_machine_method(Vec::new());
+
+        // The site is retried, the failure being retriable, and fails the same way each time
+        let failures = ctx.decryptors.get_failed(DECRYPTOR).unwrap_or_default();
+        assert!(!failures.is_empty());
+        for failure in &failures {
+            assert!(
+                matches!(failure.reason, FailureReason::SeedNotFound),
+                "{}",
+                failure.reason
+            );
+        }
+        assert_eq!(ctx.decryptors.total_decrypted(), 0);
+    }
+
+    /// A call site that failed stays a call of its decryptor in the output, and reads the
+    /// state its machine's initialization and updates produce, so the machine stays. The
+    /// cleanup ran once every site was decrypted or had failed for good, removing what a
+    /// failed site still reads.
+    #[test]
+    fn a_failed_site_keeps_its_state_machine() {
+        let (ctx, ssa) = run_state_machine_method(vec![(0, 0, 0x1234)]);
+
+        assert_eq!(
+            ctx.decryptors.total_failed(),
+            1,
+            "no emulator to decrypt with"
+        );
+        let next_calls = ssa
+            .block(0)
+            .unwrap()
+            .instructions()
+            .iter()
+            .filter(|instr| {
+                instr
+                    .op()
+                    .method_call()
+                    .is_some_and(|(token, _)| token == NEXT)
+            })
+            .count();
+        assert_eq!(
+            next_calls, 1,
+            "the update the failed site reads is still called"
+        );
     }
 }

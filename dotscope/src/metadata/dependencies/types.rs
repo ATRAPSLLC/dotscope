@@ -119,16 +119,18 @@ impl PartialEq for DependencySource {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use dotscope::metadata::dependencies::DependencySource;
-    /// use dotscope::metadata::identity::AssemblyIdentity;
+    /// use dotscope::CilObject;
     ///
-    /// let id = AssemblyIdentity::parse("Test, Version=1.0.0.0").unwrap();
-    /// let source1 = DependencySource::AssemblyRef(id.clone());
-    /// let source2 = DependencySource::AssemblyRef(id);
+    /// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// let assembly_ref = assembly.refs_assembly().iter().next().expect("a reference");
+    /// let source1 = DependencySource::AssemblyRef(assembly_ref.value().clone());
+    /// let source2 = DependencySource::AssemblyRef(assembly_ref.value().clone());
     ///
     /// // Two AssemblyRef sources to the same assembly are equal
     /// assert_eq!(source1, source2);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -572,7 +574,7 @@ impl std::fmt::Display for DependencyResolutionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::helpers::dependencies::create_test_assembly_ref;
+    use crate::testkit::helpers::dependencies::create_test_assembly_ref;
 
     #[test]
     fn test_dependency_source_display_name() {

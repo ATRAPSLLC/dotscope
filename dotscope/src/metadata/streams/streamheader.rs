@@ -163,6 +163,9 @@ use std::io::Write;
 
 use crate::{utils::read_le_at, ParseFailure, ParseStage, Result};
 
+/// The bytes a stream name and its terminating zero may take.
+const MAX_NAME_BYTES: usize = 32;
+
 /// ECMA-335 compliant stream header providing metadata stream location and identification.
 ///
 /// A stream header describes a single metadata stream within a .NET assembly's metadata directory.
@@ -265,27 +268,19 @@ use crate::{utils::read_le_at, ParseFailure, ParseStage, Result};
 /// ```rust
 /// use dotscope::metadata::streams::StreamHeader;
 ///
-/// # fn example() {
-/// // Invalid header with unaligned size
+/// // A name with no terminating zero within its 32 bytes is refused, as the runtime does.
+/// let mut unterminated = vec![0x6C, 0x00, 0x00, 0x00, 0xA4, 0x45, 0x00, 0x00];
+/// unterminated.extend([b'#'; 32]);
+/// assert!(StreamHeader::from(&unterminated).is_err());
+///
+/// // A name the runtime gives no stream is read; the directory ignores it.
 /// #[rustfmt::skip]
-/// let invalid_size = [
-///     0x6C, 0x00, 0x00, 0x00,  // Valid offset
-///     0xA5, 0x45, 0x00, 0x00,  // Invalid size (not divisible by 4)
-///     0x23, 0x7E, 0x00,        // Valid name
+/// let unknown = [
+///     0x6C, 0x00, 0x00, 0x00,  // offset
+///     0xA4, 0x45, 0x00, 0x00,  // size
+///     0x24, 0x58, 0x00,        // "$X"
 /// ];
-///
-/// assert!(StreamHeader::from(&invalid_size).is_err());
-///
-/// // Invalid header with unknown stream name
-/// #[rustfmt::skip]
-/// let invalid_name = [
-///     0x6C, 0x00, 0x00, 0x00,  // Valid offset
-///     0xA4, 0x45, 0x00, 0x00,  // Valid size
-///     0x24, 0x58, 0x00,        // Invalid name "$X\0"
-/// ];
-///
-/// assert!(StreamHeader::from(&invalid_name).is_err());
-/// # }
+/// assert_eq!(StreamHeader::from(&unknown).unwrap().name, "$X");
 /// ```
 ///
 /// # References
@@ -544,31 +539,25 @@ impl StreamHeader {
             .into());
         }
 
-        // After the 8-byte header, parse the name (max 32 chars or until end of data).
-        // `cursor` is currently 8 because we read two u32s.
-        let name_remaining = data.len().saturating_sub(cursor);
-        let max_name_bytes = std::cmp::min(32, name_remaining);
-        let mut name = String::with_capacity(32);
-        for _ in 0..max_name_bytes {
-            let name_char = read_le_at::<u8>(data, &mut cursor)?;
-            if name_char == 0 {
-                break;
-            }
-
-            name.push(char::from(name_char));
-        }
-
-        if !["#Strings", "#US", "#Blob", "#GUID", "#~", "#-"]
-            .iter()
-            .any(|valid_name| name == *valid_name)
-        {
+        // The name and its terminating zero take at most 32 bytes: the runtime refuses a
+        // longer name, even one it gives no stream. A name it gives no stream is otherwise
+        // accepted, and ignored by the directory (see `Root::stream`).
+        let field = data.get(cursor..).unwrap_or_default();
+        let field = field.get(..MAX_NAME_BYTES).unwrap_or(field);
+        let Some(length) = field.iter().position(|&byte| byte == 0) else {
             return Err(ParseFailure::InvalidField {
                 stage: ParseStage::StreamHeader,
                 field: "name",
-                reason: format!("unknown stream name `{name}`"),
+                reason: format!("no terminating zero within the name's {MAX_NAME_BYTES} bytes"),
             }
             .into());
-        }
+        };
+        let name: String = field
+            .get(..length)
+            .unwrap_or_default()
+            .iter()
+            .map(|&byte| char::from(byte))
+            .collect();
 
         Ok(StreamHeader { offset, size, name })
     }
@@ -725,8 +714,9 @@ mod tests {
         assert_eq!(parsed_header.name, "#~");
     }
 
+    /// A name the runtime gives no stream is read like any other; the directory ignores it.
     #[test]
-    fn crafted_invalid() {
+    fn a_name_the_runtime_gives_no_stream_is_read() {
         #[rustfmt::skip]
         let header_bytes = [
             0x6C, 0x00, 0x00, 0x00,
@@ -734,9 +724,24 @@ mod tests {
             0x24, 0x7E, 0x00,
         ];
 
-        if StreamHeader::from(&header_bytes).is_ok() {
-            panic!("This should not be valid!")
-        }
+        assert_eq!(StreamHeader::from(&header_bytes).unwrap().name, "$~");
+    }
+
+    /// The runtime reads a name and its terminating zero from at most 32 bytes: 31
+    /// characters load, 32 are refused (`metadata/streams/unknown_name_{31,32}.exe`).
+    #[test]
+    fn a_name_takes_at_most_32_bytes_with_its_terminator() {
+        let header = |length: usize| {
+            let mut bytes = vec![0x6C, 0x00, 0x00, 0x00, 0xA4, 0x45, 0x00, 0x00];
+            bytes.push(b'#');
+            bytes.extend(std::iter::repeat_n(b'n', length - 1));
+            bytes.push(0);
+            bytes
+        };
+        assert_eq!(StreamHeader::from(&header(31)).unwrap().name.len(), 31);
+        assert!(StreamHeader::from(&header(32)).is_err());
+        // A name the data ends inside has no terminator either.
+        assert!(StreamHeader::from(&header(8)[..12]).is_err());
     }
 
     #[test]

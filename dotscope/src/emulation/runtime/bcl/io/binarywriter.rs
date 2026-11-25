@@ -32,8 +32,9 @@
 
 use crate::{
     emulation::{
+        engine::synthetic_exception,
         runtime::{
-            bcl::io::stream::{stream_close_pre, stream_dispose_pre},
+            bcl::{io::stream::stream_dispose_pre, limits::buffer_range},
             hook::{Hook, HookContext, HookManager, PreHookResult},
         },
         thread::EmulationThread,
@@ -86,13 +87,13 @@ pub fn register(manager: &HookManager) -> Result<()> {
     manager.register(
         Hook::new("System.IO.BinaryWriter.Flush")
             .match_name("System.IO", "BinaryWriter", "Flush")
-            .pre(stream_close_pre),
+            .pre(stream_dispose_pre),
     )?;
 
     manager.register(
         Hook::new("System.IO.BinaryWriter.Close")
             .match_name("System.IO", "BinaryWriter", "Close")
-            .pre(stream_close_pre),
+            .pre(stream_dispose_pre),
     )?;
 
     manager.register(
@@ -375,23 +376,27 @@ fn binary_writer_write_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) 
                 try_hook!(thread.heap_mut().write_to_stream(stream_ref, &bytes));
             }
         }
-        // Write(byte[], int, int) — write slice of bytes
-        (Some(EmValue::ObjectRef(arr_ref)), 3) => {
-            #[allow(clippy::cast_sign_loss)]
-            if let (Some(EmValue::I32(offset)), Some(EmValue::I32(count))) =
-                (ctx.args.get(1), ctx.args.get(2))
-            {
-                let offset = *offset as usize;
-                let count = *count as usize;
-                if let Some(bytes) = try_hook!(thread.heap().get_byte_array(*arr_ref)) {
-                    let end = offset.saturating_add(count).min(bytes.len());
-                    if offset < bytes.len() {
-                        if let Some(slice) = bytes.get(offset..end) {
-                            try_hook!(thread.heap_mut().write_to_stream(stream_ref, slice));
-                        }
-                    }
-                }
-            }
+        // Write(byte[], int, int): the slice, its arguments checked as the stream beneath
+        // checks them; a null buffer is the `ArgumentNullException` the runtime throws
+        (Some(EmValue::ObjectRef(_) | EmValue::Null), 3) => {
+            let (buffer_ref, offset, count) =
+                match buffer_range(ctx, thread, synthetic_exception::ARGUMENT_OUT_OF_RANGE) {
+                    Ok(range) => range,
+                    Err(result) => return result,
+                };
+            // `Write(char[], int, int)` takes the same shape: not a byte slice, and not
+            // emulated, rather than written as nothing
+            let Some(bytes) = try_hook!(thread.heap().get_byte_array(buffer_ref)) else {
+                return PreHookResult::Error(
+                    "BinaryWriter.Write of an array slice that is no byte[] is not emulated"
+                        .to_string(),
+                );
+            };
+            // In range: `buffer_range` checked it against the buffer's length
+            let slice = bytes
+                .get(offset..offset.saturating_add(count))
+                .unwrap_or_default();
+            try_hook!(thread.heap_mut().write_to_stream(stream_ref, slice));
         }
         // Write(int) — 4 bytes little-endian (fallback: assumes Int32 when no type info)
         (Some(EmValue::I32(v)), 1) => {

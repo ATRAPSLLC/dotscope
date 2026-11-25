@@ -39,7 +39,7 @@ use crate::{
     deobfuscation::{
         passes::NativeMethodConversionPass,
         techniques::{
-            Detection, Detections, Evidence, Technique, TechniqueCategory, WorkingAssembly,
+            Detection, Evidence, Technique, TechniqueCapability, TechniqueCategory, WorkingAssembly,
         },
     },
     metadata::{tables::ImplMapRaw, token::Token, validation::ValidationConfig},
@@ -71,6 +71,10 @@ impl Technique for ConfuserExNativeHelpers {
 
     fn category(&self) -> TechniqueCategory {
         TechniqueCategory::Protection
+    }
+
+    fn capabilities(&self) -> Vec<TechniqueCapability> {
+        vec![TechniqueCapability::ByteTransform]
     }
 
     fn requires(&self) -> &[&'static str] {
@@ -149,8 +153,7 @@ impl Technique for ConfuserExNativeHelpers {
     fn byte_transform(
         &self,
         assembly: &mut WorkingAssembly,
-        detection: &Detection,
-        _detections: &Detections,
+        detection: &mut Detection,
     ) -> Option<Result<EventLog>> {
         let events = EventLog::new();
 
@@ -249,13 +252,12 @@ mod tests {
             confuserex::natives::{ConfuserExNativeHelpers, NativeFindings},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly =
-            load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_constants_x86.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_constants_x86.exe");
 
         let technique = ConfuserExNativeHelpers;
         let detection = technique.detect(&assembly);
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = ConfuserExNativeHelpers;
         let detection = technique.detect(&assembly);

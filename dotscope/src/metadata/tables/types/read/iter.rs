@@ -41,7 +41,7 @@ use crate::{
 
 /// Discards a row that could not be parsed, after logging it.
 ///
-/// For consumers that genuinely cannot propagate — an adapter chain inside a function
+/// For consumers that genuinely cannot propagate - an adapter chain inside a function
 /// returning `Option`, or a scan that has no error channel. Written as a named function
 /// rather than `.flatten()` or `.filter_map(Result::ok)` so that dropping a row is greppable
 /// and leaves a trace: a silently short table is how a malformed row turns into missing
@@ -55,7 +55,9 @@ use crate::{
 /// sequence is not its RID**. Never derive a RID from `enumerate()`, an index into a
 /// collected `Vec`, `.first()`, or `.next()`:
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # use dotscope::metadata::tables::{skip_unreadable, MetadataTable, ModuleRaw};
+/// # fn example(table: &MetadataTable<ModuleRaw>) {
 /// // Wrong: one unreadable row ahead of the match names a different row entirely.
 /// for (index, row) in table.iter().filter_map(skip_unreadable).enumerate() {
 ///     let rid = index as u32 + 1;
@@ -69,6 +71,7 @@ use crate::{
 /// // Right, when a specific RID is wanted: `get` derives each row's offset from its RID,
 /// // so an unreadable row cannot displace any other.
 /// let module = table.get(1).ok().flatten();
+/// # }
 /// ```
 ///
 /// Every raw row struct carries a `rid` field, and
@@ -102,7 +105,7 @@ pub fn skip_unreadable<T>(row: Result<T>) -> Option<T> {
 /// ## Why the item type is a `Result`
 ///
 /// Yielding `None` on a parse error would end the iteration, silently dropping every
-/// remaining row — a row-hiding primitive on a hostile file, and one that reaches further
+/// remaining row - a row-hiding primitive on a hostile file, and one that reaches further
 /// than it looks: the writer rebuilds tables by iterating them, so a table truncated this way
 /// is re-emitted without the rows that were skipped. Every row is therefore reported, and the
 /// iterator always yields exactly `row_count` items.
@@ -125,7 +128,7 @@ impl<T: RowReadable> Iterator for TableIterator<'_, T> {
         self.current_row = rid;
 
         // `get` derives each row's offset from its index, so a failure here costs this row
-        // and no other — which is what makes continuing after one sound.
+        // and no other - which is what makes continuing after one sound.
         self.table.get(rid).transpose()
     }
 
@@ -233,9 +236,23 @@ struct TableProducer<'a, T> {
     range: std::ops::Range<u32>,
 }
 
+/// The fewest rows a split leaves one task.
+///
+/// A row parses in nanoseconds, so a task of fewer rows costs more to schedule than to
+/// run. And every split is a join, at which a worker waits for the other half and runs
+/// whatever other work it finds meanwhile, on the stack it is waiting on: another
+/// table's halves, another assembly's, each nesting the next. With every table split to
+/// single rows, the loads a test suite runs side by side nested deep enough to overflow
+/// a worker's stack. A table smaller than this is not split at all.
+const ROWS_PER_TASK: usize = 512;
+
 impl<'a, T: RowReadable + Send + Sync> rayon::iter::plumbing::Producer for TableProducer<'a, T> {
     type Item = Result<T>;
     type IntoIter = TableProducerIterator<'a, T>;
+
+    fn min_len(&self) -> usize {
+        ROWS_PER_TASK
+    }
 
     fn into_iter(self) -> Self::IntoIter {
         TableProducerIterator {
@@ -300,7 +317,7 @@ impl<T: RowReadable + Send + Sync> Iterator for TableProducerIterator<'_, T> {
         // +1 because row indices start at 1
         //
         // A failing row is yielded as `Err`, so this chunk still produces exactly
-        // `range.len()` items — which is what `ExactSizeIterator` below promises rayon, and
+        // `range.len()` items - which is what `ExactSizeIterator` below promises rayon, and
         // what `IndexedParallelIterator::len` reports.
         self.table.get(row_index.saturating_add(1)).transpose()
     }

@@ -35,7 +35,7 @@
 //!
 //! # Safety
 //!
-//! If no warmup `.cctor` succeeds, the pass becomes a no-op for all methods —
+//! If no warmup `.cctor` succeeds, the pass becomes a no-op for all methods -
 //! no false positives are possible. Unresolved fields return `None` from
 //! `get_static()`, so unmatched predicates are safely skipped.
 
@@ -44,15 +44,19 @@ use std::{
     sync::{Arc, RwLockReadGuard},
 };
 
+use analyssa::ir::function::{SsaEditOptions, SsaRollbackPolicy};
 use dashmap::DashSet;
 use log::debug;
 
 use crate::{
-    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaVarId},
+    analysis::{CilTarget, ConstValue, MethodRef, SsaFunction, SsaOp, SsaOpCilExt, SsaVarId},
     compiler::{CompilerContext, EventKind, ModificationScope, PassCapability, SsaPass},
-    deobfuscation::{utils::build_def_map, EmulationTemplatePool, ProcessCell},
+    deobfuscation::{
+        utils::{build_def_map, static_loads_of},
+        EmulationTemplatePool, ProcessCell,
+    },
     emulation::{EmValue, EmulationProcess, HeapRef},
-    metadata::token::Token,
+    metadata::{tables::TableId, token::Token},
     CilObject, Result,
 };
 
@@ -60,11 +64,11 @@ use crate::{
 ///
 /// This pass targets two patterns:
 ///
-/// **Variant A** — Static field chain: a conditional branch depends on a field loaded
+/// **Variant A** - Static field chain: a conditional branch depends on a field loaded
 /// from a singleton object stored in a static field. Resolved by reading the instance
 /// field from the emulated heap.
 ///
-/// **Variant B** — Sentinel null-check: a `Call` to a tiny bool method that checks
+/// **Variant B** - Sentinel null-check: a `Call` to a tiny bool method that checks
 /// `ldsfld → ldnull → ceq → ret` (always returns true if the sentinel field is null).
 /// Resolved by reading the sentinel field from the emulator and computing `ceq(val, null)`.
 ///
@@ -88,6 +92,10 @@ pub struct OpaqueFieldPredicatePass {
     /// Sentinel method token → sentinel field token (Variant B).
     /// The method body is `ldsfld → ldnull → ceq → ret`.
     sentinel_methods: HashMap<Token, Token>,
+    /// Fields the program stores outside type initialization (as named and resolved). A
+    /// chain through one of them is never folded: its warmed-up value is not the one the
+    /// program reads at runtime.
+    runtime_stored_fields: HashSet<Token>,
 }
 
 impl OpaqueFieldPredicatePass {
@@ -104,12 +112,14 @@ impl OpaqueFieldPredicatePass {
     /// * `needed_static_fields` - Static field tokens from the SSA predicate scan.
     /// * `affected_methods` - Method tokens that contain at least one predicate.
     /// * `sentinel_methods` - Sentinel method → field mapping (Variant B).
+    /// * `runtime_stored_fields` - Fields stored outside type initialization.
     #[must_use]
     pub fn new(
         template_pool: Arc<EmulationTemplatePool>,
         needed_static_fields: HashSet<Token>,
         affected_methods: HashSet<Token>,
         sentinel_methods: HashMap<Token, Token>,
+        runtime_stored_fields: HashSet<Token>,
     ) -> Self {
         let needed = DashSet::new();
         for token in &needed_static_fields {
@@ -126,7 +136,27 @@ impl OpaqueFieldPredicatePass {
             affected_methods: affected,
             processed_methods: DashSet::new(),
             sentinel_methods,
+            runtime_stored_fields,
         }
+    }
+
+    /// Whether the chain from static field `root` through `chain` may be folded to the
+    /// value warmup gave it: the root is one detection found and proved immutable, and no
+    /// field along the chain is stored outside type initialization. Folding every chain
+    /// rooted in any static the warmup happened to set froze application state (a counter,
+    /// a cache the program fills later) to its initial value.
+    fn chain_is_foldable(&self, assembly: &CilObject, root: Token, chain: &[Token]) -> bool {
+        let stored = |token: Token| {
+            self.runtime_stored_fields.contains(&token)
+                || (token.is_table(TableId::MemberRef)
+                    && assembly
+                        .resolver()
+                        .resolve_field(token)
+                        .is_some_and(|resolved| self.runtime_stored_fields.contains(&resolved)))
+        };
+        self.needed_static_fields.contains(&root)
+            && !stored(root)
+            && !chain.iter().any(|&token| stored(token))
     }
 
     /// Finds `.cctor` tokens for types that own any of the needed static fields.
@@ -338,7 +368,7 @@ impl<'a> FieldResolver<'a> {
     ///
     /// # Returns
     ///
-    /// `Some(bool)` — `true` if the field is null (or unset), `false` otherwise.
+    /// `Some(bool)` - `true` if the field is null (or unset), `false` otherwise.
     ///
     /// # Errors
     ///
@@ -360,7 +390,7 @@ impl<'a> FieldResolver<'a> {
 /// is the field from the starting `LoadField` instruction.
 ///
 /// Returns `None` if the chain doesn't terminate at a `LoadStaticField` or exceeds
-/// the maximum depth (10 hops — more than any known obfuscator uses).
+/// the maximum depth (10 hops - more than any known obfuscator uses).
 ///
 /// # Arguments
 ///
@@ -383,7 +413,7 @@ fn trace_field_chain(
                 current_op = defs.get(object)?;
             }
             SsaOp::LoadStaticField { field, .. } => {
-                // Reached the root — reverse chain so it's in traversal order
+                // Reached the root - reverse chain so it's in traversal order
                 chain.reverse();
                 return Some((field.token(), chain));
             }
@@ -405,6 +435,10 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
 
     fn modification_scope(&self) -> ModificationScope {
         ModificationScope::CfgModifying
+    }
+
+    fn repairs_ssa(&self) -> bool {
+        true
     }
 
     fn provides(&self) -> &[PassCapability] {
@@ -454,8 +488,8 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
         let defs = build_def_map(ssa);
 
         // Find and resolve opaque predicates (Variant A: field chain + Variant B: sentinel)
-        // Each entry: (block_idx, jump_target, dropped_target)
-        let mut replacements: Vec<(usize, usize, usize)> = Vec::new();
+        // Each entry: (block_idx, jump_target)
+        let mut replacements: Vec<(usize, usize)> = Vec::new();
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             let Some(terminator) = block.control_terminator() else {
                 continue;
@@ -476,55 +510,48 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
                 continue;
             };
 
-            // --- Variant A: LoadStaticField → LoadField+ → Branch ---
+            // Variant A: LoadStaticField → LoadField+ → Branch
             // Trace backward through nested LoadField chains (supports arbitrary depth).
             // PureLogs uses multi-level chains: static → instance → instance → condition.
-            if let Some((static_token, field_chain)) = trace_field_chain(cond_def, &defs) {
+            if let Some((static_token, field_chain)) = trace_field_chain(cond_def, &defs)
+                .filter(|(root, chain)| self.chain_is_foldable(assembly, *root, chain))
+            {
                 if let Some(is_truthy) = resolver
                     .resolve_chain(static_token, &field_chain)?
                     .map(|v| v.to_bool_cil())
                 {
-                    let (target, dropped) = if is_truthy {
-                        (true_target, false_target)
-                    } else {
-                        (false_target, true_target)
-                    };
-                    replacements.push((block_idx, target, dropped));
+                    let target = if is_truthy { true_target } else { false_target };
+                    replacements.push((block_idx, target));
                     continue;
                 }
             }
 
-            // --- Variant B: Call(sentinel_method) → Branch ---
-            if let SsaOp::Call { method, .. } = cond_def {
-                if let Some(sentinel_field) = self.sentinel_methods.get(&method.token()) {
+            // Variant B: Call(sentinel_method) → Branch
+            if let Some((method_token, _)) = cond_def.method_call() {
+                if let Some(sentinel_field) = self.sentinel_methods.get(&method_token) {
                     if let Some(is_truthy) = resolver.resolve_sentinel(*sentinel_field)? {
-                        let (target, dropped) = if is_truthy {
-                            (true_target, false_target)
-                        } else {
-                            (false_target, true_target)
-                        };
-                        replacements.push((block_idx, target, dropped));
+                        let target = if is_truthy { true_target } else { false_target };
+                        replacements.push((block_idx, target));
                     }
                 }
             }
         }
 
-        // --- Variant B: Call(sentinel_method) → non-branch uses (stloc, CFF state) ---
+        // Variant B: Call(sentinel_method) → non-branch uses (stloc, CFF state)
         // Replace sentinel calls with constant true/false so downstream passes
         // (constant propagation, CFF) can fold the values.
         let mut sentinel_call_replacements: Vec<(usize, usize, SsaOp)> = Vec::new();
         if !self.sentinel_methods.is_empty() {
             for (block_idx, block) in ssa.blocks().iter().enumerate() {
                 for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                    let SsaOp::Call {
-                        dest: Some(dest),
-                        method,
-                        ..
-                    } = instr.op()
+                    let Some((method_token, Some(dest))) = instr
+                        .op()
+                        .method_call()
+                        .map(|(token, call)| (token, call.dest))
                     else {
                         continue;
                     };
-                    let Some(sentinel_field) = self.sentinel_methods.get(&method.token()) else {
+                    let Some(sentinel_field) = self.sentinel_methods.get(&method_token) else {
                         continue;
                     };
                     if let Some(is_truthy) = resolver.resolve_sentinel(*sentinel_field)? {
@@ -536,14 +563,14 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
                         sentinel_call_replacements.push((
                             block_idx,
                             instr_idx,
-                            SsaOp::Const { dest: *dest, value },
+                            SsaOp::Const { dest, value },
                         ));
                     }
                 }
             }
         }
 
-        // --- Field constant injection: LoadField+ → Const ---
+        // Field constant injection: LoadField+ → Const
         // For each LoadField, trace the chain back to a LoadStaticField and
         // resolve the value from the emulated heap. Supports nested chains.
         let mut const_replacements: Vec<(usize, usize, SsaOp)> = Vec::new();
@@ -559,6 +586,7 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
                 // preceded by any intermediate LoadField hops back to LoadStaticField.
                 let load_field_op: SsaOp = instr.op().clone();
                 let Some((static_token, field_chain)) = trace_field_chain(&load_field_op, &defs)
+                    .filter(|(root, chain)| self.chain_is_foldable(assembly, *root, chain))
                 else {
                     continue;
                 };
@@ -583,92 +611,59 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
             }
         }
 
-        // Find dead LoadStaticField instructions whose dest is only used by
-        // the LoadField instructions we're replacing with constants.
-        let mut dead_static_loads: Vec<(usize, usize)> = Vec::new();
-        for (block_idx, block) in ssa.blocks().iter().enumerate() {
-            for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                let SsaOp::LoadStaticField { dest, .. } = instr.op() else {
-                    continue;
-                };
-                if !replaced_object_vars.contains(dest) {
-                    continue;
-                }
-                if let Some(variable) = ssa.variable(*dest) {
-                    let all_uses_replaced = variable.uses().iter().all(|use_site| {
-                        const_replacements
-                            .iter()
-                            .any(|(b, i, _)| *b == use_site.block && *i == use_site.instruction)
-                    });
-                    if all_uses_replaced {
-                        dead_static_loads.push((block_idx, instr_idx));
-                    }
-                }
-            }
-        }
-
+        // LoadStaticField instructions feeding the LoadFields replaced with
+        // constants. They go once nothing reads them any more.
         // Must drop the read guard before mutating ssa
         drop(guard);
 
-        // Apply replacements: Branch → Jump (Variant A + Variant B direct branches)
-        for &(block_idx, target, dropped) in &replacements {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(last) = block.instructions_mut().last_mut() {
-                    last.set_op(SsaOp::Jump { target });
-                    ctx.events
-                        .record(EventKind::OpaquePredicateRemoved)
-                        .at(method_token, block_idx)
-                        .message(format!(
-                            "removed opaque field predicate → jump to block {target}"
-                        ));
+        // Apply everything in one edit session, so the session leaves the
+        // function repaired whole. The instruction rewrites go first, at the
+        // indices they were planned at; then the folds, which can strand a
+        // block and turn its phis into copies at its head; then the loads the
+        // folds and rewrites left unread, found in the function as it then
+        // stands. A fold only removes an edge, which
+        // `fold_terminator_pruning_phis` repairs by pruning the dropped
+        // successor's operand, so no value needs reconstructing.
+        ssa.edit(
+            SsaEditOptions::new().with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                // Sentinel call replacements: Call → Const (Variant B non-branch uses)
+                // and const replacements: LoadField → Const (Variant A field injection)
+                for (block_idx, instr_idx, new_op) in
+                    sentinel_call_replacements.iter().chain(&const_replacements)
+                {
+                    editor.replace_instruction_op(*block_idx, *instr_idx, new_op.clone())?;
                 }
-            }
+                // Branch → Jump (Variant A + Variant B direct branches)
+                for &(block_idx, target) in &replacements {
+                    editor.fold_terminator_pruning_phis(block_idx, SsaOp::Jump { target })?;
+                }
+                // NOP out the LoadStaticField instructions nothing reads any more
+                let loads = static_loads_of(editor.function(), &replaced_object_vars);
+                editor.remove_unread_instructions(loads);
+                Ok(())
+            },
+        )?;
 
-            // Clean up phi operands in the dropped target that referenced our block.
-            // Without this, rebuild_ssa() may fail because phi nodes reference variables
-            // from a predecessor edge that no longer exists.
-            if dropped != target {
-                if let Some(dropped_block) = ssa.block_mut(dropped) {
-                    for phi in dropped_block.phi_nodes_mut() {
-                        phi.retain_operands(|pred| pred != block_idx);
-                    }
-                }
-            }
+        for &(block_idx, target) in &replacements {
+            ctx.events
+                .record(EventKind::OpaquePredicateRemoved)
+                .at(method_token, block_idx)
+                .message(format!(
+                    "removed opaque field predicate → jump to block {target}"
+                ));
         }
-
-        // Apply sentinel call replacements: Call → Const (Variant B non-branch uses)
-        for (block_idx, instr_idx, new_op) in &sentinel_call_replacements {
-            if let Some(block) = ssa.block_mut(*block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                    instr.set_op(new_op.clone());
-                    ctx.events
-                        .record(EventKind::OpaquePredicateRemoved)
-                        .at(method_token, *block_idx)
-                        .message("resolved sentinel null-check call → constant");
-                }
-            }
+        for (block_idx, _, _) in &sentinel_call_replacements {
+            ctx.events
+                .record(EventKind::OpaquePredicateRemoved)
+                .at(method_token, *block_idx)
+                .message("resolved sentinel null-check call → constant");
         }
-
-        // Apply const replacements: LoadField → Const (Variant A field injection)
-        for (block_idx, instr_idx, new_op) in &const_replacements {
-            if let Some(block) = ssa.block_mut(*block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                    instr.set_op(new_op.clone());
-                    ctx.events
-                        .record(EventKind::ConstantFolded)
-                        .at(method_token, *block_idx)
-                        .message("resolved opaque field load → constant");
-                }
-            }
-        }
-
-        // NOP out dead LoadStaticField instructions
-        for (block_idx, instr_idx) in &dead_static_loads {
-            if let Some(block) = ssa.block_mut(*block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                    instr.set_op(SsaOp::Nop);
-                }
-            }
+        for (block_idx, _, _) in &const_replacements {
+            ctx.events
+                .record(EventKind::ConstantFolded)
+                .at(method_token, *block_idx)
+                .message("resolved opaque field load → constant");
         }
 
         let changed = !replacements.is_empty()
@@ -685,5 +680,62 @@ impl SsaPass<CilTarget, CompilerContext> for OpaqueFieldPredicatePass {
         // Clear the emulation process to release its Arc<CilObject> reference.
         // This is needed so the assembly can be unwrapped for code generation.
         self.lazy_process.clear().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        analysis::CallGraph,
+        deobfuscation::{context::AnalysisContext, EngineConfig},
+        testkit::fixture,
+    };
+
+    /// A pass over crafted_2 whose detection found `needed` and saw `stored` written at
+    /// runtime.
+    fn pass_with(needed: &[Token], stored: &[Token]) -> (OpaqueFieldPredicatePass, CilObject) {
+        let assembly = Arc::new(CilObject::from_path(fixture("crafted_2.exe")).unwrap());
+        let ctx = AnalysisContext::new(Arc::new(CallGraph::new()));
+        let pool = Arc::new(EmulationTemplatePool::new(
+            Arc::clone(&assembly),
+            assembly.file().fork_cowfile().unwrap(),
+            Arc::clone(&ctx.emulation_hooks),
+            Arc::clone(&ctx.warmup_methods),
+            EngineConfig::default(),
+        ));
+        let pass = OpaqueFieldPredicatePass::new(
+            pool,
+            needed.iter().copied().collect(),
+            HashSet::new(),
+            HashMap::new(),
+            stored.iter().copied().collect(),
+        );
+        (
+            pass,
+            CilObject::from_path(fixture("crafted_2.exe")).unwrap(),
+        )
+    }
+
+    /// A chain folds only from a static field detection found and proved immutable, through
+    /// fields the program never stores at runtime. Every chain rooted in any static the
+    /// warmup happened to set was folded, freezing application state to its initial value.
+    #[test]
+    fn only_a_chain_of_immutable_detected_fields_folds() {
+        let root = Token::new(0x0400_0001);
+        let other_root = Token::new(0x0400_0002);
+        let hop = Token::new(0x0400_0003);
+        let counter = Token::new(0x0400_0004);
+        let (pass, assembly) = pass_with(&[root], &[counter]);
+
+        assert!(pass.chain_is_foldable(&assembly, root, &[hop]));
+        assert!(
+            !pass.chain_is_foldable(&assembly, other_root, &[hop]),
+            "a static detection did not find"
+        );
+        assert!(
+            !pass.chain_is_foldable(&assembly, root, &[hop, counter]),
+            "through a field stored at runtime"
+        );
     }
 }

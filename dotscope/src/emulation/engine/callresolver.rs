@@ -59,9 +59,10 @@ use crate::{
     },
     metadata::{
         signatures::TypeSignature,
+        streams::SharedStr,
         tables::{MemberRef, MemberRefSignature, TableId},
         token::Token,
-        typesystem::{CilFlavor, CilTypeReference},
+        typesystem::{CilFlavor, CilTypeReference, FullName},
     },
     Result,
 };
@@ -195,7 +196,7 @@ impl CallResolver {
     /// Returns a reference to the hook manager.
     ///
     /// Used by the execution loop for operations that need direct hook access
-    /// (e.g., `newobj` resolution via [`typeops`](super::typeops)).
+    /// (e.g., `newobj` resolution via [`typeops`]).
     #[must_use]
     pub fn hooks(&self) -> &HookManager {
         &self.hooks
@@ -264,11 +265,7 @@ impl CallResolver {
             return Ok(None);
         };
         let method_name = &member_ref.name;
-        let fullname = if namespace.is_empty() {
-            type_name.clone()
-        } else {
-            format!("{namespace}.{type_name}")
-        };
+        let fullname = FullName::top_level(namespace, type_name);
 
         let state = self
             .runtime
@@ -280,7 +277,7 @@ impl CallResolver {
             let Some(asm) = state.app_domain().get_parsed_assembly(i) else {
                 continue;
             };
-            let Some(cil_type) = asm.types().get_by_fullname(&fullname, true) else {
+            let Some(cil_type) = asm.types().get_by_full_name(&fullname, true) else {
                 continue;
             };
             if let Some(method) = cil_type.find_method(method_name) {
@@ -329,6 +326,9 @@ impl CallResolver {
     ///
     /// # Resolution Order
     ///
+    /// 0. **Runtime-type hook**: for `callvirt` through a MemberRef, the hook of the
+    ///    receiver's runtime type, where it differs from the declared type (a CryptoStream
+    ///    written through `Stream::Write`)
     /// 1. **Hook dispatch** — Check registered hooks via the token cache
     /// 2. **P/Invoke** — Check native stubs for unmanaged methods
     /// 3. **MethodSpec** — Resolve generic method instantiations
@@ -363,7 +363,19 @@ impl CallResolver {
         constrained_type: Option<Token>,
         address_space: &AddressSpace,
     ) -> Result<CallResolution> {
-        // First, try to resolve via hooks (highest priority)
+        // `callvirt` reaches the override of the receiver's runtime type: a user method
+        // overriding the named one runs before any hook, and the runtime type's hook before
+        // the declared method's
+        if is_virtual && method_token.is_table(TableId::MemberRef) {
+            if let Some(resolution) = self.try_member_ref_override(context, method_token, thread)? {
+                return Ok(resolution);
+            }
+            if let Some(resolution) = self.try_runtime_type_hook(context, method_token, thread)? {
+                return Ok(resolution);
+            }
+        }
+
+        // Then the hooks of the method as named (highest priority after dispatch)
         match self.try_hook_call(context, method_token, thread)? {
             HookOutcome::ReflectionInvoke {
                 request,
@@ -456,7 +468,7 @@ impl CallResolver {
                     );
                 }
                 return Ok(CallResolution::HookedBypass {
-                    return_value: value,
+                    return_value: self.checked_hook_return(context, method_token, value)?,
                 });
             }
             HookOutcome::ThrewException {
@@ -559,6 +571,43 @@ impl CallResolver {
             .into());
         }
 
+        // A delegate's `Invoke` through a MemberRef (`Action`, `Func` and every other delegate
+        // type of another assembly) dispatches as one through a MethodDef does. It fell
+        // through to an unhooked MemberRef, answered with a symbolic value, and the delegate's
+        // method never ran.
+        if method_token.is_table(TableId::MemberRef) {
+            if let Some(member_ref) = context.get_member_ref(method_token) {
+                if let MemberRefSignature::Method(signature) = &member_ref.signature {
+                    if member_ref.name == "Invoke" && signature.has_this {
+                        let total_args = (signature.param_count as usize).saturating_add(1);
+                        let receiver = thread.peek_args(total_args)?.into_iter().next();
+                        let is_delegate = matches!(
+                            receiver,
+                            Some(EmValue::ObjectRef(href))
+                                if matches!(
+                                    thread.heap().get_shared(href).as_deref(),
+                                    Ok(HeapObject::Delegate { .. })
+                                )
+                        );
+                        if is_delegate {
+                            let arg_values = thread.pop_args(total_args)?;
+                            if let Some(resolution) = self.dispatch_delegate_invoke(
+                                context,
+                                thread,
+                                method_token,
+                                &arg_values,
+                            )? {
+                                return Ok(resolution);
+                            }
+                            for arg in arg_values {
+                                thread.push(arg)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Handle MemberRef tokens (external methods) without stubs
         if method_token.is_table(TableId::MemberRef) {
             // Try resolving MemberRef → local MethodDef before returning Symbolic
@@ -594,118 +643,6 @@ impl CallResolver {
                     } else {
                         method_sig.param_count as usize
                     };
-
-                    // Virtual dispatch hook retry: when a `callvirt` targets a base class
-                    // MemberRef (e.g., TextReader.ReadToEnd) but the runtime object is a
-                    // derived type (e.g., StreamReader), the initial hook lookup fails
-                    // because hooks are registered under the derived type name. Retry the
-                    // hook lookup using the runtime type of `this`.
-                    if is_virtual && method_sig.has_this && total_args > 0 {
-                        let args = thread.peek_args(total_args)?;
-                        let Some((this_arg, rest_args)) = args.split_first() else {
-                            return Err(out_of_bounds_error!());
-                        };
-
-                        if let EmValue::ObjectRef(heap_ref) = this_arg {
-                            if let Ok(runtime_type_token) = thread.heap().get_type_token(*heap_ref)
-                            {
-                                if let Some(runtime_type) = context.get_type(runtime_type_token) {
-                                    let rt_namespace = if runtime_type.namespace.is_empty() {
-                                        runtime_type
-                                            .enclosing_type()
-                                            .map(|enc| enc.namespace.clone())
-                                            .filter(|ns| !ns.is_empty())
-                                            .unwrap_or_default()
-                                    } else {
-                                        runtime_type.namespace.clone()
-                                    };
-                                    let rt_type_name = &runtime_type.name;
-
-                                    // Only retry if the runtime type differs from the declared type
-                                    let declared_type_info =
-                                        EmulationContext::get_member_ref_type_info(&member_ref);
-                                    let types_differ =
-                                        !declared_type_info.as_ref().is_some_and(|(dns, dtn)| {
-                                            dns == &rt_namespace && dtn == rt_type_name.as_str()
-                                        });
-
-                                    if types_differ {
-                                        let param_types =
-                                            context.get_parameter_types(method_token).ok();
-                                        let param_types_ref: Option<&[CilFlavor]> =
-                                            param_types.as_deref();
-                                        let return_type =
-                                            context.get_return_type(method_token).ok().flatten();
-
-                                        let (this_ref, method_args): (
-                                            Option<&EmValue>,
-                                            &[EmValue],
-                                        ) = (Some(this_arg), rest_args);
-
-                                        let hook_context = HookContext::new(
-                                            method_token,
-                                            &rt_namespace,
-                                            rt_type_name,
-                                            &member_ref.name,
-                                            self.config.pointer_size,
-                                        )
-                                        .with_this(this_ref)
-                                        .with_args(method_args)
-                                        .with_param_types(param_types_ref)
-                                        .with_return_type(return_type);
-
-                                        let outcome =
-                                            self.hooks.execute(&hook_context, thread, |_| None)?;
-
-                                        match outcome {
-                                            HookOutcome::Handled(value) => {
-                                                // Hook matched — pop the arguments
-                                                thread.pop_args(total_args)?;
-                                                if self.trace_stubs_enabled() {
-                                                    self.trace(TraceEvent::HookInvoke {
-                                                        method: method_token,
-                                                        hook_name: format!(
-                                                            "{}.{}.{} [virtual dispatch]",
-                                                            rt_namespace,
-                                                            rt_type_name,
-                                                            member_ref.name
-                                                        ),
-                                                        bypassed: true,
-                                                        return_value: value
-                                                            .as_ref()
-                                                            .map(|v| format!("{v}")),
-                                                    });
-                                                }
-                                                return Ok(CallResolution::HookedBypass {
-                                                    return_value: value,
-                                                });
-                                            }
-                                            HookOutcome::ThrewException {
-                                                exception_type,
-                                                message,
-                                            } => {
-                                                thread.pop_args(total_args)?;
-                                                return Ok(CallResolution::ThrowException {
-                                                    exception_type,
-                                                    message,
-                                                });
-                                            }
-                                            HookOutcome::ReflectionInvoke { .. } => {
-                                                // Unlikely for virtual dispatch, but handle
-                                                thread.pop_args(total_args)?;
-                                                return Ok(CallResolution::HookedBypass {
-                                                    return_value: None,
-                                                });
-                                            }
-                                            HookOutcome::NoMatch => {
-                                                // Still no match — fall through to Symbolic
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
 
                     // Pop arguments from stack
                     for _ in 0..total_args {
@@ -831,201 +768,13 @@ impl CallResolver {
             .into());
         }
 
-        // Delegate dispatch: if this is a `runtime managed` method named "Invoke"
-        // on a delegate object, redirect to the delegate's target method.
-        if method.is_code_runtime()
-            && method.name == "Invoke"
-            && is_instance
-            && !arg_values.is_empty()
-        {
-            if let Some(EmValue::ObjectRef(href)) = arg_values.first() {
-                match thread.heap().get(*href) {
-                    Ok(HeapObject::Delegate {
-                        invocation_list, ..
-                    }) => {
-                        // For multicast delegates, invoke entries in order (first to last).
-                        // Only the last entry's return value is propagated to the caller.
-                        if let Some(entry) = invocation_list.first() {
-                            let target_token = entry.method_token;
-                            let delegate_target = entry.target;
-
-                            // Native function pointer delegates use synthetic
-                            // tokens allocated per-function by the registry.
-                            // Look up the function name and return an
-                            // appropriate value for each native API.
-                            if tokens::is_native_function_pointer(target_token) {
-                                // Element 0 is the delegate itself; the rest are
-                                // the arguments the native function was called
-                                // with, and a hook needs them to do its work.
-                                let native_args: Vec<EmValue> =
-                                    arg_values.iter().skip(1).cloned().collect();
-                                let return_value = self.dispatch_native_delegate(
-                                    target_token,
-                                    &native_args,
-                                    thread,
-                                )?;
-                                return Ok(CallResolution::HookedBypass { return_value });
-                            }
-
-                            // Resolve MemberRef → MethodDef if the target is local
-                            let mut dispatch_token = if target_token.is_table(TableId::MemberRef) {
-                                context
-                                    .assembly()
-                                    .resolver()
-                                    .resolve_method(target_token)
-                                    .filter(|t| t.is_table(TableId::MethodDef))
-                                    .unwrap_or(target_token)
-                            } else {
-                                target_token
-                            };
-
-                            let should_dispatch = if context.is_synthetic_method(dispatch_token) {
-                                // Synthetic methods from DynamicMethod/ILGenerator
-                                // are always dispatchable.
-                                true
-                            } else if dispatch_token.is_table(TableId::MethodDef) {
-                                let has_il = context
-                                    .get_method(dispatch_token)
-                                    .map(|m| m.has_body() && m.instructions().next().is_some())
-                                    .unwrap_or(false);
-                                if has_il {
-                                    true
-                                } else {
-                                    let is_virtual = context
-                                        .get_method(dispatch_token)
-                                        .map(|m| m.is_virtual())
-                                        .unwrap_or(false);
-
-                                    if is_virtual {
-                                        let instance_ref = delegate_target.or_else(|| {
-                                            arg_values.get(1).and_then(|v| match v {
-                                                EmValue::ObjectRef(r) => Some(*r),
-                                                _ => None,
-                                            })
-                                        });
-
-                                        if let Some(inst_ref) = instance_ref {
-                                            let resolved = self.resolve_virtual_dispatch(
-                                                context,
-                                                thread,
-                                                dispatch_token,
-                                                &EmValue::ObjectRef(inst_ref),
-                                            );
-                                            if resolved != dispatch_token {
-                                                let resolved_has_il = context
-                                                    .get_method(resolved)
-                                                    .map(|m| {
-                                                        m.has_body()
-                                                            && m.instructions().next().is_some()
-                                                    })
-                                                    .unwrap_or(false);
-                                                if resolved_has_il {
-                                                    dispatch_token = resolved;
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                }
-                            } else {
-                                false
-                            };
-
-                            if should_dispatch {
-                                let delegate_args: Vec<EmValue> =
-                                    arg_values.get(1..).unwrap_or(&[]).to_vec();
-
-                                // Set up multicast state if there are more entries
-                                if invocation_list.len() > 1 {
-                                    thread.set_multicast_state(MulticastState {
-                                        remaining_entries: invocation_list
-                                            .get(1..)
-                                            .unwrap_or(&[])
-                                            .to_vec(),
-                                        delegate_args: delegate_args.clone(),
-                                        dispatch_depth: thread.call_depth(),
-                                    });
-                                }
-
-                                return Ok(CallResolution::Redirect {
-                                    target_token: dispatch_token,
-                                    arguments: delegate_args,
-                                    is_virtual: false,
-                                    pre_push_value: None,
-                                    is_reflection_invoke: false,
-                                    assembly_index: None,
-                                    method_type_args: None,
-                                });
-                            }
-
-                            if target_token.is_table(TableId::MemberRef) {
-                                let delegate_args: Vec<EmValue> =
-                                    arg_values.get(1..).unwrap_or(&[]).to_vec();
-
-                                // Set up multicast state if there are more entries
-                                if invocation_list.len() > 1 {
-                                    thread.set_multicast_state(MulticastState {
-                                        remaining_entries: invocation_list
-                                            .get(1..)
-                                            .unwrap_or(&[])
-                                            .to_vec(),
-                                        delegate_args: delegate_args.clone(),
-                                        dispatch_depth: thread.call_depth(),
-                                    });
-                                }
-
-                                return Ok(CallResolution::Redirect {
-                                    target_token,
-                                    arguments: delegate_args,
-                                    is_virtual: false,
-                                    pre_push_value: None,
-                                    is_reflection_invoke: false,
-                                    assembly_index: None,
-                                    method_type_args: None,
-                                });
-                            }
-
-                            debug!(
-                                "delegate dispatch failed: target 0x{:08X} has no concrete implementation",
-                                target_token.value()
-                            );
-                            return Ok(CallResolution::ThrowException {
-                                exception_type: synthetic_exception::INVALID_OPERATION,
-                                message: format!(
-                                    "delegate target 0x{:08X} has no concrete implementation",
-                                    target_token.value()
-                                ),
-                            });
-                        }
-                    }
-                    Ok(other) => {
-                        debug!(
-                            "Delegate Invoke on {:?}: this is {:?}, not a Delegate — dispatch skipped",
-                            resolved_method_token,
-                            std::mem::discriminant(&other),
-                        );
-                    }
-                    Err(_) => {
-                        debug!(
-                            "Delegate Invoke on {:?}: heap lookup failed for {:?}",
-                            resolved_method_token, href,
-                        );
-                    }
-                }
-            } else {
-                debug!(
-                    "Delegate Invoke on {:?}: this is {:?}, not an ObjectRef",
-                    resolved_method_token,
-                    arg_values.first(),
-                );
+        // Delegate dispatch: a `runtime managed` method named "Invoke" on a delegate object
+        // runs the delegate's entries
+        if method.is_code_runtime() && method.name == "Invoke" && is_instance {
+            if let Some(resolution) =
+                self.dispatch_delegate_invoke(context, thread, resolved_method_token, &arg_values)?
+            {
+                return Ok(resolution);
             }
         }
 
@@ -1050,28 +799,31 @@ impl CallResolver {
                         method_type_args: None,
                     });
                 }
-                // No body - likely a P/Invoke, return symbolic
-                let return_flavor = context
+                // No body, likely a P/Invoke: its result is symbolic. A void method has
+                // none, and pushing one left a value on the caller's stack that no
+                // instruction pops.
+                let value = context
                     .get_return_type(resolved_method_token)?
-                    .unwrap_or(CilFlavor::Object);
-                Ok(CallResolution::ReturnSynthetic {
-                    value: Some(EmValue::Symbolic(SymbolicValue::new(
-                        return_flavor,
-                        TaintSource::MethodReturn(resolved_method_token.value()),
-                    ))),
-                })
+                    .map(|return_flavor| {
+                        EmValue::Symbolic(SymbolicValue::new(
+                            return_flavor,
+                            TaintSource::MethodReturn(resolved_method_token.value()),
+                        ))
+                    });
+                Ok(CallResolution::ReturnSynthetic { value })
             }
 
             UnknownMethodBehavior::Symbolic => {
-                let return_flavor = context
+                // A symbolic result for a method returning one; a void method has none
+                let value = context
                     .get_return_type(resolved_method_token)?
-                    .unwrap_or(CilFlavor::Object);
-                Ok(CallResolution::ReturnSynthetic {
-                    value: Some(EmValue::Symbolic(SymbolicValue::new(
-                        return_flavor,
-                        TaintSource::MethodReturn(resolved_method_token.value()),
-                    ))),
-                })
+                    .map(|return_flavor| {
+                        EmValue::Symbolic(SymbolicValue::new(
+                            return_flavor,
+                            TaintSource::MethodReturn(resolved_method_token.value()),
+                        ))
+                    });
+                Ok(CallResolution::ReturnSynthetic { value })
             }
 
             UnknownMethodBehavior::Fail => Err(EmulationError::UnsupportedMethod {
@@ -1103,6 +855,402 @@ impl CallResolver {
 
             UnknownMethodBehavior::Skip => Ok(CallResolution::ReturnSynthetic { value: None }),
         }
+    }
+    /// Dispatches a delegate's `Invoke` (`invoke_token`) to the method its invocation list
+    /// names, with `arg_values` the arguments `Invoke` was called with, the delegate first.
+    ///
+    /// A closed delegate passes its target as the first argument; a multicast delegate runs
+    /// one entry per `Invoke`, the controller reissuing it for each next entry (see
+    /// [`MulticastState`]). A native function pointer runs through its hook.
+    ///
+    /// # Returns
+    ///
+    /// The resolution that runs the entry, or `None` when the receiver is no delegate (or its
+    /// list is empty) and the call resolves as any other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the heap or a native hook fails.
+    fn dispatch_delegate_invoke(
+        &self,
+        context: &EmulationContext,
+        thread: &mut EmulationThread,
+        invoke_token: Token,
+        arg_values: &[EmValue],
+    ) -> Result<Option<CallResolution>> {
+        if let Some(EmValue::ObjectRef(href)) = arg_values.first() {
+            match thread.heap().get_shared(*href).as_deref() {
+                Ok(HeapObject::Delegate {
+                    invocation_list, ..
+                }) => {
+                    // A multicast delegate runs its entries in order, one per `Invoke`:
+                    // the controller reissues the `Invoke` for each next entry (see
+                    // `MulticastState`), which starts here at the entry it recorded.
+                    let start = thread.take_delegate_resume(*href);
+                    if let Some(entry) = invocation_list.get(start) {
+                        let target_token = entry.method_token;
+                        let delegate_target = entry.target;
+                        // The entries after this one, for the controller to run next
+                        let multicast =
+                            (invocation_list.len() > start.saturating_add(1)).then(|| {
+                                MulticastState {
+                                    delegate: *href,
+                                    invoke_args: arg_values.to_vec(),
+                                    next_entry: start.saturating_add(1),
+                                    call_offset: 0,
+                                }
+                            });
+                        // A closed delegate (one bound to a target) passes its target as
+                        // the first argument, as the CLR does: `this` of an instance
+                        // method, or the first parameter of a static one closed over it.
+                        // An open delegate passes the arguments alone.
+                        let delegate_args: Vec<EmValue> = delegate_target
+                            .map(EmValue::ObjectRef)
+                            .into_iter()
+                            .chain(arg_values.iter().skip(1).cloned())
+                            .collect();
+
+                        // Native function pointer delegates use synthetic
+                        // tokens allocated per-function by the registry.
+                        // Look up the function name and return an
+                        // appropriate value for each native API.
+                        if tokens::is_native_function_pointer(target_token) {
+                            // Element 0 is the delegate itself; the rest are
+                            // the arguments the native function was called
+                            // with, and a hook needs them to do its work.
+                            let native_args: Vec<EmValue> =
+                                arg_values.iter().skip(1).cloned().collect();
+                            let return_value =
+                                self.dispatch_native_delegate(target_token, &native_args, thread)?;
+                            if let Some(state) = multicast {
+                                thread.set_multicast_state(state);
+                            }
+                            return Ok(Some(CallResolution::HookedBypass { return_value }));
+                        }
+
+                        // Resolve MemberRef → MethodDef if the target is local
+                        let mut dispatch_token = if target_token.is_table(TableId::MemberRef) {
+                            context
+                                .assembly()
+                                .resolver()
+                                .resolve_method(target_token)
+                                .filter(|t| t.is_table(TableId::MethodDef))
+                                .unwrap_or(target_token)
+                        } else {
+                            target_token
+                        };
+
+                        let should_dispatch = if context.is_synthetic_method(dispatch_token) {
+                            // Synthetic methods from DynamicMethod/ILGenerator
+                            // are always dispatchable.
+                            true
+                        } else if dispatch_token.is_table(TableId::MethodDef) {
+                            let has_il = context
+                                .get_method(dispatch_token)
+                                .map(|m| m.has_body() && m.instructions().next().is_some())
+                                .unwrap_or(false);
+                            if has_il {
+                                true
+                            } else {
+                                let is_virtual = context
+                                    .get_method(dispatch_token)
+                                    .map(|m| m.is_virtual())
+                                    .unwrap_or(false);
+
+                                if is_virtual {
+                                    let instance_ref = delegate_target.or_else(|| {
+                                        arg_values.get(1).and_then(|v| match v {
+                                            EmValue::ObjectRef(r) => Some(*r),
+                                            _ => None,
+                                        })
+                                    });
+
+                                    if let Some(inst_ref) = instance_ref {
+                                        let resolved = self.resolve_virtual_dispatch(
+                                            context,
+                                            thread,
+                                            dispatch_token,
+                                            &EmValue::ObjectRef(inst_ref),
+                                        );
+                                        if resolved != dispatch_token {
+                                            let resolved_has_il = context
+                                                .get_method(resolved)
+                                                .map(|m| {
+                                                    m.has_body()
+                                                        && m.instructions().next().is_some()
+                                                })
+                                                .unwrap_or(false);
+                                            if resolved_has_il {
+                                                dispatch_token = resolved;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
+                        if should_dispatch {
+                            if let Some(state) = multicast {
+                                thread.set_multicast_state(state);
+                            }
+
+                            return Ok(Some(CallResolution::Redirect {
+                                target_token: dispatch_token,
+                                arguments: delegate_args,
+                                is_virtual: false,
+                                pre_push_value: None,
+                                is_reflection_invoke: false,
+                                assembly_index: None,
+                                method_type_args: None,
+                            }));
+                        }
+
+                        if target_token.is_table(TableId::MemberRef) {
+                            if let Some(state) = multicast {
+                                thread.set_multicast_state(state);
+                            }
+
+                            return Ok(Some(CallResolution::Redirect {
+                                target_token,
+                                arguments: delegate_args,
+                                is_virtual: false,
+                                pre_push_value: None,
+                                is_reflection_invoke: false,
+                                assembly_index: None,
+                                method_type_args: None,
+                            }));
+                        }
+
+                        debug!(
+                            "delegate dispatch failed: target 0x{:08X} has no concrete implementation",
+                            target_token.value()
+                        );
+                        return Ok(Some(CallResolution::ThrowException {
+                            exception_type: synthetic_exception::INVALID_OPERATION,
+                            message: format!(
+                                "delegate target 0x{:08X} has no concrete implementation",
+                                target_token.value()
+                            ),
+                        }));
+                    }
+                }
+                Ok(other) => {
+                    debug!(
+                        "Delegate Invoke on {:?}: this is {}, not a Delegate: dispatch skipped",
+                        invoke_token,
+                        other.kind(),
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        "Delegate Invoke on {:?}: heap lookup failed for {:?}",
+                        invoke_token, href,
+                    );
+                }
+            }
+        } else {
+            debug!(
+                "Delegate Invoke on {:?}: this is {:?}, not an ObjectRef",
+                invoke_token,
+                arg_values.first(),
+            );
+        }
+        Ok(None)
+    }
+
+    /// Enters the method of the receiver's runtime type that overrides the one a `callvirt`
+    /// names by a MemberRef, as the CLR dispatches it: a user type overriding `ToString`,
+    /// `Dispose` or `Stream.Read` runs its own method, not the BCL method's hook.
+    ///
+    /// # Returns
+    /// `None` when the receiver is not an object, its type does not override the method,
+    /// the override has no body to emulate, or methods without hooks are not emulated:
+    /// the hooks and the declared method then answer the call.
+    ///
+    /// # Errors
+    /// Returns an error when the arguments cannot be read off the stack.
+    fn try_member_ref_override(
+        &self,
+        context: &EmulationContext,
+        method_token: Token,
+        thread: &mut EmulationThread,
+    ) -> Result<Option<CallResolution>> {
+        let Some(member_ref) = context.get_member_ref(method_token) else {
+            return Ok(None);
+        };
+        let MemberRefSignature::Method(method_sig) = &member_ref.signature else {
+            return Ok(None);
+        };
+        if !method_sig.has_this {
+            return Ok(None);
+        }
+        let total_args = (method_sig.param_count as usize).saturating_add(1);
+        let resolved = {
+            let args = thread.peek_args(total_args)?;
+            let Some(this_arg) = args.first() else {
+                return Err(out_of_bounds_error!());
+            };
+            self.resolve_virtual_dispatch(context, thread, method_token, this_arg)
+        };
+        if resolved == method_token || !resolved.is_table(TableId::MethodDef) {
+            return Ok(None);
+        }
+        let method = context.get_method(resolved)?;
+        if !method.has_body() || method.instructions().next().is_none() {
+            return Ok(None);
+        }
+        let emulates = self
+            .runtime
+            .read()
+            .map_err(|_| EmulationError::LockPoisoned {
+                description: "runtime lock poisoned",
+            })?
+            .unknown_method_behavior()
+            == UnknownMethodBehavior::Emulate;
+        if !emulates {
+            return Ok(None);
+        }
+        let arguments = thread.pop_args(total_args)?;
+        let expects_return = context.method_returns_value(resolved)?;
+        Ok(Some(CallResolution::EnterMethod {
+            token: resolved,
+            arguments,
+            expects_return,
+            assembly_index: None,
+            method_type_args: None,
+        }))
+    }
+
+    /// Runs the hook of the receiver's runtime type for a `callvirt` through a MemberRef,
+    /// before the hook of the declared method.
+    ///
+    /// `callvirt` reaches the override the runtime type of `this` declares (ECMA-335
+    /// §III.3.19), and compilers name the method where it was first declared: C# compiles
+    /// `cryptoStream.Write(...)` to `callvirt Stream::Write`. A hook registered for the
+    /// declared type (`Stream.Write`) would otherwise handle a `CryptoStream`, a
+    /// `DeflateStream` or a `StreamReader` as the base type it knows, reading nothing or
+    /// dropping what is written. So when the runtime type differs from the declared type
+    /// and has a hook for the method, that hook runs; otherwise the declared method's hook
+    /// and the rest of resolution follow as before.
+    ///
+    /// # Returns
+    ///
+    /// The resolution when the runtime type's hook handled the call, with the arguments
+    /// popped; `None` when no such hook matched, with the stack untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the arguments cannot be read or the hook fails.
+    fn try_runtime_type_hook(
+        &self,
+        context: &EmulationContext,
+        method_token: Token,
+        thread: &mut EmulationThread,
+    ) -> Result<Option<CallResolution>> {
+        let Some(member_ref) = context.get_member_ref(method_token) else {
+            return Ok(None);
+        };
+        let MemberRefSignature::Method(method_sig) = &member_ref.signature else {
+            return Ok(None);
+        };
+        if !method_sig.has_this {
+            return Ok(None);
+        }
+        let total_args = (method_sig.param_count as usize).saturating_add(1);
+        let args = thread.peek_args(total_args)?;
+        let Some((this_arg, rest_args)) = args.split_first() else {
+            return Err(out_of_bounds_error!());
+        };
+        let EmValue::ObjectRef(heap_ref) = this_arg else {
+            return Ok(None);
+        };
+        let Ok(runtime_type_token) = thread.heap().get_type_token(*heap_ref) else {
+            return Ok(None);
+        };
+        let Some(runtime_type) = context.get_type(runtime_type_token) else {
+            return Ok(None);
+        };
+        let rt_namespace = if runtime_type.namespace.is_empty() {
+            runtime_type
+                .enclosing_type()
+                .map(|enc| enc.namespace.clone())
+                .filter(|ns| !ns.is_empty())
+                .unwrap_or_default()
+        } else {
+            runtime_type.namespace.clone()
+        };
+        let rt_type_name = &runtime_type.name;
+
+        // The declared type's own hook is the declared method's: nothing to dispatch
+        let declared_type_info = EmulationContext::get_member_ref_type_info(&member_ref);
+        if declared_type_info
+            .as_ref()
+            .is_some_and(|(dns, dtn)| dns == &rt_namespace && dtn == rt_type_name.as_str())
+        {
+            return Ok(None);
+        }
+
+        let param_types = context.get_parameter_types(method_token).ok();
+        // `Void` for a void method; `None` only when the signature cannot be read
+        let return_type = context
+            .get_return_type(method_token)
+            .ok()
+            .map(|flavor| flavor.unwrap_or(CilFlavor::Void));
+        let hook_context = HookContext::new(
+            method_token,
+            &rt_namespace,
+            rt_type_name,
+            &member_ref.name,
+            self.config.pointer_size,
+        )
+        .with_this(Some(this_arg))
+        .with_args(rest_args)
+        .with_param_types(param_types.as_deref())
+        .with_return_type(return_type);
+
+        let resolution = match self.hooks.execute(&hook_context, thread, |_| None)? {
+            HookOutcome::Handled(value) => {
+                if self.trace_stubs_enabled() {
+                    self.trace(TraceEvent::HookInvoke {
+                        method: method_token,
+                        hook_name: format!(
+                            "{}.{}.{} [virtual dispatch]",
+                            rt_namespace, rt_type_name, member_ref.name
+                        ),
+                        bypassed: true,
+                        return_value: value.as_ref().map(|v| format!("{v}")),
+                    });
+                }
+                CallResolution::HookedBypass {
+                    return_value: self.checked_hook_return(context, method_token, value)?,
+                }
+            }
+            HookOutcome::ThrewException {
+                exception_type,
+                message,
+            } => CallResolution::ThrowException {
+                exception_type,
+                message,
+            },
+            // A reflection redirect does not arise from a stream or reader hook
+            HookOutcome::ReflectionInvoke { .. } => {
+                CallResolution::HookedBypass { return_value: None }
+            }
+            HookOutcome::NoMatch => return Ok(None),
+        };
+        thread.pop_args(total_args)?;
+        Ok(Some(resolution))
     }
 
     /// Resolves virtual dispatch to find the actual method to call.
@@ -1258,7 +1406,7 @@ impl CallResolver {
         // Resolve namespace from enclosing type for nested types.
         // In .NET, nested types have empty namespace in metadata but inherit their
         // enclosing type's namespace (e.g., List`1/Enumerator → "System.Collections.Generic").
-        let enclosing_ns: Option<String>;
+        let enclosing_ns: Option<SharedStr>;
         let namespace = if raw_namespace.is_empty() {
             enclosing_ns = declaring_type_arc
                 .as_ref()
@@ -1439,7 +1587,7 @@ impl CallResolver {
 
         // For P/Invoke methods, look up the real import name from CilImports
         // This handles obfuscated method names where the actual import name differs
-        let (function_name, dll_name): (String, Option<String>) =
+        let (function_name, dll_name): (SharedStr, Option<SharedStr>) =
             if let Some(import) = context.find_import_by_method(method_token) {
                 let dll = context.get_import_dll_name(&import);
                 (import.name.clone(), dll)
@@ -1463,9 +1611,11 @@ impl CallResolver {
             // P/Invoke calls are always bypassed - no "original" to execute (lock-free)
             match self.hooks.execute(&hook_context, thread, |_| None)? {
                 HookOutcome::NoMatch => {
-                    // No hook found - push args back and return None
-                    // (caller will decide how to handle unhandled P/Invoke)
-                    for arg in args.into_iter().rev() {
+                    // No hook found: the arguments go back as they were, the first deepest,
+                    // and the caller decides how to handle the unhandled P/Invoke.
+                    // (`pop_args` returns them in declaration order; pushing them back in
+                    // reverse swapped them for whatever ran the call next.)
+                    for arg in args {
                         thread.push(arg)?;
                     }
                     return Ok(None);
@@ -1475,7 +1625,11 @@ impl CallResolver {
                     bypass_value: result,
                     ..
                 } => {
-                    return Ok(Some(result));
+                    return Ok(Some(self.checked_hook_return(
+                        context,
+                        method_token,
+                        result,
+                    )?));
                 }
                 HookOutcome::ThrewException { message, .. } => {
                     return Err(EmulationError::HookError(format!(
@@ -1487,6 +1641,41 @@ impl CallResolver {
         }
 
         Ok(None)
+    }
+
+    /// Checks the result a hook gave for `method_token` against the method's signature: a
+    /// value for a method that returns one, nothing for a void method. The caller pushes the
+    /// result as the call's, so a value a void method's hook returned stayed on the stack, and
+    /// a missing one let the caller pop whatever lay below.
+    ///
+    /// A signature that cannot be read leaves the result as the hook gave it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmulationError::HookError`] naming the method when the result does not fit
+    /// its signature.
+    fn checked_hook_return(
+        &self,
+        context: &EmulationContext,
+        method_token: Token,
+        value: Option<EmValue>,
+    ) -> Result<Option<EmValue>> {
+        let Ok(return_type) = context.get_return_type(method_token) else {
+            return Ok(value);
+        };
+        match (return_type, &value) {
+            (Some(_), Some(_)) | (None, None) => Ok(value),
+            (Some(return_type), None) => Err(EmulationError::HookError(format!(
+                "the hook for {} returned nothing for a method returning {return_type:?}",
+                self.format_method_name(method_token)
+            ))
+            .into()),
+            (None, Some(returned)) => Err(EmulationError::HookError(format!(
+                "the hook for {} returned {returned} for a void method",
+                self.format_method_name(method_token)
+            ))
+            .into()),
+        }
     }
 
     /// Builds a [`HookContext`] from pre-resolved method identity and executes
@@ -1516,8 +1705,11 @@ impl CallResolver {
         let param_types = context.get_parameter_types(method_token).ok();
         let param_types_ref: Option<&[CilFlavor]> = param_types.as_deref();
 
-        // Get return type
-        let return_type = context.get_return_type(method_token).ok().flatten();
+        // `Void` for a void method; `None` only when the signature cannot be read
+        let return_type = context
+            .get_return_type(method_token)
+            .ok()
+            .map(|flavor| flavor.unwrap_or(CilFlavor::Void));
 
         // Split into this and method args
         let (this_ref, method_args): (Option<&EmValue>, &[EmValue]) = if info.has_this {
@@ -1693,6 +1885,103 @@ pub fn maybe_run_type_cctor(
         return Ok(false);
     };
 
+    enter_type_cctor(
+        address_space,
+        cctor_tracker,
+        interpreter,
+        thread,
+        context,
+        type_token,
+        field,
+    )
+}
+
+/// Checks if a method's declaring type needs `.cctor` initialization and runs it if needed.
+///
+/// Implements ECMA-335 §II.10.5.3: before invoking a type's static method,
+/// its static constructor (`.cctor`) must be run exactly once. This complements
+/// [`maybe_run_type_cctor`] which handles static field access.
+///
+/// # Returns
+///
+/// * `true` — A `.cctor` was pushed and needs to run first (don't advance IP)
+/// * `false` — Type is already initialized, has no `.cctor`, or the method's
+///   declaring type couldn't be resolved
+pub fn maybe_run_type_cctor_for_method(
+    address_space: &AddressSpace,
+    cctor_tracker: &CctorTracker,
+    interpreter: &mut Interpreter,
+    thread: &mut EmulationThread,
+    context: &EmulationContext,
+    method: Token,
+) -> Result<bool> {
+    // Only process MethodDef (0x06), MemberRef (0x0A), MethodSpec (0x2B)
+    let table = method.table();
+    if table != 0x06 && table != 0x0A && table != 0x2B {
+        return Ok(false);
+    }
+
+    // Find the type that declares this method.
+    //
+    // This runs for every call instruction, including after the type is initialised and this
+    // function has nothing left to do. The initialisation check cannot be hoisted above it —
+    // it is keyed by *type* token, which is precisely what this lookup produces. The lookup
+    // itself is therefore what has to be cheap: `declaring_type` resolves through the method's
+    // own back-pointer, falling back to a memoised registry index. A scan over every type and
+    // method would make dispatch O(total methods in assembly).
+    let Some(type_info) = context.assembly().resolver().declaring_type(method) else {
+        return Ok(false);
+    };
+    let type_token = type_info.token;
+
+    // Skip <Module> (global type) — its .cctor is run explicitly during warmup
+    if type_token.table() == 0x02 && type_token.row() == 1 {
+        return Ok(false);
+    }
+
+    enter_type_cctor(
+        address_space,
+        cctor_tracker,
+        interpreter,
+        thread,
+        context,
+        type_token,
+        method,
+    )
+}
+
+/// Runs the type initializer (`.cctor`) of `type_token` if it has not run, for the access
+/// `trigger` (a static field or a method of the type) that needs it.
+///
+/// The type is marked in progress and its static fields are zeroed (ECMA-335 §II.10.5.3.2)
+/// before the `.cctor` frame is pushed, so an access from inside the `.cctor` itself, or from
+/// a type it initializes in turn, sees the type as initialized rather than starting it again
+/// (§II.10.5.3.3). A type without a `.cctor`, or whose `.cctor` has no body, is initialized at
+/// once.
+///
+/// Only this type's initializer runs. ECMA-335 §II.10.5.3.1 triggers a type's initializer by
+/// accesses to that type alone, and the CLR runs a base type's when the base itself is first
+/// accessed (its static members, or its constructor the derived one calls), which these same
+/// triggers handle. Marking the base type in progress here without running its `.cctor` would
+/// leave it looking initialized, its initializer never run and its statics zero.
+///
+/// # Returns
+///
+/// * `true`: a `.cctor` frame was pushed and runs first (the caller does not advance its IP)
+/// * `false`: the type is initialized, or its `.cctor` failed before (lenient mode)
+///
+/// # Errors
+///
+/// Returns an error if the static state cannot be read or written.
+fn enter_type_cctor(
+    address_space: &AddressSpace,
+    cctor_tracker: &CctorTracker,
+    interpreter: &mut Interpreter,
+    thread: &mut EmulationThread,
+    context: &EmulationContext,
+    type_token: Token,
+    trigger: Token,
+) -> Result<bool> {
     // If this type's .cctor previously failed, re-throw the stored exception.
     // Per ECMA-335, a type whose .cctor threw is permanently unusable.
     if cctor_tracker.get_type_failure(type_token)?.is_some() {
@@ -1741,21 +2030,12 @@ pub fn maybe_run_type_cctor(
     // Zero-initialize all static fields for this type before running .cctor
     zero_initialize_static_fields(address_space, context, type_token)?;
 
-    // Base-type-first initialization: ensure parent types are initialized first
-    if let Some(parent_token) = context.get_base_type_token(type_token) {
-        if !address_space.statics().is_type_initialized(parent_token)? {
-            if let Some(parent_cctor) = context.find_type_cctor(parent_token) {
-                if let Ok(parent_method) = context.get_method(parent_cctor) {
-                    if parent_method.has_body() {
-                        address_space
-                            .statics()
-                            .set_type_init_state(parent_token, TypeInitState::InProgress)?;
-                        zero_initialize_static_fields(address_space, context, parent_token)?;
-                    }
-                }
-            }
-        }
-    }
+    debug!(
+        "triggering .cctor 0x{:08X} for type 0x{:08X} (access 0x{:08X})",
+        cctor_token.value(),
+        type_token.value(),
+        trigger.value()
+    );
 
     // .cctor takes no arguments and returns void
     let local_types = context.get_local_types(cctor_token).unwrap_or_default();
@@ -1783,139 +2063,6 @@ pub fn maybe_run_type_cctor(
     frame.set_is_cctor();
 
     // Push the frame and set up interpreter
-    thread.push_frame(frame);
-    interpreter.set_method(cctor_token);
-    interpreter.set_offset(0);
-
-    Ok(true)
-}
-
-/// Checks if a method's declaring type needs `.cctor` initialization and runs it if needed.
-///
-/// Implements ECMA-335 §II.10.5.3: before invoking a type's static method,
-/// its static constructor (`.cctor`) must be run exactly once. This complements
-/// [`maybe_run_type_cctor`] which handles static field access.
-///
-/// # Returns
-///
-/// * `true` — A `.cctor` was pushed and needs to run first (don't advance IP)
-/// * `false` — Type is already initialized, has no `.cctor`, or the method's
-///   declaring type couldn't be resolved
-pub fn maybe_run_type_cctor_for_method(
-    address_space: &AddressSpace,
-    cctor_tracker: &CctorTracker,
-    interpreter: &mut Interpreter,
-    thread: &mut EmulationThread,
-    context: &EmulationContext,
-    method: Token,
-) -> Result<bool> {
-    // Only process MethodDef (0x06), MemberRef (0x0A), MethodSpec (0x2B)
-    let table = method.table();
-    if table != 0x06 && table != 0x0A && table != 0x2B {
-        return Ok(false);
-    }
-
-    // Find the type that declares this method.
-    //
-    // This runs for every call instruction, including after the type is initialised and this
-    // function has nothing left to do. The initialisation check cannot be hoisted above it —
-    // it is keyed by *type* token, which is precisely what this lookup produces. The lookup
-    // itself is therefore what has to be cheap: `declaring_type` resolves through the method's
-    // own back-pointer, falling back to a memoised registry index. A scan over every type and
-    // method would make dispatch O(total methods in assembly).
-    let Some(type_info) = context.assembly().resolver().declaring_type(method) else {
-        return Ok(false);
-    };
-    let type_token = type_info.token;
-
-    // Skip <Module> (global type) — its .cctor is run explicitly during warmup
-    if type_token.table() == 0x02 && type_token.row() == 1 {
-        return Ok(false);
-    }
-
-    // If this type's .cctor previously failed, skip (lenient mode)
-    if cctor_tracker.get_type_failure(type_token)?.is_some() {
-        debug!(
-            "type 0x{:08X} .cctor previously failed — skipping re-throw (lenient mode)",
-            type_token.value()
-        );
-        return Ok(false);
-    }
-
-    // Check if already initialized
-    if address_space.statics().is_type_initialized(type_token)? {
-        return Ok(false);
-    }
-
-    // Find the .cctor for this type
-    let Some(cctor_token) = context.find_type_cctor(type_token) else {
-        address_space.statics().mark_type_initialized(type_token)?;
-        return Ok(false);
-    };
-
-    // Get method info for .cctor and check if it has a body
-    let Ok(cctor_method) = context.get_method(cctor_token) else {
-        address_space.statics().mark_type_initialized(type_token)?;
-        return Ok(false);
-    };
-
-    if !cctor_method.has_body() {
-        address_space.statics().mark_type_initialized(type_token)?;
-        return Ok(false);
-    }
-
-    // Mark type as InProgress BEFORE running .cctor to prevent infinite recursion
-    address_space
-        .statics()
-        .set_type_init_state(type_token, TypeInitState::InProgress)?;
-
-    // Zero-initialize all static fields for this type before running .cctor
-    zero_initialize_static_fields(address_space, context, type_token)?;
-
-    // Base-type-first initialization: ensure parent types are initialized first
-    if let Some(parent_token) = context.get_base_type_token(type_token) {
-        if !address_space.statics().is_type_initialized(parent_token)? {
-            if let Some(parent_cctor) = context.find_type_cctor(parent_token) {
-                if let Ok(parent_method) = context.get_method(parent_cctor) {
-                    if parent_method.has_body() {
-                        address_space
-                            .statics()
-                            .set_type_init_state(parent_token, TypeInitState::InProgress)?;
-                        zero_initialize_static_fields(address_space, context, parent_token)?;
-                    }
-                }
-            }
-        }
-    }
-
-    debug!(
-        "triggering .cctor 0x{:08X} for type 0x{:08X} (method call 0x{:08X})",
-        cctor_token.value(),
-        type_token.value(),
-        method.value()
-    );
-
-    let local_types = context.get_local_types(cctor_token).unwrap_or_default();
-
-    // Save current stack state
-    let caller_stack = thread.take_stack();
-
-    let return_method = interpreter.ip().method();
-    let return_offset = interpreter.ip().offset();
-
-    let args_with_types: Vec<(EmValue, CilFlavor)> = vec![];
-
-    let mut frame = ThreadCallFrame::new(
-        cctor_token,
-        Some(return_method),
-        return_offset,
-        local_types,
-        args_with_types,
-        false,
-    );
-    frame.save_caller_stack(caller_stack);
-    frame.set_is_cctor();
-
     thread.push_frame(frame);
     interpreter.set_method(cctor_token);
     interpreter.set_offset(0);
@@ -2010,14 +2157,29 @@ fn native_delegate_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulation::{
-        engine::generics::GenericRegistry, process::EmulationConfig, runtime::RuntimeState,
-        tracer::TraceWriter,
+    use crate::{
+        assembly::{InstructionAssembler, Operand},
+        cilassembly::{ChangeRefRc, CilAssembly, MethodBuilder},
+        emulation::{
+            engine::generics::GenericRegistry, runtime::RuntimeState, tracer::TraceWriter,
+            EmulationOutcome, Hook, PreHookResult, ProcessBuilder,
+        },
+        metadata::tables::{
+            AssemblyRefBuilder, CodedIndex, CodedIndexType, FieldAttributes, FieldBuilder,
+            ImplMapBuilder, MemberRefBuilder, ModuleRefBuilder, PInvokeAttributes, TypeAttributes,
+            TypeDefBuilder, TypeRefBuilder,
+        },
+        testkit::{
+            emulation::{create_test_thread, emulation_config},
+            fixture,
+        },
+        utils::compute_hmac_sha256,
+        CilObject, ValidationConfig,
     };
 
     fn create_test_resolver() -> CallResolver {
         let runtime = Arc::new(RwLock::new(RuntimeState::new()));
-        let config = Arc::new(EmulationConfig::default());
+        let config = Arc::new(emulation_config());
         let generics = Arc::new(GenericRegistry::new());
         CallResolver::new(runtime, config, None, generics).unwrap()
     }
@@ -2095,7 +2257,7 @@ mod tests {
     #[test]
     fn test_resolver_with_trace_writer() {
         let runtime = Arc::new(RwLock::new(RuntimeState::new()));
-        let config = Arc::new(EmulationConfig::default());
+        let config = Arc::new(emulation_config());
         let writer = Arc::new(TraceWriter::new_memory(1000, None));
         let generics = Arc::new(GenericRegistry::new());
         let resolver = CallResolver::new(runtime, config, Some(writer), generics).unwrap();
@@ -2103,5 +2265,923 @@ mod tests {
         // trace_stubs_enabled depends on config.tracing.trace_stubs
         // Default config has trace_stubs = false
         assert!(!resolver.trace_stubs_enabled());
+    }
+
+    /// `callvirt Stream::Write` on a CryptoStream, as C# compiles `cs.Write(...)`, reaches
+    /// the CryptoStream's hook and is buffered for its final block, instead of the hook of
+    /// `Stream.Write`, which knows only plain streams and drops the bytes. The method is
+    /// .NET Reactor's own wrapper around that call (`0x060000A5`).
+    #[test]
+    fn callvirt_reaches_the_hook_of_the_receivers_runtime_type() {
+        let assembly = Arc::new(
+            // Two Assembly rows, as .NET Reactor writes them: loaded as analysis loads it
+            CilObject::from_path_with_validation(
+                fixture("packers/netreactor/7.5.0/reactor_full.exe"),
+                ValidationConfig::analysis(),
+            )
+            .unwrap(),
+        );
+        // The TypeRef the program names CryptoStream with, as `newobj` records it
+        let crypto_stream_type = assembly
+            .types()
+            .get_by_name("CryptoStream")
+            .into_iter()
+            .find(|t| t.namespace == "System.Security.Cryptography")
+            .unwrap()
+            .token;
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::clone(&assembly))
+            .build()
+            .unwrap();
+        let heap = process.address_space().managed_heap();
+        let underlying = heap.alloc_stream(Vec::new(), None).unwrap();
+        let transform = heap
+            .alloc_crypto_transform("AES", vec![1; 16], vec![2; 16], true, 1, 2, None)
+            .unwrap();
+        let stream = heap
+            .alloc_crypto_stream(underlying, transform, 1, Some(crypto_stream_type))
+            .unwrap();
+        let buffer = heap.alloc_byte_array(b"through Stream::Write").unwrap();
+
+        let wrapper = Token::new(0x0600_00A5);
+        let outcome = process
+            .execute_method(
+                wrapper,
+                vec![
+                    EmValue::ObjectRef(stream),
+                    EmValue::ObjectRef(buffer),
+                    EmValue::I32(0),
+                    EmValue::I32(21),
+                ],
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, EmulationOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            heap.get_crypto_stream_write_buffer(stream).unwrap(),
+            Some(b"through Stream::Write".to_vec())
+        );
+    }
+
+    /// A `callvirt` of a BCL method named by a MemberRef runs the receiver's own override:
+    /// `App.Show(object o)` calls `[mscorlib]System.Object::GetHashCode()` on an `App.Named`
+    /// whose `GetHashCode` returns 4242, and gets 4242, not the `Object.GetHashCode` hook's
+    /// answer or a symbolic value.
+    #[test]
+    fn callvirt_through_a_member_ref_runs_the_receivers_override() {
+        let crafted = CilObject::from_path(fixture("crafted_2.exe")).unwrap();
+        let object = crafted
+            .types()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .find(|ty| {
+                ty.token.is_table(TableId::TypeRef)
+                    && ty.namespace == "System"
+                    && ty.name == "Object"
+            })
+            .expect("crafted_2 imports System.Object")
+            .token;
+
+        let mut app = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        // HASTHIS, no parameters, returning int32
+        let get_hash_code = MemberRefBuilder::new()
+            .class(CodedIndex::new(
+                TableId::TypeRef,
+                object.row(),
+                CodedIndexType::MemberRefParent,
+            ))
+            .name("GetHashCode")
+            .signature(&[0x20, 0x00, 0x08])
+            .build(&mut app)
+            .unwrap();
+        let get_hash_code = Token::from_parts(TableId::MemberRef, added_row(&get_hash_code));
+        let named = TypeDefBuilder::new()
+            .name("Named")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .extends(CodedIndex::new(
+                TableId::TypeRef,
+                object.row(),
+                CodedIndexType::TypeDefOrRef,
+            ))
+            .build(&mut app)
+            .unwrap();
+        let named = Token::from_parts(TableId::TypeDef, added_row(&named));
+        MethodBuilder::new("GetHashCode")
+            .public()
+            .virtual_method()
+            .returns(TypeSignature::I4)
+            .implementation(|body| {
+                body.implementation(|asm| {
+                    asm.ldc_i4(4242)?.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+        TypeDefBuilder::new()
+            .name("Program")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        let show = MethodBuilder::new("Show")
+            .public()
+            .static_method()
+            .parameter("o", TypeSignature::Object)
+            .returns(TypeSignature::I4)
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.ldarg_0()?.callvirt(get_hash_code)?.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+        let show = Token::from_parts(TableId::MethodDef, added_row(&show));
+        let app = CilObject::from_mem(app.to_memory().unwrap()).unwrap();
+
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::new(app))
+            .build()
+            .unwrap();
+        let receiver = process
+            .address_space()
+            .managed_heap()
+            .alloc_object(named)
+            .unwrap();
+        let outcome = process
+            .execute_method(show, vec![EmValue::ObjectRef(receiver)])
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(4242)),
+                    ..
+                }
+            ),
+            "the override runs: {outcome:?}"
+        );
+    }
+
+    /// The row of a table row a builder added.
+    fn added_row(change: &ChangeRefRc) -> u32 {
+        change.token().expect("the row has a token").row()
+    }
+
+    /// Assembly `Lib`, `crafted_2` with `Lib.Calc` added: `Bar(a, b) = a + b`, and
+    /// `Foo(a, b) = Bar(a, b) + 100`, which calls `Bar` by its own MethodDef token.
+    fn calc_library() -> CilObject {
+        let mut lib = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        TypeDefBuilder::new()
+            .name("Calc")
+            .namespace("Lib")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut lib)
+            .unwrap();
+        let bar = MethodBuilder::new("Bar")
+            .public()
+            .static_method()
+            .parameter("a", TypeSignature::I4)
+            .parameter("b", TypeSignature::I4)
+            .returns(TypeSignature::I4)
+            .implementation(|body| {
+                body.implementation(|asm| {
+                    asm.ldarg_0()?.ldarg_1()?.add()?.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut lib)
+            .unwrap();
+        let bar = Token::from_parts(TableId::MethodDef, added_row(&bar));
+        MethodBuilder::new("Foo")
+            .public()
+            .static_method()
+            .parameter("a", TypeSignature::I4)
+            .parameter("b", TypeSignature::I4)
+            .returns(TypeSignature::I4)
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.ldarg_0()?
+                        .ldarg_1()?
+                        .call(bar)?
+                        .ldc_i4(100)?
+                        .add()?
+                        .ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut lib)
+            .unwrap();
+        CilObject::from_mem(lib.to_memory().unwrap()).unwrap()
+    }
+
+    /// A method of an assembly loaded at run time runs in that assembly, and so do the
+    /// methods it calls by its own tokens. The application calls `Lib.Calc::Foo(3, 4)` through
+    /// a MemberRef; `Foo` calls `Bar`. Both applications are `crafted_2` with methods added, so
+    /// `Bar`'s token in the application is the application's `Main`: the redirect into `Lib`
+    /// was resolved again in the application, and the frame `Foo`'s call to `Bar` pushed named
+    /// no assembly and ran in the application.
+    #[test]
+    fn a_loaded_assembly_runs_its_own_methods() {
+        let lib = calc_library();
+        let mut app = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        let lib_ref = AssemblyRefBuilder::new()
+            .name("Lib")
+            .version(1, 0, 0, 0)
+            .build(&mut app)
+            .unwrap();
+        let calc = TypeRefBuilder::new()
+            .name("Calc")
+            .namespace("Lib")
+            .resolution_scope(CodedIndex::new(
+                TableId::AssemblyRef,
+                added_row(&lib_ref),
+                CodedIndexType::ResolutionScope,
+            ))
+            .build(&mut app)
+            .unwrap();
+        // DEFAULT (static), two parameters, returning int32, taking int32 and int32
+        let foo = MemberRefBuilder::new()
+            .class(CodedIndex::new(
+                TableId::TypeRef,
+                added_row(&calc),
+                CodedIndexType::MemberRefParent,
+            ))
+            .name("Foo")
+            .signature(&[0x00, 0x02, 0x08, 0x08, 0x08])
+            .build(&mut app)
+            .unwrap();
+        let foo = Token::from_parts(TableId::MemberRef, added_row(&foo));
+        TypeDefBuilder::new()
+            .name("Program")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        let main = MethodBuilder::new("Main")
+            .public()
+            .static_method()
+            .returns(TypeSignature::I4)
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.ldc_i4(3)?.ldc_i4(4)?.call(foo)?.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+        let main = Token::from_parts(TableId::MethodDef, added_row(&main));
+        let app = CilObject::from_mem(app.to_memory().unwrap()).unwrap();
+
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::new(app))
+            .build()
+            .unwrap();
+        process
+            .runtime()
+            .write()
+            .unwrap()
+            .app_domain_mut()
+            .register_parsed_assembly(Arc::new(lib), 8)
+            .expect("the library registers");
+
+        let outcome = process.execute_method(main, Vec::new()).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(107)),
+                    ..
+                }
+            ),
+            "Main returns Foo(3, 4) = 107: {outcome:?}"
+        );
+    }
+
+    /// crafted_2 with `App.Program`: `Native(int a, int b)`, a void P/Invoke of `native.dll`
+    /// no hook answers, and `Main`, which returns 7 after calling `Native(1, 2)`. Returns the
+    /// assembly and the tokens of `Native` and `Main`.
+    fn pinvoke_app() -> (CilObject, Token, Token) {
+        let mut app = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        let module = ModuleRefBuilder::new()
+            .name("native.dll")
+            .build(&mut app)
+            .unwrap();
+        TypeDefBuilder::new()
+            .name("Program")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        let native = MethodBuilder::new("Native")
+            .public()
+            .static_method()
+            .parameter("a", TypeSignature::I4)
+            .parameter("b", TypeSignature::I4)
+            .pinvoke_impl()
+            .build(&mut app)
+            .unwrap();
+        let native = added_row(&native);
+        ImplMapBuilder::new()
+            .mapping_flags(PInvokeAttributes::CALL_CONV_WINAPI)
+            .member_forwarded(CodedIndex::new(
+                TableId::MethodDef,
+                native,
+                CodedIndexType::MemberForwarded,
+            ))
+            .import_name("Native")
+            .import_scope(added_row(&module))
+            .build(&mut app)
+            .unwrap();
+        let native = Token::from_parts(TableId::MethodDef, native);
+        let main = MethodBuilder::new("Main")
+            .public()
+            .static_method()
+            .returns(TypeSignature::I4)
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.ldc_i4(7)?.ldc_i4_1()?.ldc_i4_2()?.call(native)?.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+        let main = Token::from_parts(TableId::MethodDef, added_row(&main));
+        let app = CilObject::from_mem(app.to_memory().unwrap()).unwrap();
+        (app, native, main)
+    }
+
+    /// A P/Invoke no native hook answers leaves its arguments as they were, the first deepest,
+    /// for the resolution steps after it. They were pushed back reversed.
+    #[test]
+    fn an_unhooked_pinvoke_leaves_its_arguments_in_order() {
+        let (app, native, _) = pinvoke_app();
+        let context = EmulationContext::new(Arc::new(app), Arc::new(DashMap::new()));
+        let resolver = create_test_resolver();
+        let mut thread = create_test_thread();
+        thread.start_method(Token::new(0x0600_0001), vec![], vec![], false);
+        thread.push(EmValue::I32(1)).unwrap();
+        thread.push(EmValue::I32(2)).unwrap();
+
+        let native_result = resolver
+            .try_native_call(&context, native, &mut thread)
+            .unwrap();
+
+        assert!(native_result.is_none(), "no native hook answers native.dll");
+        assert_eq!(thread.pop().unwrap(), EmValue::I32(2));
+        assert_eq!(thread.pop().unwrap(), EmValue::I32(1));
+    }
+
+    /// A bodyless void method no hook answers returns nothing, under every behaviour that
+    /// makes up a result: a phantom symbolic return stayed on the caller's stack, and `Main`
+    /// returned it instead of its 7.
+    #[test]
+    fn an_unhooked_void_pinvoke_returns_nothing() {
+        for behavior in [
+            UnknownMethodBehavior::Emulate,
+            UnknownMethodBehavior::Symbolic,
+            UnknownMethodBehavior::Default,
+        ] {
+            let (app, _, main) = pinvoke_app();
+            let process = ProcessBuilder::new()
+                .assembly_arc(Arc::new(app))
+                .build()
+                .unwrap();
+            process
+                .runtime()
+                .write()
+                .unwrap()
+                .set_unknown_method_behavior(behavior);
+
+            let outcome = process.execute_method(main, Vec::new()).unwrap();
+
+            assert!(
+                matches!(
+                    outcome,
+                    EmulationOutcome::Completed {
+                        return_value: Some(EmValue::I32(7)),
+                        ..
+                    }
+                ),
+                "{behavior:?}: Main returns 7: {outcome:?}"
+            );
+        }
+    }
+
+    /// Adds class `App.<name>` to `app`, extending `extends` when given, with the static
+    /// `int <field>` its `.cctor` sets to `value`. Returns the type's and the field's tokens.
+    fn class_with_cctor(
+        app: &mut CilAssembly,
+        name: &str,
+        extends: Option<Token>,
+        field: &str,
+        value: i32,
+    ) -> (Token, Token) {
+        let mut class = TypeDefBuilder::new()
+            .name(name)
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC);
+        if let Some(base) = extends {
+            class = class.extends(CodedIndex::new(
+                TableId::TypeDef,
+                base.row(),
+                CodedIndexType::TypeDefOrRef,
+            ));
+        }
+        let class = class.build(app).unwrap();
+        let class = Token::from_parts(TableId::TypeDef, added_row(&class));
+        // FIELD, int32
+        let field = FieldBuilder::new()
+            .name(field)
+            .flags(FieldAttributes::PUBLIC | FieldAttributes::STATIC)
+            .signature(&[0x06, 0x08])
+            .build(app)
+            .unwrap();
+        let field = Token::from_parts(TableId::Field, added_row(&field));
+        MethodBuilder::static_constructor()
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.ldc_i4(value)?.stsfld(field)?.ret()?;
+                    Ok(())
+                })
+            })
+            .build(app)
+            .unwrap();
+        (class, field)
+    }
+
+    /// A derived type's initializer does not touch its base's: the base's `.cctor` runs when
+    /// the base is first accessed. Running the derived `.cctor` marked the base in progress
+    /// without running it, so the base looked initialized and its static stayed zero.
+    #[test]
+    fn a_base_type_runs_its_own_cctor() {
+        let mut app = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        let (base, base_value) = class_with_cctor(&mut app, "Base", None, "BaseValue", 5);
+        let (_, derived_value) =
+            class_with_cctor(&mut app, "Derived", Some(base), "DerivedValue", 1);
+        TypeDefBuilder::new()
+            .name("Program")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        // Main() => Derived.DerivedValue * 10 + Base.BaseValue
+        let main = MethodBuilder::new("Main")
+            .public()
+            .static_method()
+            .returns(TypeSignature::I4)
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.ldsfld(derived_value)?
+                        .ldc_i4(10)?
+                        .mul()?
+                        .ldsfld(base_value)?
+                        .add()?
+                        .ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+        let main = Token::from_parts(TableId::MethodDef, added_row(&main));
+        let app = CilObject::from_mem(app.to_memory().unwrap()).unwrap();
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::new(app))
+            .build()
+            .unwrap();
+
+        let outcome = process.execute_method(main, Vec::new()).unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(15)),
+                    ..
+                }
+            ),
+            "both initializers ran, 1 * 10 + 5: {outcome:?}"
+        );
+    }
+
+    /// Adds `Main` to crafted_2, with `TypeRef`s and `MemberRef`s to `ns.name` built by
+    /// `members`, the body by `body`, and returns the assembly and `Main`'s token.
+    fn app_with_main(
+        members: impl FnOnce(&mut CilAssembly) -> Vec<Token>,
+        body: impl Fn(&mut InstructionAssembler, &[Token]) -> Result<()> + 'static,
+    ) -> (CilObject, Token) {
+        let mut app = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        let tokens = members(&mut app);
+        TypeDefBuilder::new()
+            .name("Program")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        let main = MethodBuilder::new("Main")
+            .public()
+            .static_method()
+            .returns(TypeSignature::I4)
+            .implementation(move |method| method.implementation(move |asm| body(asm, &tokens)))
+            .build(&mut app)
+            .unwrap();
+        let main = Token::from_parts(TableId::MethodDef, added_row(&main));
+        (CilObject::from_mem(app.to_memory().unwrap()).unwrap(), main)
+    }
+
+    /// A `TypeRef` to framework type `namespace.name` (crafted_2's first AssemblyRef).
+    fn framework_type(app: &mut CilAssembly, namespace: &str, name: &str) -> Token {
+        let type_ref = TypeRefBuilder::new()
+            .name(name)
+            .namespace(namespace)
+            .resolution_scope(CodedIndex::new(
+                TableId::AssemblyRef,
+                1,
+                CodedIndexType::ResolutionScope,
+            ))
+            .build(app)
+            .unwrap();
+        Token::from_parts(TableId::TypeRef, added_row(&type_ref))
+    }
+
+    /// A `MemberRef` to method `name` of type `class` with signature blob `signature`.
+    fn framework_method(
+        app: &mut CilAssembly,
+        class: Token,
+        name: &str,
+        signature: &[u8],
+    ) -> Token {
+        let member = MemberRefBuilder::new()
+            .class(CodedIndex::new(
+                TableId::TypeRef,
+                class.row(),
+                CodedIndexType::MemberRefParent,
+            ))
+            .name(name)
+            .signature(signature)
+            .build(app)
+            .unwrap();
+        Token::from_parts(TableId::MemberRef, added_row(&member))
+    }
+
+    /// `new HMACSHA256(key).ComputeHash(data)` hashes with the key: the constructor hook
+    /// initializes the object `newobj` pushes. It returned another object, which `newobj`
+    /// dropped, so `ComputeHash` ran on an uninitialized object.
+    #[test]
+    fn a_constructor_hook_initializes_the_new_object() {
+        let (app, main) = app_with_main(
+            |app| {
+                let byte = framework_type(app, "System", "Byte");
+                let hmac = framework_type(app, "System.Security.Cryptography", "HMACSHA256");
+                // HASTHIS, one parameter, void, uint8[]
+                let ctor = framework_method(app, hmac, ".ctor", &[0x20, 0x01, 0x01, 0x1D, 0x05]);
+                // HASTHIS, one parameter, uint8[], uint8[]
+                let compute = framework_method(
+                    app,
+                    hmac,
+                    "ComputeHash",
+                    &[0x20, 0x01, 0x1D, 0x05, 0x1D, 0x05],
+                );
+                vec![byte, ctor, compute]
+            },
+            |asm, tokens| {
+                // Main() => new HMACSHA256(new byte[] { 7, 0, 0, 0 }).ComputeHash(new byte[3])[0].
+                // A key of zeros hashes as an empty key does, so the key has a non-zero byte.
+                asm.ldc_i4(4)?
+                    .newarr(tokens[0])?
+                    .dup()?
+                    .ldc_i4(0)?
+                    .ldc_i4(7)?
+                    // stelem.i1
+                    .emit_opcode(0x9C, None)?
+                    .newobj(tokens[1])?
+                    .ldc_i4(3)?
+                    .newarr(tokens[0])?
+                    .callvirt(tokens[2])?
+                    .ldc_i4(0)?
+                    // ldelem.u1
+                    .emit_opcode(0x91, None)?
+                    .ret()?;
+                Ok(())
+            },
+        );
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::new(app))
+            .build()
+            .unwrap();
+
+        let outcome = process.execute_method(main, Vec::new()).unwrap();
+
+        let expected = i32::from(compute_hmac_sha256(&[7, 0, 0, 0], &[0, 0, 0])[0]);
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(first)),
+                    ..
+                } if first == expected
+            ),
+            "the hash is the HMAC-SHA256 of the data under the key: {outcome:?}"
+        );
+    }
+
+    /// Runs `Main` calling `Environment.<name>`, a framework method with signature
+    /// `signature`, under a hook for it that returns `returned`. The names are made up, so
+    /// no built-in hook answers them before the test's.
+    fn run_hooked(
+        name: &'static str,
+        signature: &'static [u8],
+        returned: Option<EmValue>,
+    ) -> Result<EmulationOutcome> {
+        let (app, main) = app_with_main(
+            move |app| {
+                let environment = framework_type(app, "System", "Environment");
+                vec![framework_method(app, environment, name, signature)]
+            },
+            |asm, tokens| {
+                asm.ldc_i4(7)?.call(tokens[0])?.ret()?;
+                Ok(())
+            },
+        );
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::new(app))
+            .hook(
+                Hook::new("test")
+                    .match_name("System", "Environment", name)
+                    .pre(move |_, _| PreHookResult::Bypass(returned.clone())),
+            )
+            .build()
+            .unwrap();
+        process.execute_method(main, Vec::new())
+    }
+
+    /// A hook's result is checked against the signature of the method it stands for: the
+    /// caller pushes it as the call's. A value from a void method's hook stayed on the
+    /// caller's stack (here, `Main` returned it instead of its 7); a missing value from a
+    /// hook of a method returning one let the caller take whatever lay below.
+    #[test]
+    fn a_hook_returns_what_its_method_returns() {
+        // DEFAULT, no parameters, void / int32
+        let void_signature: &'static [u8] = &[0x00, 0x00, 0x01];
+        let int_signature: &'static [u8] = &[0x00, 0x00, 0x08];
+
+        assert!(
+            run_hooked("Notify", void_signature, Some(EmValue::I32(9))).is_err(),
+            "a value for a void method is refused"
+        );
+        assert!(
+            run_hooked("get_Answer", int_signature, None).is_err(),
+            "no value for a method returning one is refused"
+        );
+
+        let fitting = run_hooked("Notify", void_signature, None).unwrap();
+        assert!(
+            matches!(
+                fitting,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(7)),
+                    ..
+                }
+            ),
+            "{fitting:?}"
+        );
+    }
+
+    /// crafted_2 with class `App.Counter { int total; int Add(int x) => total += x; }`, the
+    /// delegate type `App.Callback : MulticastDelegate` (`int Invoke(int)`), and `Main`, whose
+    /// body `body` gets the tokens `[Counter..ctor, Counter.Add, Callback..ctor,
+    /// Callback.Invoke, Delegate.Combine, Callback, Lib.IntFunc.Invoke]`, the last a MemberRef
+    /// to `int Invoke(int)` of a delegate type of another assembly. Main has one object local.
+    fn delegate_app(
+        body: impl Fn(&mut InstructionAssembler, &[Token]) -> Result<()> + 'static,
+    ) -> (CilObject, Token) {
+        let mut app = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+        let multicast = framework_type(&mut app, "System", "MulticastDelegate");
+        let delegate = framework_type(&mut app, "System", "Delegate");
+
+        TypeDefBuilder::new()
+            .name("Counter")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        // FIELD, int32
+        let total = FieldBuilder::new()
+            .name("total")
+            .flags(FieldAttributes::PUBLIC)
+            .signature(&[0x06, 0x08])
+            .build(&mut app)
+            .unwrap();
+        let total = Token::from_parts(TableId::Field, added_row(&total));
+        let counter_ctor = MethodBuilder::constructor()
+            .implementation(|body| {
+                body.implementation(|asm| {
+                    asm.ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+        let add = MethodBuilder::new("Add")
+            .public()
+            .parameter("x", TypeSignature::I4)
+            .returns(TypeSignature::I4)
+            .implementation(move |body| {
+                body.implementation(move |asm| {
+                    asm.ldarg_0()?
+                        .ldarg_0()?
+                        .ldfld(total)?
+                        .ldarg_1()?
+                        .add()?
+                        .stfld(total)?
+                        .ldarg_0()?
+                        .ldfld(total)?
+                        .ret()?;
+                    Ok(())
+                })
+            })
+            .build(&mut app)
+            .unwrap();
+
+        let callback = TypeDefBuilder::new()
+            .name("Callback")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC | TypeAttributes::SEALED)
+            .extends(CodedIndex::new(
+                TableId::TypeRef,
+                multicast.row(),
+                CodedIndexType::TypeDefOrRef,
+            ))
+            .build(&mut app)
+            .unwrap();
+        let callback_ctor = MethodBuilder::constructor()
+            .parameter("object", TypeSignature::Object)
+            .parameter("method", TypeSignature::I)
+            .runtime_implemented()
+            .build(&mut app)
+            .unwrap();
+        let invoke = MethodBuilder::new("Invoke")
+            .public()
+            .virtual_method()
+            .parameter("x", TypeSignature::I4)
+            .returns(TypeSignature::I4)
+            .runtime_implemented()
+            .build(&mut app)
+            .unwrap();
+
+        // DEFAULT, two parameters, returning Delegate, taking Delegate and Delegate: CLASS
+        // and the TypeDefOrRef coded index of the TypeRef, compressed
+        let coded = (delegate.row() << 2) | 1;
+        let mut class = vec![0x12];
+        if coded < 0x80 {
+            class.push(u8::try_from(coded).unwrap());
+        } else {
+            class.push(0x80 | u8::try_from(coded >> 8).unwrap());
+            class.push(u8::try_from(coded & 0xFF).unwrap());
+        }
+        let mut combine_signature = vec![0x00, 0x02];
+        for _ in 0..3 {
+            combine_signature.extend_from_slice(&class);
+        }
+        let combine = framework_method(&mut app, delegate, "Combine", &combine_signature);
+        let int_func = framework_type(&mut app, "Lib", "IntFunc");
+        // HASTHIS, one parameter, int32, int32
+        let foreign_invoke =
+            framework_method(&mut app, int_func, "Invoke", &[0x20, 0x01, 0x08, 0x08]);
+
+        let tokens = vec![
+            Token::from_parts(TableId::MethodDef, added_row(&counter_ctor)),
+            Token::from_parts(TableId::MethodDef, added_row(&add)),
+            Token::from_parts(TableId::MethodDef, added_row(&callback_ctor)),
+            Token::from_parts(TableId::MethodDef, added_row(&invoke)),
+            combine,
+            Token::from_parts(TableId::TypeDef, added_row(&callback)),
+            foreign_invoke,
+        ];
+        TypeDefBuilder::new()
+            .name("Program")
+            .namespace("App")
+            .flags(TypeAttributes::CLASS | TypeAttributes::PUBLIC)
+            .build(&mut app)
+            .unwrap();
+        let main = MethodBuilder::new("Main")
+            .public()
+            .static_method()
+            .returns(TypeSignature::I4)
+            .implementation(move |method| {
+                method
+                    .local("counter", TypeSignature::Object)
+                    .implementation(move |asm| body(asm, &tokens))
+            })
+            .build(&mut app)
+            .unwrap();
+        let main = Token::from_parts(TableId::MethodDef, added_row(&main));
+        (CilObject::from_mem(app.to_memory().unwrap()).unwrap(), main)
+    }
+
+    /// Runs `Main` of [`delegate_app`] and returns its result.
+    fn run_delegate_app(
+        body: impl Fn(&mut InstructionAssembler, &[Token]) -> Result<()> + 'static,
+    ) -> EmulationOutcome {
+        let (app, main) = delegate_app(body);
+        let process = ProcessBuilder::new()
+            .assembly_arc(Arc::new(app))
+            .build()
+            .unwrap();
+        process.execute_method(main, Vec::new()).unwrap()
+    }
+
+    /// Emits `new Callback(counter, Counter.Add)` with `counter` in local 0.
+    fn emit_callback(asm: &mut InstructionAssembler, tokens: &[Token]) -> Result<()> {
+        asm.ldloc_0()?
+            // ldftn Counter.Add
+            .emit_opcode(0xFE06, Some(Operand::Token(tokens[1])))?
+            .newobj(tokens[2])?;
+        Ok(())
+    }
+
+    /// A delegate bound to an instance method passes its target as `this`. The target was
+    /// dropped, so the method took its `this` from the caller's stack.
+    #[test]
+    fn a_closed_delegate_passes_its_target() {
+        // Main() => 1000 + new Callback(new Counter(), Counter.Add).Invoke(5)
+        let outcome = run_delegate_app(|asm, tokens| {
+            asm.ldc_i4(1000)?.newobj(tokens[0])?.stloc_0()?;
+            emit_callback(asm, tokens)?;
+            asm.ldc_i4(5)?.callvirt(tokens[3])?.add()?.ret()?;
+            Ok(())
+        });
+
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(1005)),
+                    ..
+                }
+            ),
+            "Add(5) on the counter: {outcome:?}"
+        );
+    }
+
+    /// A multicast delegate runs every entry in order and returns the last one's result to
+    /// its caller, whose stack stays as it was. The next entry returned into the entry before
+    /// it, at the offset after its `ret`.
+    #[test]
+    fn a_multicast_delegate_runs_every_entry() {
+        // Main() => 1000 + ((Callback)Delegate.Combine(add, add)).Invoke(5)
+        let outcome = run_delegate_app(|asm, tokens| {
+            asm.ldc_i4(1000)?.newobj(tokens[0])?.stloc_0()?;
+            emit_callback(asm, tokens)?;
+            emit_callback(asm, tokens)?;
+            asm.call(tokens[4])?
+                .castclass(tokens[5])?
+                .ldc_i4(5)?
+                .callvirt(tokens[3])?
+                .add()?
+                .ret()?;
+            Ok(())
+        });
+
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(1010)),
+                    ..
+                }
+            ),
+            "both entries add 5, and the second's total is the result: {outcome:?}"
+        );
+    }
+
+    /// A delegate's `Invoke` through a MemberRef to a delegate type of another assembly
+    /// (`Action`, `Func` and every framework delegate are called this way) runs the
+    /// delegate's method. It fell through to an unhooked MemberRef: a symbolic result, and the
+    /// method never ran.
+    #[test]
+    fn a_delegate_of_another_assembly_runs_its_method() {
+        // Main() => 1000 + ((IntFunc)new Callback(new Counter(), Counter.Add)).Invoke(5)
+        let outcome = run_delegate_app(|asm, tokens| {
+            asm.ldc_i4(1000)?.newobj(tokens[0])?.stloc_0()?;
+            emit_callback(asm, tokens)?;
+            asm.ldc_i4(5)?.callvirt(tokens[6])?.add()?.ret()?;
+            Ok(())
+        });
+
+        assert!(
+            matches!(
+                outcome,
+                EmulationOutcome::Completed {
+                    return_value: Some(EmValue::I32(1005)),
+                    ..
+                }
+            ),
+            "Add(5) on the counter: {outcome:?}"
+        );
     }
 }

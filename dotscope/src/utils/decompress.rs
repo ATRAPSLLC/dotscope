@@ -22,7 +22,9 @@
 //!
 //! Standard Deflate streams as used by `System.IO.Compression.DeflateStream`.
 
-use std::io::{Cursor, Read};
+#[cfg(feature = "deobfuscation")]
+use std::io::Cursor;
+use std::io::Read;
 
 use flate2::read::{DeflateDecoder, GzDecoder};
 
@@ -81,6 +83,7 @@ pub const MAX_DECOMPRESSED_BYTES: usize = 512 * 1024 * 1024;
 ///
 /// Both start with the same 5 property bytes and differ only in the width of
 /// the uncompressed-size field that follows.
+#[cfg(feature = "deobfuscation")]
 const LZMA_HEADER_LAYOUTS: [usize; 2] = [
     13, // 5 props + 8-byte size — the standard `.lzma` (alone) header
     9,  // 5 props + 4-byte size — stock ConfuserEx's `Lzma.Decompress`
@@ -98,11 +101,13 @@ const LZMA_HEADER_LAYOUTS: [usize; 2] = [
 /// fails the stream when the decoded length differs, so writing a ceiling into that field
 /// rejects every unknown-size stream whose real output is shorter — which is the normal case
 /// for the ConfuserEx payloads this module decodes.
+#[cfg(feature = "deobfuscation")]
 struct LimitedWriter {
     buffer: Vec<u8>,
     limit: usize,
 }
 
+#[cfg(feature = "deobfuscation")]
 impl std::io::Write for LimitedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.buffer.len().saturating_add(buf.len()) > self.limit {
@@ -124,6 +129,7 @@ impl std::io::Write for LimitedWriter {
 ///
 /// Checks the properties byte encodes a legal `lc`/`lp`/`pb` triple and that
 /// the dictionary size is one a real encoder would choose.
+#[cfg(feature = "deobfuscation")]
 fn valid_lzma_props(data: &[u8]) -> bool {
     // Properties byte encodes (pb * 5 + lp) * 9 + lc; the largest legal value
     // is 9 * 5 * 5 - 1 = 224.
@@ -148,6 +154,7 @@ fn valid_lzma_props(data: &[u8]) -> bool {
 /// Returns `None` when the buffer is too short, or the size is zero or beyond
 /// [`MAX_DECOMPRESSED_BYTES`]. An all-ones field means "unknown" and maps to
 /// `Some(None)` — plausible, but with no length to verify against.
+#[cfg(feature = "deobfuscation")]
 fn declared_size(data: &[u8], header_len: usize) -> Option<Option<u64>> {
     let size = match header_len {
         13 => u64::from_le_bytes(data.get(5..13)?.try_into().ok()?),
@@ -181,6 +188,7 @@ fn declared_size(data: &[u8], header_len: usize) -> Option<Option<u64>> {
 /// # Returns
 ///
 /// `true` if the data appears to be ConfuserEx LZMA format.
+#[cfg(feature = "deobfuscation")]
 #[must_use]
 pub fn is_confuserex_lzma(data: &[u8]) -> bool {
     if data.len() < 13 {
@@ -233,6 +241,7 @@ pub fn is_confuserex_lzma(data: &[u8]) -> bool {
 /// the first that decodes to the length its own header declares wins. Guessing
 /// wrong shifts the payload by four bytes and corrupts the range coder, so a
 /// successful decode is itself the discriminator.
+#[cfg(feature = "deobfuscation")]
 pub fn decompress_confuserex_lzma(data: &[u8]) -> DecompressResult<Vec<u8>> {
     decompress_confuserex_lzma_limited(data, MAX_DECOMPRESSED_BYTES)
 }
@@ -250,6 +259,7 @@ pub fn decompress_confuserex_lzma(data: &[u8]) -> DecompressResult<Vec<u8>> {
 /// `limit`, [`DecompressError::InvalidLzmaHeader`] if no header layout decodes cleanly,
 /// [`DecompressError::LzmaError`] if the stream is malformed, or
 /// [`DecompressError::BufferTooSmall`] if `data` is too short to contain a header.
+#[cfg(feature = "deobfuscation")]
 pub fn decompress_confuserex_lzma_limited(data: &[u8], limit: usize) -> DecompressResult<Vec<u8>> {
     if data.len() < 9 {
         return Err(DecompressError::BufferTooSmall);
@@ -412,6 +422,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_is_confuserex_lzma_valid() {
         // Valid LZMA header with default ConfuserEx settings
@@ -426,6 +437,7 @@ mod tests {
         assert!(is_confuserex_lzma(&valid_header));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_is_confuserex_lzma_invalid_props() {
         // Invalid props byte (> 224)
@@ -436,6 +448,7 @@ mod tests {
         assert!(!is_confuserex_lzma(&invalid_props));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_is_confuserex_lzma_too_small() {
         // Buffer too small (less than 13 bytes)
@@ -460,6 +473,7 @@ mod tests {
         0x8E, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_confuserex_lzma_standard_13_byte_header() {
         assert!(is_confuserex_lzma(&FORK_BLOB));
@@ -471,6 +485,7 @@ mod tests {
         assert!(out.windows(27).any(|w| w == b"Hello From ConfuserEx test."));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_confuserex_lzma_accepts_payload_larger_than_output() {
         // Guards a heuristic that used to reject any blob whose payload was
@@ -481,6 +496,7 @@ mod tests {
         assert!(is_confuserex_lzma(&FORK_BLOB));
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_confuserex_lzma_stock_9_byte_header() {
         // Stock ConfuserEx writes the size as 4 bytes, putting the payload at
@@ -498,6 +514,7 @@ mod tests {
         assert_eq!(decompress_confuserex_lzma(&stock).unwrap(), original);
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn test_confuserex_lzma_rejects_non_lzma() {
         // Plausible length, but the dictionary size is nonsense.
@@ -587,6 +604,7 @@ mod tests {
         assert_eq!(decompress_deflate(&payload).unwrap().len(), 1024);
     }
 
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn lzma_declared_size_above_limit_is_refused_before_decoding() {
         // Valid property bytes, then an 8-byte declared size of 256 MB, against a 1 KB limit.
@@ -624,6 +642,7 @@ mod tests {
     /// is shorter fail with a length mismatch, which silently disabled ConfuserEx constant
     /// decryption. The previous test could not catch it: it fed a garbage payload and asserted
     /// only `if let Ok(...)`, so the failing path satisfied it.
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn lzma_unknown_declared_size_still_decodes() {
         let payload = b"the quick brown fox jumps over the lazy dog".repeat(8);
@@ -639,6 +658,7 @@ mod tests {
     /// With no declared size there is no length to pre-check, so the ceiling has to be enforced
     /// during the decode. `LimitedWriter` is what does that; a limit below the true output must
     /// refuse rather than return a truncated buffer.
+    #[cfg(feature = "deobfuscation")]
     #[test]
     fn lzma_unknown_declared_size_is_still_bounded() {
         let payload = vec![0x41u8; 8192];

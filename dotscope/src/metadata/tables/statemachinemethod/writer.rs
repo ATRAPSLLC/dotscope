@@ -45,6 +45,10 @@ use crate::{
 };
 
 impl RowWritable for StateMachineMethodRaw {
+    fn sort_key(&self, _sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        Ok(Some((self.move_next_method, 0)))
+    }
+
     /// Write a `StateMachineMethod` table row to binary data
     ///
     /// Serializes one `StateMachineMethod` table entry to the metadata tables stream format, handling

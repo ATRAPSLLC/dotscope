@@ -43,12 +43,79 @@
 
 use crate::{
     metadata::{
-        tables::TableId,
+        method::MethodRc,
+        signatures::{SignatureMethod, TypeSignature},
+        tables::{MemberRefSignature, TableAccess, TableId, TypeSpecRaw},
         token::Token,
-        typesystem::{CilTypeRc, CilTypeReference},
+        typesystem::{CilTypeRc, CilTypeRef, CilTypeReference},
     },
     CilObject,
 };
+
+/// Picks the method a reference by `name` and `signature` names among
+/// `candidates`.
+///
+/// A name alone does not name a method: overloads share it. The candidates are
+/// narrowed by how closely they match, and a candidate is chosen only when it is
+/// the single one at the closest level that has any:
+///
+/// 1. the same parameters and return type (conversion operators are overloaded
+///    on their return type alone);
+/// 2. the same parameters;
+/// 3. the same arity and the same by-reference pattern - the reference spells
+///    its types differently from the definition, as when it reaches a type of
+///    this module through a `TypeRef`, but no other overload could be meant.
+///
+/// Two or more candidates at the deciding level mean the reference cannot be
+/// resolved by its signature, and nothing is chosen rather than the first.
+///
+/// # Arguments
+///
+/// * `candidates` - The methods the reference could name.
+/// * `name` - The referenced name.
+/// * `signature` - The referenced signature.
+///
+/// # Returns
+///
+/// The chosen method's token, or `None` when no single method matches.
+pub fn select_method_overload<I>(
+    candidates: I,
+    name: &str,
+    signature: &SignatureMethod,
+) -> Option<Token>
+where
+    I: IntoIterator<Item = MethodRc>,
+{
+    let named: Vec<MethodRc> = candidates
+        .into_iter()
+        .filter(|method| method.name == name)
+        .collect();
+
+    let same_arity = |method: &MethodRc| {
+        let own = &method.signature;
+        own.param_count_generic == signature.param_count_generic
+            && own.params.len() == signature.params.len()
+            && own
+                .params
+                .iter()
+                .zip(&signature.params)
+                .all(|(a, b)| a.by_ref == b.by_ref)
+    };
+    let levels: [&dyn Fn(&MethodRc) -> bool; 3] = [
+        &|method: &MethodRc| method.signature.has_same_shape(signature),
+        &|method: &MethodRc| method.signature.has_same_parameters(signature),
+        &same_arity,
+    ];
+    for matches in levels {
+        let mut found = named.iter().filter(|method| matches(method));
+        match (found.next(), found.next()) {
+            (Some(only), None) => return Some(only.token),
+            (Some(_), Some(_)) => return None,
+            (None, _) => {}
+        }
+    }
+    None
+}
 
 /// Cross-table token resolver for .NET metadata.
 ///
@@ -59,7 +126,7 @@ use crate::{
 ///
 /// # Design
 ///
-/// The resolver is a zero-cost borrowing wrapper — it holds only a `&CilObject` reference
+/// The resolver is a zero-cost borrowing wrapper - it holds only a `&CilObject` reference
 /// and performs no allocations or caching. Resolution is performed on each call by walking
 /// the metadata tables. For hot paths, callers should cache the result.
 ///
@@ -92,13 +159,12 @@ pub struct TokenResolver<'a> {
 impl<'a> TokenResolver<'a> {
     /// Creates a new `TokenResolver` for the given assembly.
     ///
-    /// This is an internal constructor — users should obtain a resolver via
-    /// [`CilObject::resolver()`].
+    /// [`CilObject::resolver()`] gives the resolver of an assembly; this builds the same one.
     ///
     /// # Arguments
     ///
     /// * `assembly` - The assembly whose metadata tables will be used for resolution.
-    pub(crate) fn new(assembly: &'a CilObject) -> Self {
+    pub fn new(assembly: &'a CilObject) -> Self {
         Self { assembly }
     }
 
@@ -198,18 +264,7 @@ impl<'a> TokenResolver<'a> {
     pub fn resolve_method(&self, token: Token) -> Option<Token> {
         match token.table() {
             0x06 => Some(token),
-            0x0A => {
-                let member_ref = self.assembly.member_ref(&token)?;
-                let declaring_type = self.resolve_declaring_type(&member_ref.declaredby)?;
-                declaring_type.methods.iter().find_map(|(_, method_ref)| {
-                    let method = method_ref.upgrade()?;
-                    if method.name == member_ref.name {
-                        Some(method.token)
-                    } else {
-                        None
-                    }
-                })
-            }
+            0x0A => self.resolve_memberref_method(token),
             0x2B => {
                 let method_spec = self.assembly.method_spec(&token).ok()?;
                 let underlying = Self::extract_methodspec_token(&method_spec.method)?;
@@ -268,17 +323,7 @@ impl<'a> TokenResolver<'a> {
     pub fn resolve_field(&self, token: Token) -> Option<Token> {
         match token.table() {
             0x04 => Some(token),
-            0x0A => {
-                let member_ref = self.assembly.member_ref(&token)?;
-                let declaring_type = self.resolve_declaring_type(&member_ref.declaredby)?;
-                declaring_type.fields.iter().find_map(|(_, field)| {
-                    if field.name == member_ref.name {
-                        Some(field.token)
-                    } else {
-                        None
-                    }
-                })
-            }
+            0x0A => self.resolve_memberref_field(token),
             _ => None,
         }
     }
@@ -302,7 +347,8 @@ impl<'a> TokenResolver<'a> {
     ///
     /// * `Some(Token)` - The resolved MethodDef token (guaranteed to be table 0x06)
     /// * `None` - The token is not a MemberRef, the entry does not exist, the declaring
-    ///   type cannot be resolved, or no method with a matching name exists
+    ///   type cannot be resolved, or no single method of that name matches the
+    ///   reference's signature (see [`select_method_overload`])
     ///
     /// # Examples
     ///
@@ -330,15 +376,18 @@ impl<'a> TokenResolver<'a> {
             return None;
         }
         let member_ref = self.assembly.member_ref(&token)?;
+        let MemberRefSignature::Method(signature) = &member_ref.signature else {
+            return None;
+        };
         let declaring_type = self.resolve_declaring_type(&member_ref.declaredby)?;
-        declaring_type.methods.iter().find_map(|(_, method_ref)| {
-            let method = method_ref.upgrade()?;
-            if method.name == member_ref.name {
-                Some(method.token)
-            } else {
-                None
-            }
-        })
+        select_method_overload(
+            declaring_type
+                .methods
+                .iter()
+                .filter_map(|(_, method_ref)| method_ref.upgrade()),
+            &member_ref.name,
+            signature,
+        )
     }
 
     /// Resolves a MemberRef token to the corresponding FieldDef token.
@@ -389,14 +438,29 @@ impl<'a> TokenResolver<'a> {
             return None;
         }
         let member_ref = self.assembly.member_ref(&token)?;
+        let MemberRefSignature::Field(signature) = &member_ref.signature else {
+            return None;
+        };
         let declaring_type = self.resolve_declaring_type(&member_ref.declaredby)?;
-        declaring_type.fields.iter().find_map(|(_, field)| {
-            if field.name == member_ref.name {
-                Some(field.token)
-            } else {
-                None
+        // Fields of one type may share a name and differ by type alone, which
+        // renaming obfuscators produce; the signature then decides, and a tie
+        // it cannot break resolves to none of them.
+        let named: Vec<_> = declaring_type
+            .fields
+            .iter()
+            .filter(|(_, field)| field.name == member_ref.name)
+            .map(|(_, field)| field.clone())
+            .collect();
+        match named.as_slice() {
+            [only] => Some(only.token),
+            _ => {
+                let mut typed = named.iter().filter(|field| field.signature == *signature);
+                match (typed.next(), typed.next()) {
+                    (Some(only), None) => Some(only.token),
+                    _ => None,
+                }
             }
-        })
+        }
     }
 
     /// Finds the declaring type of a method-like token.
@@ -409,7 +473,7 @@ impl<'a> TokenResolver<'a> {
     ///   via [`TypeRegistry::resolve()`](crate::metadata::typesystem::TypeRegistry::resolve).
     /// - **MethodDef (0x06)**: Scans all types in the registry to find which
     ///   type's method list contains the given token. This is an O(n) scan over
-    ///   all types — callers in hot paths should cache the result.
+    ///   all types - callers in hot paths should cache the result.
     /// - **MethodSpec (0x2B)**: Extracts the underlying method token from the
     ///   generic instantiation and recurses.
     ///
@@ -463,7 +527,7 @@ impl<'a> TokenResolver<'a> {
             }
             0x06 => {
                 // O(1) via the method's own back-pointer where it is set. This lookup is on the
-                // emulator's hottest paths — every `call`/`callvirt`/`newobj` — so the former
+                // emulator's hottest paths - every `call`/`callvirt`/`newobj` - so the former
                 // scan over every type and every method made dispatch O(total methods).
                 if let Ok(method) = self.assembly.method(&method_token) {
                     if let Some(declaring) = method.declaring_type_rc() {
@@ -491,8 +555,9 @@ impl<'a> TokenResolver<'a> {
     /// Finds the declaring type of a field token.
     ///
     /// Handles both FieldDef (0x04) and MemberRef (0x0A) tokens. MemberRef resolves through
-    /// the `declaredby` field; FieldDef resolves through the type registry's memoised
-    /// `field_to_type` index.
+    /// the `declaredby` field; FieldDef through the field's `declaring_type` back-pointer,
+    /// falling back to the type registry's memoised `field_to_type` index for a field no
+    /// TypeDef claims.
     ///
     /// # Arguments
     ///
@@ -505,9 +570,9 @@ impl<'a> TokenResolver<'a> {
     ///
     /// # Performance
     ///
-    /// O(1) for MemberRef via `declaredby`. For FieldDef, the first lookup of a given token
-    /// populates the registry index and every later lookup is O(1); this is on the
-    /// `ldsfld`/`stsfld` path, so the repeat case is the one that matters.
+    /// O(1) for MemberRef via `declaredby`, and for a FieldDef its declaring TypeDef claimed
+    /// via the field's back-pointer; this is on the `ldsfld`/`stsfld` path. A field no TypeDef
+    /// claimed falls back to the registry's memoised index.
     ///
     /// # Examples
     ///
@@ -533,8 +598,23 @@ impl<'a> TokenResolver<'a> {
                 self.resolve_declaring_type(&member.declaredby)
             }
             0x04 => {
-                // FieldDef: memoised index rather than a scan over every type's field list.
-                // Reached on every `ldsfld`/`stsfld`.
+                // FieldDef: O(1) via the field's own back-pointer, which its TypeDef sets
+                // when it loads. Reached on every `ldsfld`/`stsfld`, as the method path's
+                // back-pointer is on every call.
+                if let Some(declaring) =
+                    self.assembly.fields().get(&field_token).and_then(|entry| {
+                        entry
+                            .value()
+                            .declaring_type
+                            .get()
+                            .and_then(CilTypeRef::upgrade)
+                    })
+                {
+                    return Some(declaring);
+                }
+
+                // Fallback: a field no TypeDef's run claimed has no back-pointer, and the
+                // registry's memoised index answers it.
                 let type_token = self
                     .assembly
                     .types()
@@ -573,11 +653,48 @@ impl<'a> TokenResolver<'a> {
                 let t = r.upgrade()?;
                 if t.token.is_table(TableId::TypeRef) {
                     self.assembly.types().resolve(&t.token)
+                } else if t.token.is_table(TableId::TypeSpec) {
+                    self.generic_definition(t.token).or(Some(t))
                 } else {
                     Some(t)
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Resolves a generic instantiation's TypeSpec to the type it instantiates.
+    ///
+    /// A member of `Foo<int>` is declared by a TypeSpec whose own type carries
+    /// no methods or fields: those belong to the definition `Foo<T>`, which only
+    /// the TypeSpec's signature names.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - A TypeSpec token.
+    ///
+    /// # Returns
+    ///
+    /// The instantiated type, resolved like any declaring type, or `None` when
+    /// the TypeSpec is not a generic instantiation of a named type.
+    #[must_use]
+    pub fn generic_definition(&self, token: Token) -> Option<CilTypeRc> {
+        let tables = self.assembly.tables()?;
+        let blob = self.assembly.blob()?;
+        let table = <_ as TableAccess<TypeSpecRaw>>::table(tables)?;
+        let type_spec = table.get(token.row()).ok().flatten()?.to_owned(blob).ok()?;
+        let TypeSignature::GenericInst(base, _) = &type_spec.signature.base else {
+            return None;
+        };
+        let (TypeSignature::Class(definition) | TypeSignature::ValueType(definition)) =
+            base.as_ref()
+        else {
+            return None;
+        };
+        if definition.is_table(TableId::TypeRef) {
+            self.assembly.types().resolve(definition)
+        } else {
+            self.assembly.types().get(definition)
         }
     }
 
@@ -602,5 +719,234 @@ impl<'a> TokenResolver<'a> {
             CilTypeReference::MemberRef(r) => Some(r.token),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        metadata::signatures::SignatureParameter,
+        testkit::{builders::MethodBuilder, fixture},
+    };
+
+    fn param(base: TypeSignature, by_ref: bool) -> SignatureParameter {
+        SignatureParameter {
+            by_ref,
+            base,
+            ..SignatureParameter::default()
+        }
+    }
+
+    fn signature(ret: TypeSignature, params: Vec<SignatureParameter>) -> SignatureMethod {
+        SignatureMethod {
+            param_count: u32::try_from(params.len()).unwrap(),
+            return_type: param(ret, false),
+            params,
+            ..SignatureMethod::default()
+        }
+    }
+
+    fn method(rid: u32, name: &str, sig: SignatureMethod) -> MethodRc {
+        MethodBuilder::new()
+            .with_rid(rid)
+            .with_name(name)
+            .with_signature(sig)
+            .without_auto_params()
+            .build()
+    }
+
+    #[test]
+    fn an_overloaded_name_resolves_to_the_overload_the_signature_names() {
+        let by_int = method(
+            1,
+            "Decode",
+            signature(TypeSignature::String, vec![param(TypeSignature::I4, false)]),
+        );
+        let by_string = method(
+            2,
+            "Decode",
+            signature(
+                TypeSignature::String,
+                vec![param(TypeSignature::String, false)],
+            ),
+        );
+        let candidates = || [by_int.clone(), by_string.clone()];
+
+        let wants_string = signature(
+            TypeSignature::String,
+            vec![param(TypeSignature::String, false)],
+        );
+        assert_eq!(
+            select_method_overload(candidates(), "Decode", &wants_string),
+            Some(by_string.token),
+            "the first method of the name is not the one referenced"
+        );
+        let wants_int = signature(TypeSignature::String, vec![param(TypeSignature::I4, false)]);
+        assert_eq!(
+            select_method_overload(candidates(), "Decode", &wants_int),
+            Some(by_int.token)
+        );
+    }
+
+    #[test]
+    fn a_by_reference_parameter_is_a_different_overload() {
+        let by_value = method(
+            1,
+            "M",
+            signature(TypeSignature::Void, vec![param(TypeSignature::I4, false)]),
+        );
+        let by_ref = method(
+            2,
+            "M",
+            signature(TypeSignature::Void, vec![param(TypeSignature::I4, true)]),
+        );
+        let wants_ref = signature(TypeSignature::Void, vec![param(TypeSignature::I4, true)]);
+        assert_eq!(
+            select_method_overload([by_value, by_ref.clone()], "M", &wants_ref),
+            Some(by_ref.token)
+        );
+    }
+
+    #[test]
+    fn overloads_differing_only_in_return_type_resolve_by_it() {
+        let to_int = method(
+            1,
+            "op_Explicit",
+            signature(TypeSignature::I4, vec![param(TypeSignature::Object, false)]),
+        );
+        let to_long = method(
+            2,
+            "op_Explicit",
+            signature(TypeSignature::I8, vec![param(TypeSignature::Object, false)]),
+        );
+        let wants_long = signature(TypeSignature::I8, vec![param(TypeSignature::Object, false)]);
+        assert_eq!(
+            select_method_overload([to_int, to_long.clone()], "op_Explicit", &wants_long),
+            Some(to_long.token)
+        );
+    }
+
+    #[test]
+    fn a_single_method_of_the_arity_resolves_across_type_spellings() {
+        // The reference spells its parameter type differently (as a TypeRef
+        // would), but only one overload has that arity.
+        let only = method(
+            1,
+            "Run",
+            signature(TypeSignature::Void, vec![param(TypeSignature::I4, false)]),
+        );
+        let other_arity = method(2, "Run", signature(TypeSignature::Void, vec![]));
+        let respelled = signature(
+            TypeSignature::Void,
+            vec![param(TypeSignature::String, false)],
+        );
+        assert_eq!(
+            select_method_overload([only.clone(), other_arity], "Run", &respelled),
+            Some(only.token)
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_reference_resolves_to_nothing() {
+        let a = method(
+            1,
+            "Run",
+            signature(TypeSignature::Void, vec![param(TypeSignature::I4, false)]),
+        );
+        let b = method(
+            2,
+            "Run",
+            signature(TypeSignature::Void, vec![param(TypeSignature::I8, false)]),
+        );
+        let neither = signature(
+            TypeSignature::Void,
+            vec![param(TypeSignature::String, false)],
+        );
+        assert_eq!(select_method_overload([a, b], "Run", &neither), None);
+    }
+
+    /// A member of `Foo<int>` is declared by a TypeSpec whose own type holds no
+    /// methods: they belong to `Foo<T>`, named only by the TypeSpec's
+    /// signature. Every such reference to a type this module defines resolves
+    /// to a method of that definition.
+    #[test]
+    fn a_member_of_a_generic_instantiation_resolves_to_the_definitions() {
+        let assembly = CilObject::from_path(fixture("WindowsBase.dll")).unwrap();
+        let resolver = assembly.resolver();
+        let mut instantiated = 0;
+        for entry in assembly.refs_members().iter() {
+            let member_ref = entry.value();
+            if !matches!(member_ref.signature, MemberRefSignature::Method(_)) {
+                continue;
+            }
+            let CilTypeReference::TypeSpec(spec) = &member_ref.declaredby else {
+                continue;
+            };
+            let Some(spec) = spec.upgrade() else {
+                continue;
+            };
+            let Some(definition) = resolver.generic_definition(spec.token) else {
+                continue;
+            };
+            if !definition.token.is_table(TableId::TypeDef) {
+                continue;
+            }
+            instantiated += 1;
+            let resolved = resolver
+                .resolve_memberref_method(member_ref.token)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} {}::{} did not resolve",
+                        member_ref.token,
+                        definition.fullname(),
+                        member_ref.name
+                    )
+                });
+            assert!(
+                definition
+                    .methods
+                    .iter()
+                    .any(|(_, method)| method.token() == Some(resolved)),
+                "{} resolved outside {}",
+                member_ref.token,
+                definition.fullname()
+            );
+            assert_eq!(resolver.resolve_method(member_ref.token), Some(resolved));
+        }
+        assert!(instantiated > 0, "the sample instantiates its own generics");
+    }
+
+    /// A FieldDef resolves to the type whose field list holds it, through the field's
+    /// back-pointer, and to the same type the registry's index finds by scanning.
+    #[test]
+    fn a_field_resolves_to_the_type_that_lists_it() {
+        let assembly = CilObject::from_path(fixture("WindowsBase.dll")).unwrap();
+        let resolver = assembly.resolver();
+        let mut checked = 0usize;
+        for entry in assembly.fields().iter() {
+            let token = *entry.key();
+            let Some(declaring) = resolver.declaring_type_of_field(token) else {
+                continue;
+            };
+            assert!(
+                declaring
+                    .fields
+                    .iter()
+                    .any(|(_, field)| field.token == token),
+                "{token:?} resolved to a type that does not list it"
+            );
+            assert_eq!(
+                assembly.types().declaring_type_token_of_field(token),
+                Some(declaring.token),
+                "{token:?}: back-pointer and registry index disagree"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            assembly.fields().len(),
+            "every field has a declaring type"
+        );
     }
 }

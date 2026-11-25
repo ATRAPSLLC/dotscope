@@ -192,11 +192,11 @@ fn array_get_length_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> 
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
-    let Ok(obj) = thread.heap().get(*href) else {
+    let Ok(obj) = thread.heap().get_shared(*href) else {
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
-    let len = match &obj {
+    let len = match &*obj {
         HeapObject::Array { elements, .. } | HeapObject::MultiArray { elements, .. } => {
             elements.len()
         }
@@ -224,11 +224,11 @@ fn array_get_long_length_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread
         return PreHookResult::Bypass(Some(EmValue::I64(0)));
     };
 
-    let Ok(obj) = thread.heap().get(*href) else {
+    let Ok(obj) = thread.heap().get_shared(*href) else {
         return PreHookResult::Bypass(Some(EmValue::I64(0)));
     };
 
-    let len = match &obj {
+    let len = match &*obj {
         HeapObject::Array { elements, .. } | HeapObject::MultiArray { elements, .. } => {
             elements.len()
         }
@@ -257,11 +257,11 @@ fn array_get_rank_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pr
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
-    let Ok(obj) = thread.heap().get(*href) else {
+    let Ok(obj) = thread.heap().get_shared(*href) else {
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
-    let rank: i32 = match obj {
+    let rank: i32 = match &*obj {
         HeapObject::Array { .. } => 1,
         HeapObject::MultiArray { dimensions, .. } => {
             i32::try_from(dimensions.len()).unwrap_or(i32::MAX)
@@ -367,11 +367,11 @@ fn array_get_dimension_length_pre(
         .and_then(|r| r.ok())
         .unwrap_or(0);
 
-    let Ok(obj) = thread.heap().get(*href) else {
+    let Ok(obj) = thread.heap().get_shared(*href) else {
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
-    let length = match obj {
+    let length = match &*obj {
         HeapObject::Array { elements, .. } if dimension == 0 => elements.len(),
         HeapObject::MultiArray { dimensions, .. } => match dimensions.get(dimension) {
             Some(d) => *d,
@@ -401,17 +401,17 @@ fn array_clone_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHo
         return PreHookResult::Bypass(Some(EmValue::Null));
     };
 
-    let Ok(obj) = thread.heap().get(*href) else {
+    let Ok(obj) = thread.heap().get_shared(*href) else {
         return PreHookResult::Bypass(Some(EmValue::Null));
     };
 
-    match obj {
+    match &*obj {
         HeapObject::Array {
             element_type,
             elements,
         } => match thread
             .heap_mut()
-            .alloc_array_with_values(element_type, elements)
+            .alloc_array_with_values(element_type.clone(), elements.to_vec())
         {
             Ok(new_ref) => PreHookResult::Bypass(Some(EmValue::ObjectRef(new_ref))),
             Err(e) => PreHookResult::Error(format!("heap allocation failed: {e}")),
@@ -423,7 +423,7 @@ fn array_clone_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHo
         } => {
             let Ok(new_ref) = thread
                 .heap_mut()
-                .alloc_multi_array(element_type, dimensions)
+                .alloc_multi_array(element_type.clone(), dimensions.to_vec())
             else {
                 return PreHookResult::Bypass(Some(EmValue::Null));
             };
@@ -433,7 +433,7 @@ fn array_clone_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHo
                     ..
                 } = obj
                 {
-                    *new_elements = elements;
+                    *new_elements = elements.to_vec();
                 }
                 Ok(())
             }));
@@ -508,13 +508,16 @@ fn array_copy_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> PreHoo
     };
 
     let src_elements: Vec<EmValue> = {
-        let Ok(src_obj) = thread.heap().get(src_ref) else {
+        let Ok(src_obj) = thread.heap().get_shared(src_ref) else {
             return PreHookResult::Bypass(None);
         };
-        match src_obj {
-            HeapObject::Array { elements, .. } => {
-                elements.into_iter().skip(src_index).take(length).collect()
-            }
+        match &*src_obj {
+            HeapObject::Array { elements, .. } => elements
+                .iter()
+                .skip(src_index)
+                .take(length)
+                .cloned()
+                .collect(),
             _ => return PreHookResult::Bypass(None),
         }
     };
@@ -663,11 +666,11 @@ fn array_index_of_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -> Pr
         _ => return PreHookResult::Bypass(Some(EmValue::I32(-1))),
     };
 
-    let Ok(obj) = thread.heap().get(array_ref) else {
+    let Ok(obj) = thread.heap().get_shared(array_ref) else {
         return PreHookResult::Bypass(Some(EmValue::I32(-1)));
     };
 
-    let index = match obj {
+    let index = match &*obj {
         HeapObject::Array { elements, .. } => elements.iter().position(|e| e == search_value),
         _ => return PreHookResult::Bypass(Some(EmValue::I32(-1))),
     };
@@ -733,10 +736,10 @@ fn buffer_block_copy_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) ->
 
     // Extract source array bytes
     let (src_bytes, _src_elem_size): (Vec<u8>, usize) = {
-        let Ok(src_obj) = thread.heap().get(src_ref) else {
+        let Ok(src_obj) = thread.heap().get_shared(src_ref) else {
             return PreHookResult::Bypass(None);
         };
-        match src_obj {
+        match &*src_obj {
             HeapObject::Array {
                 elements,
                 element_type,
@@ -746,7 +749,7 @@ fn buffer_block_copy_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) ->
                 };
                 let bytes: Vec<u8> = elements
                     .iter()
-                    .flat_map(|e| e.to_le_bytes(&element_type, ptr_size))
+                    .flat_map(|e| e.to_le_bytes(element_type, ptr_size))
                     .collect();
                 (bytes, elem_size)
             }
@@ -843,11 +846,11 @@ fn buffer_byte_length_pre(ctx: &HookContext<'_>, thread: &mut EmulationThread) -
         _ => return PreHookResult::Bypass(Some(EmValue::I32(0))),
     };
 
-    let Ok(obj) = thread.heap().get(array_ref) else {
+    let Ok(obj) = thread.heap().get_shared(array_ref) else {
         return PreHookResult::Bypass(Some(EmValue::I32(0)));
     };
 
-    let length = match obj {
+    let length = match &*obj {
         HeapObject::Array {
             elements,
             element_type,
@@ -940,7 +943,7 @@ mod tests {
     use crate::{
         emulation::runtime::hook::HookManager,
         metadata::{token::Token, typesystem::PointerSize},
-        test::emulation::create_test_thread,
+        testkit::emulation::create_test_thread,
     };
 
     #[test]

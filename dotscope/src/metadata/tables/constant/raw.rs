@@ -71,6 +71,10 @@ pub struct ConstantRaw {
     /// For null reference constants, this is `ELEMENT_TYPE_CLASS` with a 4-byte zero value.
     pub base: u8,
 
+    /// The byte after [`Self::base`], which ECMA-335 II.22.9 requires to be zero. Kept so
+    /// that a row writes back as it was read.
+    pub padding: u8,
+
     /// `HasConstant` coded index to the parent metadata element
     ///
     /// Points to the field, property, or parameter that owns this constant. This is a coded

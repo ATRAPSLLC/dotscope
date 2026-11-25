@@ -26,8 +26,8 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! # use dotscope::metadata::tables::classlayout::ClassLayoutRaw;
+//! ```no_run
+//! # use dotscope::metadata::tables::ClassLayoutRaw;
 //! # use dotscope::metadata::typesystem::TypeRegistry;
 //! # fn example(raw: ClassLayoutRaw, types: &TypeRegistry) -> dotscope::Result<()> {
 //! // Convert to owned representation
@@ -37,6 +37,7 @@
 //! raw.apply(types)?;
 //! # Ok(())
 //! # }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Error Handling

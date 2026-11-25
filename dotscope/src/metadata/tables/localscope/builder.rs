@@ -177,7 +177,8 @@ impl LocalScopeBuilder {
     ///
     /// # Arguments
     ///
-    /// * `variable_list` - Index into LocalVariable table (0 = no variables)
+    /// * `variable_list` - Index into LocalVariable table: the first variable of the scope.
+    ///   Without it, the scope starts an empty list at the next LocalVariable row
     ///
     /// # Examples
     ///
@@ -200,7 +201,8 @@ impl LocalScopeBuilder {
     ///
     /// # Arguments
     ///
-    /// * `constant_list` - Index into LocalConstant table (0 = no constants)
+    /// * `constant_list` - Index into LocalConstant table: the first constant of the scope.
+    ///   Without it, the scope starts an empty list at the next LocalConstant row
     ///
     /// # Examples
     ///
@@ -315,8 +317,14 @@ impl LocalScopeBuilder {
             offset: 0, // Will be set during binary generation
             method,
             import_scope: self.import_scope.unwrap_or(0),
-            variable_list: self.variable_list.unwrap_or(0),
-            constant_list: self.constant_list.unwrap_or(0),
+            variable_list: match self.variable_list {
+                Some(list) => list,
+                None => assembly.next_rid(TableId::LocalVariable)?,
+            },
+            constant_list: match self.constant_list {
+                Some(list) => list,
+                None => assembly.next_rid(TableId::LocalConstant)?,
+            },
             start_offset,
             length,
         };
@@ -332,7 +340,7 @@ impl LocalScopeBuilder {
 mod tests {
     use super::*;
     use crate::{
-        cilassembly::ChangeRefKind, test::factories::table::assemblyref::get_test_assembly,
+        cilassembly::ChangeRefKind, testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

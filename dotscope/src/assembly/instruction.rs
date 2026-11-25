@@ -304,7 +304,9 @@ pub enum Operand {
     None,
     /// Immediate value (constant embedded in instruction)
     Immediate(Immediate),
-    /// Branch target address
+    /// Branch target: the RVA of the instruction a `br`, conditional branch or `leave`
+    /// transfers to, resolved from the encoded offset (the same value as
+    /// [`Instruction::branch_targets`]).
     Target(u64),
     /// Metadata token reference
     Token(Token),
@@ -398,7 +400,8 @@ impl Display for Operand {
 /// // Different flow types
 /// let sequential = FlowType::Sequential;      // Normal instructions like add, ldloc
 /// let branch = FlowType::ConditionalBranch;   // brtrue, brfalse, etc.
-/// let call = FlowType::Call;                  // call, callvirt
+/// let call = FlowType::Call;                  // call, callvirt, newobj
+/// let indirect = FlowType::CallIndirect;      // calli
 /// let ret = FlowType::Return;                 // ret instruction
 /// # Ok::<(), dotscope::Error>(())
 /// ```
@@ -415,8 +418,15 @@ pub enum FlowType {
     ConditionalBranch,
     /// Always branches to another location (unconditional jump)
     UnconditionalBranch,
-    /// Call to another method
+    /// Call to a method its operand names (`call`, `callvirt`, `newobj`); control returns
+    /// to the next instruction
     Call,
+    /// Call through the function pointer the instruction pops (`calli`, ECMA-335 III.3.20);
+    /// control returns to the next instruction
+    CallIndirect,
+    /// Transfer to the method the operand names, leaving the current one with its arguments
+    /// (`jmp`, ECMA-335 III.3.37): control never returns, so the instruction has no successor
+    MethodJump,
     /// Returns from current method
     Return,
     /// Multi-way branch (switch statement)
@@ -437,10 +447,10 @@ impl FlowType {
     /// can be parsed without quoting:
     ///
     /// `"sequential"`, `"conditional_branch"`, `"unconditional_branch"`,
-    /// `"call"`, `"return"`, `"switch"`, `"throw"`, `"end_finally"`,
-    /// `"leave"`.
+    /// `"call"`, `"call_indirect"`, `"method_jump"`, `"return"`, `"switch"`, `"throw"`,
+    /// `"end_finally"`, `"leave"`.
     ///
-    /// Prefer this accessor over `format!("{:?}", flow_type)` — the `Debug`
+    /// Prefer this accessor over `format!("{:?}", flow_type)` - the `Debug`
     /// representation is **not** part of the stable API and can change.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -449,12 +459,33 @@ impl FlowType {
             FlowType::ConditionalBranch => "conditional_branch",
             FlowType::UnconditionalBranch => "unconditional_branch",
             FlowType::Call => "call",
+            FlowType::CallIndirect => "call_indirect",
+            FlowType::MethodJump => "method_jump",
             FlowType::Return => "return",
             FlowType::Switch => "switch",
             FlowType::Throw => "throw",
             FlowType::EndFinally => "end_finally",
             FlowType::Leave => "leave",
         }
+    }
+}
+
+impl FlowType {
+    /// Whether control can continue to the next instruction: after an instruction that
+    /// does not transfer control (`Sequential`), after a call that returns (`Call`,
+    /// `CallIndirect`), and on the path a conditional branch or a switch does not take.
+    /// Branches, `ret`, `throw`, `rethrow`, `leave`, `endfinally`, `endfilter` and `jmp`
+    /// do not continue.
+    #[must_use]
+    pub const fn falls_through(&self) -> bool {
+        matches!(
+            self,
+            FlowType::Sequential
+                | FlowType::Call
+                | FlowType::CallIndirect
+                | FlowType::ConditionalBranch
+                | FlowType::Switch
+        )
     }
 }
 
@@ -640,7 +671,9 @@ pub struct Instruction {
     // Analysis information
     /// How this instruction affects the evaluation stack
     pub stack_behavior: StackBehavior,
-    /// Computed branch targets (if any, as absolute addresses)
+    /// Computed branch targets (if any, as absolute addresses). For a `switch` these are
+    /// its cases in order, case `i` at index `i`; its default, taken for an index past the
+    /// last case, is [`Instruction::fall_through`]
     pub branch_targets: Vec<u64>,
 }
 
@@ -772,6 +805,37 @@ impl Instruction {
                 self.branch_targets.clone()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// The address control reaches when this instruction does not branch: the next
+    /// instruction (`rva + size`) for an instruction whose flow continues there
+    /// ([`FlowType::falls_through`]), `None` for one that never continues there (a branch,
+    /// `ret`, `throw`, `leave`, `endfinally` or `jmp`) or whose next address overflows.
+    ///
+    /// For a conditional branch this is the path not taken, and for a `switch` its default
+    /// successor: the cases are [`Instruction::branch_targets`], and an index past the last
+    /// case continues here (ECMA-335 III.3.66).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::assembly::decode_instruction;
+    /// use dotscope::Parser;
+    ///
+    /// // switch (1 case, +0) at 0x1000, 9 bytes: the default continues at 0x1009
+    /// let code = [0x45, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    /// let mut parser = Parser::new(&code);
+    /// let switch = decode_instruction(&mut parser, 0x1000)?;
+    /// assert_eq!(switch.fall_through(), Some(0x1009));
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    #[must_use]
+    pub fn fall_through(&self) -> Option<u64> {
+        if self.flow_type.falls_through() {
+            self.rva.checked_add(self.size)
+        } else {
+            None
         }
     }
 
@@ -975,7 +1039,7 @@ impl Instruction {
     pub fn is_prefix(&self) -> bool {
         matches!(
             self.mnemonic,
-            "tail." | "volatile." | "unaligned." | "constrained." | "readonly."
+            "tail." | "volatile." | "unaligned." | "constrained." | "readonly." | "no."
         )
     }
 }
@@ -1215,6 +1279,8 @@ mod tests {
             FlowType::ConditionalBranch,
             FlowType::UnconditionalBranch,
             FlowType::Call,
+            FlowType::CallIndirect,
+            FlowType::MethodJump,
             FlowType::Return,
             FlowType::Switch,
             FlowType::Throw,
@@ -1973,6 +2039,8 @@ mod tests {
             (FlowType::ConditionalBranch, "conditional_branch"),
             (FlowType::UnconditionalBranch, "unconditional_branch"),
             (FlowType::Call, "call"),
+            (FlowType::CallIndirect, "call_indirect"),
+            (FlowType::MethodJump, "method_jump"),
             (FlowType::Return, "return"),
             (FlowType::Switch, "switch"),
             (FlowType::Throw, "throw"),

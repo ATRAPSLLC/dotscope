@@ -194,156 +194,149 @@ impl ParamBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::{cilassemblyview::CilAssemblyView, tables::ParamAttributes},
+        testkit::fixture,
     };
 
     #[test]
     fn test_param_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = ParamBuilder::new()
-                .name("testParam")
-                .flags(ParamAttributes::IN)
-                .sequence(1)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = ParamBuilder::new()
+            .name("testParam")
+            .flags(ParamAttributes::IN)
+            .sequence(1)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
     }
 
     #[test]
     fn test_param_builder_return_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a return type parameter (no name, sequence 0)
-            let ref_ = ParamBuilder::new()
-                .flags(ParamAttributes::ZERO) // No special flags for return type
-                .sequence(0) // Return type
-                .build(&mut assembly)
-                .unwrap();
+        // Create a return type parameter (no name, sequence 0)
+        let ref_ = ParamBuilder::new()
+            .flags(ParamAttributes::ZERO) // No special flags for return type
+            .sequence(0) // Return type
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
     }
 
     #[test]
     fn test_param_builder_with_attributes() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create an OUT parameter with optional flag
-            let ref_ = ParamBuilder::new()
-                .name("outParam")
-                .flags(ParamAttributes::OUT | ParamAttributes::OPTIONAL)
-                .sequence(2)
-                .build(&mut assembly)
-                .unwrap();
+        // Create an OUT parameter with optional flag
+        let ref_ = ParamBuilder::new()
+            .name("outParam")
+            .flags(ParamAttributes::OUT | ParamAttributes::OPTIONAL)
+            .sequence(2)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
     }
 
     #[test]
     fn test_param_builder_default_value() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a parameter with default value
-            let ref_ = ParamBuilder::new()
-                .name("defaultParam")
-                .flags(ParamAttributes::IN | ParamAttributes::HAS_DEFAULT)
-                .sequence(3)
-                .build(&mut assembly)
-                .unwrap();
+        // Create a parameter with default value
+        let ref_ = ParamBuilder::new()
+            .name("defaultParam")
+            .flags(ParamAttributes::IN | ParamAttributes::HAS_DEFAULT)
+            .sequence(3)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify reference is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
-        }
+        // Verify reference is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Param));
     }
 
     #[test]
     fn test_param_builder_missing_flags() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = ParamBuilder::new()
-                .name("testParam")
-                .sequence(1)
-                .build(&mut assembly);
+        let result = ParamBuilder::new()
+            .name("testParam")
+            .sequence(1)
+            .build(&mut assembly);
 
-            // Should fail because flags are required
-            assert!(result.is_err());
-        }
+        // Should fail because flags are required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_param_builder_missing_sequence() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = ParamBuilder::new()
-                .name("testParam")
-                .flags(ParamAttributes::IN)
-                .build(&mut assembly);
+        let result = ParamBuilder::new()
+            .name("testParam")
+            .flags(ParamAttributes::IN)
+            .build(&mut assembly);
 
-            // Should fail because sequence is required
-            assert!(result.is_err());
-        }
+        // Should fail because sequence is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_param_builder_multiple_params() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create multiple parameters with different sequences
-            let ref1 = ParamBuilder::new()
-                .name("param1")
-                .flags(ParamAttributes::IN)
-                .sequence(1)
-                .build(&mut assembly)
-                .unwrap();
+        // Create multiple parameters with different sequences
+        let ref1 = ParamBuilder::new()
+            .name("param1")
+            .flags(ParamAttributes::IN)
+            .sequence(1)
+            .build(&mut assembly)
+            .unwrap();
 
-            let ref2 = ParamBuilder::new()
-                .name("param2")
-                .flags(ParamAttributes::OUT)
-                .sequence(2)
-                .build(&mut assembly)
-                .unwrap();
+        let ref2 = ParamBuilder::new()
+            .name("param2")
+            .flags(ParamAttributes::OUT)
+            .sequence(2)
+            .build(&mut assembly)
+            .unwrap();
 
-            let ref3 = ParamBuilder::new()
-                .flags(ParamAttributes::ZERO)
-                .sequence(0) // Return type
-                .build(&mut assembly)
-                .unwrap();
+        let ref3 = ParamBuilder::new()
+            .flags(ParamAttributes::ZERO)
+            .sequence(0) // Return type
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed and have different references
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
-            assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
+        // All should succeed and have different references
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
+        assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
 
-            // All should have Param table kind
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::Param));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::Param));
-            assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::Param));
-        }
+        // All should have Param table kind
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::Param));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::Param));
+        assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::Param));
     }
 }

@@ -11,14 +11,14 @@
 //! ```text
 //! ldtoken    <Module>                                 // -> SSA: LoadToken
 //! call       Type::GetTypeFromHandle                  // -> SSA: Call
-//! callvirt   Type::get_Module                         // -> SSA: CallVirt
+//! callvirt   Type::get_Module                         // -> SSA: Call (virtual)
 //! ldc.i4     0x06XXXXXX                               // -> SSA: Const(I32) <- target token
 //! call       Module::ResolveMethod                    // -> SSA: Call
-//! callvirt   MethodBase::get_MethodHandle             // -> SSA: CallVirt
+//! callvirt   MethodBase::get_MethodHandle             // -> SSA: Call (virtual)
 //! stloc      <handle_local>                           // -> SSA: StoreLocal
 //! ldloca     <handle_local>                           // -> SSA: LoadLocalAddr
 //! call       RuntimeMethodHandle::GetFunctionPointer  // -> SSA: Call
-//! calli      <StandAloneSig>                          // -> SSA: CallIndirect
+//! calli      <StandAloneSig>                          // -> SSA: Call (indirect)
 //! ```
 //!
 //! # Detection
@@ -171,12 +171,12 @@ impl Technique for BitMonoCalli {
 mod tests {
     use crate::{
         deobfuscation::techniques::{bitmono::BitMonoCalli, Technique},
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly = load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_calltocalli.exe");
+        let assembly = load_sample("packers/bitmono/0.39.0/bitmono_calltocalli.exe");
 
         let technique = BitMonoCalli;
         let detection = technique.detect(&assembly);
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = BitMonoCalli;
         let detection = technique.detect(&assembly);

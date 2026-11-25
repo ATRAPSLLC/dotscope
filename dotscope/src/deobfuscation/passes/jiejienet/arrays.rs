@@ -39,7 +39,9 @@
 //! ```
 
 use crate::{
-    analysis::{CilTarget, ConstValue, FieldRef, MethodRef, SsaFunction, SsaOp},
+    analysis::{
+        Callee, CilTarget, ConstValue, FieldRef, MethodRef, SsaFunction, SsaOp, SsaOpCilExt,
+    },
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
     metadata::token::Token,
 };
@@ -117,8 +119,8 @@ impl SsaPass<CilTarget, CompilerContext> for ArrayInitRestorationPass {
 
         for (block_idx, block) in ssa.blocks().iter().enumerate() {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if let SsaOp::Call { dest, method, args } = instr.op() {
-                    let method_token = method.token();
+                if let Some((method_token, call)) = instr.op().method_call() {
+                    let (dest, args) = (&call.dest, &call.args);
 
                     // Case 1: GetHandle accessor replacement
                     if method_token == self.accessor_token {
@@ -160,14 +162,11 @@ impl SsaPass<CilTarget, CompilerContext> for ArrayInitRestorationPass {
                             // Replace Call(MyInitializeArray, array, handle, xorKey)
                             // with Call(RuntimeHelpers.InitializeArray, array, handle)
                             if let (Some(&a0), Some(&a1)) = (args.first(), args.get(1)) {
+                                let callee = Callee::Direct(MethodRef::new(init_target));
                                 replacements.push((
                                     block_idx,
                                     instr_idx,
-                                    SsaOp::Call {
-                                        dest: *dest,
-                                        method: MethodRef::new(init_target),
-                                        args: vec![a0, a1],
-                                    },
+                                    call.redirected(callee, vec![a0, a1]).into(),
                                 ));
                             }
                         }

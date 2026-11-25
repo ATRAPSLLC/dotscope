@@ -31,12 +31,16 @@ use crate::{
 ///
 /// Create a CFG from decoded basic blocks using [`from_basic_blocks`](Self::from_basic_blocks):
 ///
-/// ```rust,ignore
+/// ```
 /// use dotscope::analysis::ControlFlowGraph;
 /// use dotscope::assembly::decode_blocks;
 ///
-/// let blocks = decode_blocks(data, offset, rva, Some(size))?;
+/// // `nop; ret`: a method body of one block.
+/// let il = [0x00u8, 0x2A];
+/// let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
 /// let graph = ControlFlowGraph::from_basic_blocks(blocks)?;
+/// assert_eq!(graph.block_count(), 1);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Lazy Computation
@@ -97,12 +101,15 @@ impl ControlFlowGraph<'static> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use dotscope::analysis::ControlFlowGraph;
     /// use dotscope::assembly::decode_blocks;
     ///
-    /// let blocks = decode_blocks(data, offset, rva, Some(size))?;
+    /// // `nop; ret`
+    /// let il = [0x00u8, 0x2A];
+    /// let blocks = decode_blocks(&il, 0, 0x2050, Some(il.len()))?;
     /// let graph = ControlFlowGraph::from_basic_blocks(blocks)?;
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn from_basic_blocks(blocks: Vec<BasicBlock>) -> Result<Self> {
         if blocks.is_empty() {
@@ -250,14 +257,20 @@ impl<'a> ControlFlowGraph<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::analysis::ControlFlowGraph;
+    /// ```
+    /// use dotscope::{analysis::ControlFlowGraph, CilObject};
     ///
-    /// // Build CFG borrowing from method's blocks (zero-copy)
-    /// if let Some(blocks) = method.blocks.get() {
-    ///     let graph = ControlFlowGraph::from_blocks_ref(blocks)?;
-    ///     // graph is valid as long as `blocks` is valid
+    /// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// for entry in assembly.methods().iter() {
+    ///     let method = entry.value();
+    ///     // Build CFG borrowing from method's blocks (zero-copy)
+    ///     if let Some(blocks) = method.blocks.get().filter(|blocks| !blocks.is_empty()) {
+    ///         let graph = ControlFlowGraph::from_blocks_ref(blocks)?;
+    ///         // graph is valid as long as `blocks` is valid
+    ///         assert!(graph.block_count() > 0);
+    ///     }
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn from_blocks_ref(blocks: &'a [BasicBlock]) -> Result<Self> {
         if blocks.is_empty() {
@@ -483,17 +496,24 @@ impl<'a> ControlFlowGraph<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::analysis::ControlFlowGraph;
+    /// ```
+    /// use dotscope::CilObject;
     ///
-    /// let graph = ControlFlowGraph::from_basic_blocks(blocks)?;
-    /// for loop_info in graph.loop_forest().loops() {
-    ///     println!("Loop at {:?} with {} blocks", loop_info.header, loop_info.size());
+    /// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// for entry in assembly.methods().iter() {
+    ///     let Some(graph) = entry.value().cfg() else {
+    ///         continue;
+    ///     };
+    ///     for loop_info in graph.loop_forest().loops() {
+    ///         println!("Loop at {:?} with {} blocks", loop_info.header, loop_info.size());
+    ///     }
     /// }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn loop_forest(&self) -> &LoopForest {
-        self.loop_forest.get_or_init(|| self.detect_loop_forest())
+        self.loop_forest
+            .get_or_init(|| detect_loops(&self.graph, self.dominators()))
     }
 
     /// Returns a slice of all loops in the CFG.
@@ -506,14 +526,6 @@ impl<'a> ControlFlowGraph<'a> {
     #[must_use]
     pub fn loops(&self) -> &[LoopInfo] {
         self.loop_forest().loops()
-    }
-
-    /// Detects all loops and builds a comprehensive [`LoopForest`].
-    ///
-    /// Uses the shared [`detect_loops`] function which implements dominance-based
-    /// back edge detection and computes preheaders, exits, loop types, and nesting.
-    fn detect_loop_forest(&self) -> LoopForest {
-        detect_loops(&self.graph, self.dominators())
     }
 
     /// Returns true if this CFG contains any loops.

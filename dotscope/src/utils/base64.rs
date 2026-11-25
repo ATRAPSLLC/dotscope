@@ -19,12 +19,7 @@
 ///
 /// # Examples
 ///
-/// ```rust, ignore
-/// use dotscope::utils::base64_encode;
-///
-/// assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
-/// assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
-/// ```
+/// The `examples::base64_encode_example` test in this module runs this example.
 #[must_use]
 pub fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -81,12 +76,7 @@ pub fn base64_encode(data: &[u8]) -> String {
 ///
 /// # Examples
 ///
-/// ```rust, ignore
-/// use dotscope::utils::base64_decode;
-///
-/// assert_eq!(base64_decode("SGVsbG8="), Some(b"Hello".to_vec()));
-/// assert_eq!(base64_decode("SGVsbG8sIFdvcmxkIQ=="), Some(b"Hello, World!".to_vec()));
-/// ```
+/// The `examples::base64_decode_example` test in this module runs this example.
 #[must_use]
 pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     const DECODE_TABLE: [i8; 128] = [
@@ -193,5 +183,28 @@ mod tests {
         assert_eq!(base64_decode("SGVs!G8="), None);
         // Wrong length (not multiple of 4)
         assert_eq!(base64_decode("SGVsbG8"), None);
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn base64_encode_example() -> Result<()> {
+        assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
+        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
+        Ok(())
+    }
+
+    #[test]
+    fn base64_decode_example() -> Result<()> {
+        assert_eq!(base64_decode("SGVsbG8="), Some(b"Hello".to_vec()));
+        assert_eq!(
+            base64_decode("SGVsbG8sIFdvcmxkIQ=="),
+            Some(b"Hello, World!".to_vec())
+        );
+        Ok(())
     }
 }

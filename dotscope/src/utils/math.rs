@@ -24,6 +24,7 @@ pub fn to_u32(value: usize) -> Result<u32> {
 /// Useful for returning array lengths and similar values to .NET code,
 /// where `int` is the expected return type.
 #[must_use]
+#[cfg(feature = "emulation")]
 pub fn to_i32_saturating(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
@@ -35,16 +36,7 @@ pub fn to_i32_saturating(value: usize) -> i32 {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use dotscope::utils::is_power_of_two;
-///
-/// assert_eq!(is_power_of_two(1), Some(0));   // 2^0 = 1
-/// assert_eq!(is_power_of_two(2), Some(1));   // 2^1 = 2
-/// assert_eq!(is_power_of_two(8), Some(3));   // 2^3 = 8
-/// assert_eq!(is_power_of_two(0), None);
-/// assert_eq!(is_power_of_two(-8), None);
-/// assert_eq!(is_power_of_two(6), None);
-/// ```
+/// The `examples::is_power_of_two_example` test in this module runs this example.
 #[must_use]
 #[allow(clippy::cast_sign_loss)] // value > 0 verified above
 #[allow(clippy::cast_possible_truncation)] // trailing_zeros <= 63 for u64
@@ -94,6 +86,7 @@ mod tests {
         assert!(to_u32(usize::MAX).is_err());
     }
 
+    #[cfg(feature = "emulation")]
     #[test]
     fn test_to_i32_saturating_in_range() {
         assert_eq!(to_i32_saturating(0), 0);
@@ -101,6 +94,7 @@ mod tests {
         assert_eq!(to_i32_saturating(i32::MAX as usize), i32::MAX);
     }
 
+    #[cfg(feature = "emulation")]
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_to_i32_saturating_overflow() {
@@ -120,5 +114,22 @@ mod tests {
         assert_eq!(is_power_of_two(9), None);
         assert_eq!(is_power_of_two(15), None);
         assert_eq!(is_power_of_two(17), None);
+    }
+}
+
+#[cfg(test)]
+mod examples {
+    use super::*;
+    use crate::Result;
+
+    #[test]
+    fn is_power_of_two_example() -> Result<()> {
+        assert_eq!(is_power_of_two(1), Some(0)); // 2^0 = 1
+        assert_eq!(is_power_of_two(2), Some(1)); // 2^1 = 2
+        assert_eq!(is_power_of_two(8), Some(3)); // 2^3 = 8
+        assert_eq!(is_power_of_two(0), None);
+        assert_eq!(is_power_of_two(-8), None);
+        assert_eq!(is_power_of_two(6), None);
+        Ok(())
     }
 }

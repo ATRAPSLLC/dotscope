@@ -49,8 +49,8 @@
 //! - Invalid field accessibility levels (unknown access modifiers)
 //! - Field attribute constraint violations (literal fields not static)
 //! - Special attribute inconsistencies (RTSpecialName without SpecialName)
-//! - Field naming convention violations (backing fields not private, null characters)
-//! - Type signature resolution failures (Unknown type signatures)
+//! - Field naming convention violations (backing fields not private)
+//! - Type signature resolution failures (a named type that does not resolve)
 //! - Field modifier validation failures (invalid tokens)
 //!
 //! # Thread Safety
@@ -142,10 +142,12 @@ impl OwnedFieldValidator {
     ///
     /// Returns [`crate::Error::ValidationOwnedFailed`] if:
     /// - Field names are empty
-    /// - Field signatures contain unresolved types (Unknown type signatures)
+    /// - Field signatures name types that do not resolve
     /// - Field modifiers have invalid tokens
     fn validate_field_signatures(&self, context: &OwnedValidationContext) -> Result<()> {
-        for type_entry in context.all_types() {
+        // This assembly's types: a field's type tokens are its own module's, and a type resolved
+        // from another assembly is validated with that assembly.
+        for type_entry in context.target_assembly_types() {
             for (_, field) in type_entry.fields.iter() {
                 if field.name.is_empty() {
                     let token_value = field.token.value();
@@ -155,11 +157,15 @@ impl OwnedFieldValidator {
                     });
                 }
 
-                if let crate::metadata::signatures::TypeSignature::Unknown = &field.signature.base {
+                if let Some(token) = context.unresolved_type(|out| field.signature.type_tokens(out))
+                {
                     let field_name = &field.name;
                     return Err(Error::ValidationOwnedFailed {
                         validator: self.name().to_string(),
-                        message: format!("Field '{field_name}' has unresolved type in signature"),
+                        message: format!(
+                            "Field '{field_name}' has unresolved type 0x{:08X} in signature",
+                            token.value()
+                        ),
                     });
                 }
 
@@ -332,7 +338,6 @@ impl OwnedFieldValidator {
     ///
     /// Returns [`crate::Error::ValidationOwnedFailed`] if:
     /// - Backing fields are not marked as private
-    /// - Field names contain null characters
     fn validate_field_naming(&self, context: &OwnedValidationContext) -> Result<()> {
         for type_entry in context.all_types() {
             for (_, field) in type_entry.fields.iter() {
@@ -353,14 +358,6 @@ impl OwnedFieldValidator {
                 {
                     let access_level = field.flags.access();
                     if access_level == FieldAttributes::PUBLIC {}
-                }
-
-                if field.name.contains('\0') {
-                    let field_name = &field.name;
-                    return Err(Error::ValidationOwnedFailed {
-                        validator: self.name().to_string(),
-                        message: format!("Field '{field_name}' contains null character"),
-                    });
                 }
             }
         }
@@ -399,19 +396,17 @@ impl Default for OwnedFieldValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::members_field::owned_field_validator_file_factory,
             owned_validator_test,
         },
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_field_validator() -> Result<()> {
         let validator = OwnedFieldValidator::new();
         let config = ValidationConfig {
@@ -422,7 +417,6 @@ mod tests {
         owned_validator_test(
             owned_field_validator_file_factory,
             "OwnedFieldValidator",
-            "ValidationOwnedFailed",
             config,
             |context| validator.validate_owned(context),
         )

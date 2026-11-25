@@ -89,10 +89,12 @@ pub mod context;
 mod loader;
 mod result;
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
 
-pub(crate) use context::ProjectContext;
-use dashmap::DashMap;
+pub use context::ProjectContext;
 pub use loader::ProjectLoader;
 pub use result::{ProjectResult, VersionMismatch};
 
@@ -107,17 +109,22 @@ use crate::{
 /// Multi-assembly project container with dependency management and cross-assembly resolution.
 ///
 /// Provides centralized management for collections of related .NET assemblies
-/// with automatic dependency tracking, identity-based lookup, and cross-assembly
-/// type resolution leveraging the existing Import/Export infrastructure.
+/// with identity-based lookup and cross-assembly type resolution, leveraging the
+/// existing Import/Export infrastructure. Which assemblies a project holds is decided
+/// when it is built ([`ProjectLoader`]) or added to ([`Self::add_assembly`]).
 ///
 /// # Core Features
 ///
-/// - **Assembly Storage**: Efficient storage using AssemblyIdentity as key
-/// - **Dependency Tracking**: Integrated dependency graph management
+/// - **Assembly Storage**: Assemblies keyed by their AssemblyIdentity, kept in identity
+///   order, so iteration and every search across the project visit them in the same
+///   order on every run
+/// - **Cross-Assembly Resolution**: The type registries of the assemblies are linked, so
+///   a TypeRef of one resolves to the TypeDef of another
 /// - **Import/Export Access**: Leverages existing Import/Export containers for resolution
-/// - **Global Resolver**: Cross-assembly type resolution without duplication
-/// - **Thread Safety**: All operations are thread-safe and concurrent
-/// - **Clean Architecture**: Reuses existing infrastructure instead of duplicating it
+/// - **Thread Safety**: Every operation can be called from any thread. Each one is
+///   atomic: [`Self::add_assembly`] checks the identity and the primary constraint and
+///   links the registries under one write lock, so concurrent adds of one identity insert
+///   it once, and a refused add leaves the project as it was. Readers take a snapshot.
 ///
 /// # Design Principles
 ///
@@ -148,19 +155,25 @@ use crate::{
 /// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct CilProject {
+    /// The assemblies and the primary, behind one lock so every change to them is atomic.
+    state: RwLock<ProjectState>,
+}
+
+/// The contents of a [`CilProject`].
+#[derive(Default)]
+struct ProjectState {
     /// Map of loaded assemblies indexed by their complete identity.
     ///
-    /// Uses DashMap for lock-free concurrent access. AssemblyIdentity serves
-    /// as the primary key, ensuring proper assembly identification across
-    /// different versions, cultures, and strong names.
-    assemblies: DashMap<AssemblyIdentity, Arc<CilObject>>,
+    /// AssemblyIdentity serves as the primary key, ensuring proper assembly identification
+    /// across different versions, cultures, and strong names. The map is ordered by
+    /// identity, which makes iteration and project-wide searches deterministic.
+    assemblies: BTreeMap<AssemblyIdentity, Arc<CilObject>>,
 
-    /// Direct reference to the primary/root assembly.
+    /// The primary/root assembly.
     ///
-    /// This is typically the main executable or the primary library that
-    /// serves as the entry point for the analysis. Set by ProjectLoader
-    /// during the loading process using OnceLock for thread-safe single assignment.
-    primary_assembly: OnceLock<Arc<CilObject>>,
+    /// This is typically the main executable or the primary library that serves as the
+    /// entry point for the analysis. Set by ProjectLoader during the loading process.
+    primary: Option<Arc<CilObject>>,
 }
 
 impl CilProject {
@@ -184,16 +197,30 @@ impl CilProject {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            assemblies: DashMap::new(),
-            primary_assembly: OnceLock::new(),
+            state: RwLock::new(ProjectState::default()),
         }
+    }
+
+    /// Read access to the project's state.
+    ///
+    /// A writer validates everything before it changes anything, so a writer that
+    /// panicked under the lock left the state consistent and poisoning is ignored.
+    fn read_state(&self) -> RwLockReadGuard<'_, ProjectState> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Write access to the project's state (poisoning ignored, see [`Self::read_state`]).
+    fn write_state(&self) -> RwLockWriteGuard<'_, ProjectState> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Get a type by its fully qualified name across all assemblies.
     ///
     /// This method searches through all assemblies in the project to find a type
     /// with the given name. It prioritizes TypeDef entries (actual definitions with
-    /// table ID 0x02) over TypeRef entries (references with table ID 0x01).
+    /// table ID 0x02) over TypeRef entries (references with table ID 0x01). The
+    /// assemblies are searched in identity order, so when several define the name the
+    /// same one is returned on every run.
     ///
     /// # Arguments
     /// * `full_name` - The fully qualified type name (e.g., "System.String")
@@ -204,20 +231,20 @@ impl CilProject {
         let mut typeref_match = None;
 
         // Search through all assemblies for matching types
-        for assembly_identity in self.all_assemblies() {
-            if let Some(assembly) = self.get_assembly(&assembly_identity) {
-                // Check if this assembly defines the type locally
-                for entry in assembly.types().iter() {
-                    let type_instance = entry.value();
-                    if &*type_instance.fullname() == full_name {
-                        // Check if this is a TypeDef (0x02) or TypeRef (0x01)
-                        if type_instance.token.is_table(TableId::TypeDef) {
-                            // TypeDef - actual definition, return immediately
-                            return Some(type_instance.clone());
-                        } else if type_instance.token.is_table(TableId::TypeRef) {
-                            // TypeRef - reference, keep as fallback
-                            typeref_match = Some(type_instance.clone());
-                        }
+        for (_, assembly) in self.iter() {
+            // Check if this assembly defines the type locally
+            for entry in assembly.types().iter() {
+                let type_instance = entry.value();
+                if type_instance.fullname() == full_name {
+                    // Check if this is a TypeDef (0x02) or TypeRef (0x01)
+                    if type_instance.token.is_table(TableId::TypeDef) {
+                        // TypeDef - actual definition, return immediately
+                        return Some(type_instance.clone());
+                    } else if typeref_match.is_none()
+                        && type_instance.token.is_table(TableId::TypeRef)
+                    {
+                        // TypeRef - reference, keep the first as fallback
+                        typeref_match = Some(type_instance.clone());
                     }
                 }
             }
@@ -251,12 +278,14 @@ impl CilProject {
 
     /// Add an assembly to the project.
     ///
-    /// Adds the specified assembly to the project container and automatically
-    /// analyzes its dependencies, updating the dependency graph. If an assembly
-    /// with the same identity already exists, this operation will fail.
+    /// Adds the specified assembly to the project container and links its type registry
+    /// with the registry of every assembly already in the project, both ways, for
+    /// cross-assembly type resolution. If an assembly with the same identity already
+    /// exists, or `is_primary` is set while the project already has a primary, the
+    /// operation fails and leaves the project unchanged.
     ///
-    /// This method also registers all types from the assembly in the global registry
-    /// and builds TypeRef resolution mappings to previously loaded assemblies.
+    /// The checks, the links and the insertion happen under one write lock: concurrent
+    /// adds of one identity insert it exactly once.
     ///
     /// # Arguments
     ///
@@ -284,53 +313,51 @@ impl CilProject {
     /// ```
     ///
     /// # Errors
-    /// Returns an error if the assembly lacks identity information or if an assembly
-    /// with the same identity already exists in the project.
+    /// Returns an error if the assembly lacks identity information, if an assembly
+    /// with the same identity already exists in the project, or if `is_primary` is set
+    /// and the project already has a primary assembly.
     pub fn add_assembly(&self, assembly: CilObject, is_primary: bool) -> Result<()> {
         let identity = assembly.identity().ok_or_else(|| {
             Error::Configuration("Assembly does not have identity information".to_string())
         })?;
 
-        if self.assemblies.contains_key(&identity) {
+        let mut state = self.write_state();
+        if state.assemblies.contains_key(&identity) {
             return Err(Error::Configuration(format!(
                 "Assembly with identity '{}' already exists in project",
                 identity.name
             )));
         }
+        if is_primary {
+            if let Some(existing) = &state.primary {
+                let existing_name = existing
+                    .identity()
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.name.to_string());
+                return Err(Error::Configuration(format!(
+                    "Primary assembly already set to '{}', cannot set '{}' as primary",
+                    existing_name, identity.name
+                )));
+            }
+        }
 
         let assembly_arc = Arc::new(assembly);
 
-        for existing_entry in &self.assemblies {
-            let existing_identity = existing_entry.key();
-            let existing_assembly = existing_entry.value();
-
+        for (existing_identity, existing_assembly) in &state.assemblies {
             // Link new assembly -> existing assembly
             assembly_arc
                 .types()
-                .registry_link(existing_identity.clone(), existing_assembly.types());
+                .registry_link(existing_identity.clone(), &existing_assembly.types());
 
             // Link existing assembly -> new assembly
             existing_assembly
                 .types()
-                .registry_link(identity.clone(), assembly_arc.types());
+                .registry_link(identity.clone(), &assembly_arc.types());
         }
-
-        self.assemblies
-            .insert(identity.clone(), assembly_arc.clone());
 
         if is_primary {
-            self.primary_assembly
-                .set(assembly_arc)
-                .map_err(|existing| {
-                    let existing_name = existing
-                        .identity()
-                        .map_or_else(|| "<unknown>".to_string(), |id| id.name.clone());
-                    Error::Configuration(format!(
-                        "Primary assembly already set to '{}', cannot set '{}' as primary",
-                        existing_name, identity.name
-                    ))
-                })?;
+            state.primary = Some(Arc::clone(&assembly_arc));
         }
+        state.assemblies.insert(identity, assembly_arc);
 
         Ok(())
     }
@@ -365,7 +392,7 @@ impl CilProject {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn get_assembly(&self, identity: &AssemblyIdentity) -> Option<Arc<CilObject>> {
-        self.assemblies.get(identity).map(|entry| entry.clone())
+        self.read_state().assemblies.get(identity).cloned()
     }
 
     /// Get the number of assemblies in the project.
@@ -376,7 +403,7 @@ impl CilProject {
     ///
     /// The number of assemblies in the project.
     pub fn assembly_count(&self) -> usize {
-        self.assemblies.len()
+        self.read_state().assemblies.len()
     }
 
     /// Get all assembly identities in the project.
@@ -401,10 +428,7 @@ impl CilProject {
     /// }
     /// ```
     pub fn all_assemblies(&self) -> Vec<AssemblyIdentity> {
-        self.assemblies
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect()
+        self.read_state().assemblies.keys().cloned().collect()
     }
 
     /// Check if the project contains an assembly with the specified identity.
@@ -417,7 +441,7 @@ impl CilProject {
     ///
     /// `true` if the assembly is present, `false` otherwise.
     pub fn contains_assembly(&self, identity: &AssemblyIdentity) -> bool {
-        self.assemblies.contains_key(identity)
+        self.read_state().assemblies.contains_key(identity)
     }
 
     /// Check if the project is empty.
@@ -426,13 +450,15 @@ impl CilProject {
     ///
     /// `true` if the project contains no assemblies, `false` otherwise.
     pub fn is_empty(&self) -> bool {
-        self.assemblies.is_empty()
+        self.read_state().assemblies.is_empty()
     }
 
     /// Iterate over all assemblies in the project.
     ///
-    /// Provides direct iteration over all loaded assemblies without creating copies.
-    /// Returns an iterator that yields (AssemblyIdentity, `Arc<CilObject>`) pairs.
+    /// Iterates a snapshot of the project taken when called, in identity order: an
+    /// assembly added during the iteration is not visited, and no lock is held while the
+    /// caller works. Returns an iterator that yields (AssemblyIdentity, `Arc<CilObject>`)
+    /// pairs.
     ///
     /// # Returns
     /// Iterator over all assemblies in the project
@@ -450,9 +476,13 @@ impl CilProject {
     /// }
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = (AssemblyIdentity, Arc<CilObject>)> + '_ {
-        self.assemblies
+        let snapshot: Vec<(AssemblyIdentity, Arc<CilObject>)> = self
+            .read_state()
+            .assemblies
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|(identity, assembly)| (identity.clone(), Arc::clone(assembly)))
+            .collect();
+        snapshot.into_iter()
     }
 
     /// Find all assemblies that define a specific type.
@@ -471,7 +501,7 @@ impl CilProject {
         for (identity, assembly) in self.iter() {
             for entry in assembly.types().iter() {
                 let type_instance = entry.value();
-                if &*type_instance.fullname() == type_name
+                if type_instance.fullname() == type_name
                     && type_instance.token.is_table(TableId::TypeDef)
                 {
                     results.push((identity.clone(), type_instance.clone()));
@@ -508,17 +538,27 @@ impl CilProject {
     /// # }
     /// ```
     pub fn get_primary(&self) -> Option<Arc<CilObject>> {
-        self.primary_assembly.get().cloned()
+        self.read_state().primary.clone()
     }
 
     /// Clear all assemblies from the project.
     ///
-    /// Removes all assemblies from the project. This operation is useful for
-    /// reusing a CilProject instance for different analysis tasks.
-    /// Note: The primary assembly designation cannot be cleared due to OnceLock.
+    /// Removes all assemblies from the project and the primary designation, and unlinks
+    /// the type registries of the removed assemblies from one another. This operation is
+    /// useful for reusing a CilProject instance for different analysis tasks.
     pub fn clear(&self) {
-        self.assemblies.clear();
-        // Note: primary_assembly cannot be reset due to OnceLock semantics
+        let mut state = self.write_state();
+        // Unlink every pair, so an assembly the caller still holds no longer resolves
+        // types through the assemblies this project held.
+        for (identity, assembly) in &state.assemblies {
+            for other in state.assemblies.keys() {
+                if other != identity {
+                    assembly.types().registry_unlink(other);
+                }
+            }
+        }
+        state.assemblies.clear();
+        state.primary = None;
     }
 }
 
@@ -530,10 +570,7 @@ impl Default for CilProject {
 
 impl std::fmt::Debug for CilProject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let primary_identity = self
-            .primary_assembly
-            .get()
-            .and_then(|assembly| assembly.identity());
+        let primary_identity = self.get_primary().and_then(|assembly| assembly.identity());
 
         f.debug_struct("CilProject")
             .field("assembly_count", &self.assembly_count())
@@ -544,10 +581,131 @@ impl std::fmt::Debug for CilProject {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
+    use rayon::prelude::*;
+
     use super::*;
-    use crate::test::{verify_crafted_2, verify_windowsbasedll};
+    use crate::{
+        metadata::{
+            typesystem::{CilTypeReference, TypeSource},
+            validation::ValidationConfig,
+        },
+        testkit::{fixture, verify_crafted_2, verify_windowsbasedll},
+    };
+
+    /// In a project, a registry also holds the types its TypeRefs resolve to in other
+    /// assemblies. The types it lists as its own assembly's are that assembly's alone: every
+    /// assembly's row token is `0x20000001`, and keying sources by it once listed System's
+    /// resolved mscorlib types (`ExtensionAttribute`, `CLSCompliantAttribute`, ...) as
+    /// System's.
+    #[test]
+    fn a_registry_lists_only_its_own_assembly_s_types_as_its_own() {
+        let result = ProjectLoader::new()
+            .primary_file(fixture("mono_4.8/System.dll"))
+            .and_then(|loader| loader.with_search_path(fixture("mono_4.8")))
+            .map(|loader| {
+                loader
+                    .auto_discover(true)
+                    .with_validation(ValidationConfig::disabled())
+            })
+            .and_then(ProjectLoader::build)
+            .expect("System.dll loads with mscorlib");
+        let system = result.project.get_primary().expect("the primary assembly");
+        let identity = system.identity().expect("System's identity");
+        let own = system
+            .types()
+            .types_from_source(&TypeSource::Assembly(identity.clone()));
+
+        let foreign: Vec<String> = own
+            .iter()
+            .filter_map(|ty| match ty.external() {
+                Some(CilTypeReference::Assembly(assembly)) if assembly.name != identity.name => {
+                    Some(format!("{} from {}", ty.fullname(), assembly.name))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(foreign.is_empty(), "{} foreign: {foreign:?}", foreign.len());
+        assert!(own
+            .iter()
+            .any(|ty| ty.fullname() == "System.Text.RegularExpressions.GroupCollection"));
+    }
+
+    /// A refused add leaves the project as it was: an assembly offered as a second
+    /// primary is neither inserted nor linked. `clear` resets the primary too.
+    #[test]
+    fn a_refused_add_changes_nothing_and_clear_resets_the_primary() {
+        let project = CilProject::new();
+        let primary = CilObject::from_path(fixture("crafted_2.exe")).unwrap();
+        let primary_identity = primary.identity().unwrap();
+        project.add_assembly(primary, true).unwrap();
+
+        let second = CilObject::from_path(fixture("mono_4.8/SMDiagnostics.dll")).unwrap();
+        let second_identity = second.identity().unwrap();
+        let second_types = second.types();
+        assert!(project.add_assembly(second, true).is_err());
+        assert_eq!(
+            project.all_assemblies(),
+            std::slice::from_ref(&primary_identity)
+        );
+        assert!(!project.contains_assembly(&second_identity));
+        let linked = project
+            .get_assembly(&primary_identity)
+            .unwrap()
+            .types()
+            .external_assemblies();
+        assert!(
+            linked.is_empty(),
+            "the refused assembly is not linked: {linked:?}"
+        );
+        assert_eq!(second_types.external_registry_count(), 0);
+
+        project.clear();
+        assert!(project.is_empty());
+        assert!(project.get_primary().is_none(), "clear resets the primary");
+        let next = CilObject::from_path(fixture("mono_4.8/SMDiagnostics.dll")).unwrap();
+        project
+            .add_assembly(next, true)
+            .expect("a cleared project takes a new primary");
+    }
+
+    /// Concurrent adds of one identity insert it once; the project lists its assemblies in
+    /// identity order.
+    #[test]
+    fn concurrent_adds_insert_each_identity_once_in_identity_order() {
+        let paths = [
+            "crafted_2.exe",
+            "mono_4.8/SMDiagnostics.dll",
+            "mono_4.8/Mono.Tasklets.dll",
+        ];
+        let objects: Vec<CilObject> = paths
+            .iter()
+            .flat_map(|path| (0..4).map(move |_| CilObject::from_path(fixture(path)).unwrap()))
+            .collect();
+
+        let project = CilProject::new();
+        let added = objects
+            .into_par_iter()
+            .map(|object| project.add_assembly(object, false).is_ok())
+            .filter(|added| *added)
+            .count();
+        assert_eq!(added, paths.len(), "each identity is inserted exactly once");
+
+        let identities = project.all_assemblies();
+        let mut sorted = identities.clone();
+        sorted.sort();
+        assert_eq!(identities, sorted);
+        let names: Vec<String> = project.iter().map(|(id, _)| id.name.to_string()).collect();
+        assert_eq!(names, ["Mono.Tasklets", "SMDiagnostics", "crafted_2"]);
+        for (identity, assembly) in project.iter() {
+            assert_eq!(
+                assembly.types().external_registry_count(),
+                paths.len() - 1,
+                "{} links every other assembly",
+                identity.name
+            );
+        }
+    }
 
     #[test]
     fn test_cilproject_creation() {
@@ -567,53 +725,26 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_get_primary_with_loader() {
-        // Use CARGO_MANIFEST_DIR to get absolute paths
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let crafted2_path = std::path::Path::new(&manifest_dir).join("tests/samples/crafted_2.exe");
-        let mono_deps_path = std::path::Path::new(&manifest_dir).join("tests/samples/mono_4.8");
-
-        // Only run test if the file exists
-        if !crafted2_path.exists() {
-            println!(
-                "Skipping test - crafted_2.exe not found at {:?}",
-                crafted2_path
-            );
-            return;
-        }
-
-        match ProjectLoader::new()
-            .primary_file(&crafted2_path)
-            .and_then(|loader| loader.with_search_path(&mono_deps_path))
+        let result = ProjectLoader::new()
+            .primary_file(fixture("crafted_2.exe"))
+            .and_then(|loader| loader.with_search_path(fixture("mono_4.8")))
             .and_then(|loader| loader.auto_discover(true).build())
-        {
-            Ok(result) => {
-                // Test that get_primary() returns the primary assembly
-                if let Some(primary) = result.project.get_primary() {
-                    // Verify it's an actual assembly
-                    assert!(
-                        !primary.types().is_empty(),
-                        "Primary assembly should have types"
-                    );
-                    println!("✅ Primary assembly has {} types", primary.types().len());
-                } else {
-                    panic!("Primary assembly should be set after successful loading");
-                }
-            }
-            Err(e) => {
-                println!("Skipping test due to loading error: {}", e);
-            }
-        }
+            .expect("crafted_2.exe loads with its dependencies");
+        let primary = result
+            .project
+            .get_primary()
+            .expect("the primary assembly is set after loading");
+        assert!(
+            !primary.types().is_empty(),
+            "the primary assembly has types"
+        );
     }
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_load_crafted2_exe() {
-        // Use CARGO_MANIFEST_DIR to get absolute paths
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let crafted2_path = std::path::Path::new(&manifest_dir).join("tests/samples/crafted_2.exe");
-        let mono_deps_path = std::path::Path::new(&manifest_dir).join("tests/samples/mono_4.8");
+        let crafted2_path = fixture("crafted_2.exe");
+        let mono_deps_path = fixture("mono_4.8");
 
         println!("Loading crafted_2.exe from {:?}", crafted2_path);
         println!("Using Mono dependencies from {:?}", mono_deps_path);
@@ -671,13 +802,13 @@ mod tests {
         }
     }
 
+    /// WindowsBase.dll is the .NET 8 Windows Desktop assembly, and no committed runtime
+    /// holds its closure: against Mono 4.8 it loads with what is there, the names Mono
+    /// lacks are reported as missing, and every dependency found loads.
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_load_windowsbase_dll() {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let windowsbase_path =
-            std::path::Path::new(&manifest_dir).join("tests/samples/WindowsBase.dll");
-        let mono_deps_path = std::path::Path::new(&manifest_dir).join("tests/samples/mono_4.8");
+        let windowsbase_path = fixture("WindowsBase.dll");
+        let mono_deps_path = fixture("mono_4.8");
 
         println!("Loading WindowsBase.dll from {:?}", windowsbase_path);
         println!("Using Mono dependencies from {:?}", mono_deps_path);
@@ -686,7 +817,7 @@ mod tests {
             .primary_file(&windowsbase_path)
             .and_then(|loader| loader.with_search_path(&mono_deps_path))
             .map(|loader| loader.auto_discover(true))
-            .and_then(|loader| loader.strict_mode(true).build())
+            .and_then(ProjectLoader::build)
         {
             Ok(result) => {
                 println!(
@@ -725,6 +856,29 @@ mod tests {
 
                 assert!(result.success_count() >= 1);
                 assert!(!result.loaded_assemblies.is_empty());
+                assert!(
+                    result.failed_loads.is_empty(),
+                    "every dependency found loads: {:?}",
+                    result.failed_loads
+                );
+                assert!(
+                    result
+                        .missing_dependencies
+                        .iter()
+                        .any(|name| name == "Microsoft.Win32.Registry"),
+                    "{:?}",
+                    result.missing_dependencies
+                );
+                // It references System.Runtime 8.0, which Mono 4.8 has only as 4.1.2: a
+                // mismatch that is recorded, not refused.
+                assert!(
+                    result
+                        .version_mismatches
+                        .iter()
+                        .any(|mismatch| mismatch.required.name == "System.Runtime"),
+                    "{:?}",
+                    result.version_mismatches
+                );
 
                 let loaded = result.project.get_primary().unwrap();
                 verify_windowsbasedll(&loaded)

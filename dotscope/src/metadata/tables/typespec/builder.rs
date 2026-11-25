@@ -467,6 +467,7 @@ impl TypeSpecBuilder {
     ///     stdcall: false,
     ///     thiscall: false,
     ///     fastcall: false,
+    ///     unmanaged: false,
     ///     param_count_generic: 0,
     ///     param_count: 2,
     ///     return_type: SignatureParameter {
@@ -558,7 +559,6 @@ impl TypeSpecBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
@@ -567,6 +567,7 @@ mod tests {
             cilassemblyview::CilAssemblyView,
             signatures::{SignatureMethod, SignatureParameter},
         },
+        testkit::fixture,
     };
 
     #[test]
@@ -583,192 +584,183 @@ mod tests {
 
     #[test]
     fn test_direct_signature() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeSpecBuilder::new()
-                .signature(TypeSignature::I4)
-                .build(&mut assembly)
-                .expect("Should build TypeSpec");
+        let ref_ = TypeSpecBuilder::new()
+            .signature(TypeSignature::I4)
+            .build(&mut assembly)
+            .expect("Should build TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_single_dimensional_array() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeSpecBuilder::new()
-                .single_dimensional_array(TypeSignature::String)
-                .build(&mut assembly)
-                .expect("Should build string array TypeSpec");
+        let ref_ = TypeSpecBuilder::new()
+            .single_dimensional_array(TypeSignature::String)
+            .build(&mut assembly)
+            .expect("Should build string array TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_multi_dimensional_array() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeSpecBuilder::new()
-                .multi_dimensional_array(TypeSignature::I4, 2)
-                .build(&mut assembly)
-                .expect("Should build 2D int array TypeSpec");
+        let ref_ = TypeSpecBuilder::new()
+            .multi_dimensional_array(TypeSignature::I4, 2)
+            .build(&mut assembly)
+            .expect("Should build 2D int array TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_generic_instantiation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let list_type = Token::new(0x02000001);
-            let ref_ = TypeSpecBuilder::new()
-                .generic_instantiation(list_type, vec![TypeSignature::I4])
-                .build(&mut assembly)
-                .expect("Should build generic instantiation TypeSpec");
+        let list_type = Token::new(0x02000001);
+        let ref_ = TypeSpecBuilder::new()
+            .generic_instantiation(list_type, vec![TypeSignature::I4])
+            .build(&mut assembly)
+            .expect("Should build generic instantiation TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_pointer_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeSpecBuilder::new()
-                .pointer(TypeSignature::I4)
-                .build(&mut assembly)
-                .expect("Should build pointer TypeSpec");
+        let ref_ = TypeSpecBuilder::new()
+            .pointer(TypeSignature::I4)
+            .build(&mut assembly)
+            .expect("Should build pointer TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_managed_reference() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = TypeSpecBuilder::new()
-                .managed_reference(TypeSignature::String)
-                .build(&mut assembly)
-                .expect("Should build managed reference TypeSpec");
+        let ref_ = TypeSpecBuilder::new()
+            .managed_reference(TypeSignature::String)
+            .build(&mut assembly)
+            .expect("Should build managed reference TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_function_pointer() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let method_sig = SignatureMethod {
-                has_this: false,
-                explicit_this: false,
-                default: true,
-                vararg: false,
-                cdecl: false,
-                stdcall: false,
-                thiscall: false,
-                fastcall: false,
-                param_count: 1,
-                param_count_generic: 0,
-                varargs: vec![],
-                return_type: SignatureParameter {
-                    modifiers: vec![],
-                    by_ref: false,
-                    base: TypeSignature::I4,
-                },
-                params: vec![SignatureParameter {
-                    modifiers: vec![],
-                    by_ref: false,
-                    base: TypeSignature::String,
-                }],
-            };
+        let method_sig = SignatureMethod {
+            has_this: false,
+            explicit_this: false,
+            default: true,
+            vararg: false,
+            cdecl: false,
+            stdcall: false,
+            thiscall: false,
+            fastcall: false,
+            unmanaged: false,
+            param_count: 1,
+            param_count_generic: 0,
+            varargs: vec![],
+            return_type: SignatureParameter {
+                modifiers: vec![],
+                by_ref: false,
+                base: TypeSignature::I4,
+            },
+            params: vec![SignatureParameter {
+                modifiers: vec![],
+                by_ref: false,
+                base: TypeSignature::String,
+            }],
+        };
 
-            let ref_ = TypeSpecBuilder::new()
-                .function_pointer(method_sig)
-                .build(&mut assembly)
-                .expect("Should build function pointer TypeSpec");
+        let ref_ = TypeSpecBuilder::new()
+            .function_pointer(method_sig)
+            .build(&mut assembly)
+            .expect("Should build function pointer TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_complex_nested_generic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let dict_type = Token::new(0x02000002);
-            let list_type = Token::new(0x02000001);
+        let dict_type = Token::new(0x02000002);
+        let list_type = Token::new(0x02000001);
 
-            // Create Dictionary<string, List<int>>
-            let nested_list = TypeSignature::GenericInst(
-                Box::new(TypeSignature::Class(list_type)),
-                vec![TypeSignature::I4],
-            );
+        // Create Dictionary<string, List<int>>
+        let nested_list = TypeSignature::GenericInst(
+            Box::new(TypeSignature::Class(list_type)),
+            vec![TypeSignature::I4],
+        );
 
-            let ref_ = TypeSpecBuilder::new()
-                .generic_instantiation(dict_type, vec![TypeSignature::String, nested_list])
-                .build(&mut assembly)
-                .expect("Should build complex nested generic TypeSpec");
+        let ref_ = TypeSpecBuilder::new()
+            .generic_instantiation(dict_type, vec![TypeSignature::String, nested_list])
+            .build(&mut assembly)
+            .expect("Should build complex nested generic TypeSpec");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
     }
 
     #[test]
     fn test_build_without_signature_fails() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = TypeSpecBuilder::new().build(&mut assembly);
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("requires a type signature"));
-        }
+        let result = TypeSpecBuilder::new().build(&mut assembly);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires a type signature"));
     }
 
     #[test]
     fn test_multiple_typespecs() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref1 = TypeSpecBuilder::new()
-                .signature(TypeSignature::I4)
-                .build(&mut assembly)
-                .expect("Should build first TypeSpec");
+        let ref1 = TypeSpecBuilder::new()
+            .signature(TypeSignature::I4)
+            .build(&mut assembly)
+            .expect("Should build first TypeSpec");
 
-            let ref2 = TypeSpecBuilder::new()
-                .single_dimensional_array(TypeSignature::String)
-                .build(&mut assembly)
-                .expect("Should build second TypeSpec");
+        let ref2 = TypeSpecBuilder::new()
+            .single_dimensional_array(TypeSignature::String)
+            .build(&mut assembly)
+            .expect("Should build second TypeSpec");
 
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-        }
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::TypeSpec));
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
     }
 }

@@ -95,7 +95,7 @@
 //! use dotscope::metadata::{streams::TablesHeader, tables::{TableId, TypeDefRaw, MethodDefRaw}};
 //!
 //! # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-//! let tables = TablesHeader::from(tables_data)?;
+//! let tables = TablesHeader::from(tables_data, false)?;
 //!
 //! // Analyze assembly structure
 //! println!("Assembly contains {} metadata tables", tables.table_count());
@@ -134,7 +134,7 @@
 //! use dotscope::metadata::{streams::TablesHeader, tables::{TableId, TypeDefRaw, FieldRaw}};
 //!
 //! # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-//! let tables = TablesHeader::from(tables_data)?;
+//! let tables = TablesHeader::from(tables_data, false)?;
 //!
 //! // Analyze types and their fields together
 //! if let (Some(typedef_table), Some(field_table)) = (
@@ -171,7 +171,7 @@
 //! use rayon::prelude::*;
 //!
 //! # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-//! let tables = TablesHeader::from(tables_data)?;
+//! let tables = TablesHeader::from(tables_data, false)?;
 //!
 //! // Process custom attributes in parallel for large assemblies
 //! if let Some(ca_table) = tables.table::<CustomAttributeRaw>() {
@@ -199,7 +199,7 @@
 //! use dotscope::metadata::{streams::TablesHeader, tables::{TableId, MemberRefRaw}};
 //!
 //! # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-//! let tables = TablesHeader::from(tables_data)?;
+//! let tables = TablesHeader::from(tables_data, false)?;
 //!
 //! // Process large tables in chunks to manage memory usage
 //! if let Some(memberref_table) = tables.table::<MemberRefRaw>() {
@@ -235,7 +235,7 @@
 //! use dotscope::metadata::{streams::TablesHeader, tables::TableId};
 //!
 //! # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-//! let tables = TablesHeader::from(tables_data)?;
+//! let tables = TablesHeader::from(tables_data, false)?;
 //!
 //! println!("Assembly Metadata Summary:");
 //! println!("========================");
@@ -314,15 +314,19 @@ use crate::{
         EventPtrRaw, EventRaw, ExportedTypeRaw, FieldLayoutRaw, FieldMarshalRaw, FieldPtrRaw,
         FieldRaw, FieldRvaRaw, FileRaw, GenericParamConstraintRaw, GenericParamRaw, ImplMapRaw,
         ImportScopeRaw, InterfaceImplRaw, LocalConstantRaw, LocalScopeRaw, LocalVariableRaw,
-        ManifestResourceRaw, MemberRefRaw, MetadataTable, MethodDebugInformationRaw, MethodDefRaw,
-        MethodImplRaw, MethodPtrRaw, MethodSemanticsRaw, MethodSpecRaw, ModuleRaw, ModuleRefRaw,
-        NestedClassRaw, ParamPtrRaw, ParamRaw, PropertyMapRaw, PropertyPtrRaw, PropertyRaw,
-        RowReadable, StandAloneSigRaw, StateMachineMethodRaw, TableAccess, TableData, TableId,
-        TableInfo, TableInfoRef, TypeDefRaw, TypeRefRaw, TypeSpecRaw,
+        ManifestResourceRaw, MemberList, MemberRanges, MemberRefRaw, MetadataTable,
+        MethodDebugInformationRaw, MethodDefRaw, MethodImplRaw, MethodPtrRaw, MethodSemanticsRaw,
+        MethodSpecRaw, ModuleRaw, ModuleRefRaw, NestedClassRaw, ParamPtrRaw, ParamRaw,
+        PropertyMapRaw, PropertyPtrRaw, PropertyRaw, RowReadable, StandAloneSigRaw,
+        StateMachineMethodRaw, TableAccess, TableData, TableId, TableInfo, TableInfoRef,
+        TypeDefRaw, TypeRefRaw, TypeSpecRaw,
     },
     utils::read_le,
     Error, ParseFailure, ParseStage, Result,
 };
+
+/// HeapSizes bit 0x40 (ExtraData): a u32 follows the row counts, before the first table.
+const HEAP_SIZES_EXTRA_DATA: u8 = 0x40;
 
 /// ECMA-335 compliant metadata tables header providing efficient access to .NET assembly metadata.
 ///
@@ -384,7 +388,7 @@ use crate::{
 /// use dotscope::metadata::{streams::TablesHeader, tables::{TableId, TypeDefRaw, MethodDefRaw}};
 ///
 /// # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-/// let tables = TablesHeader::from(tables_data)?;
+/// let tables = TablesHeader::from(tables_data, false)?;
 ///
 /// // Safe table presence checking
 /// if tables.has_table(TableId::TypeDef) {
@@ -414,7 +418,7 @@ use crate::{
 /// use dotscope::metadata::{streams::TablesHeader, tables::{TableId, TypeDefRaw, FieldRaw, MethodDefRaw}};
 ///
 /// # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-/// let tables = TablesHeader::from(tables_data)?;
+/// let tables = TablesHeader::from(tables_data, false)?;
 ///
 /// // Analyze complete type structure with members
 /// if let (Some(typedef_table), Some(field_table), Some(method_table)) = (
@@ -455,7 +459,7 @@ use crate::{
 /// use std::collections::HashMap;
 ///
 /// # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-/// let tables = TablesHeader::from(tables_data)?;
+/// let tables = TablesHeader::from(tables_data, false)?;
 ///
 /// // Parallel analysis of custom attributes
 /// if let Some(ca_table) = tables.table::<CustomAttributeRaw>() {
@@ -487,7 +491,7 @@ use crate::{
 /// use dotscope::metadata::{streams::TablesHeader, tables::{TableId, MemberRefRaw}};
 ///
 /// # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-/// let tables = TablesHeader::from(tables_data)?;
+/// let tables = TablesHeader::from(tables_data, false)?;
 ///
 /// // Process large tables without loading all data into memory
 /// if let Some(memberref_table) = tables.table::<MemberRefRaw>() {
@@ -533,7 +537,7 @@ use crate::{
 /// use dotscope::metadata::{streams::TablesHeader, tables::TableId};
 ///
 /// # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-/// let tables = TablesHeader::from(tables_data)?;
+/// let tables = TablesHeader::from(tables_data, false)?;
 ///
 /// println!("Assembly Metadata Analysis");
 /// println!("=========================");
@@ -856,7 +860,10 @@ impl<'a> TablesHeader<'a> {
     /// 5. **Validation**: Verify all tables conform to ECMA-335 format
     ///
     /// # Arguments
-    /// * `data` - Complete binary data of the compressed metadata tables stream
+    /// * `data` - Complete binary data of the metadata tables stream (`#~` or `#-`)
+    /// * `wide_columns` - Every index column is four bytes wide: the CLR's reading of
+    ///   uncompressed (`#-`) tables beside a `#JTD` stream, which only the stream directory
+    ///   can tell. `false` for any other tables stream.
     ///
     /// # Returns
     /// * `Ok(TablesHeader)` - Successfully parsed and validated tables header
@@ -882,7 +889,7 @@ impl<'a> TablesHeader<'a> {
     /// # let tables_stream_data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
     /// let tables_stream_data = &[/* binary data from #~ stream */];
     ///
-    /// let tables = TablesHeader::from(tables_stream_data)?;
+    /// let tables = TablesHeader::from(tables_stream_data, false)?;
     ///
     /// // Verify successful construction
     /// println!("Parsed metadata with {} tables", tables.table_count());
@@ -907,7 +914,7 @@ impl<'a> TablesHeader<'a> {
     /// # fn example() {
     /// // Error: Data too short
     /// let too_short = [0u8; 20]; // Only 20 bytes, need at least 24
-    /// assert!(TablesHeader::from(&too_short).is_err());
+    /// assert!(TablesHeader::from(&too_short, false).is_err());
     ///
     /// // Error: No valid tables
     /// let no_tables = [
@@ -917,7 +924,7 @@ impl<'a> TablesHeader<'a> {
     ///     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Valid = 0 (no tables)
     ///     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Sorted
     /// ];
-    /// assert!(TablesHeader::from(&no_tables).is_err());
+    /// assert!(TablesHeader::from(&no_tables, false).is_err());
     /// # }
     /// ```
     ///
@@ -931,7 +938,7 @@ impl<'a> TablesHeader<'a> {
     /// let large_assembly_data = &[/* large assembly #~ stream data */];
     ///
     /// let start_time = std::time::Instant::now();
-    /// let tables = TablesHeader::from(large_assembly_data)?;
+    /// let tables = TablesHeader::from(large_assembly_data, false)?;
     /// let parse_time = start_time.elapsed();
     ///
     /// println!("Parsed {} tables in {:?}", tables.table_count(), parse_time);
@@ -966,7 +973,7 @@ impl<'a> TablesHeader<'a> {
     /// # fn example() -> dotscope::Result<()> {
     /// # let assembly_data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
     /// let assembly_data = &[/* assembly #~ stream data */];
-    /// let tables = TablesHeader::from(assembly_data)?;
+    /// let tables = TablesHeader::from(assembly_data, false)?;
     ///
     /// println!("Assembly Feature Analysis:");
     /// println!("=========================");
@@ -1024,7 +1031,26 @@ impl<'a> TablesHeader<'a> {
     /// - [`TablesHeader::table_summary`]: Get overview of all present tables
     /// - [`crate::metadata::tables::TableInfo`]: Table metadata and row count information
     /// - [ECMA-335 II.24.2.6](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Tables header specification
-    pub fn from(data: &'a [u8]) -> Result<TablesHeader<'a>> {
+    pub fn from(data: &'a [u8], wide_columns: bool) -> Result<TablesHeader<'a>> {
+        Self::parse(data, wide_columns, None)
+    }
+
+    /// Parses a Portable PDB's tables stream: its columns index the assembly's tables by the
+    /// row counts `type_system_rows` gives them (the `#Pdb` stream's,
+    /// [`crate::metadata::streams::PdbStream::type_system_rows`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TablesHeader::from`].
+    pub fn from_pdb(data: &'a [u8], type_system_rows: &[u32; 64]) -> Result<TablesHeader<'a>> {
+        Self::parse(data, false, Some(type_system_rows))
+    }
+
+    fn parse(
+        data: &'a [u8],
+        wide_columns: bool,
+        type_system_rows: Option<&[u32; 64]>,
+    ) -> Result<TablesHeader<'a>> {
         let truncated = |expected: usize, found: usize| ParseFailure::Truncated {
             stage: ParseStage::TildeStream,
             expected,
@@ -1047,8 +1073,19 @@ impl<'a> TablesHeader<'a> {
             .into());
         }
 
+        // HeapSizes bit 0x40 (ExtraData): one more u32 follows the row counts, and the tables
+        // start after it, as the CLR and dnlib read it. ECMA-335 does not document the bit.
+        let heap_sizes = read_le::<u8>(
+            data.get(6..)
+                .ok_or_else(|| Error::from(truncated(7, data.len())))?,
+        )?;
+        let extra_data_words = usize::from(heap_sizes & HEAP_SIZES_EXTRA_DATA != 0);
         let tables_offset = 24usize
-            .checked_add((valid_bitvec.count_ones() as usize).saturating_mul(4))
+            .checked_add(
+                (valid_bitvec.count_ones() as usize)
+                    .saturating_add(extra_data_words)
+                    .saturating_mul(4),
+            )
             .ok_or_else(|| ParseFailure::InvalidField {
                 stage: ParseStage::TildeStream,
                 field: "valid",
@@ -1070,7 +1107,10 @@ impl<'a> TablesHeader<'a> {
                 data.get(16..)
                     .ok_or_else(|| Error::from(truncated(24, data.len())))?,
             )?,
-            info: Arc::new(TableInfo::new(data, valid_bitvec)?),
+            info: Arc::new(match type_system_rows {
+                Some(rows) => TableInfo::with_external_rows(data, valid_bitvec, rows)?,
+                None => TableInfo::new(data, valid_bitvec, wide_columns)?,
+            }),
             tables_offset,
             tables: Vec::with_capacity(table_capacity),
         };
@@ -1100,8 +1140,8 @@ impl<'a> TablesHeader<'a> {
         }
 
         // Checked again after the loop, not only at the top of each iteration: the check above
-        // catches an overshoot on the *next* variant, which leaves the last one — presently
-        // `CustomDebugInformation` — with nothing behind it to notice.
+        // catches an overshoot on the *next* variant, which leaves the last one - presently
+        // `CustomDebugInformation` - with nothing behind it to notice.
         if current_offset > data.len() {
             return Err(ParseFailure::OutOfBounds {
                 stage: ParseStage::TildeStream,
@@ -1218,9 +1258,10 @@ impl<'a> TablesHeader<'a> {
         table_type: TableId,
         current_offset: &mut usize,
     ) -> Result<()> {
+        // Only the tables the stream declares are in it: a Portable PDB's row counts for the
+        // assembly's tables size its indexes, and their rows are not here
         let t_info = self.info.get(table_type);
-        if t_info.rows == 0 {
-            // We filtered out empty tables earlier, this case shouldn't happen here
+        if t_info.rows == 0 || self.valid & (1u64 << (table_type as u8)) == 0 {
             return Ok(());
         }
 
@@ -1478,7 +1519,166 @@ impl<'a> TablesHeader<'a> {
     /// This method is thread-safe and can be called concurrently from multiple threads.
     #[must_use]
     pub fn table_row_count(&self, table_id: TableId) -> u32 {
-        self.info.get(table_id).rows
+        if self.has_table(table_id) {
+            self.info.get(table_id).rows
+        } else {
+            0
+        }
+    }
+
+    /// The normalized runs of one list column, read from this header's tables.
+    ///
+    /// Reads the owner table's column once per row and normalizes it with
+    /// [`MemberRanges::new`]: runs are clamped to the member table, made non-overlapping, and
+    /// an owner whose column is 0 or whose row cannot be read owns nothing. When the list's Ptr
+    /// table has rows (an uncompressed `#-` stream), the runs cover the Ptr table's positions
+    /// and [`MemberRanges::is_indirect`] is set; a Ptr table that is absent or empty means the
+    /// columns index members directly, as both CoreCLR and `System.Reflection.Metadata` decide.
+    ///
+    /// The cost is one row decode per owner row; build it once per load, not per owner.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::{
+    ///     metadata::tables::{MemberList, TypeDefRaw},
+    ///     CilAssemblyView,
+    /// };
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> dotscope::Result<()> {
+    /// let view = CilAssemblyView::from_path(Path::new("tests/samples/WindowsBase.dll"))?;
+    /// let tables = view.tables().expect("a #~ stream");
+    /// let methods = tables.member_ranges(MemberList::TypeDefMethods);
+    /// for rid in 1..=methods.owner_rows() {
+    ///     println!("TypeDef {rid} owns methods {:?}", methods.range(rid));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn member_ranges(&self, list: MemberList) -> MemberRanges {
+        fn read<'t, T: RowReadable>(
+            list: MemberList,
+            table: Option<&MetadataTable<'t, T>>,
+            members: u32,
+            indirect: bool,
+            column: impl Fn(&T) -> u32,
+        ) -> MemberRanges {
+            let Some(table) = table else {
+                return MemberRanges::new(list, 0, members, indirect, |_| None);
+            };
+            MemberRanges::new(list, table.row_count, members, indirect, |rid| {
+                table.get(rid).ok().flatten().map(|row| column(&row))
+            })
+        }
+
+        let ptr_rows = list.ptr_table().map_or(0, |ptr| self.table_row_count(ptr));
+        let indirect = ptr_rows > 0;
+        let members = if indirect {
+            ptr_rows
+        } else {
+            self.table_row_count(list.member_table())
+        };
+
+        match list {
+            MemberList::TypeDefFields => {
+                read(list, self.table::<TypeDefRaw>(), members, indirect, |row| {
+                    row.field_list
+                })
+            }
+            MemberList::TypeDefMethods => {
+                read(list, self.table::<TypeDefRaw>(), members, indirect, |row| {
+                    row.method_list
+                })
+            }
+            MemberList::MethodDefParams => read(
+                list,
+                self.table::<MethodDefRaw>(),
+                members,
+                indirect,
+                |row| row.param_list,
+            ),
+            MemberList::EventMapEvents => read(
+                list,
+                self.table::<EventMapRaw>(),
+                members,
+                indirect,
+                |row| row.event_list,
+            ),
+            MemberList::PropertyMapProperties => read(
+                list,
+                self.table::<PropertyMapRaw>(),
+                members,
+                indirect,
+                |row| row.property_list,
+            ),
+            MemberList::LocalScopeVariables => read(
+                list,
+                self.table::<LocalScopeRaw>(),
+                members,
+                indirect,
+                |row| row.variable_list,
+            ),
+            MemberList::LocalScopeConstants => read(
+                list,
+                self.table::<LocalScopeRaw>(),
+                members,
+                indirect,
+                |row| row.constant_list,
+            ),
+        }
+    }
+
+    /// The member rows owner `owner_rid` owns under `ranges`, as rids in the member table.
+    ///
+    /// For direct runs these are the positions of [`MemberRanges::range`]. For
+    /// [indirect](MemberRanges::is_indirect) runs each position is looked up in the list's Ptr
+    /// table and its target row is yielded instead, so a `#-` stream yields the rows the
+    /// runtime would bind, not the Ptr positions. A Ptr row that cannot be read, or whose
+    /// target is 0 or past the member table, is skipped: it names no member.
+    ///
+    /// `ranges` must have been built from this header (see [`member_ranges`](Self::member_ranges)).
+    pub fn member_rids<'r>(
+        &'r self,
+        ranges: &'r MemberRanges,
+        owner_rid: u32,
+    ) -> impl Iterator<Item = u32> + 'r {
+        let list = ranges.list();
+        let member_rows = self.table_row_count(list.member_table());
+        ranges
+            .range(owner_rid)
+            .filter_map(move |position| {
+                if !ranges.is_indirect() {
+                    return Some(position);
+                }
+                match list {
+                    MemberList::TypeDefFields => self
+                        .table::<FieldPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.field),
+                    MemberList::TypeDefMethods => self
+                        .table::<MethodPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.method),
+                    MemberList::MethodDefParams => self
+                        .table::<ParamPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.param),
+                    MemberList::EventMapEvents => self
+                        .table::<EventPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.event),
+                    MemberList::PropertyMapProperties => self
+                        .table::<PropertyPtrRaw>()
+                        .and_then(|ptr| ptr.get(position).ok().flatten())
+                        .map(|row| row.property),
+                    MemberList::LocalScopeVariables | MemberList::LocalScopeConstants => {
+                        Some(position)
+                    }
+                }
+            })
+            .filter(move |&rid| rid != 0 && rid <= member_rows)
     }
 
     /// Get a summary of all present metadata tables with their row counts.
@@ -1632,7 +1832,7 @@ impl<'a> TablesHeader<'a> {
 /// use dotscope::metadata::streams::TablesHeader;
 ///
 /// # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-/// let tables = TablesHeader::from(tables_data)?;
+/// let tables = TablesHeader::from(tables_data, false)?;
 ///
 /// // Get overview of all tables
 /// let summaries = tables.table_summary();
@@ -1654,7 +1854,7 @@ impl<'a> TablesHeader<'a> {
 /// use dotscope::metadata::{streams::TablesHeader, tables::TableId};
 ///
 /// # fn example(tables_data: &[u8]) -> dotscope::Result<()> {
-/// let tables = TablesHeader::from(tables_data)?;
+/// let tables = TablesHeader::from(tables_data, false)?;
 /// let summaries = tables.table_summary();
 ///
 /// // Find the largest tables
@@ -1788,21 +1988,173 @@ impl_table_access!(EncMapRaw, TableId::EncMap, EncMap);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::verify_tableheader;
+    use crate::testkit::verify_tableheader;
 
     #[test]
     fn wb_stream_0() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         verify_tableheader(&header);
+    }
+
+    /// A tables stream holding `tables` (id, row count, row bytes), every index two bytes wide.
+    fn stream(tables: &[(TableId, u32, Vec<u8>)]) -> Vec<u8> {
+        let valid = tables
+            .iter()
+            .fold(0u64, |mask, (id, _, _)| mask | (1u64 << (*id as u8)));
+        let mut data = vec![0, 0, 0, 0, 2, 0, 0, 1];
+        data.extend_from_slice(&valid.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        for (_, rows, _) in tables {
+            data.extend_from_slice(&rows.to_le_bytes());
+        }
+        for (_, _, bytes) in tables {
+            data.extend_from_slice(bytes);
+        }
+        data
+    }
+
+    /// TypeDef rows (flags, name, namespace, extends, field list, method list) with the given
+    /// field lists and method list 1.
+    fn typedefs(field_lists: &[u16]) -> Vec<u8> {
+        field_lists
+            .iter()
+            .flat_map(|list| {
+                let mut row = vec![0u8; 10];
+                row.extend_from_slice(&list.to_le_bytes());
+                row.extend_from_slice(&1u16.to_le_bytes());
+                row
+            })
+            .collect()
+    }
+
+    fn u16_rows(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn member_rids_of(header: &TablesHeader, list: MemberList) -> Vec<Vec<u32>> {
+        let ranges = header.member_ranges(list);
+        (1..=ranges.owner_rows())
+            .map(|rid| header.member_rids(&ranges, rid).collect())
+            .collect()
+    }
+
+    #[test]
+    fn member_ranges_follow_a_permuted_ptr_table() {
+        // `#-` stream: TypeDef field lists index FieldPtr positions, which name Field rows
+        // out of order.
+        let data = stream(&[
+            (TableId::TypeDef, 3, typedefs(&[1, 3, 3])),
+            (TableId::FieldPtr, 4, u16_rows(&[3, 1, 4, 2])),
+            (TableId::Field, 4, vec![0; 4 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        let ranges = header.member_ranges(MemberList::TypeDefFields);
+        assert!(ranges.is_indirect());
+        assert_eq!(ranges.member_rows(), 4);
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![3, 1], vec![], vec![4, 2]]
+        );
+        // MethodDef is absent: every type owns no methods.
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefMethods),
+            vec![Vec::<u32>::new(); 3]
+        );
+    }
+
+    #[test]
+    fn member_ranges_clamp_hostile_columns() {
+        // The second type's field list is far past the three fields, the third goes back to
+        // 2: read literally, the first would own nothing past 0xFFFF and the third would
+        // re-own fields 2 and 3.
+        let data = stream(&[
+            (TableId::TypeDef, 3, typedefs(&[1, 0xFFFF, 2])),
+            (TableId::Field, 3, vec![0; 3 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        let ranges = header.member_ranges(MemberList::TypeDefFields);
+        assert!(!ranges.is_indirect());
+        assert_eq!(ranges.adjusted(), &[2, 3]);
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![1, 2, 3], vec![], vec![]]
+        );
+    }
+
+    #[test]
+    fn member_rids_skip_ptr_entries_naming_no_member() {
+        let data = stream(&[
+            (TableId::TypeDef, 1, typedefs(&[1])),
+            (TableId::FieldPtr, 3, u16_rows(&[2, 0, 9])),
+            (TableId::Field, 2, vec![0; 2 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![2]]
+        );
+    }
+
+    #[test]
+    fn an_empty_ptr_table_means_direct_runs() {
+        // A Ptr table that is present but has no rows does not redirect the columns, as
+        // CoreCLR and System.Reflection.Metadata decide by its row count.
+        let data = stream(&[
+            (TableId::TypeDef, 2, typedefs(&[1, 2])),
+            (TableId::FieldPtr, 0, Vec::new()),
+            (TableId::Field, 2, vec![0; 2 * 6]),
+        ]);
+        let header = TablesHeader::from(&data, false).unwrap();
+        assert!(!header
+            .member_ranges(MemberList::TypeDefFields)
+            .is_indirect());
+        assert_eq!(
+            member_rids_of(&header, MemberList::TypeDefFields),
+            vec![vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn member_ranges_match_the_literal_runs_of_a_real_stream() {
+        // WindowsBase is compiler output: its runs are well formed, so the normalized ranges
+        // must be exactly the literal "this start to the next start" reading.
+        let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
+        let header = TablesHeader::from(data, false).unwrap();
+        let typedefs = header.table::<TypeDefRaw>().unwrap();
+        let rows: Vec<TypeDefRaw> = typedefs.iter().map(|row| row.unwrap()).collect();
+        for (list, column, members) in [
+            (
+                MemberList::TypeDefFields,
+                (|row: &TypeDefRaw| row.field_list) as fn(&TypeDefRaw) -> u32,
+                header.table_row_count(TableId::Field),
+            ),
+            (
+                MemberList::TypeDefMethods,
+                |row: &TypeDefRaw| row.method_list,
+                header.table_row_count(TableId::MethodDef),
+            ),
+        ] {
+            let ranges = header.member_ranges(list);
+            assert!(ranges.adjusted().is_empty() && ranges.absent().is_empty());
+            for (index, row) in rows.iter().enumerate() {
+                let end = rows.get(index + 1).map_or(members + 1, column);
+                assert_eq!(
+                    ranges.range(row.rid),
+                    column(row)..end,
+                    "{list:?} {}",
+                    row.rid
+                );
+            }
+        }
     }
 
     #[test]
     fn test_tables_header_too_short() {
         // Header must be at least 24 bytes
         let data = [0u8; 20];
-        assert!(TablesHeader::from(&data).is_err());
+        assert!(TablesHeader::from(&data, false).is_err());
     }
 
     #[test]
@@ -1815,7 +2167,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // valid bitmask (8 bytes)
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sorted bitmask (8 bytes)
         ];
-        assert!(TablesHeader::from(&data).is_err());
+        assert!(TablesHeader::from(&data, false).is_err());
     }
 
     #[test]
@@ -1829,7 +2181,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sorted bitmask
         ];
         // Note: This may fail due to row count parsing - depends on exact header format requirements
-        let result = TablesHeader::from(&data);
+        let result = TablesHeader::from(&data, false);
         // Empty valid bitmask means no tables, which should be accepted
         // but may require row counts, so we just verify it doesn't panic
         let _ = result;
@@ -1838,7 +2190,7 @@ mod tests {
     #[test]
     fn test_has_table() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         // Module table (0x00) should always be present
         assert!(header.has_table(TableId::Module));
@@ -1850,7 +2202,7 @@ mod tests {
     #[test]
     fn test_has_table_by_id() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         // Module table (0x00) should always be present
         assert!(header.has_table_by_id(0x00));
@@ -1866,7 +2218,7 @@ mod tests {
     #[test]
     fn test_table_count() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         // table_count should match the number of bits set in the valid bitmask
         let count = header.table_count();
@@ -1881,7 +2233,7 @@ mod tests {
     #[test]
     fn test_table_summary() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         let summaries = header.table_summary();
 
@@ -1900,7 +2252,7 @@ mod tests {
     #[test]
     fn test_type_safe_table_access() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         // Access Module table with type-safe generic method
         let module_table = header.table::<ModuleRaw>();
@@ -1917,7 +2269,7 @@ mod tests {
     #[test]
     fn test_write_header_to() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         let mut buffer = Vec::new();
         header.write_header_to(&mut buffer).unwrap();
@@ -1950,7 +2302,7 @@ mod tests {
     #[test]
     fn test_header_size() {
         let data = include_bytes!("../../../tests/samples/WB_STREAM_TABLES_O-0x6C_S-0x59EB4.bin");
-        let header = TablesHeader::from(data).unwrap();
+        let header = TablesHeader::from(data, false).unwrap();
 
         // Header size should be 24 + (4 * number of tables)
         let expected_size = 24 + (header.table_count() as usize * 4);

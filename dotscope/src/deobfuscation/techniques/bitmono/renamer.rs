@@ -85,12 +85,12 @@ impl Technique for BitMonoRenamer {
 mod tests {
     use crate::{
         deobfuscation::techniques::{bitmono::BitMonoRenamer, Technique},
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly = load_sample("tests/samples/packers/bitmono/0.39.0/bitmono_renamer.exe");
+        let assembly = load_sample("packers/bitmono/0.39.0/bitmono_renamer.exe");
 
         let technique = BitMonoRenamer;
         let detection = technique.detect(&assembly);
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = BitMonoRenamer;
         let detection = technique.detect(&assembly);

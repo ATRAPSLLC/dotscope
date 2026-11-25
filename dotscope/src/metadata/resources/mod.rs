@@ -38,7 +38,8 @@
 //!
 //! ## Basic Resource Enumeration
 //!
-//! ```ignore
+//! ```
+//! use dotscope::metadata::tables::ManifestResourceAttributes;
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -48,12 +49,12 @@
 //! println!("Assembly contains {} resources", resources.len());
 //!
 //! for resource_entry in resources.iter() {
-//!     let (name, resource) = (resource_entry.key(), resource_entry.value());
+//!     let resource = resource_entry.value();
 //!     println!("Resource: {} (Size: {} bytes, Offset: 0x{:X})",
-//!              name, resource.data_size, resource.data_offset);
+//!              resource.name, resource.data_size, resource.data_offset);
 //!     
 //!     // Check resource visibility using flags
-//!     if resource.flags_visibility.is_public() {
+//!     if resource.flags.contains(ManifestResourceAttributes::PUBLIC) {
 //!         println!("  - Public resource");
 //!     } else {
 //!         println!("  - Private resource");
@@ -64,7 +65,7 @@
 //!
 //! ## Resource Data Access
 //!
-//! ```ignore
+//! ```no_run
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -90,7 +91,7 @@
 //!
 //! ## Comprehensive Resource Analysis
 //!
-//! ```ignore
+//! ```
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -112,7 +113,7 @@
 //!         }
 //!         Some(ref source) => {
 //!             external_count += 1;
-//!             println!("External: {} -> {}", resource.name, source.name);
+//!             println!("External: {} -> {:?}", resource.name, source.name());
 //!         }
 //!     }
 //! }
@@ -157,18 +158,26 @@
 //! - **Bounds Checking**: All data access is bounds-checked for safety
 //! - **Format Validation**: Resource headers validated during parsing
 //! - **Memory Safety**: No unsafe code in resource data access paths
+pub mod baml;
 mod encoder;
+pub mod nrbf;
 mod parser;
 mod types;
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use dashmap::DashMap;
+use crossbeam_skiplist::{
+    map::{Entry, Iter},
+    SkipMap,
+};
 pub use encoder::*;
 pub use parser::{parse_dotnet_resource, parse_dotnet_resource_ref, Resource};
 pub use types::*;
 
-use crate::{file::File, metadata::tables::ManifestResourceRc};
+use crate::{
+    file::File,
+    metadata::{tables::ManifestResourceRc, token::Token},
+};
 
 /// Container for all resources in an assembly with thread-safe access and efficient lookup.
 ///
@@ -201,7 +210,7 @@ use crate::{file::File, metadata::tables::ManifestResourceRc};
 ///
 /// ## Basic Resource Management
 ///
-/// ```ignore
+/// ```no_run
 /// use dotscope::CilObject;
 /// use std::path::Path;
 ///
@@ -223,7 +232,7 @@ use crate::{file::File, metadata::tables::ManifestResourceRc};
 ///
 /// ## Resource Data Processing
 ///
-/// ```ignore
+/// ```no_run
 /// use dotscope::CilObject;
 /// use std::path::Path;
 ///
@@ -252,8 +261,9 @@ use crate::{file::File, metadata::tables::ManifestResourceRc};
 pub struct Resources {
     /// Reference to the originally loaded file
     file: Arc<File>,
-    /// Map of all resources by name
-    data: DashMap<String, ManifestResourceRc>,
+    /// Every resource, keyed by its `ManifestResource` token so the map
+    /// iterates in table order however the loader's threads inserted them
+    data: SkipMap<Token, ManifestResourceRc>,
 }
 
 impl Resources {
@@ -270,27 +280,29 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// use dotscope::metadata::resources::Resources;
+    /// use dotscope::File;
     /// use std::sync::Arc;
     ///
-    /// let file = Arc::new(file_instance);
+    /// let file = Arc::new(File::from_path("tests/samples/crafted_2.exe")?);
     /// let resources = Resources::new(file);
     /// assert!(resources.is_empty());
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
     pub fn new(file: Arc<File>) -> Self {
         Resources {
             file,
-            data: DashMap::new(),
+            data: SkipMap::new(),
         }
     }
 
     /// Gets a resource by name.
     ///
-    /// Performs a thread-safe lookup in the internal hash map to find a resource
-    /// with the specified name. Returns a cloned reference-counted pointer to the
-    /// resource if found.
+    /// Returns the first resource in table order with the specified name, as a
+    /// cloned reference-counted pointer. The collection is keyed by row, so
+    /// this walks it; an assembly declares few resources.
     ///
     /// # Arguments
     ///
@@ -303,7 +315,7 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
     /// use dotscope::CilObject;
     /// use std::path::Path;
     ///
@@ -323,22 +335,26 @@ impl Resources {
     /// ```
     #[must_use]
     pub fn get(&self, name: &str) -> Option<ManifestResourceRc> {
-        self.data.get(name).map(|entry| entry.clone())
+        self.data
+            .iter()
+            .find(|entry| entry.value().name == name)
+            .map(|entry| entry.value().clone())
     }
 
     /// Gets a reference to all resources for advanced iteration patterns.
     ///
-    /// Returns a direct reference to the internal `DashMap` for advanced use cases
+    /// Returns a direct reference to the internal map for advanced use cases
     /// that require direct map operations. For simple iteration, prefer using the
     /// [`iter()`](Resources::iter) method or the `IntoIterator` implementation.
     ///
     /// # Returns
     ///
-    /// A reference to the internal `DashMap<String, ManifestResourceRc>`
+    /// A reference to the internal `SkipMap<Token, ManifestResourceRc>`, keyed
+    /// by `ManifestResource` token
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
     /// use dotscope::CilObject;
     /// use std::path::Path;
     ///
@@ -348,14 +364,14 @@ impl Resources {
     /// // Advanced map operations
     /// let all_resources = resources.all();
     /// let resource_names: Vec<String> = all_resources.iter()
-    ///     .map(|entry| entry.key().clone())
+    ///     .map(|entry| entry.value().name.to_string())
     ///     .collect();
     ///
     /// println!("All resource names: {:?}", resource_names);
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
-    pub fn all(&self) -> &DashMap<String, ManifestResourceRc> {
+    pub fn all(&self) -> &SkipMap<Token, ManifestResourceRc> {
         &self.data
     }
 
@@ -385,7 +401,7 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
     /// use dotscope::CilObject;
     /// use std::path::Path;
     ///
@@ -446,11 +462,11 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::metadata::resources::ResourceTypeRef;
     /// use dotscope::CilObject;
-    /// use std::path::Path;
     ///
-    /// let assembly = CilObject::from_path("MyApp.dll")?;
+    /// let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
     /// let resources = assembly.resources();
     ///
     /// // Find .resources files
@@ -508,13 +524,22 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// // This is typically called internally during metadata loading
-    /// let resource = ManifestResourceRc::new(/* ... */);
+    /// ```
+    /// use std::sync::Arc;
+    /// use dotscope::metadata::resources::Resources;
+    /// use dotscope::{CilObject, File};
+    ///
+    /// // This is typically called internally during metadata loading: here a
+    /// // resource the loaded assembly holds goes into a fresh collection
+    /// let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
+    /// let resource = assembly.resources().iter().next().expect("a resource").value().clone();
+    /// let resources = Resources::new(Arc::new(File::from_path("tests/samples/WindowsBase.dll")?));
     /// resources.insert(resource);
+    /// assert_eq!(resources.len(), 1);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn insert(&self, resource: ManifestResourceRc) {
-        self.data.insert(resource.name.clone(), resource);
+        self.data.insert(resource.token, resource);
     }
 
     /// Returns the number of resources in the collection.
@@ -528,7 +553,7 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
     /// use dotscope::CilObject;
     /// use std::path::Path;
     ///
@@ -559,7 +584,7 @@ impl Resources {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
     /// use dotscope::CilObject;
     /// use std::path::Path;
     ///
@@ -584,16 +609,17 @@ impl Resources {
         self.data.is_empty()
     }
 
-    /// Get an iterator over all resources for efficient traversal.
+    /// Get an iterator over all resources, in `ManifestResource` table order.
     ///
-    /// Returns an iterator that yields references to each resource entry in the
-    /// collection. The iterator is thread-safe and can be used concurrently with
-    /// other operations on the same `Resources` instance.
+    /// The order is the one the assembly declares them in, which is the order
+    /// `Assembly.GetManifestResourceNames` reports and the order a rewritten
+    /// assembly keeps. The iterator is thread-safe and can run concurrently
+    /// with other operations on the same `Resources` instance.
     ///
     /// # Returns
     ///
-    /// An iterator over `(String, ManifestResourceRc)` pairs representing
-    /// resource names and their corresponding resource objects
+    /// An iterator over entries whose [`key`](Entry::key) is the resource's
+    /// `ManifestResource` token and whose [`value`](Entry::value) is its row
     ///
     /// # Examples
     ///
@@ -606,10 +632,10 @@ impl Resources {
     ///
     /// // Iterate over all resources
     /// for resource_entry in resources.iter() {
-    ///     let (name, resource) = (resource_entry.key(), resource_entry.value());
-    ///     
+    ///     let resource = resource_entry.value();
+    ///
     ///     println!("Resource: {} (Offset: 0x{:X}, Size: {} bytes)",
-    ///              name, resource.data_offset, resource.data_size);
+    ///              resource.name, resource.data_offset, resource.data_size);
     ///     
     ///     // Check resource properties
     ///     if resource.flags.contains(dotscope::metadata::tables::ManifestResourceAttributes::PUBLIC) {
@@ -619,14 +645,14 @@ impl Resources {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
-    pub fn iter(&self) -> dashmap::iter::Iter<'_, String, ManifestResourceRc> {
+    pub fn iter(&self) -> Iter<'_, Token, ManifestResourceRc> {
         self.data.iter()
     }
 }
 
 impl<'a> IntoIterator for &'a Resources {
-    type Item = dashmap::mapref::multiple::RefMulti<'a, String, ManifestResourceRc>;
-    type IntoIter = dashmap::iter::Iter<'a, String, ManifestResourceRc>;
+    type Item = Entry<'a, Token, ManifestResourceRc>;
+    type IntoIter = Iter<'a, Token, ManifestResourceRc>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -636,7 +662,38 @@ impl<'a> IntoIterator for &'a Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::resources::parser::{parse_dotnet_resource, parse_dotnet_resource_ref};
+    use crate::{
+        metadata::{
+            resources::parser::{parse_dotnet_resource, parse_dotnet_resource_ref},
+            tables::{ManifestResource, ManifestResourceAttributes},
+        },
+        testkit::helpers::test_assembly_arc,
+    };
+
+    #[test]
+    fn resources_come_back_in_table_order() {
+        let resources = Resources::new(test_assembly_arc().file().clone());
+        // Inserted last row first, the way parallel loading can deliver them.
+        for rid in (1..=32u32).rev() {
+            resources.insert(Arc::new(ManifestResource {
+                rid,
+                token: Token::new(0x2800_0000 | rid),
+                offset: 0,
+                data_offset: 0,
+                data_size: 0,
+                flags: ManifestResourceAttributes::PUBLIC,
+                name: format!("resource{rid}").into(),
+                source: None,
+            }));
+        }
+
+        let rids: Vec<u32> = resources.iter().map(|entry| entry.value().rid).collect();
+        assert_eq!(rids, (1..=32).collect::<Vec<_>>());
+        assert_eq!(
+            resources.get("resource7").map(|resource| resource.rid),
+            Some(7)
+        );
+    }
 
     /// Helper trait to abstract over owned (ResourceType) and borrowed (ResourceTypeRef) variants.
     /// This allows writing generic test code that works with both.

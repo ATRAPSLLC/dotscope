@@ -27,8 +27,8 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! # use dotscope::metadata::tables::assemblyrefos::AssemblyRefOsRaw;
+//! ```no_run
+//! # use dotscope::metadata::tables::AssemblyRefOsRaw;
 //! # use dotscope::metadata::tables::AssemblyRefMap;
 //! # fn example(raw: AssemblyRefOsRaw, refs: &AssemblyRefMap) -> dotscope::Result<()> {
 //! // Convert to owned representation
@@ -38,6 +38,7 @@
 //! raw.apply(refs)?;
 //! # Ok(())
 //! # }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Error Handling

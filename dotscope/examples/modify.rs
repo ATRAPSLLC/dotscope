@@ -76,7 +76,7 @@ fn main() -> Result<()> {
     println!("  Assembly loaded successfully");
     println!();
 
-    // === Heap Modifications ===
+    // Heap Modifications
     // Note: All add operations return ChangeRefRc which holds a reference to the
     // pending change. The actual heap offsets are resolved during write.
     // Use placeholder() when you need a u32 value for table row fields.
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
     println!("  Queued 2 user strings for addition");
     println!();
 
-    // === Native Import Management ===
+    // Native Import Management
     println!("NATIVE IMPORT MANAGEMENT");
     println!("========================");
 
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
     println!("  Added ordinal import (120 from user32.dll)");
     println!();
 
-    // === Using High-Level Builder APIs ===
+    // Using High-Level Builder APIs
     println!("METADATA TABLE OPERATIONS (Using Builder APIs)");
     println!("===============================================");
 
@@ -216,7 +216,7 @@ fn main() -> Result<()> {
     println!("  Created static method returning int");
     println!();
 
-    // === Assembly Writing ===
+    // Assembly Writing
     println!("WRITING ASSEMBLY");
     println!("================");
 
@@ -241,7 +241,7 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // === Verification ===
+    // Verification
     println!("VERIFICATION");
     println!("============");
 
@@ -292,7 +292,7 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // === Summary ===
+    // Summary
     println!("MODIFICATION SUMMARY");
     println!("====================");
     println!("Successfully demonstrated:");

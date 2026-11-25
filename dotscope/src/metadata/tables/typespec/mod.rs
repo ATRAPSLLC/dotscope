@@ -51,7 +51,7 @@
 //!
 //! - [`TypeSpecRaw`] - Raw table entry format for binary parsing
 //! - [`TypeSpec`] - Fully parsed and validated type specification
-//! - [`TypeSpecLoader`] - Parallel loading and validation logic
+//! - [`TypeSpecLoader`](crate::metadata::loader::tables::TypeSpecLoader) - Parallel loading and validation logic
 //! - [`TypeSpecMap`] - Token-indexed storage for efficient lookup
 //! - [`TypeSpecList`] - Sequential storage for iteration
 //! - [`TypeSpecRc`] - Reference-counted shared access
@@ -81,14 +81,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

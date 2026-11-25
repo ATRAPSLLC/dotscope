@@ -41,27 +41,29 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```no_run
 /// # use dotscope::prelude::*;
-/// # use dotscope::metadata::tables::{EventBuilder, CodedIndex, TableId};
+/// # use dotscope::metadata::tables::{
+/// #     CodedIndex, CodedIndexType, EventAttributes, EventBuilder, TableId,
+/// # };
 /// # use std::path::Path;
 /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
 /// let mut assembly = CilAssembly::new(view);
 ///
 /// // Create a coded index for System.EventHandler delegate type
-/// let event_handler_type = CodedIndex::new(TableId::TypeRef, 1); // TypeRef to EventHandler
+/// let event_handler_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef); // TypeRef to EventHandler
 ///
 /// // Create a standard event
 /// let click_event = EventBuilder::new()
 ///     .name("Click")
-///     .flags(0x0000) // No special flags
+///     .flags(EventAttributes::ZERO) // No special flags
 ///     .event_type(event_handler_type.clone())
 ///     .build(&mut assembly)?;
 ///
 /// // Create an event with special naming
 /// let special_event = EventBuilder::new()
 ///     .name("PropertyChanged")
-///     .flags(0x0200) // SpecialName
+///     .flags(EventAttributes::SPECIAL_NAME)
 ///     .event_type(event_handler_type)
 ///     .build(&mut assembly)?;
 /// # Ok::<(), dotscope::Error>(())
@@ -115,7 +117,7 @@ impl EventBuilder {
     /// Sets the event flags (attributes).
     ///
     /// Event flags control special behaviors and characteristics.
-    /// Common flag values from [`EventAttributes`](crate::metadata::tables::EventAttributes):
+    /// Common flag values from [`EventAttributes`]:
     /// - `0x0000`: No special flags (default for most events)
     /// - `0x0200`: SPECIAL_NAME - Event has special naming conventions
     /// - `0x0400`: RTSPECIAL_NAME - Runtime provides special behavior based on name
@@ -222,200 +224,187 @@ impl EventBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::{cilassemblyview::CilAssemblyView, tables::EventAttributes},
+        testkit::fixture,
     };
 
     #[test]
     fn test_event_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a TypeDefOrRef coded index (System.EventHandler)
-            let event_handler_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
+        // Create a TypeDefOrRef coded index (System.EventHandler)
+        let event_handler_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
 
-            let ref_ = EventBuilder::new()
-                .name("TestEvent")
-                .flags(EventAttributes::ZERO)
-                .event_type(event_handler_type)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = EventBuilder::new()
+            .name("TestEvent")
+            .flags(EventAttributes::ZERO)
+            .event_type(event_handler_type)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Event));
-        }
+        // Verify ref is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Event));
     }
 
     #[test]
     fn test_event_builder_with_special_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a TypeDefOrRef coded index
-            let event_handler_type =
-                CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef);
+        // Create a TypeDefOrRef coded index
+        let event_handler_type = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef);
 
-            // Create an event with special naming
-            let ref_ = EventBuilder::new()
-                .name("PropertyChanged")
-                .flags(EventAttributes::SPECIAL_NAME)
-                .event_type(event_handler_type)
-                .build(&mut assembly)
-                .unwrap();
+        // Create an event with special naming
+        let ref_ = EventBuilder::new()
+            .name("PropertyChanged")
+            .flags(EventAttributes::SPECIAL_NAME)
+            .event_type(event_handler_type)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Event));
-        }
+        // Verify ref is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Event));
     }
 
     #[test]
     fn test_event_builder_with_rtspecial_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a TypeDefOrRef coded index
-            let event_handler_type =
-                CodedIndex::new(TableId::TypeRef, 3, CodedIndexType::TypeDefOrRef);
+        // Create a TypeDefOrRef coded index
+        let event_handler_type = CodedIndex::new(TableId::TypeRef, 3, CodedIndexType::TypeDefOrRef);
 
-            // Create an event with runtime special naming
-            let ref_ = EventBuilder::new()
-                .name("RuntimeSpecialEvent")
-                .flags(EventAttributes::RTSPECIAL_NAME)
-                .event_type(event_handler_type)
-                .build(&mut assembly)
-                .unwrap();
+        // Create an event with runtime special naming
+        let ref_ = EventBuilder::new()
+            .name("RuntimeSpecialEvent")
+            .flags(EventAttributes::RTSPECIAL_NAME)
+            .event_type(event_handler_type)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Event));
-        }
+        // Verify ref is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Event));
     }
 
     #[test]
     fn test_event_builder_missing_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let event_handler_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
+        let event_handler_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
 
-            let result = EventBuilder::new()
-                .flags(EventAttributes::ZERO)
-                .event_type(event_handler_type)
-                .build(&mut assembly);
+        let result = EventBuilder::new()
+            .flags(EventAttributes::ZERO)
+            .event_type(event_handler_type)
+            .build(&mut assembly);
 
-            // Should fail because name is required
-            assert!(result.is_err());
-        }
+        // Should fail because name is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_event_builder_missing_flags() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let event_handler_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
+        let event_handler_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
 
-            let result = EventBuilder::new()
-                .name("TestEvent")
-                .event_type(event_handler_type)
-                .build(&mut assembly);
+        let result = EventBuilder::new()
+            .name("TestEvent")
+            .event_type(event_handler_type)
+            .build(&mut assembly);
 
-            // Should fail because flags are required
-            assert!(result.is_err());
-        }
+        // Should fail because flags are required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_event_builder_missing_event_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = EventBuilder::new()
-                .name("TestEvent")
-                .flags(EventAttributes::ZERO)
-                .build(&mut assembly);
+        let result = EventBuilder::new()
+            .name("TestEvent")
+            .flags(EventAttributes::ZERO)
+            .build(&mut assembly);
 
-            // Should fail because event_type is required
-            assert!(result.is_err());
-        }
+        // Should fail because event_type is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_event_builder_invalid_coded_index_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Use wrong coded index type (not TypeDefOrRef)
-            let wrong_type = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::TypeDefOrRef); // MethodDef is not valid for TypeDefOrRef
+        // Use wrong coded index type (not TypeDefOrRef)
+        let wrong_type = CodedIndex::new(TableId::MethodDef, 1, CodedIndexType::TypeDefOrRef); // MethodDef is not valid for TypeDefOrRef
 
-            let result = EventBuilder::new()
-                .name("TestEvent")
-                .flags(EventAttributes::ZERO)
-                .event_type(wrong_type)
-                .build(&mut assembly);
+        let result = EventBuilder::new()
+            .name("TestEvent")
+            .flags(EventAttributes::ZERO)
+            .event_type(wrong_type)
+            .build(&mut assembly);
 
-            // Should fail because event_type must be TypeDefOrRef
-            assert!(result.is_err());
-        }
+        // Should fail because event_type must be TypeDefOrRef
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_event_builder_multiple_events() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let event_handler_type1 =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
-            let event_handler_type2 =
-                CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef);
-            let event_handler_type3 =
-                CodedIndex::new(TableId::TypeRef, 3, CodedIndexType::TypeDefOrRef);
+        let event_handler_type1 =
+            CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::TypeDefOrRef);
+        let event_handler_type2 =
+            CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::TypeDefOrRef);
+        let event_handler_type3 =
+            CodedIndex::new(TableId::TypeRef, 3, CodedIndexType::TypeDefOrRef);
 
-            // Create multiple events
-            let ref1 = EventBuilder::new()
-                .name("Event1")
-                .flags(EventAttributes::ZERO)
-                .event_type(event_handler_type1)
-                .build(&mut assembly)
-                .unwrap();
+        // Create multiple events
+        let ref1 = EventBuilder::new()
+            .name("Event1")
+            .flags(EventAttributes::ZERO)
+            .event_type(event_handler_type1)
+            .build(&mut assembly)
+            .unwrap();
 
-            let ref2 = EventBuilder::new()
-                .name("Event2")
-                .flags(EventAttributes::SPECIAL_NAME)
-                .event_type(event_handler_type2)
-                .build(&mut assembly)
-                .unwrap();
+        let ref2 = EventBuilder::new()
+            .name("Event2")
+            .flags(EventAttributes::SPECIAL_NAME)
+            .event_type(event_handler_type2)
+            .build(&mut assembly)
+            .unwrap();
 
-            let ref3 = EventBuilder::new()
-                .name("Event3")
-                .flags(EventAttributes::RTSPECIAL_NAME)
-                .event_type(event_handler_type3)
-                .build(&mut assembly)
-                .unwrap();
+        let ref3 = EventBuilder::new()
+            .name("Event3")
+            .flags(EventAttributes::RTSPECIAL_NAME)
+            .event_type(event_handler_type3)
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed and be different refs
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
-            assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
+        // All should succeed and be different refs
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref3));
+        assert!(!std::sync::Arc::ptr_eq(&ref2, &ref3));
 
-            // All should have Event table kind
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::Event));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::Event));
-            assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::Event));
-        }
+        // All should have Event table kind
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::Event));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::Event));
+        assert_eq!(ref3.kind(), ChangeRefKind::TableRow(TableId::Event));
     }
 }

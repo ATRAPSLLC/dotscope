@@ -1,0 +1,16 @@
+{
+  "Protections": [
+    { "Name": "StringsEncryption", "Enabled": true },
+    { "Name": "CallToCalli", "Enabled": true },
+    { "Name": "DotNetHook", "Enabled": true },
+    { "Name": "UnmanagedString", "Enabled": true },
+    { "Name": "FullRenamer", "Enabled": true },
+    { "Name": "NoNamespaces", "Enabled": true },
+    { "Name": "ObjectReturnType", "Enabled": true },
+    { "Name": "AntiDebugBreakpoints", "Enabled": true },
+    { "Name": "BitMethodDotnet", "Enabled": true },
+    { "Name": "BillionNops", "Enabled": true },
+    { "Name": "AntiDe4dot", "Enabled": true },
+    { "Name": "AntiILdasm", "Enabled": true }
+  ]
+}

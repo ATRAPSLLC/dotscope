@@ -10,7 +10,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::{
     cilassembly::cleanup::CleanupRequest,
     metadata::{
-        tables::{CustomAttributeRaw, TableId},
+        signatures::{parse_type_spec_signature, TypeSignature},
+        tables::{
+            skip_unreadable, CustomAttributeRaw, GenericParamConstraintRaw, GenericParamRaw,
+            InterfaceImplRaw, TableId, TypeDefRaw, TypeSpecRaw,
+        },
         token::Token,
     },
     CilObject,
@@ -73,6 +77,133 @@ pub fn expand_type_tokens(request: &CleanupRequest, assembly: &CilObject) -> Has
     }
 
     tokens
+}
+
+/// Which rows name which types.
+///
+/// Instructions are not the only place a type is named. A field's type, a
+/// method's parameters and return type, a property's type, a type's base and
+/// the interfaces it implements, the constraints on a generic parameter, the
+/// parts a TypeSpec is built from, and a method's local variables all name
+/// types, and no call records any of them, so a call graph cannot see them.
+/// Deleting a type one of them still names leaves that row pointing at
+/// whatever the type's row number holds after compaction - another type, or
+/// nothing - and the result fails to load at the survivor, far from the
+/// decision that broke it.
+///
+/// Each name is kept with the row whose survival keeps it alive, so the table
+/// is built once and asking what the rows surviving a cleanup name is a
+/// filter over it, however often the removal set changes.
+#[derive(Debug, Default)]
+pub struct TypeNames {
+    /// `(owner, named type)`. `None` for a name nothing's removal withdraws:
+    /// TypeSpecs are removed only as orphans, after this decision.
+    names: Vec<(Option<Token>, Token)>,
+    /// Scratch set for collecting one signature's names.
+    scratch: HashSet<Token>,
+}
+
+impl TypeNames {
+    /// The names the assembly's metadata holds: member signatures, base types,
+    /// interface lists, generic parameter constraints and TypeSpecs. Local
+    /// variables are the caller's to add with [`add_signature`](Self::add_signature),
+    /// since which signature a method ends up with depends on whether its body
+    /// is regenerated.
+    #[must_use]
+    pub fn of_metadata(assembly: &CilObject) -> Self {
+        let mut names = Self::default();
+
+        for type_entry in assembly.types().iter() {
+            let type_token = *type_entry.key();
+            if !type_token.is_table(TableId::TypeDef) {
+                continue;
+            }
+            let cil_type = type_entry.value();
+            for (_, field) in cil_type.fields.iter() {
+                names.add_signature(Some(field.token), &field.signature.base);
+            }
+            for method in cil_type.methods() {
+                let signature = &method.signature;
+                for param in std::iter::once(&signature.return_type)
+                    .chain(&signature.params)
+                    .chain(&signature.varargs)
+                {
+                    names.add_signature(Some(method.token), &param.base);
+                }
+            }
+            for (_, property) in cil_type.properties.iter() {
+                names.add_signature(Some(type_token), &property.signature.base);
+                for param in &property.signature.params {
+                    names.add_signature(Some(type_token), &param.base);
+                }
+            }
+        }
+
+        let Some(tables) = assembly.tables() else {
+            return names;
+        };
+        if let Some(table) = tables.table::<TypeDefRaw>() {
+            for row in table.iter().filter_map(skip_unreadable) {
+                names.add_token(Some(row.token), row.extends.token);
+            }
+        }
+        if let Some(table) = tables.table::<InterfaceImplRaw>() {
+            for row in table.iter().filter_map(skip_unreadable) {
+                let class = Token::from_parts(TableId::TypeDef, row.class);
+                names.add_token(Some(class), row.interface.token);
+            }
+        }
+        if let (Some(constraints), Some(params)) = (
+            tables.table::<GenericParamConstraintRaw>(),
+            tables.table::<GenericParamRaw>(),
+        ) {
+            for row in constraints.iter().filter_map(skip_unreadable) {
+                if let Some(param) = params.get(row.owner).ok().flatten() {
+                    names.add_token(Some(param.owner.token), row.constraint.token);
+                }
+            }
+        }
+        if let (Some(table), Some(blob_heap)) = (tables.table::<TypeSpecRaw>(), assembly.blob()) {
+            for row in table.iter().filter_map(skip_unreadable) {
+                if let Ok(sig) = blob_heap
+                    .get(row.signature as usize)
+                    .and_then(parse_type_spec_signature)
+                {
+                    names.add_signature(None, &sig.base);
+                }
+            }
+        }
+
+        names
+    }
+
+    /// Records that `owner` names every type `signature` names.
+    pub fn add_signature(&mut self, owner: Option<Token>, signature: &TypeSignature) {
+        signature.type_tokens(&mut self.scratch);
+        for named in self.scratch.drain() {
+            self.names.push((owner, named));
+        }
+    }
+
+    /// Records that `owner` names `named`, when it names a type at all.
+    fn add_token(&mut self, owner: Option<Token>, named: Token) {
+        if matches!(named.table(), 0x01 | 0x02 | 0x1B) && named.row() != 0 {
+            self.names.push((owner, named));
+        }
+    }
+
+    /// The types named by rows that survive a cleanup removing `removed`
+    /// (every token it removes, members of removed types included - see
+    /// [`expand_type_tokens`]).
+    pub fn named_by_survivors<'a>(
+        &'a self,
+        removed: &'a HashSet<Token>,
+    ) -> impl Iterator<Item = Token> + 'a {
+        self.names
+            .iter()
+            .filter(|(owner, _)| owner.is_none_or(|owner| !removed.contains(&owner)))
+            .map(|&(_, named)| named)
+    }
 }
 
 /// Finds non-public TypeDef tokens that have no live cross-type references
@@ -351,7 +482,7 @@ pub fn compute_entry_points(assembly: &CilObject, aggressive: bool) -> HashSet<T
 /// Returns a [`HashMap`] mapping each method token to the TypeDef token of
 /// the type that declares it. This is useful for determining whether two
 /// methods belong to the same type.
-pub(super) fn build_method_type_map(assembly: &CilObject) -> HashMap<Token, Token> {
+pub fn build_method_type_map(assembly: &CilObject) -> HashMap<Token, Token> {
     let registry = assembly.types();
     let mut map = HashMap::new();
 
@@ -371,9 +502,104 @@ pub(super) fn build_method_type_map(assembly: &CilObject) -> HashMap<Token, Toke
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-    use crate::{cilassembly::cleanup::CleanupRequest, metadata::token::Token};
+    use super::*;
+    use crate::{metadata::signatures::TypeSignature, testkit::helpers::test_assembly_arc};
+
+    #[test]
+    fn signatures_and_base_types_name_the_types_they_use() {
+        let assembly = test_assembly_arc();
+        let named: HashSet<Token> = TypeNames::of_metadata(&assembly)
+            .named_by_survivors(&HashSet::new())
+            .collect();
+
+        let mut by_fields = 0;
+        let mut by_bases = 0;
+        for entry in assembly.types().iter() {
+            let cil_type = entry.value();
+            if !cil_type.token.is_table(TableId::TypeDef) {
+                continue;
+            }
+            for (_, field) in cil_type.fields.iter() {
+                if let TypeSignature::Class(token) | TypeSignature::ValueType(token) =
+                    field.signature.base
+                {
+                    if token.is_table(TableId::TypeDef) {
+                        assert!(
+                            named.contains(&token),
+                            "{token:?}, the type of {:?}",
+                            field.token
+                        );
+                        by_fields += 1;
+                    }
+                }
+            }
+        }
+        let tables = assembly.tables().expect("tables");
+        let typedefs = tables.table::<TypeDefRaw>().expect("TypeDef table");
+        for row in typedefs.iter().filter_map(skip_unreadable) {
+            if row.extends.token.is_table(TableId::TypeDef) && row.extends.token.row() != 0 {
+                assert!(
+                    named.contains(&row.extends.token),
+                    "{:?}, the base of {:?}",
+                    row.extends.token,
+                    row.token
+                );
+                by_bases += 1;
+            }
+        }
+        assert!(
+            by_fields > 0,
+            "the sample has a field of one of its own types"
+        );
+        assert!(
+            by_bases > 0,
+            "the sample has a type deriving from one of its own"
+        );
+    }
+
+    #[test]
+    fn a_removed_type_names_nothing() {
+        let assembly = test_assembly_arc();
+        let mut removed: HashSet<Token> = assembly
+            .types()
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|token| token.is_table(TableId::TypeDef))
+            .chain(assembly.methods().iter().map(|entry| *entry.key()))
+            .collect();
+        for entry in assembly.types().iter() {
+            for (_, field) in entry.value().fields.iter() {
+                removed.insert(field.token);
+            }
+        }
+
+        // With every type gone, only TypeSpecs (which cleanup removes later,
+        // as orphans) still name anything.
+        let names = TypeNames::of_metadata(&assembly);
+        let named: HashSet<Token> = names.named_by_survivors(&removed).collect();
+        let by_typespecs = typespec_names(&assembly);
+        let stray: Vec<&Token> = named.difference(&by_typespecs).collect();
+        assert!(stray.is_empty(), "removed rows still named {stray:?}");
+    }
+
+    fn typespec_names(assembly: &CilObject) -> HashSet<Token> {
+        let mut names = HashSet::new();
+        let tables = assembly.tables().expect("tables");
+        let blob_heap = assembly.blob().expect("blob heap");
+        if let Some(table) = tables.table::<TypeSpecRaw>() {
+            for row in table.iter().filter_map(skip_unreadable) {
+                if let Ok(sig) = blob_heap
+                    .get(row.signature as usize)
+                    .and_then(parse_type_spec_signature)
+                {
+                    sig.type_tokens(&mut names);
+                }
+            }
+        }
+        names
+    }
 
     #[test]
     fn test_expand_type_tokens_empty_request() {

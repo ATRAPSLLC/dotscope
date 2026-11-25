@@ -602,7 +602,7 @@ mod tests {
     // The `*Ptr` indirection tables are keyed by tokens built in their readers from literal
     // prefixes, while the consumers that look rows up build the same tokens independently.
     // These assert both halves agree, so a lookup key can never silently address the wrong
-    // table — a mismatch makes every lookup miss, which reads as "the assembly has no methods"
+    // table - a mismatch makes every lookup miss, which reads as "the assembly has no methods"
     // rather than as an error.
 
     #[test]

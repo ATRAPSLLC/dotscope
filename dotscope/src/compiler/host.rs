@@ -3,9 +3,9 @@
 //! [`CompilerContext`] is the dotscope-side adapter that the analyssa
 //! [`PassScheduler`](analyssa::scheduling::PassScheduler) drives. This
 //! module wires it into the analyssa host trait family
-//! ([`World`](analyssa::World), [`SsaStore`](analyssa::SsaStore),
-//! [`DirtySet`](analyssa::DirtySet),
-//! [`SsaPassHost`](analyssa::scheduling::SsaPassHost)) and adds the CIL
+//! ([`World`], [`SsaStore`],
+//! [`DirtySet`],
+//! [`SsaPassHost`]) and adds the CIL
 //! extension trait [`CilHost`] which surfaces the assembly handle and
 //! other .NET-specific accessors that target-generic analyssa passes don't
 //! need to know about.
@@ -13,12 +13,12 @@
 use std::sync::Arc;
 
 use analyssa::{
+    analysis::AnalysisContext,
     events::EventListener,
     host::{DirtySet, SsaStore},
     ir::function::SsaFunction,
     scheduling::SsaPassHost,
     world::World,
-    PointerSize,
 };
 
 use crate::{
@@ -149,14 +149,8 @@ impl SsaPassHost<CilTarget> for CompilerContext {
         &self.events
     }
 
-    fn ptr_size(&self) -> PointerSize {
-        // If the assembly is set, derive from its PE header. Test
-        // contexts without an assembly default to 64-bit (matches the
-        // existing dotscope default in `analysis::ssa::CilTarget::x64()`).
-        match self.assembly() {
-            Some(asm) => PointerSize::from_is_64bit(asm.file().pe().is_64bit),
-            None => PointerSize::Bit64,
-        }
+    fn context(&self) -> AnalysisContext<'_> {
+        AnalysisContext::new(Self::machine(self)).with_budget(Self::budget(self))
     }
 }
 

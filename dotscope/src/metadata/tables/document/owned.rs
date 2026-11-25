@@ -5,7 +5,11 @@
 //! This is the primary data structure for representing Portable PDB documents in a usable form,
 //! with parsed document names and resolved GUID references after the dual variant resolution phase.
 
-use crate::metadata::token::Token;
+use crate::metadata::{
+    pdb::{guids, DocumentName},
+    streams::SharedBytes,
+    token::Token,
+};
 
 /// Represents a Portable PDB document with fully resolved metadata and parsed data
 ///
@@ -45,23 +49,29 @@ pub struct Document {
 
     /// Resolved document name/path
     ///
-    /// The fully parsed document name, typically a file path or URI that identifies
-    /// the source document. This has been resolved from the blob heap and parsed
-    /// according to the Portable PDB document name format.
-    pub name: String,
+    /// The document's path, typically a file path (`/_/src/Program.cs` with a SourceLink
+    /// path map) or a URI. The Name column names a DocumentNameBlob, which stores the path
+    /// as a separator character followed by the `#Blob` indices of its parts; the parts are
+    /// joined by that separator when the name is displayed or compared: a
+    /// [`DocumentName`] keeps the blob's index and a shared copy of the heap rather than
+    /// the joined path, which a hostile name blob can make many times the heap's size.
+    pub name: DocumentName,
 
     /// Hash algorithm identifier
     ///
-    /// The GUID identifying the hash algorithm used to compute the document hash.
-    /// Common algorithm GUIDs include SHA-1, SHA-256, and other cryptographic hash functions.
-    pub hash_algorithm: uguid::Guid,
+    /// The GUID identifying the algorithm the document's [`hash`](Self::hash) was computed
+    /// with: [`guids::HASH_SHA1`] or [`guids::HASH_SHA256`] for the compilers' documents.
+    /// `None` when the HashAlgorithm column is a nil index, which the compilers write for a
+    /// document they have no content for (a `#line` directive naming a file they never
+    /// read); such a document has no hash either.
+    pub hash_algorithm: Option<uguid::Guid>,
 
     /// Document content hash
     ///
     /// The actual hash bytes computed from the document content using the specified
     /// hash algorithm. Used for integrity verification and change detection during debugging.
     /// An empty vector indicates no hash is available.
-    pub hash: Vec<u8>,
+    pub hash: SharedBytes,
 
     /// Source language identifier
     ///
@@ -87,18 +97,18 @@ impl Document {
         rid: u32,
         token: Token,
         offset: usize,
-        name: String,
-        hash_algorithm: uguid::Guid,
-        hash: Vec<u8>,
+        name: impl Into<DocumentName>,
+        hash_algorithm: Option<uguid::Guid>,
+        hash: impl Into<SharedBytes>,
         language: uguid::Guid,
     ) -> Self {
         Self {
             rid,
             token,
             offset,
-            name,
+            name: name.into(),
             hash_algorithm,
-            hash,
+            hash: hash.into(),
             language,
         }
     }
@@ -114,8 +124,7 @@ impl Document {
     /// C# language GUID: {3F5162F8-07C6-11D3-9053-00C04FA302A1}
     #[must_use]
     pub fn is_csharp(&self) -> bool {
-        const CSHARP_GUID: uguid::Guid = uguid::guid!("3F5162F8-07C6-11D3-9053-00C04FA302A1");
-        self.language == CSHARP_GUID
+        self.language == guids::LANGUAGE_CSHARP
     }
 
     /// Check if this is a Visual Basic document based on the language GUID
@@ -123,8 +132,7 @@ impl Document {
     /// VB.NET language GUID: {3A12D0B8-C26C-11D0-B442-00A0244A1DD2}
     #[must_use]
     pub fn is_visual_basic(&self) -> bool {
-        const VB_GUID: uguid::Guid = uguid::guid!("3A12D0B8-C26C-11D0-B442-00A0244A1DD2");
-        self.language == VB_GUID
+        self.language == guids::LANGUAGE_VISUAL_BASIC
     }
 
     /// Check if this is an F# document based on the language GUID
@@ -132,20 +140,22 @@ impl Document {
     /// F# language GUID: {AB4F38C9-B6E6-43BA-BE3B-58080B2CCCE3}
     #[must_use]
     pub fn is_fsharp(&self) -> bool {
-        const FSHARP_GUID: uguid::Guid = uguid::guid!("AB4F38C9-B6E6-43BA-BE3B-58080B2CCCE3");
-        self.language == FSHARP_GUID
+        self.language == guids::LANGUAGE_FSHARP
     }
 
     /// Get a human-readable description of the hash algorithm
+    ///
+    /// # Returns
+    ///
+    /// `"SHA-1"` or `"SHA-256"` for those algorithms' GUIDs, `"None"` for a document with no
+    /// hash algorithm, and `"Unknown"` for any other GUID.
     #[must_use]
     pub fn hash_algorithm_name(&self) -> &'static str {
-        const SHA1_GUID: uguid::Guid = uguid::guid!("FF1816EC-AA5E-4D10-87F7-6F4963833460");
-        const SHA256_GUID: uguid::Guid = uguid::guid!("8829D00F-11B8-4213-878B-770E8597AC16");
-
         match self.hash_algorithm {
-            SHA1_GUID => "SHA-1",
-            SHA256_GUID => "SHA-256",
-            _ => "Unknown",
+            Some(guids::HASH_SHA1) => "SHA-1",
+            Some(guids::HASH_SHA256) => "SHA-256",
+            None => "None",
+            Some(_) => "Unknown",
         }
     }
 

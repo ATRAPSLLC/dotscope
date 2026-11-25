@@ -39,9 +39,11 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use dotscope::emulation::{ProcessBuilder, CallTreeBuilder};
+//! ```
+//! use dotscope::emulation::{CallTreeBuilder, ProcessBuilder};
+//! use dotscope::CilObject;
 //!
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
 //! let tree_builder = CallTreeBuilder::new();
 //! let process = ProcessBuilder::new()
 //!     .assembly(assembly)
@@ -50,6 +52,7 @@
 //!
 //! // After emulation, retrieve the tree
 //! // (or use build_call_tree() for post-hoc construction from events)
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use std::{fmt, sync::Mutex};

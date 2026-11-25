@@ -14,7 +14,7 @@
 //!
 //! Local variable storage tracks both values and their declared CIL types.
 //! The [`set`](LocalVariables::set) method performs type checking using
-//! [`CilFlavor`](crate::metadata::typesystem::CilFlavor) compatibility rules,
+//! [`CilFlavor`] compatibility rules,
 //! with relaxed checking for symbolic values used in analysis.
 
 use std::fmt;

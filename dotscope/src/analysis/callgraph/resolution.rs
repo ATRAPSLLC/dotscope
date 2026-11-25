@@ -13,7 +13,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    metadata::{token::Token, typesystem::TypeRegistry},
+    metadata::{
+        method::Method,
+        tables::TableId,
+        token::Token,
+        typesystem::{CilTypeRc, CilTypeReference, TypeRegistry},
+    },
     CilObject,
 };
 
@@ -31,7 +36,8 @@ pub struct CallResolver {
     virtual_dispatch_table: HashMap<Token, Vec<Token>>,
     /// Map from method token to its declaring type.
     method_to_type: HashMap<Token, Token>,
-    /// Type hierarchy: type token -> direct subtypes.
+    /// Type hierarchy: type token -> direct subtypes (the types deriving from it, or
+    /// implementing it when it is an interface), keyed by a generic type's definition.
     type_subtypes: HashMap<Token, Vec<Token>>,
     /// Set of interface types.
     interfaces: HashSet<Token>,
@@ -111,12 +117,29 @@ impl CallResolver {
             }
         }
 
-        // Second pass: build subtype relationships
+        // Second pass: build subtype relationships. A type is a subtype of its base and of
+        // every interface it implements, each named by its definition: a type deriving from
+        // `Base<int>` overrides the methods `Base<T>` declares.
+        let resolver = assembly.resolver();
+        let definition = |token: Token| {
+            if token.is_table(TableId::TypeSpec) {
+                resolver
+                    .generic_definition(token)
+                    .map_or(token, |definition| definition.token)
+            } else {
+                token
+            }
+        };
         for type_info in types.all_types() {
-            if let Some(base) = type_info.base() {
-                let base_token = base.token;
+            let supertypes = type_info.base().into_iter().chain(
+                type_info
+                    .interfaces
+                    .iter()
+                    .filter_map(|(_, entry)| entry.interface.upgrade()),
+            );
+            for supertype in supertypes {
                 self.type_subtypes
-                    .entry(base_token)
+                    .entry(definition(supertype.token))
                     .or_default()
                     .push(type_info.token);
             }
@@ -138,7 +161,6 @@ impl CallResolver {
             }
 
             let method_token = method.token;
-            let method_name = &method.name;
 
             // Get declaring type
             let Some(&declaring_type) = self.method_to_type.get(&method_token) else {
@@ -147,7 +169,7 @@ impl CallResolver {
 
             // Find all overriders in derived types
             let mut overriders = vec![method_token]; // Include self
-            self.find_overriders(&types, declaring_type, method_name, &mut overriders);
+            self.find_overriders(assembly, &types, declaring_type, method, &mut overriders);
 
             if overriders.len() > 1 {
                 self.virtual_dispatch_table.insert(method_token, overriders);
@@ -155,37 +177,68 @@ impl CallResolver {
         }
     }
 
-    /// Recursively finds all methods that override a virtual method.
+    /// Finds every method of a subtype of `type_token` that may override or implement `base`.
+    ///
+    /// The set may hold more than the runtime's overrides, never fewer: a pass treats a
+    /// virtual call as reaching one body only where nothing else could run, so a method this
+    /// misses is a body a pass folds or inlines in place of the one the call reaches. A
+    /// candidate is a virtual method that names `base` in a MethodImpl, or one of its name
+    /// with as many parameters (its parameter types may be `base`'s with a generic base's
+    /// arguments substituted, and a `newslot` one implements an interface method). The walk
+    /// visits each subtype once, so an inheritance cycle in malformed metadata ends it.
     fn find_overriders(
         &self,
+        assembly: &CilObject,
         types: &TypeRegistry,
         type_token: Token,
-        method_name: &str,
+        base: &Method,
         overriders: &mut Vec<Token>,
     ) {
-        // Get subtypes of this type
-        let Some(subtypes) = self.type_subtypes.get(&type_token) else {
-            return;
+        let resolver = assembly.resolver();
+        let names_base = |reference: &CilTypeReference| {
+            let token = match reference {
+                CilTypeReference::MethodDef(method) => method.upgrade().map(|m| m.token),
+                CilTypeReference::MemberRef(member) => resolver.resolve_method(member.token),
+                _ => None,
+            };
+            token == Some(base.token)
         };
-
-        for &subtype_token in subtypes {
-            // Find the type
-            if let Some(subtype) = types.get(&subtype_token) {
-                // Look for an overriding method
-                for (_, method_ref) in subtype.methods.iter() {
-                    if let Some(method) = method_ref.upgrade() {
-                        if method.name == method_name && method.is_virtual() {
-                            if !overriders.contains(&method.token) {
-                                overriders.push(method.token);
-                            }
-                            break;
-                        }
+        let mut visited = HashSet::from([type_token]);
+        let mut worklist = vec![type_token];
+        while let Some(current) = worklist.pop() {
+            for &subtype_token in self.type_subtypes.get(&current).into_iter().flatten() {
+                if !visited.insert(subtype_token) {
+                    continue;
+                }
+                worklist.push(subtype_token);
+                let Some(subtype) = types.get(&subtype_token) else {
+                    continue;
+                };
+                // A type implements an interface method with a method of its own or one it
+                // inherits; it overrides a class's method only with its own
+                let inherited: Vec<CilTypeRc> = if self.interfaces.contains(&current) {
+                    subtype.base_chain().collect()
+                } else {
+                    Vec::new()
+                };
+                let methods = std::iter::once(&subtype)
+                    .chain(&inherited)
+                    .flat_map(|declaring| declaring.methods.iter());
+                for (_, method_ref) in methods {
+                    let Some(method) = method_ref.upgrade() else {
+                        continue;
+                    };
+                    let candidate = method.is_virtual()
+                        && (method.overrides.iter().any(|(_, r)| names_base(r))
+                            || (method.name == base.name
+                                && method.signature.params.len() == base.signature.params.len()
+                                && method.signature.param_count_generic
+                                    == base.signature.param_count_generic));
+                    if candidate && !overriders.contains(&method.token) {
+                        overriders.push(method.token);
                     }
                 }
             }
-
-            // Recurse into further derived types
-            self.find_overriders(types, subtype_token, method_name, overriders);
         }
     }
 
@@ -277,8 +330,9 @@ impl CallResolver {
 
     /// Returns all direct subtypes of a given type.
     ///
-    /// Only returns types that directly inherit from the specified type,
-    /// not transitive descendants.
+    /// Only returns the types that directly derive from the specified type, or
+    /// implement it when it is an interface, not transitive descendants. A
+    /// generic type's subtypes are those of any of its instantiations.
     ///
     /// # Arguments
     ///
@@ -298,8 +352,8 @@ impl CallResolver {
 
     /// Returns all types in the subtype hierarchy (transitive closure).
     ///
-    /// Computes all types that inherit from the specified type, including
-    /// indirect descendants through the entire inheritance chain.
+    /// Computes all types that derive from the specified type or implement it,
+    /// including indirect descendants through the entire inheritance chain.
     ///
     /// # Arguments
     ///
@@ -391,7 +445,170 @@ pub struct ResolverStats {
 
 #[cfg(test)]
 mod tests {
-    use crate::analysis::callgraph::ResolverStats;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        analysis::callgraph::ResolverStats,
+        metadata::{
+            signatures::TypeSignature,
+            tables::{CodedIndex, CodedIndexType, TableDataOwned, TypeDefRaw},
+            validation::ValidationConfig,
+        },
+        testkit::{
+            mono::compilation::compile,
+            tools::{require_tool, ToolKind},
+        },
+    };
+
+    /// Every shape an override or implementation takes: an overload of the overridden
+    /// method's name declared before the override, an override of a generic base's method,
+    /// an implicit and an explicit interface implementation.
+    const HIERARCHY: &str = r#"
+public class Shape { public virtual int Area(int scale) { return 0; } }
+public class Square : Shape {
+    public virtual int Area(string unit) { return 1; }
+    public override int Area(int scale) { return 2; }
+}
+public class Box<T> { public virtual int Size(T item) { return 0; } }
+public class IntBox : Box<int> { public override int Size(int item) { return 4; } }
+public interface IMeasure { int Measure(); }
+public class Ruler : IMeasure { public int Measure() { return 5; } }
+public class Tape { public virtual int Measure() { return 7; } }
+public class Reel : Tape, IMeasure { }
+public interface ICount { int Count(); }
+public class Counter : ICount { int ICount.Count() { return 6; } }
+public static class Program { public static void Main() { } }
+"#;
+
+    /// `HIERARCHY` compiled and loaded, or `None` without a C# compiler.
+    fn hierarchy(dir: &TempDir) -> Option<CilObject> {
+        let caps = require_tool(ToolKind::Toolchain)?;
+        let arch = caps.supported_architectures.first().unwrap();
+        let compiled = compile(caps, HIERARCHY, dir.path(), "hierarchy", arch).unwrap();
+        assert!(compiled.is_success(), "{:?}", compiled.error);
+        Some(CilObject::from_path(compiled.assembly_path()).unwrap())
+    }
+
+    /// The method `name` of the type `type_name`, its first parameter `first` when given.
+    fn method(
+        assembly: &CilObject,
+        type_name: &str,
+        name: &str,
+        first: Option<TypeSignature>,
+    ) -> Token {
+        assembly
+            .methods()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .find(|method| {
+                method.name == name
+                    && method
+                        .declaring_type_rc()
+                        .is_some_and(|declaring| declaring.name == type_name)
+                    && first.as_ref().is_none_or(|first| {
+                        method
+                            .signature
+                            .params
+                            .first()
+                            .is_some_and(|param| param.base == *first)
+                    })
+            })
+            .map(|method| method.token)
+            .unwrap_or_else(|| panic!("{type_name}::{name}"))
+    }
+
+    #[test]
+    fn every_override_and_implementation_is_a_target() {
+        let dir = TempDir::new().unwrap();
+        let Some(assembly) = hierarchy(&dir) else {
+            return;
+        };
+        let resolver = CallResolver::new(&assembly);
+        let targets = |token: Token| resolver.resolve_virtual(token);
+
+        let area = method(&assembly, "Shape", "Area", None);
+        let override_ = method(&assembly, "Square", "Area", Some(TypeSignature::I4));
+        assert!(
+            targets(area).contains(&override_),
+            "an overload declared before the override hid it"
+        );
+
+        let size = method(&assembly, "Box`1", "Size", None);
+        let int_size = method(&assembly, "IntBox", "Size", None);
+        assert!(
+            targets(size).contains(&int_size),
+            "an override of a generic base's method"
+        );
+        assert!(resolver.is_polymorphic(size));
+
+        let measure = method(&assembly, "IMeasure", "Measure", None);
+        let ruler = method(&assembly, "Ruler", "Measure", None);
+        assert!(
+            targets(measure).contains(&ruler),
+            "an implicit implementation"
+        );
+        let tape = method(&assembly, "Tape", "Measure", None);
+        assert!(
+            targets(measure).contains(&tape),
+            "an implementation the implementing type inherits"
+        );
+
+        let count = method(&assembly, "ICount", "Count", None);
+        let counter = method(&assembly, "Counter", "ICount.Count", None);
+        assert!(
+            targets(count).contains(&counter),
+            "an explicit implementation"
+        );
+    }
+
+    #[test]
+    fn an_inheritance_cycle_ends_the_walk() {
+        let dir = TempDir::new().unwrap();
+        let Some(assembly) = hierarchy(&dir) else {
+            return;
+        };
+        // Shape extends Square, which extends Shape
+        let shape = method(&assembly, "Shape", "Area", None);
+        let shape_type = resolver_type(&assembly, shape);
+        let square_type = resolver_type(&assembly, method(&assembly, "Square", "Area", None));
+        let mut row = assembly
+            .tables()
+            .and_then(|tables| tables.table::<TypeDefRaw>())
+            .and_then(|table| table.get(shape_type.row()).ok().flatten())
+            .unwrap();
+        row.extends = CodedIndex::new(
+            TableId::TypeDef,
+            square_type.row(),
+            CodedIndexType::TypeDefOrRef,
+        );
+        let mut cyclic = assembly.into_assembly();
+        cyclic
+            .table_row_update(
+                TableId::TypeDef,
+                shape_type.row(),
+                TableDataOwned::TypeDef(row),
+            )
+            .unwrap();
+        let cyclic = CilObject::from_mem_with_validation(
+            cyclic.to_memory().unwrap(),
+            ValidationConfig::analysis(),
+        )
+        .unwrap();
+
+        let resolver = CallResolver::new(&cyclic);
+        assert!(resolver.resolve_virtual(shape).contains(&shape));
+    }
+
+    /// The type declaring `method`.
+    fn resolver_type(assembly: &CilObject, method: Token) -> Token {
+        assembly
+            .method(&method)
+            .ok()
+            .and_then(|method| method.declaring_type_rc())
+            .map(|declaring| declaring.token)
+            .unwrap()
+    }
 
     #[test]
     fn test_resolver_stats_default() {

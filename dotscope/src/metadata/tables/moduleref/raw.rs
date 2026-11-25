@@ -10,7 +10,6 @@ use crate::{
         tables::{ModuleRef, ModuleRefRc, TableInfoRef, TableRow},
         token::Token,
     },
-    utils::LazyList,
     Result,
 };
 
@@ -102,8 +101,8 @@ impl ModuleRefRaw {
             rid: self.rid,
             token: self.token,
             offset: self.offset,
-            name: strings.get(self.name as usize)?.to_string(),
-            custom_attributes: LazyList::new(),
+            name: strings.get_shared(self.name as usize)?,
+            custom_attributes: Default::default(),
         }))
     }
 

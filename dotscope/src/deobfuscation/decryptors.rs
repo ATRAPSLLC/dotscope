@@ -29,26 +29,36 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use dotscope::deobfuscation::AnalysisContext;
+//! ```
+//! use dotscope::analysis::ConstValue;
+//! use dotscope::deobfuscation::DecryptorContext;
+//! use dotscope::metadata::token::Token;
+//!
+//! // The analysis context's decryptors (`ctx.decryptors`)
+//! let decryptors = DecryptorContext::new();
+//! let (call_target, caller) = (Token::new(0x0600_0010), Token::new(0x0600_0001));
 //!
 //! // During obfuscator detection:
-//! ctx.decryptors.register(decryptor_token);
+//! decryptors.register(call_target);
 //!
-//! // During SSA pass:
-//! if ctx.decryptors.is_decryptor(call_target) {
-//!     if let Some(cached) = ctx.decryptors.with_cached(call_target, &args, |v| v.clone()) {
+//! // During SSA pass: a call to the decryptor with these arguments
+//! let args = [ConstValue::I32(7)];
+//! if decryptors.is_decryptor(call_target) {
+//!     if let Some(cached) = decryptors.with_cached(call_target, &args, |v| v.clone()) {
 //!         // Use cached value
+//!         println!("cached: {:?}", cached);
 //!     } else {
 //!         // Emulate and cache
-//!         ctx.decryptors.cache_value(call_target, &args, value.clone());
-//!         ctx.decryptors.record_success(call_target, caller, location, value);
+//!         let value = ConstValue::I32(42);
+//!         decryptors.cache_value(call_target, &args, value.clone());
+//!         decryptors.record_success(call_target, caller, None, value);
 //!     }
 //! }
+//! assert!(decryptors.is_cached(call_target, &args));
 //!
-//! // During cleanup:
-//! for token in ctx.decryptors.removable_decryptors() {
-//!     assembly.mark_method_dead(token);
+//! // During cleanup: each decryptor whose every call was decrypted
+//! for token in decryptors.removable_decryptors() {
+//!     println!("dead: {}", token);
 //! }
 //! ```
 
@@ -59,7 +69,10 @@ use std::{
 
 use dashmap::{DashMap, DashSet};
 
-use crate::{analysis::ConstValue, metadata::token::Token};
+use crate::{
+    analysis::{ConstValue, InstrId},
+    metadata::token::Token,
+};
 
 /// Consolidated context for all decryptor-related tracking.
 ///
@@ -97,18 +110,24 @@ pub struct DecryptorContext {
     /// called via MethodSpec tokens that instantiate the generic.
     methodspec_to_decryptor: DashMap<Token, Token>,
 
-    /// Secondary index for O(1) permanent failure lookups, keyed by (caller, location).
-    permanent_failure_index: DashSet<(Token, usize)>,
+    /// Call sites that failed permanently, keyed by the call's identity.
+    ///
+    /// By identity rather than position: a permanent failure is a fact about
+    /// *this call* - its target cannot be emulated, or does not exist - and
+    /// every rewrite above it moves where it sits. A positional key made the
+    /// record describe whichever call inherited the position, which skips a
+    /// site that was never tried and retries one that was.
+    permanent_failure_index: DashSet<(Token, InstrId)>,
 
-    /// Secondary index for O(1) successful decryption lookups, keyed by (caller, location).
-    decrypted_index: DashSet<(Token, usize)>,
+    /// Call sites already decrypted, keyed by the call's identity.
+    decrypted_index: DashSet<(Token, InstrId)>,
 
     /// Emulations performed so far in this run.
     ///
     /// The per-emulation instruction and wall-clock budgets bound one call; nothing bounds
     /// how many calls a run makes. The decryption pass emulates once per distinct call site
     /// with constant arguments, and [`Self::cache`] is keyed on `(decryptor, args)`, so
-    /// distinct arguments always miss — a method that calls a decryptor in a loop with a
+    /// distinct arguments always miss - a method that calls a decryptor in a loop with a
     /// varying key produces one emulation per iteration. This counter is what gives the run
     /// as a whole a ceiling.
     emulations_performed: AtomicUsize,
@@ -119,8 +138,8 @@ pub struct DecryptorContext {
 pub struct DecryptedCall {
     /// Method containing the call.
     pub caller: Token,
-    /// Location within the method (typically block_idx * 1000 + instr_idx).
-    pub location: usize,
+    /// The call instruction's identity, when it had one.
+    pub location: Option<InstrId>,
     /// The decrypted constant value.
     pub value: ConstValue,
 }
@@ -130,8 +149,8 @@ pub struct DecryptedCall {
 pub struct FailedCall {
     /// Method containing the call.
     pub caller: Token,
-    /// Location within the method.
-    pub location: usize,
+    /// The call instruction's identity, when it had one.
+    pub location: Option<InstrId>,
     /// Why decryption failed.
     pub reason: FailureReason,
 }
@@ -151,6 +170,10 @@ pub enum FailureReason {
     InvalidReturnValue,
     /// Method not found in assembly.
     MethodNotFound,
+    /// No initialization of the state machine was found for the call site, so the state
+    /// its decryptor reads is unknown. Decrypting from an assumed seed answers a wrong value
+    /// that looks like a right one.
+    SeedNotFound,
 }
 
 impl FailureReason {
@@ -164,11 +187,15 @@ impl FailureReason {
     ///
     /// Retriable failures include:
     /// - `NonConstantArgs` - the arguments might become constant in later passes
+    /// - `SeedNotFound` - the seed's argument might become constant in later passes
     #[must_use]
     pub fn is_permanent(&self) -> bool {
         // Budget exhaustion is a property of the run, not of the call site: with a larger
         // budget the same site could succeed, so it must not be cached as permanent.
-        !matches!(self, Self::NonConstantArgs | Self::EmulationBudgetExhausted)
+        !matches!(
+            self,
+            Self::NonConstantArgs | Self::EmulationBudgetExhausted | Self::SeedNotFound
+        )
     }
 }
 
@@ -181,6 +208,7 @@ impl std::fmt::Display for FailureReason {
             Self::InvalidReturnValue => write!(f, "invalid return value"),
             Self::MethodNotFound => write!(f, "method not found"),
             Self::EmulationBudgetExhausted => write!(f, "run emulation budget exhausted"),
+            Self::SeedNotFound => write!(f, "no state machine seed found for the call site"),
         }
     }
 }
@@ -195,7 +223,8 @@ impl std::fmt::Display for FailureReason {
 /// (causing redundant emulation, not incorrect results).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
-    /// The decryptor method token.
+    /// The token the call names: the decryptor, or for a generic one its instantiation (a
+    /// MethodSpec), so `Get<int>(5)` and `Get<string>(5)` are cached apart.
     pub decryptor: Token,
     /// String representation of arguments for hashing.
     pub args_repr: String,
@@ -213,7 +242,7 @@ impl CacheKey {
 
     /// Converts arguments to a string representation for hashing.
     ///
-    /// See [`CacheKey`] stability contract — correctness depends on `ConstValue::Debug`
+    /// See [`CacheKey`] stability contract - correctness depends on `ConstValue::Debug`
     /// producing deterministic output for equal values.
     fn args_to_string(args: &[ConstValue]) -> String {
         args.iter()
@@ -427,7 +456,8 @@ impl DecryptorContext {
     ///
     /// # Arguments
     ///
-    /// * `decryptor` - The decryptor method token.
+    /// * `decryptor` - The token the call names: the decryptor, or for a generic one its
+    ///   instantiation, whose results differ by type argument.
     /// * `args` - The constant arguments.
     /// * `f` - A closure that receives a reference to the cached value.
     ///
@@ -446,7 +476,8 @@ impl DecryptorContext {
     ///
     /// # Arguments
     ///
-    /// * `decryptor` - The decryptor method token.
+    /// * `decryptor` - The token the call names: the decryptor, or for a generic one its
+    ///   instantiation, whose results differ by type argument.
     /// * `args` - The constant arguments.
     /// * `value` - The decrypted value to cache.
     pub fn cache_value(&self, decryptor: Token, args: &[ConstValue], value: ConstValue) {
@@ -474,13 +505,13 @@ impl DecryptorContext {
     ///
     /// * `decryptor` - The decryptor method token.
     /// * `caller` - The method containing the call.
-    /// * `location` - Location within the caller method.
+    /// * `location` - The call instruction's identity.
     /// * `value` - The decrypted value.
     pub fn record_success(
         &self,
         decryptor: Token,
         caller: Token,
-        location: usize,
+        location: Option<InstrId>,
         value: ConstValue,
     ) {
         self.decrypted
@@ -491,7 +522,9 @@ impl DecryptorContext {
                 location,
                 value,
             });
-        self.decrypted_index.insert((caller, location));
+        if let Some(id) = location {
+            self.decrypted_index.insert((caller, id));
+        }
     }
 
     /// Records a failed decryption attempt.
@@ -500,13 +533,13 @@ impl DecryptorContext {
     ///
     /// * `decryptor` - The decryptor method token.
     /// * `caller` - The method containing the call.
-    /// * `location` - Location within the caller method.
+    /// * `location` - The call instruction's identity.
     /// * `reason` - Why decryption failed.
     pub fn record_failure(
         &self,
         decryptor: Token,
         caller: Token,
-        location: usize,
+        location: Option<InstrId>,
         reason: FailureReason,
     ) {
         let is_permanent = reason.is_permanent();
@@ -516,7 +549,9 @@ impl DecryptorContext {
             reason,
         });
         if is_permanent {
-            self.permanent_failure_index.insert((caller, location));
+            if let Some(id) = location {
+                self.permanent_failure_index.insert((caller, id));
+            }
         }
     }
 
@@ -546,14 +581,16 @@ impl DecryptorContext {
     /// # Arguments
     ///
     /// * `caller` - The method containing the call.
-    /// * `location` - Location within the caller method.
+    /// * `location` - The call instruction's identity.
     ///
     /// # Returns
     ///
     /// `true` if a permanent failure was recorded for this call site.
     #[must_use]
-    pub fn has_permanent_failure(&self, caller: Token, location: usize) -> bool {
-        self.permanent_failure_index.contains(&(caller, location))
+    pub fn has_permanent_failure(&self, caller: Token, location: Option<InstrId>) -> bool {
+        // A call with no identity is one this run has never recorded anything
+        // about, so nothing is known against it.
+        location.is_some_and(|id| self.permanent_failure_index.contains(&(caller, id)))
     }
 
     /// Checks if a call site has already been successfully decrypted.
@@ -564,14 +601,14 @@ impl DecryptorContext {
     /// # Arguments
     ///
     /// * `caller` - The method containing the call.
-    /// * `location` - Location within the caller method.
+    /// * `location` - The call instruction's identity.
     ///
     /// # Returns
     ///
     /// `true` if a successful decryption was recorded for this call site.
     #[must_use]
-    pub fn is_already_decrypted(&self, caller: Token, location: usize) -> bool {
-        self.decrypted_index.contains(&(caller, location))
+    pub fn is_already_decrypted(&self, caller: Token, location: Option<InstrId>) -> bool {
+        location.is_some_and(|id| self.decrypted_index.contains(&(caller, id)))
     }
 
     /// Returns the total number of successful decryptions.
@@ -595,7 +632,7 @@ impl DecryptorContext {
     ///
     /// Note that this is not on its own sufficient to justify deleting the
     /// method: a decryptor that was never exercised also has no failures.
-    /// Removal additionally requires that nothing still calls it — see
+    /// Removal additionally requires that nothing still calls it - see
     /// `decryptors_still_called` in the cleanup builder.
     ///
     /// # Arguments
@@ -679,6 +716,14 @@ impl DecryptorContext {
 mod tests {
     use std::{sync::Arc, thread};
 
+    /// A stand-in instruction identity, for the records these tests make.
+    ///
+    /// Identities come from a function's allocator; a test with no function
+    /// builds one directly so the record it makes is keyed the way a real one
+    /// would be.
+    fn identity(raw: u32) -> Option<InstrId> {
+        InstrId::from_raw(raw)
+    }
     use super::*;
 
     #[test]
@@ -767,15 +812,20 @@ mod tests {
         ctx.register(decryptor);
 
         // Record success
-        ctx.record_success(decryptor, caller, 100, ConstValue::I32(42));
-        ctx.record_success(decryptor, caller, 200, ConstValue::I32(43));
+        ctx.record_success(decryptor, caller, identity(100), ConstValue::I32(42));
+        ctx.record_success(decryptor, caller, identity(200), ConstValue::I32(43));
 
         assert_eq!(ctx.total_decrypted(), 2);
         assert_eq!(ctx.total_failed(), 0);
         assert!(ctx.is_fully_decrypted(decryptor));
 
         // Record failure
-        ctx.record_failure(decryptor, caller, 300, FailureReason::NonConstantArgs);
+        ctx.record_failure(
+            decryptor,
+            caller,
+            identity(300),
+            FailureReason::NonConstantArgs,
+        );
 
         assert_eq!(ctx.total_decrypted(), 2);
         assert_eq!(ctx.total_failed(), 1);
@@ -793,11 +843,16 @@ mod tests {
         ctx.register(decryptor2);
 
         // decryptor1: all successes
-        ctx.record_success(decryptor1, caller, 100, ConstValue::I32(1));
+        ctx.record_success(decryptor1, caller, identity(100), ConstValue::I32(1));
 
         // decryptor2: has a failure
-        ctx.record_success(decryptor2, caller, 200, ConstValue::I32(2));
-        ctx.record_failure(decryptor2, caller, 300, FailureReason::NonConstantArgs);
+        ctx.record_success(decryptor2, caller, identity(200), ConstValue::I32(2));
+        ctx.record_failure(
+            decryptor2,
+            caller,
+            identity(300),
+            FailureReason::NonConstantArgs,
+        );
 
         let removable = ctx.removable_decryptors();
         assert!(removable.contains(&decryptor1));
@@ -814,8 +869,13 @@ mod tests {
         ctx.register(decryptor);
         ctx.map_methodspec(methodspec, decryptor);
         ctx.cache_value(decryptor, &[ConstValue::I32(1)], ConstValue::I32(10));
-        ctx.record_success(decryptor, caller, 100, ConstValue::I32(10));
-        ctx.record_failure(decryptor, caller, 200, FailureReason::NonConstantArgs);
+        ctx.record_success(decryptor, caller, identity(100), ConstValue::I32(10));
+        ctx.record_failure(
+            decryptor,
+            caller,
+            identity(200),
+            FailureReason::NonConstantArgs,
+        );
 
         // Verify registration
         assert!(ctx.is_decryptor(decryptor));
@@ -825,8 +885,8 @@ mod tests {
         assert_eq!(ctx.resolve_decryptor(methodspec), Some(decryptor));
 
         // Verify success/failure tracking (for operational checks, not stats)
-        assert!(ctx.is_already_decrypted(caller, 100));
-        assert!(!ctx.is_already_decrypted(caller, 200)); // failure, not success
+        assert!(ctx.is_already_decrypted(caller, identity(100)));
+        assert!(!ctx.is_already_decrypted(caller, identity(200))); // failure, not success
 
         // Verify decryption counts via internal methods
         assert_eq!(ctx.total_decrypted(), 1);
@@ -857,7 +917,7 @@ mod tests {
 
         ctx.register(decryptor);
         ctx.cache_value(decryptor, &[ConstValue::I32(1)], ConstValue::I32(10));
-        ctx.record_success(decryptor, caller, 100, ConstValue::I32(10));
+        ctx.record_success(decryptor, caller, identity(100), ConstValue::I32(10));
 
         ctx.clear_results();
 
@@ -913,24 +973,29 @@ mod tests {
         ctx.register(decryptor);
 
         // Initially no failures
-        assert!(!ctx.has_permanent_failure(caller, 100));
+        assert!(!ctx.has_permanent_failure(caller, identity(100)));
 
         // Record a non-permanent failure
-        ctx.record_failure(decryptor, caller, 100, FailureReason::NonConstantArgs);
+        ctx.record_failure(
+            decryptor,
+            caller,
+            identity(100),
+            FailureReason::NonConstantArgs,
+        );
         // Still no permanent failure
-        assert!(!ctx.has_permanent_failure(caller, 100));
+        assert!(!ctx.has_permanent_failure(caller, identity(100)));
 
         // Record a permanent failure at different location
         ctx.record_failure(
             decryptor,
             caller,
-            200,
+            identity(200),
             FailureReason::EmulationFailed("timeout".to_string()),
         );
         // Location 100 still not permanently failed
-        assert!(!ctx.has_permanent_failure(caller, 100));
+        assert!(!ctx.has_permanent_failure(caller, identity(100)));
         // Location 200 is permanently failed
-        assert!(ctx.has_permanent_failure(caller, 200));
+        assert!(ctx.has_permanent_failure(caller, identity(200)));
     }
 
     #[test]
@@ -942,16 +1007,16 @@ mod tests {
         ctx.register(decryptor);
 
         // Initially not decrypted
-        assert!(!ctx.is_already_decrypted(caller, 100));
+        assert!(!ctx.is_already_decrypted(caller, identity(100)));
 
         // Record a success
-        ctx.record_success(decryptor, caller, 100, ConstValue::I32(42));
+        ctx.record_success(decryptor, caller, identity(100), ConstValue::I32(42));
         // Now it's marked as decrypted
-        assert!(ctx.is_already_decrypted(caller, 100));
+        assert!(ctx.is_already_decrypted(caller, identity(100)));
         // Different location is not decrypted
-        assert!(!ctx.is_already_decrypted(caller, 200));
+        assert!(!ctx.is_already_decrypted(caller, identity(200)));
         // Different caller is not decrypted
-        assert!(!ctx.is_already_decrypted(Token::new(0x06000003), 100));
+        assert!(!ctx.is_already_decrypted(Token::new(0x06000003), identity(100)));
     }
 
     #[test]
@@ -969,7 +1034,7 @@ mod tests {
                     ctx_clone.record_success(
                         decryptor,
                         Token::new(0x06001000),
-                        j as usize,
+                        identity(j.saturating_add(1) as u32),
                         ConstValue::I32(j),
                     );
                     ctx_clone.cache_value(decryptor, &[ConstValue::I32(j)], ConstValue::I32(j * 2));
@@ -1039,7 +1104,7 @@ mod tests {
     }
 
     /// Budget exhaustion is a property of the run, not the call site, so it must not be
-    /// cached as a permanent failure — a larger budget would let the same site succeed.
+    /// cached as a permanent failure - a larger budget would let the same site succeed.
     #[test]
     fn budget_exhaustion_is_not_a_permanent_failure() {
         assert!(!FailureReason::EmulationBudgetExhausted.is_permanent());

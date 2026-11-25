@@ -467,12 +467,11 @@ impl Default for OwnedTypeCircularityValidator {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "skip-expensive-tests", allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::{
         metadata::validation::ValidationConfig,
-        test::{
+        testkit::{
             factories::validation::type_circularity::owned_type_circularity_validator_file_factory,
             owned_validator_test,
         },
@@ -480,14 +479,12 @@ mod tests {
     };
 
     #[test]
-    #[cfg(not(feature = "skip-expensive-tests"))]
     fn test_owned_type_circularity_validator() -> Result<()> {
         let validator = OwnedTypeCircularityValidator::new();
 
         owned_validator_test(
             owned_type_circularity_validator_file_factory,
             "OwnedTypeCircularityValidator",
-            "ValidationOwnedFailed",
             ValidationConfig {
                 enable_semantic_validation: true,
                 max_nesting_depth: 100,

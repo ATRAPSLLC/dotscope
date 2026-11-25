@@ -112,7 +112,7 @@ use crate::{
     analysis::{
         BlockRange, ControlFlowGraph, SsaConverter, SsaExceptionHandler, SsaFunction, TypeContext,
     },
-    assembly::{self, BasicBlock, InstructionEncoder},
+    assembly::{self, BasicBlock, DecodedBodies, InstructionEncoder},
     file::File,
     metadata::{
         customattributes::CustomAttributeValueList,
@@ -120,14 +120,15 @@ use crate::{
         signatures::{
             parse_local_var_signature, SignatureLocalVariable, SignatureMethod, TypeSignature,
         },
-        streams::Blob,
+        streams::{Blob, SharedStr},
         tables::{GenericParamList, MetadataTable, MethodSpecList, ParamList, StandAloneSigRaw},
         token::Token,
         typesystem::{
-            CilModifier, CilTypeRc, CilTypeRef, CilTypeReference, TypeRegistry, TypeResolver,
+            CilModifier, CilTypeRc, CilTypeRef, CilTypeReference, FullName, TypeRegistry,
+            TypeResolver,
         },
     },
-    utils::{LazyList, VisitedMap},
+    utils::{LazyList, RowList},
     CilObject,
     Error::SsaError,
     Result,
@@ -155,8 +156,9 @@ pub type MethodRc = Arc<Method>;
 ///
 /// # Returns
 ///
-/// The method name as a `String` if a method with the given token exists, `None` otherwise.
-pub fn method_name_by_token(map: &MethodMap, token: &Token) -> Option<String> {
+/// The method name, shared with the method, if a method with the given token exists, `None`
+/// otherwise.
+pub fn method_name_by_token(map: &MethodMap, token: &Token) -> Option<SharedStr> {
     map.get(token).map(|e| e.value().name.clone())
 }
 
@@ -396,7 +398,7 @@ impl MethodRef {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     #[must_use]
-    pub fn name(&self) -> Option<String> {
+    pub fn name(&self) -> Option<SharedStr> {
         self.upgrade().map(|m| m.name.clone())
     }
 
@@ -451,7 +453,7 @@ impl From<MethodRc> for MethodRef {
 /// Returned by [`Method::rva_kind`]. Lets callers distinguish between a method
 /// with a real IL body (`Resolved(addr)`), one of the legitimate "no IL"
 /// cases (`Abstract`, `PInvoke`, `Runtime`), and a malformed-input case
-/// (`UnresolvedZero` — RVA is `None` with no flag explaining why).
+/// (`UnresolvedZero` - RVA is `None` with no flag explaining why).
 ///
 /// `Method.rva` carried `Option<u32>` does not surface this distinction;
 /// `rva_kind()` is the recommended accessor for downstream code that needs
@@ -466,15 +468,16 @@ impl From<MethodRc> for MethodRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MethodRvaKind {
-    /// IL code lives at the given RVA. Equivalent to `Method.rva == Some(addr)`.
+    /// The method's code (IL, or a native method's machine code) lives at the given RVA.
+    /// Equivalent to `Method.rva == Some(addr)`; [`Method::code_kind`] says which code.
     Resolved(u32),
-    /// Method is declared abstract — body is supplied by an overriding type
+    /// Method is declared abstract - body is supplied by an overriding type
     /// in this or another assembly.
     Abstract,
-    /// Method is implemented via Platform Invoke — body lives in an external
+    /// Method is implemented via Platform Invoke - body lives in an external
     /// native module referenced by `MethodModifiers::PINVOKE_IMPL`.
     PInvoke,
-    /// Method is runtime-managed — implemented by the CLR rather than by IL
+    /// Method is runtime-managed - implemented by the CLR rather than by IL
     /// in this assembly. Identified by `MethodImplCodeType::RUNTIME`.
     Runtime,
     /// `Method.rva` is `None` but no flag explains why. Indicates malformed
@@ -506,6 +509,53 @@ impl std::fmt::Display for MethodRvaKind {
             MethodRvaKind::Resolved(addr) => write!(f, "resolved(0x{addr:08X})"),
             other => f.write_str(other.as_str()),
         }
+    }
+}
+
+/// What implements a method, as [`Method::code_kind`] reports it: the code type
+/// (ECMA-335 II.23.1.11, `CodeTypeMask`) of a method whose code is in this image, or that the
+/// image holds none for it.
+///
+/// # Stability
+///
+/// `#[non_exhaustive]`: consumers include a wildcard arm when matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MethodCodeKind {
+    /// CIL at the method's RVA, after its tiny or fat header.
+    Il,
+    /// Optimized CIL (`OPTIL`, reserved: conforming implementations do not write it) at the
+    /// method's RVA.
+    OptIl,
+    /// Native machine code at the method's RVA (a mixed-mode assembly's native method), with
+    /// no CIL header.
+    Native,
+    /// Implemented by the runtime (`RUNTIME`): no code in the image, an RVA or not.
+    Runtime,
+    /// No code in the image: an abstract method, a P/Invoke, an internal call, or any other
+    /// method without an RVA.
+    None,
+}
+
+impl MethodCodeKind {
+    /// Returns a stable `&'static str` identifier for this code kind: `"il"`, `"opt_il"`,
+    /// `"native"`, `"runtime"` or `"none"`. The strings are part of the stable public API and
+    /// safe to persist.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            MethodCodeKind::Il => "il",
+            MethodCodeKind::OptIl => "opt_il",
+            MethodCodeKind::Native => "native",
+            MethodCodeKind::Runtime => "runtime",
+            MethodCodeKind::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for MethodCodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -547,7 +597,7 @@ pub struct Method {
     /// The offset in the `MetadataTable`
     pub meta_offset: usize,
     /// This methods name
-    pub name: String,
+    pub name: SharedStr,
     /// `MethodImplAttributes`, §II.23.1.10
     pub impl_code_type: MethodImplCodeType,
     /// `MethodImplAttributes`, §II.23.1.10
@@ -565,8 +615,6 @@ pub struct Method {
     /// The parameters (from `Param` table, enhanced with information from the `SignatureMethod`)
     /// sequence 0, is the return value (if there is a count 0).
     pub params: ParamList,
-    /// The vararg parameters of this method
-    pub varargs: Arc<boxcar::Vec<VarArg>>,
     /// All generic parameters this type has (type information, not the instantiated version)
     pub generic_params: GenericParamList,
     /// `MethodSpec` instances that provide generic instantiations for this method
@@ -577,17 +625,19 @@ pub struct Method {
     pub rva: Option<u32>,
     /// The `MethodBody`
     pub body: OnceLock<MethodBody>,
-    /// The local variables
-    pub local_vars: Arc<boxcar::Vec<LocalVariable>>,
+    /// The local variables, allocated on the first one
+    pub local_vars: LazyList<LocalVariable>,
     /// Overridden method declarations for `.override` directive emission
     /// (from `MethodImpl` table where `MethodBody` points to this method).
     /// A method can implement multiple interface methods via separate MethodImpl rows.
-    pub overrides: Arc<boxcar::Vec<CilTypeReference>>,
+    pub overrides: RowList<CilTypeReference>,
     /// Implemented interface methods
     /// (from `MethodImpl` table entries for this type)
-    pub interface_impls: MethodRefList,
-    /// The .NET CIL Security Information (if present)
-    pub security: OnceLock<Security>,
+    pub interface_impls: RowList<MethodRef>,
+    /// The method's declarative security, a `DeclSecurity` row each, in table order: a method
+    /// may demand permissions under several actions (a link demand and an inheritance
+    /// demand, say).
+    pub security: RowList<Security>,
     /// The basic blocks of this method, lazily initialized
     pub blocks: OnceLock<Vec<BasicBlock>>,
     /// Custom attributes attached to this method
@@ -784,9 +834,11 @@ impl Method {
 
     /// Returns true if the method has IL code.
     ///
-    /// This checks the `MethodImplCodeType::IL` flag in the method's implementation
-    /// attributes to determine if the method contains Common Intermediate Language (CIL)
-    /// instructions that can be disassembled and analyzed.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::IL`: the
+    /// method contains Common Intermediate Language (CIL) instructions that can be
+    /// disassembled and analyzed. The code type is a two-bit enumeration, not a set of
+    /// flags, so exactly one of `is_code_il`, `is_code_native`, `is_code_opt_il` and
+    /// `is_code_runtime` holds for a method.
     ///
     /// # Examples
     ///
@@ -804,14 +856,14 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_il(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::IL)
+        self.impl_code_type == MethodImplCodeType::IL
     }
 
     /// Returns true if the method has native code (P/Invoke).
     ///
-    /// This checks the `MethodImplCodeType::NATIVE` flag to determine if the method
-    /// is implemented in native code rather than IL. This is typical for P/Invoke
-    /// methods that call into unmanaged libraries.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::NATIVE`:
+    /// the method is implemented in native code rather than IL, as a mixed-mode assembly's
+    /// native methods are. A runtime-implemented method is not native.
     ///
     /// # Examples
     ///
@@ -829,14 +881,14 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_native(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::NATIVE)
+        self.impl_code_type == MethodImplCodeType::NATIVE
     }
 
     /// Returns true if the method has optimized IL code.
     ///
-    /// This checks the `MethodImplCodeType::OPTIL` flag to determine if the method
-    /// contains optimized Common Intermediate Language that may have been transformed
-    /// by the runtime or tools for better performance.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::OPTIL`,
+    /// optimized Common Intermediate Language (reserved: conforming implementations write
+    /// zero). A runtime-implemented method is not optimized IL.
     ///
     /// # Examples
     ///
@@ -854,13 +906,14 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_opt_il(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::OPTIL)
+        self.impl_code_type == MethodImplCodeType::OPTIL
     }
 
     /// Returns true if the method is implemented in the runtime.
     ///
-    /// This checks the `MethodImplCodeType::RUNTIME` flag to determine if the method
-    /// is implemented directly by the .NET runtime rather than containing user code.
+    /// The code type (ECMA-335 II.23.1.11, `CodeTypeMask`) is `MethodImplCodeType::RUNTIME`:
+    /// the method is implemented directly by the .NET runtime rather than containing user
+    /// code.
     /// This is common for intrinsic methods and runtime-provided functionality.
     ///
     /// # Examples
@@ -879,7 +932,7 @@ impl Method {
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn is_code_runtime(&self) -> bool {
-        self.impl_code_type.contains(MethodImplCodeType::RUNTIME)
+        self.impl_code_type == MethodImplCodeType::RUNTIME
     }
 
     /// Returns true if the method is unmanaged.
@@ -1011,33 +1064,6 @@ impl Method {
         self.impl_options.contains(MethodImplOptions::INTERNAL_CALL)
     }
 
-    /// Returns true if the method implementation is forwarded through P/Invoke.
-    ///
-    /// This checks the `MethodImplOptions::MAX_METHOD_IMPL_VAL` flag to determine
-    /// if the method implementation is forwarded to an external library through
-    /// the Platform Invoke (P/Invoke) mechanism.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use dotscope::CilObject;
-    /// use std::path::Path;
-    ///
-    /// let assembly = CilObject::from_path(Path::new("tests/samples/WindowsBase.dll"))?;
-    /// for entry in assembly.methods().iter() {
-    ///     let method = entry.value();
-    ///     if method.is_forwarded_pinvoke() {
-    ///         println!("Forwarded P/Invoke method: {}", method.name);
-    ///     }
-    /// }
-    /// # Ok::<(), dotscope::Error>(())
-    /// ```
-    #[must_use]
-    pub fn is_forwarded_pinvoke(&self) -> bool {
-        self.impl_options
-            .contains(MethodImplOptions::MAX_METHOD_IMPL_VAL)
-    }
-
     /// Returns true if the method is a constructor (.ctor or .cctor).
     #[must_use]
     pub fn is_constructor(&self) -> bool {
@@ -1084,7 +1110,7 @@ impl Method {
     ///
     /// `Method.rva` is `Some(addr)` for methods with IL bodies and `None`
     /// for methods that legitimately have no IL (abstract, P/Invoke,
-    /// runtime-managed) — but the bare `Option` cannot tell consumers *why*
+    /// runtime-managed) - but the bare `Option` cannot tell consumers *why*
     /// a method has no body. This accessor classifies by examining the
     /// method's `MethodModifiers` and `MethodImplCodeType` flags so callers
     /// can log a meaningful reason instead of treating "RVA = 0" as
@@ -1093,8 +1119,8 @@ impl Method {
     /// The classification follows ECMA-335 §II.23.1.10: `ABSTRACT` and
     /// `PINVOKE_IMPL` are method-attribute bits (`MethodModifiers`), and the
     /// `RUNTIME` impl-code-type bits live in `MethodImplCodeType`. Variants
-    /// are tested in priority order — `Abstract` first, then `PInvoke`, then
-    /// `Runtime` — so a method tagged with multiple flags reports the most
+    /// are tested in priority order - `Abstract` first, then `PInvoke`, then
+    /// `Runtime` - so a method tagged with multiple flags reports the most
     /// informative reason.
     ///
     /// # Examples
@@ -1113,13 +1139,13 @@ impl Method {
     ///             println!("IL at 0x{addr:08X}");
     ///         }
     ///         MethodRvaKind::Abstract => {
-    ///             println!("abstract — no body in this assembly");
+    ///             println!("abstract - no body in this assembly");
     ///         }
     ///         MethodRvaKind::PInvoke => {
-    ///             println!("P/Invoke — body lives in a native module");
+    ///             println!("P/Invoke - body lives in a native module");
     ///         }
     ///         MethodRvaKind::Runtime => {
-    ///             println!("runtime-managed — implemented by the CLR");
+    ///             println!("runtime-managed - implemented by the CLR");
     ///         }
     ///         MethodRvaKind::UnresolvedZero => {
     ///             println!("RVA = 0 with no flag explanation; suspicious metadata");
@@ -1140,10 +1166,64 @@ impl Method {
         if self.flags_modifiers.contains(MethodModifiers::PINVOKE_IMPL) {
             return MethodRvaKind::PInvoke;
         }
-        if self.impl_code_type.contains(MethodImplCodeType::RUNTIME) {
+        if self.impl_code_type == MethodImplCodeType::RUNTIME {
             return MethodRvaKind::Runtime;
         }
         MethodRvaKind::UnresolvedZero
+    }
+
+    /// What implements this method: the code type of a method with code at its RVA, and
+    /// [`MethodCodeKind::None`] for one without an RVA (abstract, P/Invoke, internal call).
+    /// A runtime-implemented method is [`MethodCodeKind::Runtime`] whether or not its row
+    /// names an RVA: the runtime supplies its code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use dotscope::CilObject;
+    /// use dotscope::metadata::method::MethodCodeKind;
+    ///
+    /// let assembly = CilObject::from_path("tests/samples/WindowsBase.dll")?;
+    /// let native = assembly
+    ///     .methods()
+    ///     .iter()
+    ///     .filter(|entry| entry.value().code_kind() == MethodCodeKind::Native)
+    ///     .count();
+    /// println!("{native} native methods");
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    #[must_use]
+    pub fn code_kind(&self) -> MethodCodeKind {
+        if self.is_code_runtime() {
+            return MethodCodeKind::Runtime;
+        }
+        if self.rva.is_none() {
+            return MethodCodeKind::None;
+        }
+        if self.is_code_native() {
+            MethodCodeKind::Native
+        } else if self.is_code_opt_il() {
+            MethodCodeKind::OptIl
+        } else {
+            MethodCodeKind::Il
+        }
+    }
+
+    /// The RVA of the method's first instruction: after the tiny or fat header for CIL (the
+    /// method's RVA plus the size of the header its body was read with), and the RVA itself
+    /// for native code. `None` when the image holds no code for it ([`Method::code_kind`] is
+    /// `Runtime` or `None`) or its CIL body was not read (a lenient load drops a body it
+    /// cannot read).
+    #[must_use]
+    pub fn code_rva(&self) -> Option<u32> {
+        match self.code_kind() {
+            MethodCodeKind::Il | MethodCodeKind::OptIl => {
+                let header = u32::try_from(self.body.get()?.size_header).ok()?;
+                self.rva?.checked_add(header)
+            }
+            MethodCodeKind::Native => self.rva,
+            _ => None,
+        }
     }
 
     /// Returns true if the method has public access.
@@ -1163,8 +1243,8 @@ impl Method {
 
     /// Returns the fully-qualified name of the declaring type, if available.
     #[must_use]
-    pub fn declaring_type_fullname(&self) -> Option<String> {
-        self.declaring_type_rc().map(|t| t.fullname().to_string())
+    pub fn declaring_type_fullname(&self) -> Option<FullName> {
+        self.declaring_type_rc().map(|t| t.fullname())
     }
 
     /// Returns the fully-qualified method name in `"DeclaringType::MethodName"` format.
@@ -1175,7 +1255,7 @@ impl Method {
     pub fn fullname(&self) -> String {
         match self.declaring_type_fullname() {
             Some(type_name) if !type_name.is_empty() => format!("{}::{}", type_name, self.name),
-            _ => self.name.clone(),
+            _ => self.name.to_string(),
         }
     }
 
@@ -1240,6 +1320,7 @@ impl Method {
     /// * `blobs`   - The processed Blobs
     /// * `sigs`    - The table of signatures
     /// * `types`   - The type registry
+    /// * `bodies`  - The bodies decoded so far in this load, shared by the methods naming them
     ///
     /// # Errors
     /// Returns an error if parsing fails or if referenced types/signatures cannot be resolved.
@@ -1249,7 +1330,7 @@ impl Method {
         blobs: &Blob,
         sigs: Option<&MetadataTable<StandAloneSigRaw>>,
         types: &Arc<TypeRegistry>,
-        shared_visited: Arc<VisitedMap>,
+        bodies: &DecodedBodies,
     ) -> Result<()> {
         // Native and runtime methods don't have CIL method bodies - their RVA
         // points to x86/x64 machine code or runtime-provided implementations,
@@ -1263,10 +1344,9 @@ impl Method {
         }
 
         self.resolve_parameter_signatures(types)?;
-        self.parse_varargs(types)?;
 
         if has_il_body {
-            assembly::decode_method(self, file, shared_visited)?;
+            assembly::decode_method(self, file, bodies)?;
         }
         Ok(())
     }
@@ -1290,19 +1370,8 @@ impl Method {
         types: &Arc<TypeRegistry>,
         rva: u32,
     ) -> Result<MethodBody> {
-        let method_offset = file.rva_to_offset(rva as usize)?;
-        if method_offset == 0 || method_offset >= file.data().len() {
-            return Err(malformed_error!(
-                "Method offset is invalid - {}",
-                method_offset
-            ));
-        }
-
-        let mut body = MethodBody::from(
-            file.data()
-                .get(method_offset..)
-                .ok_or(out_of_bounds_error!())?,
-        )?;
+        // The runtimes read a body only within its section's VirtualSize
+        let mut body = MethodBody::from(file.section_bounded(rva as usize)?)?;
         if body.local_var_sig_token != 0 {
             self.parse_local_variables(&body, blobs, sigs, types)?;
         }
@@ -1332,7 +1401,14 @@ impl Method {
             return Ok(());
         };
 
-        let local_var_sig_data = match sigs_table.get(body.local_var_sig_token & 0x00FF_FFFF)? {
+        // A token naming another table names no local signature (ECMA-335 §II.25.4.3)
+        let Some(sig_rid) = body.local_var_sig_rid() else {
+            return Err(malformed_error!(
+                "Local variable signature token 0x{:08X} is not a StandAloneSig token",
+                body.local_var_sig_token
+            ));
+        };
+        let local_var_sig_data = match sigs_table.get(sig_rid)? {
             Some(var_sig_row) => blobs.get(var_sig_row.signature as usize)?,
             None => {
                 return Err(malformed_error!(
@@ -1440,39 +1516,6 @@ impl Method {
                     )?;
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    /// Parses vararg (variable argument) parameters from the method signature.
-    ///
-    /// # Arguments
-    /// * `types` - The type registry
-    ///
-    /// # Errors
-    /// Returns an error if a vararg modifier type cannot be resolved.
-    fn parse_varargs(&self, types: &Arc<TypeRegistry>) -> Result<()> {
-        for vararg in &self.signature.varargs {
-            let modifiers = Arc::new(boxcar::Vec::with_capacity(vararg.modifiers.len()));
-            for modifier in &vararg.modifiers {
-                match types.get(&modifier.modifier_type) {
-                    Some(new_mod) => _ = modifiers.push(new_mod.into()),
-                    None => {
-                        return Err(malformed_error!(
-                            "Failed to resolve vararg modifier type - token 0x{:08X}",
-                            modifier.modifier_type.value()
-                        ))
-                    }
-                }
-            }
-
-            let mut resolver = TypeResolver::new(types.clone());
-            self.varargs.push(VarArg {
-                modifiers,
-                by_ref: vararg.by_ref,
-                base: resolver.resolve(&vararg.base)?.into(),
-            });
         }
 
         Ok(())
@@ -1599,7 +1642,7 @@ impl Method {
 
         // If no locals are declared (e.g., Tiny Format method body), infer from IL usage.
         // Some obfuscators (JIEJIE.NET) emit Tiny Format methods that use stloc/ldloc
-        // without a LocalVarSig — technically invalid per ECMA-335 §II.25.4.1, but the
+        // without a LocalVarSig - technically invalid per ECMA-335 §II.25.4.1, but the
         // CLR tolerates it by implicitly allocating locals.
         let num_locals = if declared_locals == 0 {
             Self::infer_local_count_from_blocks(blocks)
@@ -1610,19 +1653,84 @@ impl Method {
         // Create type context for type lookup during SSA construction
         let type_context = TypeContext::new(self, assembly);
 
-        // Build SSA from CFG with type context (also sets original local types)
-        let mut ssa = SsaConverter::build(&cfg, num_args, num_locals, &type_context)?;
+        // The exception table first, because construction reads it: where
+        // control can enter decides where the dominator walk is rooted, which
+        // blocks are reachable, and what a phi at a handler entry merges.
+        let ssa_handlers = self.ssa_exception_handlers(blocks)?;
 
-        // Populate exception handlers from method body
-        if let Some(body) = self.body.get() {
-            if !body.exception_handlers.is_empty() {
+        // Build SSA from CFG with type context (also sets original local types)
+        let ssa = SsaConverter::build(&cfg, num_args, num_locals, &type_context, ssa_handlers)?;
+
+        Ok(ssa)
+    }
+
+    /// Maps the method body's exception clauses onto block ranges.
+    ///
+    /// The IL table addresses its regions by byte offset and everything above
+    /// addresses blocks by index, so this is where the two meet. A clause whose
+    /// parts cannot both be resolved to a block range contributes nothing
+    /// rather than a half-stated region: a start without an end describes
+    /// nothing an IL table could be regenerated from.
+    ///
+    /// # Arguments
+    ///
+    /// * `blocks` - The method's basic blocks, in layout order.
+    ///
+    /// # Returns
+    ///
+    /// One [`SsaExceptionHandler`] per clause, empty when the body has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a clause's offsets overflow.
+    fn ssa_exception_handlers(&self, blocks: &[BasicBlock]) -> Result<Vec<SsaExceptionHandler>> {
+        match self.body.get() {
+            Some(body) => Self::ssa_handlers_for_clauses(&body.exception_handlers, blocks),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Maps exception clauses onto the block ranges SSA construction reads.
+    ///
+    /// The clause table addresses its regions by byte offset and SSA addresses
+    /// blocks by index, so this is where the two meet. A clause whose parts
+    /// cannot both be resolved to a block range contributes nothing rather than
+    /// a half-stated region: a start without an end describes nothing an IL
+    /// table could be regenerated from.
+    ///
+    /// For code decoded outside a method - by
+    /// [`decode_blocks_with_handlers`](crate::assembly::decode_blocks_with_handlers),
+    /// say - this is the step between decoding and
+    /// [`SsaConverter::build`](crate::analysis::SsaConverter::build).
+    ///
+    /// # Arguments
+    ///
+    /// * `clauses` - The exception clauses, offsets relative to the first block.
+    /// * `blocks` - The blocks they cover, in layout order, decoded with the
+    ///   clauses so that each handler entry is a block.
+    ///
+    /// # Returns
+    ///
+    /// One [`SsaExceptionHandler`] per clause.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a clause's offsets overflow.
+    pub fn ssa_handlers_for_clauses(
+        clauses: &[ExceptionHandler],
+        blocks: &[BasicBlock],
+    ) -> Result<Vec<SsaExceptionHandler>> {
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+        {
+            {
                 // Exception handler offsets are relative to method body start.
                 // Block offsets are absolute file offsets. Get base offset from first block.
                 let base_offset = blocks.first().map_or(0, |b| b.offset);
 
-                let mut ssa_handlers: Vec<SsaExceptionHandler> =
-                    Vec::with_capacity(body.exception_handlers.len());
-                for (handler_idx, eh) in body.exception_handlers.iter().enumerate() {
+                let mut ssa_handlers: Vec<SsaExceptionHandler> = Vec::with_capacity(clauses.len());
+                for (handler_idx, eh) in clauses.iter().enumerate() {
                     let try_offset_abs = base_offset
                         .checked_add(eh.try_offset as usize)
                         .ok_or_else(|| malformed_error!("Exception handler try_offset overflow"))?;
@@ -1646,7 +1754,7 @@ impl Method {
 
                     // Map offsets to block indices (add base_offset to convert relative to absolute)
                     let try_start_block = Self::find_block_at_offset(blocks, try_offset_abs);
-                    let try_end_block = Self::find_region_end_block(blocks, try_end_abs);
+                    let try_end_block = Some(Self::find_region_end_block(blocks, try_end_abs));
 
                     // The filter expression is resolved first because the handler's own
                     // start depends on it: the decoder marks the filter's entry block with
@@ -1668,13 +1776,19 @@ impl Method {
                     let handler_start_block =
                         Self::find_handler_entry_block(blocks, handler_idx, filter_start_block)
                             .or_else(|| Self::find_block_at_offset(blocks, handler_offset_abs));
-                    let handler_end_block = Self::find_region_end_block(blocks, handler_end_abs);
+                    let handler_end_block =
+                        Some(Self::find_region_end_block(blocks, handler_end_abs));
 
                     // Get the class token for catch handlers
                     let class_token_or_filter = match eh.flags.kind() {
-                        ExceptionHandlerKind::Catch => {
-                            eh.handler.as_ref().map_or(0, |t| t.token.value())
-                        }
+                        // The resolved type's token, or the raw clause field
+                        // when the type was not resolved: a catch clause stores
+                        // its class token in the same slot a filter stores its
+                        // offset.
+                        ExceptionHandlerKind::Catch => eh
+                            .handler
+                            .as_ref()
+                            .map_or(eh.filter_offset, |t| t.token.value()),
                         ExceptionHandlerKind::Filter => eh.filter_offset,
                         ExceptionHandlerKind::Finally | ExceptionHandlerKind::Fault => 0,
                     };
@@ -1699,17 +1813,16 @@ impl Method {
                         // so its exclusive end is wherever the handler begins. Taking the
                         // handler's resolved start rather than re-deriving one from
                         // `handler_offset_abs` keeps the two parts from claiming the same
-                        // block when the decoder's marker and the IL offset disagree — an
+                        // block when the decoder's marker and the IL offset disagree - an
                         // overlap analyssa reports as a malformed clause.
                         filter_range: range(filter_start_block, handler_start_block),
+                        selector: None,
                     });
                 }
 
-                ssa.set_exception_handlers(ssa_handlers);
+                Ok(ssa_handlers)
             }
         }
-
-        Ok(ssa)
     }
 
     /// Infers the number of local variables from IL usage in the basic blocks.
@@ -1718,7 +1831,7 @@ impl Method {
     /// `max_index + 1`. Returns 0 if no local variable instructions are found.
     ///
     /// This handles Tiny Format method bodies that use locals without declaring
-    /// a LocalVarSig token — technically invalid per ECMA-335 §II.25.4.1, but
+    /// a LocalVarSig token - technically invalid per ECMA-335 §II.25.4.1, but
     /// tolerated by the CLR.
     fn infer_local_count_from_blocks(blocks: &[BasicBlock]) -> usize {
         let mut max_index: Option<usize> = None;
@@ -1780,24 +1893,28 @@ impl Method {
 
     /// Finds the exclusive end block of a region ending at `offset`.
     ///
-    /// `offset` is one past the region's last IL byte, so the answer is the block
-    /// that begins there. A region running to the end of the method body has no
-    /// such block; its exclusive end is one past the last block, which is what
-    /// distinguishes "the region ends with the method" from "the region's end
-    /// could not be mapped at all".
-    fn find_region_end_block(blocks: &[BasicBlock], offset: usize) -> Option<usize> {
-        if let Some(idx) = Self::find_block_at_offset(blocks, offset) {
-            return Some(idx);
-        }
-
-        let body_end = blocks.last().map_or(0, |b| b.offset.saturating_add(b.size));
-        (offset >= body_end).then_some(blocks.len())
+    /// `offset` is one past the region's last IL byte, so the answer is the first
+    /// block at or after it. Usually one begins exactly there. When none does, the
+    /// bytes after the region are ones nothing reaches - an obfuscator's junk
+    /// after an `endfinally`, which decoding by control flow never turns into a
+    /// block - and the region still ends where the next decoded block begins. A
+    /// region running to the end of the method body ends one past the last block.
+    ///
+    /// Blocks are in layout order. A block that straddles `offset` is taken as
+    /// the end, as a region boundary never falls inside a decoded block.
+    fn find_region_end_block(blocks: &[BasicBlock], offset: usize) -> usize {
+        Self::find_block_at_offset(blocks, offset).unwrap_or_else(|| {
+            blocks
+                .iter()
+                .position(|b| b.offset >= offset)
+                .unwrap_or(blocks.len())
+        })
     }
 
     /// Finds the block that is marked as an entry point for the given handler index.
     ///
-    /// A filter clause marks two blocks with the same handler index — the filter
-    /// expression's entry and the handler body's — and the filter is laid out
+    /// A filter clause marks two blocks with the same handler index - the filter
+    /// expression's entry and the handler body's - and the filter is laid out
     /// first, so `filter_block` names the one to skip. Without it the handler
     /// body of every filter clause would resolve to its filter expression.
     fn find_handler_entry_block(
@@ -1838,15 +1955,12 @@ impl Method {
             .collect()
     }
 
-    /// Encodes the method body to a byte vector.
-    ///
-    /// This method serializes the complete method body including:
-    /// - Method header (tiny or fat format as appropriate)
-    /// - All CIL instructions from basic blocks
-    /// - Exception handler sections (if any)
-    ///
-    /// The output format is compatible with ECMA-335 II.25.4 and can be
-    /// directly written to a PE file's .text section.
+    /// Encodes the method body to a byte vector (ECMA-335 II.25.4), ready for a PE file's
+    /// `.text` section: the header as it was read (its format, its declared stack depth,
+    /// which the instructions alone cannot recompute since a call's stack effect is its
+    /// signature's), the instructions of every block at their places in the code, and the
+    /// exception section as it was laid out. Bytes no block covers, code no path reaches,
+    /// are written as `nop`s.
     ///
     /// # Returns
     ///
@@ -1888,120 +2002,41 @@ impl Method {
             .get()
             .ok_or_else(|| malformed_error!("Method {} has no decoded blocks", self.name))?;
 
-        // Encode all instructions using InstructionEncoder
-        let mut encoder = InstructionEncoder::new();
-
-        for block in blocks {
-            for instruction in &block.instructions {
-                // Convert Operand to Option<Operand> for the encoder
-                let operand = match &instruction.operand {
-                    crate::assembly::Operand::None => None,
-                    op => Some(op.clone()),
-                };
-                encoder.emit_instruction(instruction.mnemonic, operand)?;
-            }
-        }
-
-        // Finalize to get the IL bytecode and max stack
-        let (il_code, max_stack, _) = encoder.finalize()?;
-
-        // Determine if we have exception handlers
-        let has_exceptions = !body.exception_handlers.is_empty();
-
-        // Calculate IL code size, ensuring it fits in u32
-        let il_code_size = u32::try_from(il_code.len())
-            .map_err(|_| malformed_error!("IL code size {} exceeds u32 range", il_code.len()))?;
-
-        // Encode the method header
-        let header = encode_method_body_header(
-            il_code_size,
-            max_stack,
-            body.local_var_sig_token,
-            has_exceptions,
-            body.is_init_local,
+        // The instructions of every block, each at its place in the code, where the exception
+        // handlers' offsets find them. Bytes no block covers (code no path reaches) are not
+        // kept with the method: they are written as `nop`s.
+        let instructions: Vec<_> = blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter().cloned())
+            .collect();
+        let code_rva = instructions
+            .iter()
+            .map(|instruction| instruction.rva)
+            .min()
+            .unwrap_or_default();
+        let il_code = InstructionEncoder::encode_decoded(
+            &instructions,
+            &vec![0x00; body.size_code],
+            code_rva,
         )?;
 
-        // Build the complete method body
-        let mut result = header;
-        result.extend_from_slice(&il_code);
-
-        // If fat format with exceptions, align to 4 bytes and add exception handlers
-        if has_exceptions {
-            // Align to 4-byte boundary
-            let remainder = result.len() % 4;
-            let padding = if remainder == 0 {
-                0
-            } else {
-                4usize.saturating_sub(remainder)
-            };
-            result.extend(std::iter::repeat_n(0u8, padding));
-
-            // Encode and append exception handlers
-            let exception_data = encode_exception_handlers(&body.exception_handlers)?;
-            result.extend_from_slice(&exception_data);
-        }
-
+        // The body as it was read: its header format, its exception section's layout and its
+        // declared stack depth, which the instructions alone cannot recompute (a call's
+        // effect on the stack is its signature's)
+        let mut result = Vec::new();
+        body.write_to(&mut result, &il_code)?;
         Ok(result)
     }
 
-    /// Returns the total encoded size of this method body in bytes.
-    ///
-    /// This calculates the size without actually encoding, useful for
-    /// layout planning. The size includes header, IL code, alignment
-    /// padding, and exception handler sections.
+    /// The size [`Self::encode_body`] encodes the method body to, in bytes: header, code,
+    /// alignment padding and exception section.
     ///
     /// # Returns
     ///
-    /// Returns `Some(size)` if the method has a body, `None` otherwise.
+    /// `None` when the method has no body or it does not encode.
     #[must_use]
     pub fn encoded_size(&self) -> Option<usize> {
-        let body = self.body.get()?;
-        let blocks = self.blocks.get()?;
-
-        // Calculate IL code size from instructions
-        let mut code_size = 0usize;
-        for block in blocks {
-            for instruction in &block.instructions {
-                // instruction.size is u64, safely convert to usize
-                let size = usize::try_from(instruction.size).ok()?;
-                code_size = code_size.checked_add(size)?;
-            }
-        }
-
-        // Determine header size
-        let has_exceptions = !body.exception_handlers.is_empty();
-        let has_locals = body.local_var_sig_token != 0;
-        let needs_fat = code_size > 63 || body.max_stack > 8 || has_locals || has_exceptions;
-
-        let header_size: usize = if needs_fat { 12 } else { 1 };
-
-        let mut total = header_size.checked_add(code_size)?;
-
-        // Add exception handler section size if needed
-        if has_exceptions {
-            // Align to 4 bytes
-            total = total.checked_add(3)? & !3;
-
-            // Calculate exception section size
-            let handler_count = body.exception_handlers.len();
-            // Check if we need fat format for exception handlers
-            let needs_fat_exceptions = handler_count > 20
-                || body.exception_handlers.iter().any(|h| {
-                    h.try_offset > 0xFFFF
-                        || h.try_length > 0xFF
-                        || h.handler_offset > 0xFFFF
-                        || h.handler_length > 0xFF
-                });
-
-            let per_handler = if needs_fat_exceptions { 24 } else { 12 };
-            // Fat format: 4-byte header + 24 bytes per handler
-            // Small format: 4-byte header + 12 bytes per handler
-            let handlers_size = handler_count.checked_mul(per_handler)?;
-            let section_size = handlers_size.checked_add(4)?;
-            total = total.checked_add(section_size)?;
-        }
-
-        Some(total)
+        self.encode_body().ok().map(|bytes| bytes.len())
     }
 }
 
@@ -2012,7 +2047,7 @@ mod tests {
         assembly::{
             BasicBlock, FlowType, Instruction, InstructionCategory, Operand, StackBehavior,
         },
-        test::builders::MethodBuilder,
+        testkit::{builders::MethodBuilder, helpers::load_sample},
     };
 
     #[test]
@@ -2028,6 +2063,46 @@ mod tests {
 
         assert_eq!(instruction_count, 0);
         assert_eq!(method.instruction_count(), 0);
+    }
+
+    /// A block of `size` bytes at `offset`, for clause-mapping tests.
+    fn block_at(id: usize, offset: usize, size: usize) -> BasicBlock {
+        let mut block = BasicBlock::new(id, 0x1000 + offset as u64, offset);
+        block.size = size;
+        block
+    }
+
+    #[test]
+    fn a_handler_ending_before_undecoded_bytes_keeps_its_range() {
+        // try [0x00, 0x10), finally [0x10, 0x16), then junk nothing reaches up
+        // to the leave target at 0x20. No block begins where the handler ends,
+        // and the handler still ends there.
+        let blocks = vec![
+            block_at(0, 0x00, 0x10),
+            block_at(1, 0x10, 0x06),
+            block_at(2, 0x20, 0x05),
+        ];
+        let clause = ExceptionHandler {
+            flags: ExceptionHandlerFlags::FINALLY,
+            try_offset: 0x00,
+            try_length: 0x10,
+            handler_offset: 0x10,
+            handler_length: 0x06,
+            handler: None,
+            filter_offset: 0,
+        };
+
+        let handlers = Method::ssa_handlers_for_clauses(&[clause], &blocks).unwrap();
+        let handler = &handlers[0];
+        assert_eq!(
+            handler.protected_range.map(|r| (r.start(), r.end())),
+            Some((0, 1))
+        );
+        assert_eq!(
+            handler.handler_range.map(|r| (r.start(), r.end())),
+            Some((1, 2)),
+            "a handler whose end falls in a gap must not lose its range"
+        );
     }
 
     #[test]
@@ -2281,7 +2356,7 @@ mod tests {
         assert_eq!(method_ref.token(), Some(Token::new(0x06000001)));
 
         // Test name
-        assert_eq!(method_ref.name(), Some("TestMethod".to_string()));
+        assert_eq!(method_ref.name().as_deref(), Some("TestMethod"));
     }
 
     #[test]
@@ -2310,13 +2385,104 @@ mod tests {
         assert!(!regular.is_constructor());
     }
 
+    /// A method's code kind is its code type when it has an RVA, `Runtime` for a runtime
+    /// method with or without one, and `None` for any other method without an RVA; a native
+    /// method's code starts at its RVA and one without code has no code start.
     #[test]
-    fn test_is_forwarded_pinvoke() {
-        // Test that the renamed method works correctly
-        let method = MethodBuilder::new().with_name("TestMethod").build();
+    fn code_kind_follows_the_code_type_and_the_rva() {
+        let cases = [
+            (MethodImplCodeType::IL, true, MethodCodeKind::Il),
+            (MethodImplCodeType::OPTIL, true, MethodCodeKind::OptIl),
+            (MethodImplCodeType::NATIVE, true, MethodCodeKind::Native),
+            (MethodImplCodeType::RUNTIME, true, MethodCodeKind::Runtime),
+            (MethodImplCodeType::IL, false, MethodCodeKind::None),
+            (MethodImplCodeType::OPTIL, false, MethodCodeKind::None),
+            (MethodImplCodeType::NATIVE, false, MethodCodeKind::None),
+            (MethodImplCodeType::RUNTIME, false, MethodCodeKind::Runtime),
+        ];
+        for (code_type, with_rva, kind) in cases {
+            let builder = MethodBuilder::new().with_impl_code_type(code_type);
+            let method = if with_rva {
+                builder.with_rva(0x2050)
+            } else {
+                builder.without_rva()
+            }
+            .build();
+            assert_eq!(method.code_kind(), kind, "{code_type:?}, RVA {with_rva}");
+            let code_rva = match kind {
+                // No body was read for a built method
+                MethodCodeKind::Native => Some(0x2050),
+                _ => None,
+            };
+            assert_eq!(method.code_rva(), code_rva, "{code_type:?}, RVA {with_rva}");
+        }
+    }
 
-        // Default method should not have forwarded pinvoke flag
-        assert!(!method.is_forwarded_pinvoke());
+    /// The first instruction of a CIL method follows its header, read from the image's
+    /// bytes as ECMA-335 II.25.4 lays them out: a tiny header (low bits `0b10`) is one byte,
+    /// a fat header (`0b11`) is its size field (the top four bits of its first word) times
+    /// four. Every method of the sample with a body is checked, tiny and fat alike.
+    #[test]
+    fn code_rva_is_the_first_instruction_after_the_header() {
+        let assembly = load_sample("WindowsBase.dll");
+        let file = assembly.file();
+        let (mut tiny, mut fat) = (0usize, 0usize);
+        for entry in assembly.methods().iter() {
+            let method = entry.value();
+            let (Some(rva), Some(_)) = (method.rva, method.body.get()) else {
+                continue;
+            };
+            assert_eq!(method.code_kind(), MethodCodeKind::Il, "{}", method.name);
+            let offset = file
+                .rva_to_offset(rva as usize)
+                .expect("the body's RVA maps");
+            let header = file
+                .data_slice(offset, 2)
+                .expect("the header is in the file");
+            let size = match header[0] & 0b11 {
+                0b10 => {
+                    tiny += 1;
+                    1
+                }
+                0b11 => {
+                    fat += 1;
+                    u32::from(header[1] >> 4) * 4
+                }
+                other => panic!("{}: header format {other:#b}", method.name),
+            };
+            assert_eq!(method.code_rva(), Some(rva + size), "{}", method.name);
+        }
+        assert!(tiny > 0 && fat > 0, "tiny {tiny}, fat {fat}");
+    }
+
+    /// The code type is a two-bit enumeration (ECMA-335 II.23.1.11): for each of its four
+    /// values exactly one predicate holds. Tested as flags, IL (zero) held for every method,
+    /// and native (one) and optimized IL (two) for a runtime method (three).
+    #[test]
+    fn exactly_one_code_type_predicate_holds() {
+        for code_type in [
+            MethodImplCodeType::IL,
+            MethodImplCodeType::NATIVE,
+            MethodImplCodeType::OPTIL,
+            MethodImplCodeType::RUNTIME,
+        ] {
+            let method = MethodBuilder::new().with_impl_code_type(code_type).build();
+            let holds = [
+                (MethodImplCodeType::IL, method.is_code_il()),
+                (MethodImplCodeType::NATIVE, method.is_code_native()),
+                (MethodImplCodeType::OPTIL, method.is_code_opt_il()),
+                (MethodImplCodeType::RUNTIME, method.is_code_runtime()),
+            ];
+            for (predicate, result) in holds {
+                assert_eq!(
+                    result,
+                    predicate == code_type,
+                    "code type {:#x}: the predicate for {:#x}",
+                    code_type.bits(),
+                    predicate.bits()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2346,7 +2512,7 @@ mod tests {
             .build();
         assert_eq!(runtime.rva_kind(), MethodRvaKind::Runtime);
 
-        // UnresolvedZero: no rva, no flag explanation — malformed metadata.
+        // UnresolvedZero: no rva, no flag explanation - malformed metadata.
         let unresolved = MethodBuilder::new().without_rva().build();
         assert_eq!(unresolved.rva_kind(), MethodRvaKind::UnresolvedZero);
 

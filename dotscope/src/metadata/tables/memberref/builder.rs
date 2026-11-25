@@ -249,285 +249,269 @@ impl MemberRefBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::{cilassembly::CilAssembly, metadata::cilassemblyview::CilAssemblyView};
+    use crate::{
+        cilassembly::CilAssembly, metadata::cilassemblyview::CilAssemblyView, testkit::fixture,
+    };
 
     #[test]
     fn test_memberref_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Create a MemberRefParent coded index (TypeRef)
-            let declaring_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
+        // Create a MemberRefParent coded index (TypeRef)
+        let declaring_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
 
-            // Create a method signature for a simple method
-            let method_signature = &[0x20, 0x00, 0x01]; // Default instance method, no params, void return
+        // Create a method signature for a simple method
+        let method_signature = &[0x20, 0x00, 0x01]; // Default instance method, no params, void return
 
-            let ref_ = MemberRefBuilder::new()
-                .class(declaring_type)
-                .name("ToString")
-                .signature(method_signature)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MemberRefBuilder::new()
+            .class(declaring_type)
+            .name("ToString")
+            .signature(method_signature)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                ref_.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            ref_.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
     }
 
     #[test]
     fn test_memberref_builder_field_reference() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let declaring_type =
-                CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::MemberRefParent); // Local type
+        let declaring_type = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::MemberRefParent); // Local type
 
-            // Create a field signature
-            let field_signature = &[0x06, 0x08]; // Field signature, int32 type
+        // Create a field signature
+        let field_signature = &[0x06, 0x08]; // Field signature, int32 type
 
-            let ref_ = MemberRefBuilder::new()
-                .class(declaring_type)
-                .name("m_value")
-                .signature(field_signature)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MemberRefBuilder::new()
+            .class(declaring_type)
+            .name("m_value")
+            .signature(field_signature)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                ref_.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            ref_.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
     }
 
     #[test]
     fn test_memberref_builder_constructor_reference() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let declaring_type =
-                CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::MemberRefParent);
+        let declaring_type = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::MemberRefParent);
 
-            // Create a constructor signature
-            let ctor_signature = &[0x20, 0x01, 0x01, 0x1C]; // Default instance method, 1 param, void return, object param
+        // Create a constructor signature
+        let ctor_signature = &[0x20, 0x01, 0x01, 0x1C]; // Default instance method, 1 param, void return, object param
 
-            let ref_ = MemberRefBuilder::new()
-                .class(declaring_type)
-                .name(".ctor")
-                .signature(ctor_signature)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MemberRefBuilder::new()
+            .class(declaring_type)
+            .name(".ctor")
+            .signature(ctor_signature)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                ref_.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            ref_.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
     }
 
     #[test]
     fn test_memberref_builder_module_reference() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let module_ref =
-                CodedIndex::new(TableId::ModuleRef, 1, CodedIndexType::MemberRefParent); // External module
+        let module_ref = CodedIndex::new(TableId::ModuleRef, 1, CodedIndexType::MemberRefParent); // External module
 
-            // Create a method signature for global function
-            let global_method_sig = &[0x00, 0x01, 0x08, 0x08]; // Static method, 1 param, int32 return, int32 param
+        // Create a method signature for global function
+        let global_method_sig = &[0x00, 0x01, 0x08, 0x08]; // Static method, 1 param, int32 return, int32 param
 
-            let ref_ = MemberRefBuilder::new()
-                .class(module_ref)
-                .name("GlobalFunction")
-                .signature(global_method_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MemberRefBuilder::new()
+            .class(module_ref)
+            .name("GlobalFunction")
+            .signature(global_method_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                ref_.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            ref_.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
     }
 
     #[test]
     fn test_memberref_builder_generic_type_reference() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let generic_type =
-                CodedIndex::new(TableId::TypeSpec, 1, CodedIndexType::MemberRefParent); // Generic type instantiation
+        let generic_type = CodedIndex::new(TableId::TypeSpec, 1, CodedIndexType::MemberRefParent); // Generic type instantiation
 
-            // Create a method signature
-            let method_signature = &[0x20, 0x01, 0x0E, 0x1C]; // Default instance method, 1 param, string return, object param
+        // Create a method signature
+        let method_signature = &[0x20, 0x01, 0x0E, 0x1C]; // Default instance method, 1 param, string return, object param
 
-            let ref_ = MemberRefBuilder::new()
-                .class(generic_type)
-                .name("GetValue")
-                .signature(method_signature)
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = MemberRefBuilder::new()
+            .class(generic_type)
+            .name("GetValue")
+            .signature(method_signature)
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(
-                ref_.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-        }
+        // Verify ref is created correctly
+        assert_eq!(
+            ref_.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
     }
 
     #[test]
     fn test_memberref_builder_missing_class() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = MemberRefBuilder::new()
-                .name("TestMethod")
-                .signature(&[0x20, 0x00, 0x01])
-                .build(&mut assembly);
+        let result = MemberRefBuilder::new()
+            .name("TestMethod")
+            .signature(&[0x20, 0x00, 0x01])
+            .build(&mut assembly);
 
-            // Should fail because class is required
-            assert!(result.is_err());
-        }
+        // Should fail because class is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_memberref_builder_missing_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let declaring_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
+        let declaring_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
 
-            let result = MemberRefBuilder::new()
-                .class(declaring_type)
-                .signature(&[0x20, 0x00, 0x01])
-                .build(&mut assembly);
+        let result = MemberRefBuilder::new()
+            .class(declaring_type)
+            .signature(&[0x20, 0x00, 0x01])
+            .build(&mut assembly);
 
-            // Should fail because name is required
-            assert!(result.is_err());
-        }
+        // Should fail because name is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_memberref_builder_missing_signature() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let declaring_type =
-                CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
+        let declaring_type = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
 
-            let result = MemberRefBuilder::new()
-                .class(declaring_type)
-                .name("TestMethod")
-                .build(&mut assembly);
+        let result = MemberRefBuilder::new()
+            .class(declaring_type)
+            .name("TestMethod")
+            .build(&mut assembly);
 
-            // Should fail because signature is required
-            assert!(result.is_err());
-        }
+        // Should fail because signature is required
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_memberref_builder_invalid_class_type() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Use a table type that's not valid for MemberRefParent
-            let invalid_class = CodedIndex::new(TableId::Field, 1, CodedIndexType::MemberRefParent); // Field not in MemberRefParent
+        // Use a table type that's not valid for MemberRefParent
+        let invalid_class = CodedIndex::new(TableId::Field, 1, CodedIndexType::MemberRefParent); // Field not in MemberRefParent
 
-            let result = MemberRefBuilder::new()
-                .class(invalid_class)
-                .name("TestMethod")
-                .signature(&[0x20, 0x00, 0x01])
-                .build(&mut assembly);
+        let result = MemberRefBuilder::new()
+            .class(invalid_class)
+            .name("TestMethod")
+            .signature(&[0x20, 0x00, 0x01])
+            .build(&mut assembly);
 
-            // Should fail because class type is not valid for MemberRefParent
-            assert!(result.is_err());
-        }
+        // Should fail because class type is not valid for MemberRefParent
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_memberref_builder_multiple_member_refs() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let type_ref1 = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
-            let type_ref2 = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::MemberRefParent);
-            let type_def1 = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::MemberRefParent);
+        let type_ref1 = CodedIndex::new(TableId::TypeRef, 1, CodedIndexType::MemberRefParent);
+        let type_ref2 = CodedIndex::new(TableId::TypeRef, 2, CodedIndexType::MemberRefParent);
+        let type_def1 = CodedIndex::new(TableId::TypeDef, 1, CodedIndexType::MemberRefParent);
 
-            let method_sig = &[0x20, 0x00, 0x01]; // Default instance method, no params, void return
-            let field_sig = &[0x06, 0x08]; // Field signature, int32
+        let method_sig = &[0x20, 0x00, 0x01]; // Default instance method, no params, void return
+        let field_sig = &[0x06, 0x08]; // Field signature, int32
 
-            // Create multiple member references
-            let member1 = MemberRefBuilder::new()
-                .class(type_ref1)
-                .name("Method1")
-                .signature(method_sig)
-                .build(&mut assembly)
-                .unwrap();
+        // Create multiple member references
+        let member1 = MemberRefBuilder::new()
+            .class(type_ref1)
+            .name("Method1")
+            .signature(method_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            let member2 = MemberRefBuilder::new()
-                .class(type_ref2.clone())
-                .name("Field1")
-                .signature(field_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let member2 = MemberRefBuilder::new()
+            .class(type_ref2.clone())
+            .name("Field1")
+            .signature(field_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            let member3 = MemberRefBuilder::new()
-                .class(type_def1)
-                .name("Method2")
-                .signature(method_sig)
-                .build(&mut assembly)
-                .unwrap();
+        let member3 = MemberRefBuilder::new()
+            .class(type_def1)
+            .name("Method2")
+            .signature(method_sig)
+            .build(&mut assembly)
+            .unwrap();
 
-            let member4 = MemberRefBuilder::new()
-                .class(type_ref2)
-                .name(".ctor")
-                .signature(&[0x20, 0x01, 0x01, 0x08]) // Constructor with int32 param
-                .build(&mut assembly)
-                .unwrap();
+        let member4 = MemberRefBuilder::new()
+            .class(type_ref2)
+            .name(".ctor")
+            .signature(&[0x20, 0x01, 0x01, 0x08]) // Constructor with int32 param
+            .build(&mut assembly)
+            .unwrap();
 
-            // All should succeed and have unique refs
-            assert!(!std::sync::Arc::ptr_eq(&member1, &member2));
-            assert!(!std::sync::Arc::ptr_eq(&member2, &member3));
-            assert!(!std::sync::Arc::ptr_eq(&member3, &member4));
+        // All should succeed and have unique refs
+        assert!(!std::sync::Arc::ptr_eq(&member1, &member2));
+        assert!(!std::sync::Arc::ptr_eq(&member2, &member3));
+        assert!(!std::sync::Arc::ptr_eq(&member3, &member4));
 
-            // All should have MemberRef table kind
-            assert_eq!(
-                member1.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-            assert_eq!(
-                member2.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-            assert_eq!(
-                member3.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-            assert_eq!(
-                member4.kind(),
-                crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
-            );
-        }
+        // All should have MemberRef table kind
+        assert_eq!(
+            member1.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
+        assert_eq!(
+            member2.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
+        assert_eq!(
+            member3.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
+        assert_eq!(
+            member4.kind(),
+            crate::cilassembly::ChangeRefKind::TableRow(TableId::MemberRef)
+        );
     }
 }

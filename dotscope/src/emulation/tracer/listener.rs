@@ -25,7 +25,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use dotscope::emulation::{TraceEvent, TraceListener};
 //! use std::sync::atomic::{AtomicU64, Ordering};
 //!

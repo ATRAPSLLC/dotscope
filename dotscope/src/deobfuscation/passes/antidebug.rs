@@ -7,14 +7,16 @@
 //!
 //! # Algorithm
 //!
-//! 1. Scan the method for `Call`/`CallVirt` instructions matching the sentinel patterns
-//! 2. Check the [`SentinelCondition`] — skip the method if sentinel co-occurrence
+//! 1. Scan the method for calls of methods matching the sentinel patterns
+//! 2. Check the [`SentinelCondition`] - skip the method if sentinel co-occurrence
 //!    requirements are not met
 //! 3. Run forward-only taint analysis from matched sentinel tokens
-//! 4. NOP all tainted non-terminator instructions
+//! 4. NOP the tainted non-terminator instructions, keeping any whose result
+//!    code that survives the pass still reads
 //! 5. Replace tainted branch terminators with unconditional jumps to the clean
-//!    successor (the branch that does NOT lead to the crash/exit path)
-//! 6. Remove tainted PHI nodes
+//!    successor (the branch that does NOT lead to the crash/exit path); other
+//!    tainted terminators stay
+//! 6. Remove the tainted PHI nodes nothing that survives reads
 //!
 //! # False Positive Mitigation
 //!
@@ -25,7 +27,7 @@
 //!   `target_methods` from detection for safety)
 //!
 //! Within a qualifying method, only instructions reachable via data-flow from sentinel
-//! tokens are removed — legitimate code that doesn't depend on sentinel results is
+//! tokens are removed - legitimate code that doesn't depend on sentinel results is
 //! preserved.
 //!
 //! # Example (BitMono timing checks)
@@ -50,14 +52,17 @@
 //! Jump(normal_block)
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+
+use analyssa::ir::function::{SsaEditOptions, SsaRollbackPolicy};
 
 use crate::{
     analysis::{
-        CilTarget, MethodRef, PhiTaintMode, SsaFunction, SsaOp, TaintConfig, TokenTaintBuilder,
+        CilTarget, MethodRef, PhiTaintMode, SsaFunction, SsaOp, SsaOpCilExt, TaintConfig,
+        TokenTaintBuilder,
     },
     compiler::{CompilerContext, EventKind, ModificationScope, SsaPass},
-    deobfuscation::utils::{resolve_qualified_method_name, retain_removable},
+    deobfuscation::utils::resolve_qualified_method_name,
     metadata::token::Token,
     CilObject,
 };
@@ -73,17 +78,17 @@ use crate::{
 pub enum SentinelCondition {
     /// All sentinel patterns must be present in the method.
     ///
-    /// Strongest gate — use when the sentinel set forms a known chain
+    /// Strongest gate - use when the sentinel set forms a known chain
     /// (e.g., BitMono's `UtcNow` → `op_Subtraction` → `TotalMilliseconds`).
     All,
     /// At least one sentinel pattern must be present.
     ///
-    /// Weakest gate — only safe when combined with a tight `target_methods`
+    /// Weakest gate - only safe when combined with a tight `target_methods`
     /// set from detection.
     Any,
     /// At least N distinct sentinel patterns must be present.
     ///
-    /// Middle ground — e.g., `AtLeast(2)` for "any 2 of 5 anti-debug APIs."
+    /// Middle ground - e.g., `AtLeast(2)` for "any 2 of 5 anti-debug APIs."
     AtLeast(usize),
 }
 
@@ -168,6 +173,10 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
         ModificationScope::CfgModifying
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn should_run(&self, method: &MethodRef, _host: &CompilerContext) -> bool {
         self.target_methods.is_empty() || self.target_methods.contains(&method.0)
     }
@@ -205,37 +214,48 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
                 forward: true,
                 backward: false,
                 phi_mode: PhiTaintMode::NoPropagation,
-                max_iterations: 100,
             })
-            .analyze(ssa);
+            .analyze(ssa, &host.budget());
         if taint.tainted_instr_count() == 0 {
             return Ok(false);
         }
 
-        let mut tainted_instrs: HashSet<(usize, usize)> =
+        let tainted_instrs: HashSet<(usize, usize)> =
             taint.tainted_instructions().iter().copied().collect();
-        let mut tainted_phis: HashSet<(usize, usize)> =
-            taint.tainted_phis().iter().copied().collect();
 
-        // Step 2b: Refuse to destroy a definition something still reads.
-        // `PhiTaintMode::NoPropagation` makes phis taint barriers, so a phi can
-        // merge a tainted definition into code the analysis never marks — and
-        // NOPing the definition would leave that read dangling, which the SSA
-        // verifier rejects for the whole method.
-        retain_removable(ssa, &mut tainted_instrs, &mut tainted_phis);
-        if tainted_instrs.is_empty() && tainted_phis.is_empty() {
+        // Step 2b: Settle what is removed. A tainted terminator other than a
+        // conditional branch has no neutralized form - a `ret` still returns,
+        // a `throw` still throws - so it stays, and goes on reading what it
+        // reads. Of the rest, a definition something outside the set still
+        // reads is kept: `PhiTaintMode::NoPropagation` makes phis taint
+        // barriers, so a phi can merge a tainted definition into code the
+        // analysis never marks, and NOPing the definition would leave that
+        // read dangling, which the SSA verifier rejects for the whole method.
+        let mut removable_instrs: BTreeSet<(usize, usize)> = tainted_instrs
+            .iter()
+            .copied()
+            .filter(|&(block_idx, instr_idx)| {
+                ssa.block(block_idx)
+                    .and_then(|block| block.instruction(instr_idx))
+                    .is_some_and(|instr| {
+                        !instr.is_terminator()
+                            || matches!(instr.op(), SsaOp::Branch { .. } | SsaOp::BranchCmp { .. })
+                    })
+            })
+            .collect();
+        let mut removable_phis: BTreeSet<(usize, usize)> =
+            taint.tainted_phis().iter().copied().collect();
+        ssa.retain_unread_removals(&mut removable_instrs, &mut removable_phis);
+        if removable_instrs.is_empty() && removable_phis.is_empty() {
             return Ok(false);
         }
 
-        // Sorted so the event log and the rewrite order do not depend on hash
-        // iteration order.
-        let mut removals: Vec<(usize, usize)> = tainted_instrs.iter().copied().collect();
-        removals.sort_unstable();
-
         // Step 3: Pre-compute branch redirect targets (immutable borrow)
-        // before mutating instructions (mutable borrow).
+        // before mutating instructions (mutable borrow). Which arm is
+        // protection is a question for the taint, not for the removal set:
+        // which definitions happened to be kept says nothing about it.
         let mut branch_redirects: Vec<(usize, usize, usize)> = Vec::new();
-        for &(block_idx, instr_idx) in &removals {
+        for &(block_idx, instr_idx) in &removable_instrs {
             if let Some(block) = ssa.block(block_idx) {
                 if let Some(instr) = block.instruction(instr_idx) {
                     if instr.is_terminator() {
@@ -265,46 +285,62 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
             }
         }
 
-        // Step 4: Apply mutations.
+        // Step 4: Apply the removals in one edit session. The tainted phis go
+        // first and the terminators last: folding a branch can strand a block,
+        // whose phis then become copies at its head, which would move both the
+        // phis and the instructions the plan names by index. A fold only removes
+        // an edge, and `fold_terminator_pruning_phis` repairs that by pruning
+        // the dropped successor's operand, so the session needs no value
+        // reconstruction.
         let mut neutralized = 0usize;
-
-        for &(block_idx, instr_idx) in &removals {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(instr) = block.instruction_mut(instr_idx) {
-                    // Record metadata tokens before neutralizing
-                    match instr.op() {
-                        SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => {
-                            ctx.neutralized_tokens.insert(method.token());
-                        }
-                        _ => {}
+        let mut neutralized_tokens: Vec<Token> = Vec::new();
+        ssa.edit(
+            SsaEditOptions::new().with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                for &(block_idx, phi_idx) in removable_phis.iter().rev() {
+                    let present = editor
+                        .function()
+                        .block(block_idx)
+                        .is_some_and(|block| phi_idx < block.phi_nodes().len());
+                    if present {
+                        editor.remove_phi(block_idx, phi_idx)?;
+                        neutralized = neutralized.saturating_add(1);
                     }
-
+                }
+                let mut folds: Vec<(usize, usize)> = Vec::new();
+                for &(block_idx, instr_idx) in &removable_instrs {
+                    let Some(instr) = editor
+                        .function()
+                        .block(block_idx)
+                        .and_then(|block| block.instruction(instr_idx))
+                    else {
+                        continue;
+                    };
+                    // Record metadata tokens before neutralizing
+                    if let Some((method_token, _)) = instr.op().method_call() {
+                        neutralized_tokens.push(method_token);
+                    }
                     if instr.is_terminator() {
                         if let Some(&(_, _, target)) = branch_redirects
                             .iter()
                             .find(|&&(bi, ii, _)| bi == block_idx && ii == instr_idx)
                         {
-                            instr.set_op(SsaOp::Jump { target });
-                            neutralized = neutralized.saturating_add(1);
+                            folds.push((block_idx, target));
                         }
                     } else {
-                        instr.set_op(SsaOp::Nop);
+                        editor.nop_instruction(block_idx, instr_idx)?;
                         neutralized = neutralized.saturating_add(1);
                     }
                 }
-            }
-        }
-
-        // Step 5: Remove tainted PHI nodes (reverse order for safe removal).
-        let mut removable_phis: Vec<(usize, usize)> = tainted_phis.into_iter().collect();
-        removable_phis.sort_by(|a, b| b.cmp(a));
-        for (block_idx, phi_idx) in removable_phis {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if phi_idx < block.phi_nodes().len() {
-                    block.phi_nodes_mut().remove(phi_idx);
+                for (block_idx, target) in folds {
+                    editor.fold_terminator_pruning_phis(block_idx, SsaOp::Jump { target })?;
                     neutralized = neutralized.saturating_add(1);
                 }
-            }
+                Ok(())
+            },
+        )?;
+        for token in neutralized_tokens {
+            ctx.neutralized_tokens.insert(token);
         }
 
         if neutralized > 0 {
@@ -323,7 +359,7 @@ impl SsaPass<CilTarget, CompilerContext> for SentinelTaintRemovalPass {
 
 /// Finds metadata tokens of sentinel API calls within a method's SSA.
 ///
-/// Scans all `Call`/`CallVirt` instructions and checks whether the resolved
+/// Scans all calls naming their method and checks whether the resolved
 /// method name contains any of the sentinel patterns.
 ///
 /// # Arguments
@@ -347,9 +383,8 @@ fn find_sentinel_tokens(
 
     for block in ssa.blocks() {
         for instr in block.instructions() {
-            let method_token = match instr.op() {
-                SsaOp::Call { method, .. } | SsaOp::CallVirt { method, .. } => method.token(),
-                _ => continue,
+            let Some((method_token, _)) = instr.op().method_call() else {
+                continue;
             };
 
             if let Some(name) = resolve_qualified_method_name(assembly, method_token) {
@@ -399,7 +434,101 @@ fn choose_clean_target(
     match (true_tainted, false_tainted) {
         (true, false) => false_target,
         (false, true) => true_target,
-        // Both or neither tainted — prefer true (typically the forward/exit path)
+        // Both or neither tainted - prefer true (typically the forward/exit path)
         _ => true_target,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        analysis::{CallGraph, Callee, SsaFunctionBuilder, SsaType},
+        testkit::{helpers::test_assembly_arc, passes::run_verified},
+    };
+
+    /// Runs a pass whose only sentinel is the test assembly's first MemberRef.
+    fn run(ssa: &mut SsaFunction) {
+        let assembly = test_assembly_arc();
+        let sentinel = Token::new(0x0A00_0001);
+        let name = resolve_qualified_method_name(&assembly, sentinel).unwrap();
+        let pattern: &'static str = Box::leak(name.into_boxed_str());
+        let pass = SentinelTaintRemovalPass::new(
+            "test",
+            "test",
+            HashSet::new(),
+            vec![pattern],
+            SentinelCondition::Any,
+        );
+        let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
+        ctx.set_assembly(assembly);
+        run_verified(&pass, ssa, &MethodRef::new(Token::new(0x0600_0001)), &ctx).unwrap();
+    }
+
+    /// A tainted `ret` stays, so the value it returns keeps its definition.
+    #[test]
+    fn a_tainted_return_keeps_the_value_it_returns() {
+        let sentinel = Callee::Direct(MethodRef::new(Token::new(0x0A00_0001)));
+        let mut ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    let value = b.call(sentinel, &[], SsaType::I32);
+                    b.ret_val(value);
+                });
+            })
+            .unwrap();
+        run(&mut ssa);
+        let instructions = ssa.block(0).unwrap().instructions();
+        assert!(
+            matches!(instructions[0].op(), SsaOp::Call(_)),
+            "the returned value is still defined"
+        );
+        assert!(matches!(
+            instructions[1].op(),
+            SsaOp::Return { value: Some(_), .. }
+        ));
+    }
+
+    /// The arm a tainted branch drops is the tainted one, even when a
+    /// definition in it has to be kept because a phi past the branch reads it.
+    #[test]
+    fn a_kept_definition_does_not_make_its_arm_clean() {
+        let sentinel = Callee::Direct(MethodRef::new(Token::new(0x0A00_0001)));
+        let mut ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                let mut flag = None;
+                f.block(0, |b| {
+                    let value = b.call(sentinel, &[], SsaType::I32);
+                    flag = Some(value);
+                    b.branch(value, 1, 2);
+                });
+                let flag = flag.unwrap();
+                let mut protected = None;
+                f.block(1, |b| {
+                    protected = Some(b.add(flag, flag));
+                    b.jump(3);
+                });
+                let mut clean = None;
+                f.block(2, |b| {
+                    clean = Some(b.const_i32(0));
+                    b.jump(3);
+                });
+                let (protected, clean) = (protected.unwrap(), clean.unwrap());
+                f.block(3, |b| {
+                    let merged = b.phi(&[(1, protected), (2, clean)]);
+                    b.ret_val(merged);
+                });
+            })
+            .unwrap();
+        run(&mut ssa);
+        assert!(
+            matches!(
+                ssa.block(0).unwrap().instructions().last().unwrap().op(),
+                SsaOp::Jump { target: 2 }
+            ),
+            "the branch keeps the untainted arm"
+        );
     }
 }

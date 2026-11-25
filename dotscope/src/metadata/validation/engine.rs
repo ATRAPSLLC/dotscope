@@ -14,7 +14,7 @@
 //! # Key Components
 //!
 //! - [`crate::metadata::validation::ValidationEngine`] - Main validation orchestrator
-//! - [`crate::metadata::validation::ValidationStatistics`] - Runtime validation statistics
+//! - [`crate::metadata::validation::EngineStatistics`] - Runtime validation statistics
 //! - [`crate::metadata::validation::TwoStageValidationResult`] - Results from both validation stages
 //! - [`crate::metadata::validation::ReferenceScanner`] - Shared reference scanning infrastructure
 //!
@@ -52,7 +52,7 @@
 use std::{sync::OnceLock, time::Instant};
 
 use log::debug;
-use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
+use rayon::prelude::*;
 
 use crate::{
     cilassembly::AssemblyChanges,
@@ -74,7 +74,7 @@ use crate::{
                 OwnedTypeDependencyValidator, OwnedTypeOwnershipValidator,
                 RawChangeIntegrityValidator, RawGenericConstraintValidator, RawHeapValidator,
                 RawLayoutConstraintValidator, RawOperationValidator, RawSignatureValidator,
-                RawTableValidator, RawTokenValidator,
+                RawSortOrderValidator, RawTableValidator, RawTokenValidator,
             },
         },
     },
@@ -99,6 +99,7 @@ fn init_raw_validators() -> Vec<Box<dyn RawValidator>> {
         // Structure validators (priority 175-200)
         Box::new(RawTokenValidator::new()),     // priority 200
         Box::new(RawTableValidator::new()),     // priority 190
+        Box::new(RawSortOrderValidator::new()), // priority 185
         Box::new(RawHeapValidator::new()),      // priority 180
         Box::new(RawSignatureValidator::new()), // priority 175
         // Constraint validators (priority 120-130)
@@ -153,26 +154,28 @@ fn init_owned_validators() -> Vec<Box<dyn OwnedValidator>> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use crate::metadata::validation::engine::ValidationEngine;
+/// ```
+/// use dotscope::metadata::validation::{ValidationConfig, ValidationEngine};
+/// use dotscope::{CilAssemblyView, CilObject};
 ///
-/// let engine = ValidationEngine::new(config)?;
+/// let assembly_view = CilAssemblyView::from_path("tests/samples/crafted_2.exe")?;
+/// let object_data = CilObject::from_path("tests/samples/crafted_2.exe")?;
+/// let config = ValidationConfig::production();
+/// let engine = ValidationEngine::new(&assembly_view, config)?;
 ///
 /// // Two-stage validation
 /// let result = engine.execute_two_stage_validation(
 ///     &assembly_view,
 ///     None, // No modifications
 ///     Some(&object_data),
-///     &config,
 /// )?;
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct ValidationEngine {
     /// Validation configuration
     config: ValidationConfig,
     /// Shared reference scanner
     scanner: ReferenceScanner,
-    /// Dedicated thread pool for this validation engine instance
-    thread_pool: ThreadPool,
 }
 
 impl ValidationEngine {
@@ -196,17 +199,6 @@ impl ValidationEngine {
                 message: format!("Failed to initialize reference scanner: {e}"),
             })?;
 
-        let thread_count = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(4);
-        let thread_pool = ThreadPoolBuilder::new()
-            .thread_name(|i| format!("validation-engine-{i}"))
-            .num_threads(thread_count)
-            .build()
-            .map_err(|e| Error::ValidationEngineInitFailed {
-                message: format!("Failed to create thread pool: {e}"),
-            })?;
-
         debug!(
             "Validation starting: {} raw + {} owned validators, lenient={}",
             init_raw_validators().len(),
@@ -214,11 +206,7 @@ impl ValidationEngine {
             config.lenient
         );
 
-        Ok(Self {
-            config,
-            scanner,
-            thread_pool,
-        })
+        Ok(Self { config, scanner })
     }
 
     /// Executes validation in two stages: Raw → Owned.
@@ -343,20 +331,9 @@ impl ValidationEngine {
 
         // Create validation context
         let context = if let Some(changes) = changes {
-            context_factory::raw_modification_context(
-                view,
-                changes,
-                &self.scanner,
-                &self.config,
-                &self.thread_pool,
-            )
+            context_factory::raw_modification_context(view, changes, &self.scanner, &self.config)
         } else {
-            context_factory::raw_loading_context(
-                view,
-                &self.scanner,
-                &self.config,
-                &self.thread_pool,
-            )
+            context_factory::raw_loading_context(view, &self.scanner, &self.config)
         };
 
         let active_validators: Vec<_> = validators
@@ -368,22 +345,20 @@ impl ValidationEngine {
             return Ok(ValidationResult::success());
         }
 
-        // Execute validators in parallel using this instance's dedicated thread pool
-        let results: Vec<(&str, Result<()>)> = self.thread_pool.install(|| {
-            active_validators
-                .par_iter()
-                .map(|validator| {
-                    let validator_result =
-                        validator
-                            .validate_raw(&context)
-                            .map_err(|e| Error::ValidationRawFailed {
-                                validator: validator.name().to_string(),
-                                message: e.to_string(),
-                            });
-                    (validator.name(), validator_result)
-                })
-                .collect()
-        });
+        // Execute validators in parallel on the global pool
+        let results: Vec<(&str, Result<()>)> = active_validators
+            .par_iter()
+            .map(|validator| {
+                let validator_result =
+                    validator
+                        .validate_raw(&context)
+                        .map_err(|e| Error::ValidationRawFailed {
+                            validator: validator.name().to_string(),
+                            message: e.to_string(),
+                        });
+                (validator.name(), validator_result)
+            })
+            .collect();
 
         let duration = start_time.elapsed();
 
@@ -431,8 +406,7 @@ impl ValidationEngine {
         let start_time = Instant::now();
 
         // Create validation context
-        let context =
-            context_factory::owned_context(object, &self.scanner, &self.config, &self.thread_pool);
+        let context = context_factory::owned_context(object, &self.scanner, &self.config);
 
         let active_validators: Vec<_> = validators
             .iter()
@@ -443,21 +417,20 @@ impl ValidationEngine {
             return Ok(ValidationResult::success());
         }
 
-        // Execute validators in parallel using this instance's dedicated thread pool (collect all errors)
-        let results: Vec<(&str, Result<()>)> = self.thread_pool.install(|| {
-            active_validators
-                .par_iter()
-                .map(|validator| {
-                    let validator_result = validator.validate_owned(&context).map_err(|e| {
-                        Error::ValidationOwnedFailed {
+        // Execute validators in parallel on the global pool (collect all errors)
+        let results: Vec<(&str, Result<()>)> = active_validators
+            .par_iter()
+            .map(|validator| {
+                let validator_result =
+                    validator
+                        .validate_owned(&context)
+                        .map_err(|e| Error::ValidationOwnedFailed {
                             validator: validator.name().to_string(),
                             message: e.to_string(),
-                        }
-                    });
-                    (validator.name(), validator_result)
-                })
-                .collect()
-        });
+                        });
+                (validator.name(), validator_result)
+            })
+            .collect();
 
         let duration = start_time.elapsed();
 
@@ -588,121 +561,94 @@ pub mod factory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::AssemblyChanges,
         metadata::{
-            cilassemblyview::CilAssemblyView,
-            cilobject::CilObject,
-            validation::{
-                config::ValidationConfig, context::RawValidationContext, traits::RawValidator,
-            },
+            cilassemblyview::CilAssemblyView, cilobject::CilObject,
+            validation::config::ValidationConfig,
         },
+        testkit::fixture,
     };
 
     // Test validator for validation
-    struct TestRawValidator {
-        should_fail: bool,
-    }
-
-    impl RawValidator for TestRawValidator {
-        fn validate_raw(&self, _context: &RawValidationContext) -> Result<()> {
-            if self.should_fail {
-                Err(Error::NotSupported)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn name(&self) -> &'static str {
-            "TestRawValidator"
-        }
-    }
 
     #[test]
     fn test_validation_engine_creation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let config = ValidationConfig::minimal();
-            let engine = ValidationEngine::new(&view, config);
-            assert!(engine.is_ok(), "Engine creation should succeed");
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let config = ValidationConfig::minimal();
+        let engine = ValidationEngine::new(&view, config);
+        assert!(engine.is_ok(), "Engine creation should succeed");
 
-            let engine = engine.unwrap();
-            let stats = engine.statistics();
-            assert!(stats.scanner_stats.total_tokens > 0);
-        }
+        let engine = engine.unwrap();
+        let stats = engine.statistics();
+        assert!(stats.scanner_stats.total_tokens > 0);
     }
 
     #[test]
     fn test_two_stage_validation_early_termination() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut config = ValidationConfig::comprehensive();
-            config.enable_raw_validation = true;
-            config.enable_owned_validation = true;
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut config = ValidationConfig::comprehensive();
+        config.enable_raw_validation = true;
+        config.enable_owned_validation = true;
 
-            if let Ok(engine) = ValidationEngine::new(&view, config) {
-                // Test with no object data - should only run Stage 1
-                let result = engine.execute_two_stage_validation(&view, None, None);
-                assert!(result.is_ok());
+        let engine = ValidationEngine::new(&view, config).expect("the validation engine builds");
+        // Test with no object data - should only run Stage 1
+        let result = engine.execute_two_stage_validation(&view, None, None);
+        assert!(result.is_ok());
 
-                let result = result.unwrap();
-                assert!(result.stage1_result().is_some());
-                assert!(result.stage2_result().is_none());
-            }
-        }
+        let result = result.unwrap();
+        assert!(result.stage1_result().is_some());
+        assert!(result.stage2_result().is_none());
     }
 
     #[test]
     fn test_raw_validation_with_changes() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let config = ValidationConfig::minimal();
-            if let Ok(engine) = ValidationEngine::new(&view, config) {
-                let changes = AssemblyChanges::empty();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let config = ValidationConfig::minimal();
+        let engine = ValidationEngine::new(&view, config).expect("the validation engine builds");
+        let changes = AssemblyChanges::empty();
 
-                // Test modification validation
-                let result = engine.execute_stage1_validation(&view, Some(&changes));
-                assert!(result.is_ok());
+        // Test modification validation
+        let result = engine.execute_stage1_validation(&view, Some(&changes));
+        assert!(result.is_ok());
 
-                // Test loading validation
-                let result = engine.execute_stage1_validation(&view, None);
-                assert!(result.is_ok());
-            }
-        }
+        // Test loading validation
+        let result = engine.execute_stage1_validation(&view, None);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_factory_functions() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            assert!(factory::minimal_engine(&view).is_ok());
-            assert!(factory::production_engine(&view).is_ok());
-            assert!(factory::comprehensive_engine(&view).is_ok());
-            assert!(factory::strict_engine(&view).is_ok());
-        }
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        assert!(factory::minimal_engine(&view).is_ok());
+        assert!(factory::production_engine(&view).is_ok());
+        assert!(factory::comprehensive_engine(&view).is_ok());
+        assert!(factory::strict_engine(&view).is_ok());
     }
 
     #[test]
     fn test_engine_statistics() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            if let Ok(engine) = ValidationEngine::new(&view, ValidationConfig::minimal()) {
-                let stats = engine.statistics();
-                let stats_string = stats.to_string();
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let engine = ValidationEngine::new(&view, ValidationConfig::minimal())
+            .expect("the validation engine builds");
+        let stats = engine.statistics();
+        let stats_string = stats.to_string();
 
-                assert!(stats_string.contains("validators"));
-                assert!(stats_string.contains("tokens"));
-            }
-        }
+        assert!(stats_string.contains("validators"));
+        assert!(stats_string.contains("tokens"));
     }
 
     /// Test that all validators are properly registered and the engine can create them
     #[test]
     fn test_all_validators_registered() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path).expect("Failed to load test assembly");
 
         // Create validation engine with comprehensive config to ensure all validators would run
@@ -730,7 +676,7 @@ mod tests {
     /// Test that raw validator creation doesn't panic and validators have unique names
     #[test]
     fn test_raw_validators_creation_and_uniqueness() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path).expect("Failed to load test assembly");
 
         let config = ValidationConfig::comprehensive();
@@ -754,8 +700,7 @@ mod tests {
     /// Test that owned validator creation doesn't panic and validators have unique names
     #[test]
     fn test_owned_validators_creation_and_uniqueness() {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let path = PathBuf::from(&manifest_dir).join("tests/samples/mono_4.8/mscorlib.dll");
+        let path = fixture("mono_4.8/mscorlib.dll");
 
         let object = CilObject::from_path(&path).expect("Failed to load mscorlib.dll");
         let view = CilAssemblyView::from_path(&path).expect("Failed to load test assembly");
@@ -777,8 +722,7 @@ mod tests {
     /// Test two-stage validation with all validators
     #[test]
     fn test_complete_two_stage_validation() {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let path = PathBuf::from(&manifest_dir).join("tests/samples/mono_4.8/mscorlib.dll");
+        let path = fixture("mono_4.8/mscorlib.dll");
         let view = CilAssemblyView::from_path(&path).expect("Failed to load test assembly");
         let object = CilObject::from_path(&path).expect("Failed to load mscorlib.dll");
 
@@ -815,7 +759,7 @@ mod tests {
     /// Test validation engine factory methods work with all validators
     #[test]
     fn test_validation_engine_factories() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path).expect("Failed to load test assembly");
 
         // Test all factory methods
@@ -850,7 +794,7 @@ mod tests {
     /// Test that validator names are unique for debugging purposes
     #[test]
     fn test_validator_name_uniqueness() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
+        let path = fixture("WindowsBase.dll");
         let view = CilAssemblyView::from_path(&path).expect("Failed to load test assembly");
 
         let config = ValidationConfig::comprehensive();

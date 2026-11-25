@@ -291,7 +291,7 @@ impl<'a, T: Target> SemanticAnalyzer<'a, T> {
                     add_sub_ops = add_sub_ops.saturating_add(1);
                     semantics.updated_vars.push(*dest);
                 }
-                SsaOp::Call { .. } | SsaOp::CallVirt { .. } | SsaOp::NewObj { .. } => {
+                SsaOp::Call(_) | SsaOp::NewObj { .. } => {
                     call_count = call_count.saturating_add(1);
                     semantics.has_side_effects = true;
                 }

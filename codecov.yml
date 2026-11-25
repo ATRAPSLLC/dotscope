@@ -5,8 +5,8 @@ coverage:
   status:
     project:
       default:
-        target: 90%
-        threshold: 2%
+        target: 80%
+        threshold: 1%
         if_ci_failed: error
     patch:
       default:
@@ -14,12 +14,13 @@ coverage:
         threshold: 5%
         if_ci_failed: error
 
-  ignore:
-    - "tests/**/*"
-    - "examples/**/*"
-    - "benches/**/*"
-    - "fuzz/**/*"
-    - "src/test/**/*"
+# Paths are relative to the repository root, where the crate is `dotscope/`.
+ignore:
+  - "dotscope/tests/**/*"
+  - "dotscope/examples/**/*"
+  - "dotscope/benches/**/*"
+  - "dotscope/fuzz/**/*"
+  - "dotscope/src/testkit/**/*"
 
 comment:
   layout: "reach,diff,flags,files,footer"

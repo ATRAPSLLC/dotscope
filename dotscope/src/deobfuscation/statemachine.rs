@@ -51,7 +51,7 @@ use std::{
 use analyssa::graph::{algorithms::DominatorTree, NodeId};
 
 use crate::{
-    analysis::{ConstValue, SsaFunction, SsaOp, SsaVarId},
+    analysis::{ConstValue, InstrId, SsaFunction, SsaOp, SsaVarId},
     compiler::CompilerContext,
     metadata::token::Token,
     CilObject,
@@ -90,9 +90,19 @@ pub struct StateUpdateCall {
 #[derive(Debug, Clone)]
 pub struct StateMachineCallSite {
     /// Block index where the decryptor call occurs.
+    ///
+    /// Where the call *is*, for the analyses that reason about position -
+    /// which state updates dominate it, which block it shares with its seed.
+    /// Not an identity: the first edit above it makes it name something else.
     pub block_idx: usize,
     /// Instruction index within the block.
     pub instr_idx: usize,
+    /// The call instruction's identity.
+    ///
+    /// What the call *is*, which is what a record about it has to be keyed by.
+    /// `None` for a function whose instructions carry no identity yet, which a
+    /// repair boundary fixes; such a site is processed but not remembered.
+    pub instr_id: Option<InstrId>,
     /// SSA variable that receives the decrypted value.
     pub dest: SsaVarId,
     /// Token of the decryptor method being called (resolved MethodDef).
@@ -109,12 +119,17 @@ pub struct StateMachineCallSite {
 }
 
 impl StateMachineCallSite {
-    /// Returns a location identifier for this call site.
+    /// Returns the call instruction's identity, which is how a record about
+    /// this call site is keyed.
+    ///
+    /// Position is not identity. The previous key was `block * 1000 + instr`,
+    /// which fails twice over: every edit above the call renumbers it, so a
+    /// record made before a rewrite describes a different call afterwards; and
+    /// a block with a thousand instructions - which obfuscated code reaches -
+    /// collides with the next block outright.
     #[must_use]
-    pub fn location(&self) -> usize {
-        self.block_idx
-            .saturating_mul(1000)
-            .saturating_add(self.instr_idx)
+    pub const fn identity(&self) -> Option<InstrId> {
+        self.instr_id
     }
 }
 
@@ -150,7 +165,7 @@ pub struct CfgInfo<'a> {
 ///
 /// # Example: ConfuserEx
 ///
-/// ```rust,ignore
+/// ```text
 /// impl StateMachineProvider for ConfuserExStateMachine {
 ///     fn applies_to_method(&self, method: Token) -> bool {
 ///         self.cfg_mode_methods.contains(&method)
@@ -689,7 +704,10 @@ impl StateMachineSemantics {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```text
+/// use std::sync::Arc;
+/// use dotscope::deobfuscation::{StateMachineSemantics, StateMachineState};
+///
 /// let semantics = Arc::new(StateMachineSemantics::confuserex_default());
 /// let mut state = StateMachineState::from_seed(0x12345678, semantics);
 ///
@@ -697,6 +715,7 @@ impl StateMachineSemantics {
 /// // - Updates slot 0 (flag & 0x03 = 0) with XOR
 /// // - Returns slot 1 ((flag >> 2) & 0x03 = 1)
 /// let result = state.next(0x04, 0x1111);
+/// println!("slot 1: {:#x}", result);
 /// ```
 #[derive(Debug, Clone)]
 pub struct StateMachineState {

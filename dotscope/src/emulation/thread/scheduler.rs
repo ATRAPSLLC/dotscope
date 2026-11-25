@@ -147,26 +147,46 @@ impl PartialOrd for ScheduleEntry {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use dotscope::emulation::thread::ThreadScheduler;
+/// ```
+/// use dotscope::emulation::ThreadScheduler;
+/// # use std::sync::{Arc, RwLock};
+/// # use dotscope::emulation::{
+/// #     AddressSpace, CaptureContext, EmulationConfig, EmulationThread, RuntimeState,
+/// #     SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+/// # };
+/// # let address_space = Arc::new(AddressSpace::new());
+/// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+/// # let context = Arc::new(ThreadContext::new(
+/// #     address_space,
+/// #     Arc::new(RwLock::new(RuntimeState::new())),
+/// #     Arc::new(CaptureContext::new()),
+/// #     Arc::new(EmulationConfig::default()),
+/// #     None,
+/// #     fake_objects,
+/// #     Arc::new(VirtualFs::new()),
+/// # ));
 ///
 /// // Create scheduler with 500 instructions per quantum
 /// let mut scheduler = ThreadScheduler::new(500);
 ///
 /// // Add threads and run
+/// let main_thread = EmulationThread::new(ThreadId::MAIN, context);
 /// scheduler.add_main_thread(main_thread);
 ///
 /// loop {
 ///     match scheduler.select_next() {
-///         Some(thread_id) => {
+///         Some(_thread_id) => {
 ///             // Execute instructions for this thread
 ///             if scheduler.record_instruction() {
 ///                 // Quantum exhausted, will switch on next select
 ///             }
+///             // Here the thread returns after its first instruction
+///             scheduler.complete_current(None);
 ///         }
 ///         None => break, // No ready threads
 ///     }
 /// }
+/// assert!(scheduler.all_completed());
 /// ```
 #[derive(Debug)]
 pub struct ThreadScheduler {
@@ -215,7 +235,9 @@ impl ThreadScheduler {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::emulation::ThreadScheduler;
+    ///
     /// let scheduler = ThreadScheduler::new(1000);
     /// assert_eq!(scheduler.quantum(), 1000);
     /// ```
@@ -447,11 +469,30 @@ impl ThreadScheduler {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// # use std::sync::{Arc, RwLock};
+    /// # use dotscope::emulation::{
+    /// #     AddressSpace, CaptureContext, EmulationConfig, EmulationThread, RuntimeState,
+    /// #     SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+    /// # };
+    /// # let address_space = Arc::new(AddressSpace::new());
+    /// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+    /// # let context = Arc::new(ThreadContext::new(
+    /// #     address_space,
+    /// #     Arc::new(RwLock::new(RuntimeState::new())),
+    /// #     Arc::new(CaptureContext::new()),
+    /// #     Arc::new(EmulationConfig::default()),
+    /// #     None,
+    /// #     fake_objects,
+    /// #     Arc::new(VirtualFs::new()),
+    /// # ));
+    /// # let mut scheduler = dotscope::emulation::ThreadScheduler::new(500);
+    /// # scheduler.add_main_thread(EmulationThread::new(ThreadId::MAIN, context));
     /// while let Some(thread_id) = scheduler.select_next() {
-    ///     // Execute one instruction for this thread
-    ///     execute_instruction(&mut scheduler, thread_id);
+    ///     // Execute one instruction for this thread: here its last
+    ///     println!("Thread {} runs", thread_id);
     ///     scheduler.record_instruction();
+    ///     scheduler.complete_current(None);
     /// }
     /// ```
     pub fn select_next(&mut self) -> Option<ThreadId> {
@@ -502,10 +543,27 @@ impl ThreadScheduler {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// // Execute instruction
-    /// execute_instruction(thread_id);
-    ///
+    /// ```
+    /// # use std::sync::{Arc, RwLock};
+    /// # use dotscope::emulation::{
+    /// #     AddressSpace, CaptureContext, EmulationConfig, EmulationThread, RuntimeState,
+    /// #     SharedFakeObjects, ThreadContext, ThreadId, VirtualFs,
+    /// # };
+    /// # let address_space = Arc::new(AddressSpace::new());
+    /// # let fake_objects = SharedFakeObjects::new(address_space.managed_heap());
+    /// # let context = Arc::new(ThreadContext::new(
+    /// #     address_space,
+    /// #     Arc::new(RwLock::new(RuntimeState::new())),
+    /// #     Arc::new(CaptureContext::new()),
+    /// #     Arc::new(EmulationConfig::default()),
+    /// #     None,
+    /// #     fake_objects,
+    /// #     Arc::new(VirtualFs::new()),
+    /// # ));
+    /// # let mut scheduler = dotscope::emulation::ThreadScheduler::new(500);
+    /// # scheduler.add_main_thread(EmulationThread::new(ThreadId::MAIN, context));
+    /// # let thread_id = scheduler.select_next().expect("the main thread is ready");
+    /// // Execute instruction, then count it against the quantum
     /// if scheduler.record_instruction() {
     ///     // Quantum exhausted, next select_next() will switch threads
     ///     println!("Thread {} preempted", thread_id);
@@ -573,12 +631,17 @@ impl ThreadScheduler {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::emulation::{HeapRef, ThreadScheduler, WakeCondition};
+    ///
+    /// let mut scheduler = ThreadScheduler::new(500);
+    /// let obj_ref = HeapRef::new(1);
+    ///
     /// // Wake all threads sleeping past instruction 1000
-    /// scheduler.wake(WakeCondition::SleepElapsed { current_instruction: 1000 });
+    /// scheduler.wake(&WakeCondition::SleepElapsed { current_instruction: 1000 });
     ///
     /// // Wake threads waiting on a specific monitor
-    /// scheduler.wake(WakeCondition::Monitor(obj_ref));
+    /// scheduler.wake(&WakeCondition::Monitor(obj_ref));
     /// ```
     pub fn wake(&mut self, condition: &WakeCondition) {
         let threads_to_wake: Vec<ThreadId> = self
@@ -769,17 +832,22 @@ impl ThreadScheduler {
 ///
 /// # Usage
 ///
-/// ```ignore
+/// ```
+/// use dotscope::emulation::{HeapRef, ThreadScheduler, WakeCondition};
+///
+/// let mut scheduler = ThreadScheduler::new(500);
+/// let object_ref = HeapRef::new(1);
+///
 /// // Wake threads waiting on a monitor
-/// scheduler.wake(WakeCondition::Monitor(object_ref));
+/// scheduler.wake(&WakeCondition::Monitor(object_ref));
 ///
 /// // Wake threads whose sleep has elapsed
-/// scheduler.wake(WakeCondition::SleepElapsed {
+/// scheduler.wake(&WakeCondition::SleepElapsed {
 ///     current_instruction: scheduler.total_instructions(),
 /// });
 ///
 /// // Wake all waiting threads
-/// scheduler.wake(WakeCondition::All);
+/// scheduler.wake(&WakeCondition::All);
 /// ```
 #[derive(Clone, Debug)]
 pub enum WakeCondition {
@@ -882,7 +950,7 @@ mod tests {
             },
             EmValue, HeapRef, ThreadId,
         },
-        test::emulation::create_test_context,
+        testkit::emulation::create_test_context,
     };
 
     fn create_test_thread(id: u32) -> EmulationThread {

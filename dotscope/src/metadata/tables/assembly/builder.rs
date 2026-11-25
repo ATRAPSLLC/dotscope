@@ -239,65 +239,62 @@ impl Default for AssemblyBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
+        testkit::fixture,
     };
 
     #[test]
     fn test_assembly_builder_basic() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref_ = AssemblyBuilder::new()
-                .name("TestAssembly")
-                .version(1, 2, 3, 4)
-                .culture("neutral")
-                .build(&mut assembly)
-                .unwrap();
+        let ref_ = AssemblyBuilder::new()
+            .name("TestAssembly")
+            .version(1, 2, 3, 4)
+            .culture("neutral")
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Assembly));
-        }
+        // Verify ref is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Assembly));
     }
 
     #[test]
     fn test_assembly_builder_with_public_key() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let public_key = vec![0x01, 0x02, 0x03, 0x04];
-            let ref_ = AssemblyBuilder::new()
-                .name("SignedAssembly")
-                .version(2, 0, 0, 0)
-                .public_key(public_key)
-                .hash_algorithm(0x8004) // SHA1
-                .flags(0x0001) // Public key flag
-                .build(&mut assembly)
-                .unwrap();
+        let public_key = vec![0x01, 0x02, 0x03, 0x04];
+        let ref_ = AssemblyBuilder::new()
+            .name("SignedAssembly")
+            .version(2, 0, 0, 0)
+            .public_key(public_key)
+            .hash_algorithm(0x8004) // SHA1
+            .flags(0x0001) // Public key flag
+            .build(&mut assembly)
+            .unwrap();
 
-            // Verify ref is created correctly
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Assembly));
-        }
+        // Verify ref is created correctly
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::Assembly));
     }
 
     #[test]
     fn test_assembly_builder_missing_name() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = AssemblyBuilder::new()
-                .version(1, 0, 0, 0)
-                .build(&mut assembly);
+        let result = AssemblyBuilder::new()
+            .version(1, 0, 0, 0)
+            .build(&mut assembly);
 
-            // Should fail because name is required
-            assert!(result.is_err());
-        }
+        // Should fail because name is required
+        assert!(result.is_err());
     }
 }

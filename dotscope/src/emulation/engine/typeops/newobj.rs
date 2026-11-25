@@ -14,6 +14,7 @@ use crate::{
         EmValue, HeapRef,
     },
     metadata::{
+        streams::SharedStr,
         tables::{MemberRefSignature, TableId},
         token::Token,
         typesystem::{CilFlavor, CilType, PointerSize},
@@ -101,8 +102,8 @@ pub fn resolve_newobj(
         .heap_mut()
         .alloc_object_with_fields(type_token, &field_types)?;
 
-    // Try to find a constructor hook
-    let mut hook_handled = false;
+    // Try to find a constructor hook. What it constructs is what `newobj` pushes.
+    let mut hooked: Option<EmValue> = None;
     if let Some(ref decl_type) = declaring_type {
         let this_value = EmValue::ObjectRef(obj_ref);
         let hook_context = HookContext::new(
@@ -118,8 +119,11 @@ pub fn resolve_newobj(
 
         match hooks.execute(&hook_context, thread, |_| None)? {
             HookOutcome::NoMatch => {}
-            HookOutcome::Handled(_) | HookOutcome::ReflectionInvoke { .. } => {
-                hook_handled = true;
+            HookOutcome::Handled(value) => {
+                hooked = Some(value.unwrap_or(EmValue::ObjectRef(obj_ref)));
+            }
+            HookOutcome::ReflectionInvoke { .. } => {
+                hooked = Some(EmValue::ObjectRef(obj_ref));
             }
             HookOutcome::ThrewException {
                 exception_type,
@@ -135,7 +139,7 @@ pub fn resolve_newobj(
 
     // Check that the method has a body AND has decoded instructions
     let has_instructions = method.instructions().next().is_some();
-    if !hook_handled && method.has_body() && has_instructions {
+    if hooked.is_none() && method.has_body() && has_instructions {
         let mut full_args = vec![EmValue::ObjectRef(obj_ref)];
         full_args.extend(arg_values);
 
@@ -147,7 +151,7 @@ pub fn resolve_newobj(
     }
 
     // Delegate constructor detection
-    if !hook_handled && method.is_code_runtime() && arg_values.len() == 2 {
+    if hooked.is_none() && method.is_code_runtime() && arg_values.len() == 2 {
         if let Some(ref decl_type) = declaring_type {
             if is_delegate_type(decl_type) {
                 let target = match arg_values.first() {
@@ -189,10 +193,9 @@ pub fn resolve_newobj(
         }
     }
 
-    if hook_handled {
-        Ok(NewObjResolution::HookedBypass { obj_ref })
-    } else {
-        Ok(NewObjResolution::DefaultObject { obj_ref })
+    match hooked {
+        Some(value) => Ok(NewObjResolution::HookedBypass { value }),
+        None => Ok(NewObjResolution::DefaultObject { obj_ref }),
     }
 }
 
@@ -228,7 +231,7 @@ fn resolve_newobj_memberref(
     let args = thread.pop_args(param_count)?;
 
     let (namespace, type_name_only) = EmulationContext::get_member_ref_type_info(&member_ref)
-        .unwrap_or_else(|| (String::new(), String::from("Unknown")));
+        .unwrap_or_else(|| (SharedStr::default(), SharedStr::from("Unknown")));
 
     let type_token = EmulationContext::get_member_ref_type_token(&member_ref)
         .unwrap_or_else(|| Token::new(constructor_token.value() & 0x00FF_FFFF));
@@ -271,8 +274,16 @@ fn resolve_newobj_memberref(
 
     match hooks.execute(&hook_context, thread, |_| None)? {
         HookOutcome::NoMatch => {}
-        HookOutcome::Handled(_) | HookOutcome::ReflectionInvoke { .. } => {
-            return Ok(NewObjResolution::HookedBypass { obj_ref });
+        HookOutcome::Handled(value) => {
+            // What the hook constructed, or the allocation it initialized
+            return Ok(NewObjResolution::HookedBypass {
+                value: value.unwrap_or(EmValue::ObjectRef(obj_ref)),
+            });
+        }
+        HookOutcome::ReflectionInvoke { .. } => {
+            return Ok(NewObjResolution::HookedBypass {
+                value: EmValue::ObjectRef(obj_ref),
+            });
         }
         HookOutcome::ThrewException {
             exception_type,
@@ -363,14 +374,38 @@ pub fn is_delegate_type(cil_type: &CilType) -> bool {
     false
 }
 
+/// The character `value` holds: a `char` as the stack or an array element holds it, either
+/// as [`EmValue::Char`] or as the `int32` its UTF-16 code unit widens to.
+fn char_of(value: &EmValue) -> Option<char> {
+    match value {
+        EmValue::Char(c) => Some(*c),
+        #[allow(clippy::cast_sign_loss)]
+        EmValue::I32(unit) => char::from_u32(*unit as u32),
+        _ => None,
+    }
+}
+
 /// Creates a `System.String` from constructor arguments.
 ///
-/// Supports the common string constructor overloads:
-/// - `String(char[])` — builds string from character array
-/// - `String(char[], int, int)` — builds string from char array slice
+/// Supports the string constructor overloads that take characters:
+/// - `String(char[])` - the array's characters;
+/// - `String(char[], int startIndex, int length)` - `length` of them from `startIndex`;
+/// - `String(char c, int count)` - `c` repeated `count` times.
 ///
-/// Falls back to an empty string for unrecognized overloads.
+/// A character is accepted as [`EmValue::Char`] or as the `int32` a `char` widens to on the
+/// stack. A negative count, start or length, or a slice past the array's end, is refused as
+/// the runtime refuses it (`ArgumentOutOfRangeException`), and any other overload (from a
+/// pointer, a span, an encoding) is refused rather than answered with a string it did not
+/// build.
+///
+/// # Errors
+///
+/// [`EmulationError::InvalidStringOperation`] for the arguments the runtime refuses and the
+/// overloads not emulated; a heap error reading the array or allocating the string.
 fn create_string_from_ctor_args(thread: &mut EmulationThread, args: &[EmValue]) -> Result<HeapRef> {
+    let refused = |description: String| -> crate::Error {
+        EmulationError::InvalidStringOperation { description }.into()
+    };
     match args {
         // String(char[])
         [EmValue::ObjectRef(array_ref)] => {
@@ -379,60 +414,140 @@ fn create_string_from_ctor_args(thread: &mut EmulationThread, args: &[EmValue]) 
         }
         // String(char[], int startIndex, int length)
         [EmValue::ObjectRef(array_ref), EmValue::I32(start), EmValue::I32(len)] => {
-            let full = read_string_from_char_array(thread, *array_ref)?;
-            let start = *start as usize;
-            let len = *len as usize;
-            let chars: Vec<char> = full.chars().collect();
-            let slice: String = chars
-                .get(start..start.saturating_add(len))
-                .unwrap_or(&[])
-                .iter()
+            let (Ok(start), Ok(len)) = (usize::try_from(*start), usize::try_from(*len)) else {
+                return Err(refused(format!(
+                    "String(char[], int, int): start {start} and length {len} must be \
+                     non-negative"
+                )));
+            };
+            let chars: Vec<char> = read_string_from_char_array(thread, *array_ref)?
+                .chars()
                 .collect();
-            thread.heap_mut().alloc_string(&slice)
-        }
-        // String(char, int count) — repeats a character
-        [EmValue::I32(ch), EmValue::I32(count)] => {
-            if *count < 0 {
-                return Err(EmulationError::InvalidStringOperation {
-                    description: format!(
-                        "String(char, int) constructor: count must be non-negative, got {count}"
-                    ),
-                }
-                .into());
-            }
-            let c = char::from_u32(*ch as u32).unwrap_or('\0');
-            let s: String = std::iter::repeat_n(c, *count as usize).collect();
+            let Some(slice) = start.checked_add(len).and_then(|end| chars.get(start..end)) else {
+                return Err(refused(format!(
+                    "String(char[], int, int): {len} characters from {start} pass the \
+                     array's {} characters",
+                    chars.len()
+                )));
+            };
+            let s: String = slice.iter().collect();
             thread.heap_mut().alloc_string(&s)
         }
-        // Fallback: empty string
-        _ => {
-            debug!(
-                "String constructor with {} args not fully handled, creating empty string",
-                args.len()
-            );
-            thread.heap_mut().alloc_string("")
+        // String(char c, int count) - repeats a character
+        [ch, EmValue::I32(count)] if char_of(ch).is_some() => {
+            let Ok(count) = usize::try_from(*count) else {
+                return Err(refused(format!(
+                    "String(char, int) constructor: count must be non-negative, got {count}"
+                )));
+            };
+            let c = char_of(ch).unwrap_or('\0');
+            let s: String = std::iter::repeat_n(c, count).collect();
+            thread.heap_mut().alloc_string(&s)
         }
+        _ => Err(refused(format!(
+            "String constructor with arguments ({}) is not emulated",
+            args.iter()
+                .map(|arg| arg.cil_flavor().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 
 /// Reads a `char[]` array from the managed heap and converts it to a Rust `String`.
+///
+/// # Errors
+///
+/// [`EmulationError::InvalidStringOperation`] for an element that is no character; a heap
+/// error reading the array.
 fn read_string_from_char_array(thread: &EmulationThread, array_ref: HeapRef) -> Result<String> {
     let heap = thread.heap();
     let length = heap.get_array_length(array_ref)?;
-    let mut chars = Vec::with_capacity(length);
-
+    let mut chars = String::with_capacity(length);
     for i in 0..length {
-        let elem = heap.get_array_element(array_ref, i)?;
-        let ch = match elem {
-            EmValue::I32(v) =>
-            {
-                #[allow(clippy::cast_sign_loss)]
-                char::from_u32(v as u32).unwrap_or('\0')
+        let element = heap.get_array_element(array_ref, i)?;
+        let Some(ch) = char_of(&element) else {
+            return Err(EmulationError::InvalidStringOperation {
+                description: format!(
+                    "char[] element {i} holds {}, which is no character",
+                    element.cil_flavor()
+                ),
             }
-            _ => '\0',
+            .into());
         };
         chars.push(ch);
     }
+    Ok(chars)
+}
 
-    Ok(chars.into_iter().collect())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::emulation::create_test_thread;
+
+    /// The string `args` construct, or the error they are refused with.
+    fn construct(thread: &mut EmulationThread, args: &[EmValue]) -> Result<String> {
+        let string = create_string_from_ctor_args(thread, args)?;
+        Ok(thread.heap().get_string(string)?.to_string())
+    }
+
+    /// A `char[]` holding `text`, its elements as `kind` makes them.
+    fn char_array(thread: &mut EmulationThread, text: &str, kind: fn(char) -> EmValue) -> EmValue {
+        let elements = text.chars().map(kind).collect();
+        EmValue::ObjectRef(
+            thread
+                .heap()
+                .alloc_array_with_values(CilFlavor::Char, elements)
+                .unwrap(),
+        )
+    }
+
+    /// A character is accepted as `EmValue::Char` and as the `int32` a `char` widens to, in
+    /// an array and as the repeated character alike.
+    #[test]
+    fn characters_are_read_as_chars_and_as_int32() {
+        let mut thread = create_test_thread();
+        for kind in [EmValue::Char as fn(char) -> EmValue, |c| {
+            EmValue::I32(c as i32)
+        }] {
+            let array = char_array(&mut thread, "dotscope", kind);
+            assert_eq!(
+                construct(&mut thread, std::slice::from_ref(&array)).unwrap(),
+                "dotscope"
+            );
+            assert_eq!(
+                construct(&mut thread, &[array, EmValue::I32(3), EmValue::I32(5)]).unwrap(),
+                "scope"
+            );
+            assert_eq!(
+                construct(&mut thread, &[kind('x'), EmValue::I32(3)]).unwrap(),
+                "xxx"
+            );
+        }
+    }
+
+    /// What the runtime refuses is refused, and an overload not emulated is refused rather
+    /// than answered with an empty string.
+    #[test]
+    fn refused_arguments_and_unknown_overloads_are_errors() {
+        let mut thread = create_test_thread();
+        let array = char_array(&mut thread, "abc", EmValue::Char);
+        for args in [
+            vec![EmValue::Char('x'), EmValue::I32(-1)],
+            vec![array.clone(), EmValue::I32(-1), EmValue::I32(1)],
+            vec![array.clone(), EmValue::I32(1), EmValue::I32(-1)],
+            vec![array.clone(), EmValue::I32(2), EmValue::I32(2)],
+            vec![EmValue::I64(0)],
+            vec![],
+        ] {
+            assert!(construct(&mut thread, &args).is_err(), "{args:?}");
+        }
+        let numbers = EmValue::ObjectRef(
+            thread
+                .heap()
+                .alloc_array_with_values(CilFlavor::I8, vec![EmValue::I64(1)])
+                .unwrap(),
+        );
+        assert!(construct(&mut thread, &[numbers]).is_err());
+    }
 }

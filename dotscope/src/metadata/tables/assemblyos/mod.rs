@@ -8,7 +8,7 @@
 //!
 //! - [`crate::metadata::tables::assemblyos::AssemblyOsRaw`]: Raw table structure (no heap resolution needed)
 //! - [`crate::metadata::tables::assemblyos::AssemblyOs`]: Type alias to Raw since all data is self-contained
-//! - [`crate::metadata::tables::assemblyos::loader::AssemblyOsLoader`]: Internal loader for processing `AssemblyOS` table data
+//! - [`crate::metadata::loader::tables::AssemblyOsLoader`]: Internal loader for processing `AssemblyOS` table data
 //! - Type aliases for efficient collections and reference management
 //!
 //! # `AssemblyOS` Table Structure
@@ -34,13 +34,11 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use raw::*;
 
 /// A map that holds the mapping of [`crate::metadata::token::Token`] to parsed [`crate::metadata::tables::assemblyos::AssemblyOs`]

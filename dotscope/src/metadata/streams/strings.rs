@@ -200,9 +200,18 @@
 //! - **ECMA-335 II.24.2.3**: Strings heap format and UTF-8 encoding requirements
 //! - **ECMA-335 II.22**: Metadata tables and string reference mechanisms
 
-use std::{ffi::CStr, str};
+use std::{
+    ffi::CStr,
+    str,
+    sync::{Arc, OnceLock},
+};
 
-use crate::{Error, HeapKind, ParseFailure, Result};
+use dashmap::DashMap;
+
+use crate::{
+    metadata::streams::{sentinel_heap, sharedstr::Run, SharedStr},
+    Error, HeapKind, ParseFailure, Result,
+};
 
 /// ECMA-335 compliant `#Strings` heap providing UTF-8 identifier string access.
 ///
@@ -375,6 +384,22 @@ use crate::{Error, HeapKind, ParseFailure, Result};
 pub struct Strings<'a> {
     /// Raw bytes of the strings heap
     data: &'a [u8],
+    /// The heap's strings as shared copies, built on the first [`Self::get_shared`]
+    shared: OnceLock<SharedRuns>,
+}
+
+/// The shared copies of a strings heap's NUL-terminated runs.
+///
+/// Any offset into the heap names the suffix of one run, the bytes up to the next NUL. A run
+/// is copied once, on the first name inside it, and every name inside it shares the copy:
+/// memory stays within the heap's size, and each lookup costs a binary search, however many
+/// rows name the run and at whatever offsets.
+struct SharedRuns {
+    /// The offset of every NUL byte of the heap, ascending: the end of each run.
+    ends: Vec<u32>,
+    /// By run (its index in `ends`): the offset its longest valid UTF-8 suffix starts at,
+    /// and a copy of that suffix.
+    runs: DashMap<usize, (usize, Arc<Run>)>,
 }
 
 impl<'a> Strings<'a> {
@@ -395,9 +420,10 @@ impl<'a> Strings<'a> {
     /// ## Validation Performed
     ///
     /// This method enforces ECMA-335 compliance by checking:
-    /// 1. **Non-empty data**: Heap must contain at least one byte
-    /// 2. **Mandatory null byte**: First byte must be 0x00 (empty string at index 0)
-    /// 3. **Format integrity**: Basic structural validation of heap data
+    /// 1. **Mandatory null byte**: First byte must be 0x00 (empty string at index 0)
+    /// 2. **Format integrity**: Basic structural validation of heap data
+    ///
+    /// A stream of no bytes is a heap with no entries: index 0 reads as the empty string.
     ///
     /// Note: Individual string UTF-8 validation is performed during access via [`Strings::get`]
     /// to optimize construction performance for large heaps.
@@ -412,7 +438,6 @@ impl<'a> Strings<'a> {
     /// # Errors
     ///
     /// Returns [`crate::Error`] in the following cases:
-    /// - **Empty heap**: Data slice is empty (violates ECMA-335 requirement)
     /// - **Missing null byte**: First byte is not 0x00 (violates mandatory empty string at index 0)
     ///
     /// # Examples
@@ -465,10 +490,6 @@ impl<'a> Strings<'a> {
     /// use dotscope::metadata::streams::Strings;
     ///
     /// # fn example() {
-    /// // Error: Empty data (no mandatory null byte)
-    /// let empty_data = [];
-    /// assert!(Strings::from(&empty_data).is_err());
-    ///
     /// // Error: Missing mandatory null byte at index 0
     /// let no_null_byte = [b'I', b'n', b'v', b'a', b'l', b'i', b'd'];
     /// assert!(Strings::from(&no_null_byte).is_err());
@@ -532,15 +553,10 @@ impl<'a> Strings<'a> {
     /// - [`Strings::iter`]: Sequential iteration over all heap strings
     /// - [ECMA-335 II.24.2.3](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Strings heap format specification
     pub fn from(data: &[u8]) -> Result<Strings<'_>> {
-        if data.first() != Some(&0) {
-            return Err(ParseFailure::HeapCorrupt {
-                heap: HeapKind::Strings,
-                reason: "first byte must be 0 (empty string sentinel)".into(),
-            }
-            .into());
-        }
-
-        Ok(Strings { data })
+        Ok(Strings {
+            data: sentinel_heap(data, HeapKind::Strings)?,
+            shared: OnceLock::new(),
+        })
     }
 
     /// Access a UTF-8 string at the specified heap offset with comprehensive validation.
@@ -795,6 +811,87 @@ impl<'a> Strings<'a> {
         }
     }
 
+    /// Access the string at the specified heap offset as a [`SharedStr`].
+    ///
+    /// Resolves the same string as [`Self::get`], and fails exactly where it fails (out of
+    /// bounds, no terminating NUL, not valid UTF-8 from `index`), but returns a string that
+    /// shares its storage with every other name of the same NUL-terminated run of the
+    /// heap. A metadata row keeps its name this way: a run is copied once, however many rows
+    /// name it and at whatever offsets inside it, so a hostile image pointing many rows at
+    /// one long string costs no more memory than the heap, and a lookup costs a binary
+    /// search instead of a scan of the string.
+    ///
+    /// The first call indexes the heap's NUL bytes (one pass over the heap).
+    ///
+    /// # Arguments
+    /// * `index` - Byte offset within the strings heap where the string begins
+    ///
+    /// # Errors
+    /// Returns an error when `index` is past the heap, when no NUL ends the string, or when
+    /// the bytes from `index` to the NUL are not valid UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dotscope::metadata::streams::Strings;
+    ///
+    /// let data = [0u8, b'L', b'i', b's', b't', 0];
+    /// let strings = Strings::from(&data)?;
+    /// assert_eq!(strings.get_shared(1)?, "List");
+    /// assert_eq!(strings.get_shared(3)?, "st", "an offset inside a string names its tail");
+    /// # Ok::<(), dotscope::Error>(())
+    /// ```
+    pub fn get_shared(&self, index: usize) -> Result<SharedStr> {
+        let oob = || ParseFailure::HeapOutOfBounds {
+            heap: HeapKind::Strings,
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+        };
+        let corrupt = || ParseFailure::HeapCorrupt {
+            heap: HeapKind::Strings,
+            reason: format!("invalid UTF-8 string at index {index}"),
+        };
+        if index >= self.data.len() {
+            return Err(oob().into());
+        }
+
+        let shared = self.shared.get_or_init(|| SharedRuns {
+            ends: self
+                .data
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == 0)
+                .filter_map(|(offset, _)| u32::try_from(offset).ok())
+                .collect(),
+            runs: DashMap::new(),
+        });
+        let run = shared
+            .ends
+            .partition_point(|end| usize::try_from(*end).is_ok_and(|end| end < index));
+        let end = shared
+            .ends
+            .get(run)
+            .and_then(|end| usize::try_from(*end).ok())
+            .ok_or_else(|| Error::from(corrupt()))?;
+        let run_start = match run.checked_sub(1) {
+            Some(previous) => shared
+                .ends
+                .get(previous)
+                .and_then(|end| usize::try_from(*end).ok())
+                .map_or(0, |end| end.saturating_add(1)),
+            None => 0,
+        };
+
+        let (valid_start, buf) = shared
+            .runs
+            .entry(run)
+            .or_insert_with(|| valid_suffix(self.data, run_start, end))
+            .clone();
+        index
+            .checked_sub(valid_start)
+            .and_then(|start| SharedStr::suffix(buf, start))
+            .ok_or_else(|| corrupt().into())
+    }
+
     /// Create an iterator for sequential traversal of all strings in the heap.
     ///
     /// Returns a [`crate::metadata::streams::strings::StringsIterator`] that provides zero-copy access to all null-terminated
@@ -991,6 +1088,18 @@ impl<'a> Strings<'a> {
         StringsIterator::new(self)
     }
 
+    /// Every entry of the heap after the null string at offset 0, as its bytes without the
+    /// null terminator, with its offset: valid UTF-8 or not, so that nothing that follows an
+    /// entry [`Self::get`] refuses goes missing. A heap that ends without a terminator ends
+    /// with its unterminated bytes as the last entry.
+    #[must_use]
+    pub fn entries(&self) -> StringEntries<'a> {
+        StringEntries {
+            data: self.data,
+            position: 1,
+        }
+    }
+
     /// Returns the raw underlying data of the strings heap.
     ///
     /// This provides access to the complete heap data including the null byte at offset 0
@@ -1130,6 +1239,32 @@ impl<'a> Strings<'a> {
             .filter_map(|(offset, _)| u32::try_from(offset).ok())
             .collect()
     }
+}
+
+/// The longest suffix of `data[start..end]` that is valid UTF-8, with the offset it starts
+/// at.
+///
+/// A string read from an offset is valid exactly when the bytes from there to the NUL are:
+/// the valid suffixes of a run are those starting on a char boundary of its longest valid
+/// suffix, which begins after the run's last invalid sequence (an empty string at `end` when
+/// the run ends inside one).
+fn valid_suffix(data: &[u8], start: usize, end: usize) -> (usize, Arc<Run>) {
+    let mut from = start;
+    while from < end {
+        let Some(bytes) = data.get(from..end) else {
+            break;
+        };
+        match str::from_utf8(bytes) {
+            Ok(text) => return (from, Run::new(text)),
+            Err(error) => {
+                let skip = error
+                    .valid_up_to()
+                    .saturating_add(error.error_len().unwrap_or(bytes.len()));
+                from = from.saturating_add(skip.max(1));
+            }
+        }
+    }
+    (end, Run::new(""))
 }
 
 impl<'a> IntoIterator for &'a Strings<'a> {
@@ -1272,10 +1407,8 @@ impl<'a> IntoIterator for &'a Strings<'a> {
 /// - [`std::iter::Iterator`]: Standard iterator trait implementation
 /// - [ECMA-335 II.24.2.3](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf): Strings heap specification
 pub struct StringsIterator<'a> {
-    /// Reference to the strings heap being iterated
-    strings: &'a Strings<'a>,
-    /// Current position within the strings heap
-    position: usize,
+    /// The heap's entries, valid UTF-8 or not
+    entries: StringEntries<'a>,
 }
 
 impl<'a> StringsIterator<'a> {
@@ -1288,10 +1421,9 @@ impl<'a> StringsIterator<'a> {
     /// # Returns
     ///
     /// A new iterator that will yield all strings in the heap in order.
-    pub(crate) fn new(strings: &'a Strings<'a>) -> Self {
+    pub fn new(strings: &'a Strings<'a>) -> Self {
         Self {
-            strings,
-            position: 1,
+            entries: strings.entries(),
         }
     }
 }
@@ -1299,26 +1431,108 @@ impl<'a> StringsIterator<'a> {
 impl<'a> Iterator for StringsIterator<'a> {
     type Item = (usize, &'a str);
 
+    /// The next entry that is valid UTF-8. One that is not is passed over, not taken for the
+    /// end of the heap: [`Strings::entries`] yields it too.
     fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.strings.data.len() {
-            return None;
-        }
-
-        let start_position = self.position;
-        match self.strings.get(self.position) {
-            Ok(string) => {
-                // Move position past this string and its null terminator
-                self.position = self.position.saturating_add(string.len()).saturating_add(1);
-                Some((start_position, string))
+        loop {
+            let (offset, bytes) = self.entries.next()?;
+            if let Ok(text) = str::from_utf8(bytes) {
+                return Some((offset, text));
             }
-            Err(_) => None,
         }
+    }
+}
+
+/// Every entry of a strings heap as its bytes, from [`Strings::entries`].
+pub struct StringEntries<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Iterator for StringEntries<'a> {
+    type Item = (usize, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = self
+            .data
+            .get(self.position..)
+            .filter(|rest| !rest.is_empty())?;
+        let offset = self.position;
+        let length = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        self.position = self.position.saturating_add(length).saturating_add(1);
+        Some((offset, rest.get(..length).unwrap_or_default()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `get_shared` resolves every offset as `get` does, string or error, over heaps with
+    /// valid runs, invalid and truncated UTF-8 sequences, an empty run and no final NUL.
+    #[test]
+    fn get_shared_agrees_with_get_at_every_offset() {
+        let heaps: [&[u8]; 6] = [
+            b"\0List\0Namespace.Type\0\0x\0",
+            b"\0ab\xffcd\0\xe2\x82\xacEuro\0",
+            b"\0ok\xe2\x82\0\xc3\0tail\0",
+            "\0caf\u{e9}\0\u{1f600}x\0".as_bytes(),
+            b"\0no terminator",
+            b"\0\xff\xfe\xfd\0a\xff\0",
+        ];
+        for data in heaps {
+            let strings = Strings::from(data).unwrap();
+            for index in 0..=data.len() {
+                let borrowed = strings.get(index);
+                let shared = strings.get_shared(index);
+                match (&borrowed, &shared) {
+                    (Ok(text), Ok(name)) => assert_eq!(*text, name.as_str(), "{data:?} at {index}"),
+                    (Err(_), Err(_)) => {}
+                    _ => panic!("{data:?} at {index}: get {borrowed:?}, get_shared {shared:?}"),
+                }
+            }
+        }
+    }
+
+    /// Names inside one run share one copy of it, whatever offsets they start at.
+    #[test]
+    fn names_inside_one_run_share_one_copy() {
+        let mut data = vec![0u8];
+        data.extend(std::iter::repeat_n(b'a', 1 << 16));
+        data.push(0);
+        let strings = Strings::from(&data).unwrap();
+        let names: Vec<SharedStr> = (1..=1 << 16)
+            .map(|index| strings.get_shared(index).unwrap())
+            .collect();
+        assert_eq!(names[0].len(), 1 << 16);
+        assert_eq!(names[names.len() - 1], "a");
+        let shared = strings.shared.get().unwrap();
+        assert_eq!(shared.runs.len(), 1, "one copy of the run");
+        let (_, run) = shared.runs.get(&1).unwrap().clone();
+        assert_eq!(
+            Arc::strong_count(&run),
+            names.len() + 2,
+            "every name holds the one copy"
+        );
+    }
+
+    /// A `#Strings` stream of no bytes is a heap with no entries: index 0 is the empty string,
+    /// any other index out of bounds.
+    #[test]
+    fn a_stream_of_no_bytes_is_a_heap_of_no_entries() {
+        let heap = Strings::from(&[]).unwrap();
+
+        assert_eq!(heap.get(0).unwrap(), "");
+        assert!(heap.get(1).is_err());
+        assert_eq!(heap.iter().count(), 0);
+    }
+
+    /// Bytes that do not begin with the sentinel stay corrupt: only the stream of no bytes
+    /// changes meaning.
+    #[test]
+    fn bytes_without_the_sentinel_are_corrupt() {
+        assert!(Strings::from(b"a\0").is_err());
+    }
 
     #[test]
     fn crafted() {
@@ -1418,17 +1632,28 @@ mod tests {
         ];
 
         let strings = Strings::from(&data).unwrap();
-        let mut iter = strings.iter();
 
-        // First valid string
-        let (offset1, string1) = iter.next().unwrap();
-        assert_eq!(offset1, 1);
-        assert_eq!(string1, "Hello");
+        // The invalid entry is passed over, not taken for the end of the heap
+        let valid: Vec<(usize, &str)> = strings.iter().collect();
+        assert_eq!(valid, [(1, "Hello"), (10, "World")]);
 
-        // Second string is invalid, should return None
-        assert!(iter.next().is_none());
+        // Every entry, the invalid one too, as bytes
+        let entries: Vec<(usize, &[u8])> = strings.entries().collect();
+        assert_eq!(
+            entries,
+            [
+                (1, &b"Hello"[..]),
+                (7, &[0xFF, 0xFF][..]),
+                (10, &b"World"[..])
+            ]
+        );
+    }
 
-        // Third string should not be reached due to invalid UTF-8
-        assert!(iter.next().is_none());
+    #[test]
+    fn an_unterminated_last_entry_is_an_entry() {
+        let data = [0x00, b'A', 0x00, b'B', b'C'];
+        let strings = Strings::from(&data).unwrap();
+        let entries: Vec<(usize, &[u8])> = strings.entries().collect();
+        assert_eq!(entries, [(1, &b"A"[..]), (3, &b"BC"[..])]);
     }
 }

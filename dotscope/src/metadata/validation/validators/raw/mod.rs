@@ -70,5 +70,6 @@ mod structure;
 pub use constraints::{RawGenericConstraintValidator, RawLayoutConstraintValidator};
 pub use modification::{RawChangeIntegrityValidator, RawOperationValidator};
 pub use structure::{
-    RawHeapValidator, RawSignatureValidator, RawTableValidator, RawTokenValidator,
+    RawHeapValidator, RawSignatureValidator, RawSortOrderValidator, RawTableValidator,
+    RawTokenValidator,
 };

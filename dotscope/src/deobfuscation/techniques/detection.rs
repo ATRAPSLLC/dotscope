@@ -185,6 +185,11 @@ impl Detections {
         self.entries.get(id)
     }
 
+    /// Gets the detection result for a technique, to update.
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Detection> {
+        self.entries.get_mut(id)
+    }
+
     /// Downcast a technique's findings to a concrete type.
     #[must_use]
     pub fn findings<T: 'static>(&self, id: &str) -> Option<&T> {
@@ -495,16 +500,16 @@ mod tests {
     #[test]
     fn test_merge_updates_findings_on_augment() {
         #[derive(Debug)]
-        struct V1(u32);
+        struct V1;
         #[derive(Debug)]
-        struct V2(u32);
+        struct V2;
 
         let mut ds = Detections::new();
         ds.insert(
             "tech",
             Detection::new_detected(
                 vec![],
-                Some(Box::new(V1(1)) as Box<dyn std::any::Any + Send + Sync>),
+                Some(Box::new(V1) as Box<dyn std::any::Any + Send + Sync>),
             ),
         );
 
@@ -512,7 +517,7 @@ mod tests {
             "tech",
             Detection::new_detected(
                 vec![],
-                Some(Box::new(V2(2)) as Box<dyn std::any::Any + Send + Sync>),
+                Some(Box::new(V2) as Box<dyn std::any::Any + Send + Sync>),
             ),
         );
 

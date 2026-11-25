@@ -10,19 +10,19 @@
 //! - **Call-site counting**: [`build_call_site_counts()`] provides O(n) batch counting of
 //!   call/callvirt targets.
 //! - **Method name resolution**: [`is_method_named()`] checks if a token resolves to a
-//!   method whose name contains a given substring.
-//! - **Blob parsing**: [`read_packed_len()`] decodes the .NET SerString packed length encoding.
+//!   method of a given name.
+//! - **Blob parsing**: [`read_packed_len()`](crate::io::read_packed_len) decodes the .NET SerString packed length encoding.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    analysis::{SsaFunction, SsaInstruction, SsaOp, SsaVarId},
+    analysis::{SsaFunction, SsaOp, SsaVarId},
     metadata::{
         signatures::{parse_field_signature, TypeSignature},
-        streams::Strings,
+        streams::{Strings, TablesHeader},
         tables::{
-            skip_unreadable, ClassLayoutRaw, FieldRaw, MemberRefRaw, MetadataTable, MethodDefRaw,
-            TableId, TypeDefRaw, TypeRefRaw,
+            skip_unreadable, ClassLayoutRaw, FieldRaw, MemberList, MemberRefRaw, MetadataTable,
+            MethodDefRaw, MethodPtrRaw, TableId, TypeDefRaw, TypeRefRaw,
         },
         token::Token,
         typesystem::{wellknown, PointerSize},
@@ -36,7 +36,7 @@ use crate::{
 /// - **Primitive types** (e.g., `int64` for 8-byte arrays): size from `byte_size()`
 /// - **Value types** with ClassLayout (e.g., `__StaticArrayInitTypeSize=40`):
 ///   size from the ClassLayout table's `class_size` column
-pub(crate) fn get_field_data_size(assembly: &CilObject, field_rid: u32) -> Option<usize> {
+pub fn get_field_data_size(assembly: &CilObject, field_rid: u32) -> Option<usize> {
     let tables = assembly.tables()?;
     let blobs = assembly.blob()?;
 
@@ -92,7 +92,7 @@ pub(crate) fn get_field_data_size(assembly: &CilObject, field_rid: u32) -> Optio
 /// # Returns
 ///
 /// A [`HashMap`] mapping each defined [`SsaVarId`] to its defining [`SsaOp`].
-pub(crate) fn build_def_map(ssa: &SsaFunction) -> HashMap<SsaVarId, &SsaOp> {
+pub fn build_def_map(ssa: &SsaFunction) -> HashMap<SsaVarId, &SsaOp> {
     let mut defs = HashMap::new();
     for block in ssa.blocks() {
         for instr in block.instructions() {
@@ -104,116 +104,36 @@ pub(crate) fn build_def_map(ssa: &SsaFunction) -> HashMap<SsaVarId, &SsaOp> {
     defs
 }
 
-/// Shrinks a candidate removal set until nothing it destroys is still read.
+/// Returns the static field loads defining `values`, as `(block, instruction)`
+/// sites.
 ///
-/// Neutralizing an instruction (rewriting it to `Nop`) or dropping a phi
-/// destroys the definition it produced. If any *surviving* instruction or phi
-/// operand still reads that variable, the result is IR with a read of a
-/// variable nothing defines — which the SSA verifier rejects outright, failing
-/// the whole method rather than the one rewrite. Taint analysis does not
-/// prevent this on its own: [`PhiTaintMode::NoPropagation`] deliberately makes
-/// phis taint barriers, so a phi can merge a tainted definition into code that
-/// is never itself marked tainted.
-///
-/// The resolution is to keep the definition, not to widen the removal into
-/// legitimate code: a candidate whose result still has a reader is dropped from
-/// the set. Dropping it makes it a survivor in turn, so its own operands must
-/// be kept too — hence the fixpoint. The sets only ever shrink, so this
-/// terminates in at most one round per candidate.
+/// A pass that resolves what a static field holds rewrites the instructions
+/// reading the loaded value, and the load itself is dead only once every
+/// reader is gone. The sites go to `remove_unread_instructions`, on the
+/// function or within an edit session, which decides that from the function as
+/// it stands rather than from recorded use lists, which go stale as soon as an
+/// earlier pass rewrites an instruction: a load another instruction still
+/// reads is kept.
 ///
 /// # Arguments
 ///
-/// * `ssa` - The SSA function the candidates index into.
-/// * `instrs` - Candidate `(block, instr)` instruction locations. Shrunk in place.
-/// * `phis` - Candidate `(block, phi)` phi locations. Shrunk in place.
+/// * `ssa` - The SSA function to search.
+/// * `values` - Values whose `LoadStaticField` definitions may go.
 ///
-/// [`PhiTaintMode::NoPropagation`]: crate::analysis::PhiTaintMode::NoPropagation
-pub(crate) fn retain_removable(
-    ssa: &SsaFunction,
-    instrs: &mut HashSet<(usize, usize)>,
-    phis: &mut HashSet<(usize, usize)>,
-) {
-    loop {
-        // Every variable the current candidate set would destroy, mapped back to
-        // the candidate that has to be dropped if the variable turns out live.
-        let mut destroyed: HashMap<SsaVarId, Removal> = HashMap::new();
-        for &(block_idx, instr_idx) in instrs.iter() {
-            let Some(op) = ssa
-                .block(block_idx)
-                .and_then(|b| b.instruction(instr_idx))
-                .map(SsaInstruction::op)
-            else {
-                continue;
-            };
-            for def in op.defs() {
-                destroyed.insert(def, Removal::Instruction(block_idx, instr_idx));
-            }
-        }
-        for &(block_idx, phi_idx) in phis.iter() {
-            if let Some(phi) = ssa
-                .block(block_idx)
-                .and_then(|b| b.phi_nodes().get(phi_idx))
-            {
-                destroyed.insert(phi.result(), Removal::Phi(block_idx, phi_idx));
-            }
-        }
-        if destroyed.is_empty() {
-            return;
-        }
-
-        // Anything not being removed is a survivor, and its reads keep the
-        // definitions behind them alive.
-        let mut rescued: HashSet<Removal> = HashSet::new();
-        for (block_idx, block) in ssa.blocks().iter().enumerate() {
-            for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
-                if phis.contains(&(block_idx, phi_idx)) {
-                    continue;
-                }
-                for operand in phi.operands() {
-                    if let Some(removal) = destroyed.get(&operand.value()) {
-                        rescued.insert(*removal);
-                    }
-                }
-            }
-            for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                if instrs.contains(&(block_idx, instr_idx)) {
-                    continue;
-                }
-                instr.op().for_each_use(|used| {
-                    if let Some(removal) = destroyed.get(&used) {
-                        rescued.insert(*removal);
-                    }
-                });
-            }
-        }
-        if rescued.is_empty() {
-            return;
-        }
-
-        for removal in rescued {
-            match removal {
-                Removal::Instruction(block_idx, instr_idx) => {
-                    instrs.remove(&(block_idx, instr_idx));
-                }
-                Removal::Phi(block_idx, phi_idx) => {
-                    phis.remove(&(block_idx, phi_idx));
-                }
-            }
-        }
-    }
-}
-
-/// A location in the candidate removal set handled by [`retain_removable`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Removal {
-    /// Instruction at `(block, instr)`.
-    Instruction(usize, usize),
-    /// Phi node at `(block, phi)`.
-    Phi(usize, usize),
+/// # Returns
+///
+/// The sites of those loads, in block order.
+pub fn static_loads_of(ssa: &SsaFunction, values: &HashSet<SsaVarId>) -> Vec<(usize, usize)> {
+    ssa.iter_instructions()
+        .filter(|(_, _, instr)| {
+            matches!(instr.op(), SsaOp::LoadStaticField { dest, .. } if values.contains(dest))
+        })
+        .map(|(block_idx, instr_idx, _)| (block_idx, instr_idx))
+        .collect()
 }
 
 /// Checks if a name contains obfuscation indicators (zero-width chars, PUA, spaces).
-pub(crate) fn is_obfuscated_name(name: &str) -> bool {
+pub fn is_obfuscated_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -242,7 +162,7 @@ pub(crate) fn is_obfuscated_name(name: &str) -> bool {
 ///
 /// Protects constructors, module types, CLR-internal angle-bracket names,
 /// and property/event accessor prefixes (get_, set_, add_, remove_).
-pub(crate) fn is_special_name(name: &str) -> bool {
+pub fn is_special_name(name: &str) -> bool {
     if name == wellknown::members::CTOR || name == wellknown::members::CCTOR {
         return true;
     }
@@ -294,7 +214,7 @@ pub(crate) fn is_special_name(name: &str) -> bool {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use crate::deobfuscation::utils::build_call_site_counts;
 ///
 /// let candidates: Vec<Token> = collect_decryptor_candidates(&assembly);
@@ -304,7 +224,7 @@ pub(crate) fn is_special_name(name: &str) -> bool {
 ///     .filter(|t| *counts.get(t).unwrap_or(&0) >= 3)
 ///     .collect();
 /// ```
-pub(crate) fn build_call_site_counts(
+pub fn build_call_site_counts(
     assembly: &CilObject,
     target_tokens: impl IntoIterator<Item = Token>,
 ) -> HashMap<Token, usize> {
@@ -347,7 +267,7 @@ pub(crate) fn build_call_site_counts(
 /// constructor → declaring type chain. Contains all metadata that different
 /// technique implementations may need.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedType<'a> {
+pub struct ResolvedType<'a> {
     /// Type name (e.g., `"ConfusedByAttribute"`).
     pub name: &'a str,
     /// Type namespace, if present (e.g., `"System.Runtime.CompilerServices"`).
@@ -368,34 +288,27 @@ pub(crate) struct ResolvedType<'a> {
 ///
 /// * `tag` - Table identifier of the constructor (typically `MethodDef` or `MemberRef`).
 /// * `row` - Row index within the table.
-/// * `methoddef_table` - Optional reference to the MethodDef table.
-/// * `typedef_table` - Optional reference to the TypeDef table.
-/// * `typeref_table` - Optional reference to the TypeRef table.
-/// * `memberref_table` - Optional reference to the MemberRef table.
+/// * `tables` - The tables stream holding the MethodDef, TypeDef, TypeRef and MemberRef
+///   tables (and MethodPtr, in a `#-` stream).
 /// * `strings` - The `#Strings` heap for resolving name indices.
 ///
 /// # Returns
 ///
-/// [`Some(ResolvedType)`] with the declaring type's metadata, or `None` if
+/// [`Some(ResolvedType)`](ResolvedType) with the declaring type's metadata, or `None` if
 /// the constructor cannot be resolved (missing tables, invalid row, etc.).
-pub(crate) fn resolve_constructor_type<'a>(
+pub fn resolve_constructor_type<'a>(
     tag: TableId,
     row: u32,
-    methoddef_table: Option<&'a MetadataTable<'a, MethodDefRaw>>,
-    typedef_table: Option<&'a MetadataTable<'a, TypeDefRaw>>,
-    typeref_table: Option<&'a MetadataTable<'a, TypeRefRaw>>,
-    memberref_table: Option<&'a MetadataTable<'a, MemberRefRaw>>,
+    tables: &'a TablesHeader<'a>,
     strings: &'a Strings<'a>,
 ) -> Option<ResolvedType<'a>> {
     match tag {
-        TableId::MethodDef => {
-            resolve_methoddef_declaring_type(row, methoddef_table, typedef_table, strings)
-        }
+        TableId::MethodDef => resolve_methoddef_declaring_type(row, tables, strings),
         TableId::MemberRef => resolve_memberref_declaring_type(
             row,
-            memberref_table,
-            typedef_table,
-            typeref_table,
+            tables.table::<MemberRefRaw>(),
+            tables.table::<TypeDefRaw>(),
+            tables.table::<TypeRefRaw>(),
             strings,
         ),
         _ => None,
@@ -404,25 +317,39 @@ pub(crate) fn resolve_constructor_type<'a>(
 
 /// Resolves a MethodDef to its declaring TypeDef's name, namespace, and token.
 ///
-/// Walks the TypeDef table to find the type that owns the given method RID
-/// by checking `method_list` ranges.
-pub(crate) fn resolve_methoddef_declaring_type<'a>(
+/// The declaring type is the TypeDef whose normalized `MethodList` run
+/// ([`TablesHeader::member_ranges`]) contains the method: its row directly, or, in a `#-`
+/// stream with a MethodPtr table, the MethodPtr position naming it. Building the runs is one
+/// pass over the TypeDef table; the lookup is a binary search.
+pub fn resolve_methoddef_declaring_type<'a>(
     method_row: u32,
-    methoddef_table: Option<&'a MetadataTable<'a, MethodDefRaw>>,
-    typedef_table: Option<&'a MetadataTable<'a, TypeDefRaw>>,
+    tables: &'a TablesHeader<'a>,
     strings: &'a Strings<'a>,
 ) -> Option<ResolvedType<'a>> {
-    let methoddef_table = methoddef_table?;
-    let typedef_table = typedef_table?;
-    let method = methoddef_table.get(method_row).ok().flatten()?;
+    let typedef_table = tables.table::<TypeDefRaw>()?;
+    tables
+        .table::<MethodDefRaw>()?
+        .get(method_row)
+        .ok()
+        .flatten()?;
 
-    // No error channel here (the function answers `Option`), so an unreadable row is
-    // reported and skipped rather than vanishing inside the iterator.
+    let ranges = tables.member_ranges(MemberList::TypeDefMethods);
+    let position = if ranges.is_indirect() {
+        // The position whose MethodPtr entry names the method. No error channel here (the
+        // function answers `Option`), so an unreadable row is reported and skipped.
+        tables
+            .table::<MethodPtrRaw>()?
+            .iter()
+            .filter_map(skip_unreadable)
+            .find(|ptr| ptr.method == method_row)?
+            .rid
+    } else {
+        method_row
+    };
     let typedef = typedef_table
-        .iter()
-        .filter_map(skip_unreadable)
-        .filter(|t| t.method_list <= method.rid)
-        .last()?;
+        .get(ranges.owner_of(position)?)
+        .ok()
+        .flatten()?;
 
     let name = strings.get(typedef.type_name as usize).ok()?;
     let namespace = strings.get(typedef.type_namespace as usize).ok();
@@ -441,7 +368,7 @@ pub(crate) fn resolve_methoddef_declaring_type<'a>(
 /// (external reference). For TypeDef, the typedef token is included; for
 /// TypeRef, the `has_module_scope` flag indicates whether the reference
 /// resolves through the Module table.
-pub(crate) fn resolve_memberref_declaring_type<'a>(
+pub fn resolve_memberref_declaring_type<'a>(
     memberref_row: u32,
     memberref_table: Option<&'a MetadataTable<'a, MemberRefRaw>>,
     typedef_table: Option<&'a MetadataTable<'a, TypeDefRaw>>,
@@ -482,27 +409,29 @@ pub(crate) fn resolve_memberref_declaring_type<'a>(
 
 /// Resolves a qualified method name for a call target token.
 ///
-/// For MemberRef tokens (cross-assembly calls), uses [`CilTypeReference::fullname()`]
+/// For MemberRef tokens (cross-assembly calls), uses [`CilTypeReference::fullname()`](crate::metadata::typesystem::CilTypeReference::fullname)
 /// on the `declaredby` field to produce `"DeclaringType.MethodName"`
 /// (e.g., `"System.Environment.FailFast"`). For MethodDef and MethodSpec tokens,
 /// falls back to just the method name (the declaring type lookup for MethodDef
-/// requires an O(n) scan via [`TokenResolver::declaring_type()`] which is too
+/// requires an O(n) scan via [`TokenResolver::declaring_type()`](crate::metadata::resolver::TokenResolver::declaring_type) which is too
 /// expensive for batch scanning).
 ///
 /// This enables patterns like `"Environment.FailFast"` to match only the BCL method,
 /// not a user-defined method also named `FailFast`.
-pub(crate) fn resolve_qualified_method_name(assembly: &CilObject, token: Token) -> Option<String> {
+pub fn resolve_qualified_method_name(assembly: &CilObject, token: Token) -> Option<String> {
     // MemberRef: cheaply get declaring type from the declaredby field
     if token.table() == 0x0A {
         if let Some(member) = assembly.member_ref(&token) {
             if let Some(type_name) = member.declaredby.fullname() {
                 return Some(format!("{}.{}", type_name, member.name));
             }
-            return Some(member.name.clone());
+            return Some(member.name.to_string());
         }
     }
     // MethodDef / MethodSpec: fall back to unqualified name
-    assembly.resolve_method_name(token)
+    assembly
+        .resolve_method_name(token)
+        .map(|name| name.to_string())
 }
 
 /// Scans all methods for calls matching any of the given name patterns.
@@ -526,7 +455,7 @@ pub(crate) fn resolve_qualified_method_name(assembly: &CilObject, token: Token) 
 ///
 /// A [`HashMap`] from method token to the set of matched pattern indices.
 /// Only methods with at least one match are included.
-pub(crate) fn find_methods_calling_apis(
+pub fn find_methods_calling_apis(
     assembly: &CilObject,
     patterns: &[&str],
 ) -> HashMap<Token, Vec<usize>> {
@@ -571,7 +500,7 @@ pub(crate) fn find_methods_calling_apis(
 /// # Returns
 ///
 /// A [`HashSet`] of tokens meeting the threshold.
-pub(crate) fn filter_by_call_threshold(
+pub fn filter_by_call_threshold(
     candidates: Vec<Token>,
     counts: &HashMap<Token, usize>,
     min_calls: usize,
@@ -603,7 +532,7 @@ pub(crate) fn filter_by_call_threshold(
 ///
 /// A [`HashSet`] containing only candidates whose bodies do not call any other
 /// candidate. Methods whose bodies cannot be inspected are kept.
-pub(crate) fn exclude_cross_calling_candidates(
+pub fn exclude_cross_calling_candidates(
     candidates: HashSet<Token>,
     assembly: &CilObject,
 ) -> HashSet<Token> {
@@ -650,7 +579,7 @@ pub(crate) fn exclude_cross_calling_candidates(
 /// # Returns
 ///
 /// A [`HashMap`] mapping each byte-array field token to its backing field token.
-pub(crate) fn build_init_array_map(assembly: &CilObject) -> HashMap<Token, Token> {
+pub fn build_init_array_map(assembly: &CilObject) -> HashMap<Token, Token> {
     let mut map = HashMap::new();
 
     for method_entry in assembly.methods() {
@@ -726,7 +655,7 @@ pub(crate) fn build_init_array_map(assembly: &CilObject) -> HashMap<Token, Token
 /// Expected pattern: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 characters),
 /// with dashes at positions 8, 13, 18, and 23 and hex digits everywhere else.
 /// Both uppercase and lowercase hex digits are accepted.
-pub(crate) fn is_guid_name(name: &str) -> bool {
+pub fn is_guid_name(name: &str) -> bool {
     if name.len() != 36 {
         return false;
     }
@@ -760,95 +689,99 @@ pub(crate) fn is_guid_name(name: &str) -> bool {
 ///
 /// # Returns
 ///
-/// [`Some(ResolvedType)`] with the declaring type's metadata, or `None` if
+/// [`Some(ResolvedType)`](ResolvedType) with the declaring type's metadata, or `None` if
 /// the constructor cannot be resolved.
-pub(crate) fn resolve_custom_attr_type<'a>(
+pub fn resolve_custom_attr_type<'a>(
     assembly: &'a CilObject,
     attr: &crate::metadata::tables::CustomAttributeRaw,
 ) -> Option<ResolvedType<'a>> {
     let tables = assembly.tables()?;
     let strings = assembly.strings()?;
 
-    resolve_constructor_type(
-        attr.constructor.tag,
-        attr.constructor.row,
-        tables.table::<MethodDefRaw>(),
-        tables.table::<TypeDefRaw>(),
-        tables.table::<TypeRefRaw>(),
-        tables.table::<MemberRefRaw>(),
-        strings,
-    )
+    resolve_constructor_type(attr.constructor.tag, attr.constructor.row, tables, strings)
 }
 
-/// Checks whether a metadata token resolves to a method whose name contains `name`.
+/// Checks whether a metadata token resolves to a method named `name`.
+///
+/// The whole name: `ResolveMethod` is not `ResolveMethodHandle`, and
+/// `get_Module` is not `get_ModuleHandle`.
 ///
 /// # Arguments
 ///
 /// * `assembly` - The assembly used to resolve the token.
-/// * `token` - Metadata token to look up (MethodDef or MemberRef).
-/// * `name` - Substring to search for in the resolved method name.
+/// * `token` - Metadata token to look up (MethodDef, MemberRef or MethodSpec).
+/// * `name` - The method name.
 ///
 /// # Returns
 ///
-/// `true` if the token resolves to a method name that contains `name`,
-/// `false` if the token does not resolve or the name does not match.
-pub(crate) fn is_method_named(assembly: &CilObject, token: Token, name: &str) -> bool {
+/// `true` if the token resolves to a method of that name, `false` if it does
+/// not resolve or names another method.
+pub fn is_method_named(assembly: &CilObject, token: Token, name: &str) -> bool {
     assembly
         .resolve_method_name(token)
-        .is_some_and(|n| n.contains(name))
-}
-
-/// Checks if a method token's declaring type name contains the given substring.
-///
-/// Works for both MethodDef (table 0x06) and MemberRef (table 0x0A) tokens.
-/// For MethodDef, resolves via the declaring type. For MemberRef, resolves
-/// via the `declaredby` parent reference.
-///
-/// # Returns
-///
-/// `true` if the declaring type name contains `type_name`,
-/// `false` if the token cannot be resolved or the name does not match.
-pub(crate) fn is_method_on_type(assembly: &CilObject, token: Token, type_name: &str) -> bool {
-    match token.table() {
-        0x06 => assembly
-            .method(&token)
-            .ok()
-            .and_then(|m| m.declaring_type_rc())
-            .is_some_and(|ty| ty.name.contains(type_name)),
-        0x0A => assembly
-            .refs_members()
-            .get(&token)
-            .and_then(|entry| entry.value().declaredby.fullname())
-            .is_some_and(|name| name.contains(type_name)),
-        _ => false,
-    }
-}
-
-/// Checks if a token resolves to a method with the given name on the given declaring type.
-///
-/// Combines [`is_method_on_type`] and [`is_method_named`] in a single lookup.
-pub(crate) fn is_typed_method_named(
-    assembly: &CilObject,
-    token: Token,
-    type_name: &str,
-    method_name: &str,
-) -> bool {
-    is_method_on_type(assembly, token, type_name) && is_method_named(assembly, token, method_name)
+        .is_some_and(|n| n == name)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
+        analysis::{
+            AccessQualifiers, Callee, FieldRef, MethodRef, SsaFunctionBuilder, SsaOp, SsaType,
+        },
         deobfuscation::utils::{
             build_call_site_counts, is_method_named, is_obfuscated_name, is_special_name,
-            resolve_constructor_type,
+            resolve_constructor_type, static_loads_of,
         },
-        metadata::{
-            tables::{MemberRefRaw, MethodDefRaw, TableId, TypeDefRaw, TypeRefRaw},
-            token::Token,
-        },
-        test::helpers::load_sample,
+        metadata::{tables::TableId, token::Token},
+        testkit::helpers::{load_sample, method_token, mono_mscorlib},
     };
+
+    /// A static load goes once nothing reads it, and stays while an
+    /// instruction the resolving pass did not rewrite still reads it.
+    #[test]
+    fn test_static_loads_go_once_unread_and_stay_while_read() {
+        let removed = |still_read: bool| {
+            let field = FieldRef::new(Token::new(0x0400_0001));
+            let mut loaded = None;
+            let mut ssa = SsaFunctionBuilder::new(0, 0)
+                .build_with(|f| {
+                    let object = f.var();
+                    loaded = Some(object);
+                    f.block(0, |b| {
+                        b.op_typed(
+                            SsaOp::LoadStaticField {
+                                dest: object,
+                                field,
+                                access: AccessQualifiers::FLAT,
+                            },
+                            SsaType::Object,
+                        );
+                        // The field load the pass resolved, already a constant.
+                        let _ = b.const_i32(1);
+                        if still_read {
+                            let _ = b.call(
+                                Callee::Direct(MethodRef::new(Token::new(0x0A00_0001))),
+                                &[object],
+                                SsaType::I32,
+                            );
+                        }
+                        b.ret();
+                    });
+                })
+                .unwrap();
+            let values = [loaded.unwrap()].into_iter().collect();
+            let loads = static_loads_of(&ssa, &values);
+            assert_eq!(loads, vec![(0, 0)], "the load defining the value");
+            let count = ssa.remove_unread_instructions(loads).len();
+            let kept = matches!(
+                ssa.block(0).unwrap().instructions()[0].op(),
+                SsaOp::LoadStaticField { .. }
+            );
+            (count, kept)
+        };
+        assert_eq!(removed(false), (1, false), "an unread load is removed");
+        assert_eq!(removed(true), (0, true), "a load still read is kept");
+    }
 
     #[test]
     fn test_is_obfuscated_name_normal_names() {
@@ -926,14 +859,14 @@ mod tests {
 
     #[test]
     fn test_build_call_site_counts_empty_targets() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
         let counts = build_call_site_counts(&asm, std::iter::empty());
         assert!(counts.is_empty());
     }
 
     #[test]
     fn test_build_call_site_counts_nonexistent_token() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
         let bogus = Token::new(0x06FFFFFF);
         let counts = build_call_site_counts(&asm, std::iter::once(bogus));
         assert_eq!(counts.get(&bogus), Some(&0));
@@ -941,7 +874,7 @@ mod tests {
 
     #[test]
     fn test_resolve_constructor_type_confuserex_marker() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_normal.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/mkaring_normal.exe");
 
         let tables = asm.tables().expect("tables should be present");
         let strings = asm.strings().expect("strings should be present");
@@ -949,11 +882,6 @@ mod tests {
         let ca_table = tables
             .table::<crate::metadata::tables::CustomAttributeRaw>()
             .expect("CustomAttribute table should be present");
-
-        let methoddef_table = tables.table::<MethodDefRaw>();
-        let typedef_table = tables.table::<TypeDefRaw>();
-        let typeref_table = tables.table::<TypeRefRaw>();
-        let memberref_table = tables.table::<MemberRefRaw>();
 
         let mut found_marker = false;
         for attr in ca_table {
@@ -967,10 +895,7 @@ mod tests {
             if let Some(resolved) = resolve_constructor_type(
                 attr.constructor.tag,
                 attr.constructor.row,
-                methoddef_table,
-                typedef_table,
-                typeref_table,
-                memberref_table,
+                tables,
                 strings,
             ) {
                 if resolved.name.contains("ConfuserVersion")
@@ -989,28 +914,29 @@ mod tests {
     #[test]
     fn test_resolve_constructor_type_unsupported_tag() {
         // Tag other than MethodDef/MemberRef should return None
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let tables = asm.tables().expect("tables should be present");
         let strings = asm.strings().expect("strings should be present");
 
-        let result = resolve_constructor_type(
-            TableId::Field,
-            1,
-            tables.table::<MethodDefRaw>(),
-            tables.table::<TypeDefRaw>(),
-            tables.table::<TypeRefRaw>(),
-            tables.table::<MemberRefRaw>(),
-            strings,
-        );
+        let result = resolve_constructor_type(TableId::Field, 1, tables, strings);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_is_method_named_with_real_assembly() {
-        let asm = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let asm = load_sample("packers/confuserex/1.6.0/original.exe");
 
         // Token for a nonexistent method should return false
         assert!(!is_method_named(&asm, Token::new(0x06FFFFFF), "Main"));
+    }
+
+    /// A method is named by its whole name, not by a prefix of it.
+    #[test]
+    fn a_method_is_named_by_its_whole_name() {
+        let mscorlib = mono_mscorlib();
+        let resolve = method_token(&mscorlib, "System.ModuleHandle", "ResolveMethodHandle", 1);
+        assert!(is_method_named(&mscorlib, resolve, "ResolveMethodHandle"));
+        assert!(!is_method_named(&mscorlib, resolve, "ResolveMethod"));
     }
 }

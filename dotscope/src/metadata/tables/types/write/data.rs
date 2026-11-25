@@ -433,28 +433,26 @@ impl TableDataOwned {
             Self::GenericParam(row) => row.resolve_placeholders(changes),
             Self::MethodSpec(row) => row.resolve_placeholders(changes),
             Self::GenericParamConstraint(row) => row.resolve_placeholders(changes),
-            // Tables without heap refs - these don't need resolution
-            Self::FieldPtr(_)
-            | Self::MethodPtr(_)
-            | Self::ParamPtr(_)
-            | Self::Document(_)
-            | Self::MethodDebugInformation(_)
-            | Self::LocalScope(_)
-            | Self::LocalVariable(_)
-            | Self::LocalConstant(_)
-            | Self::ImportScope(_)
-            | Self::StateMachineMethod(_)
-            | Self::CustomDebugInformation(_)
-            | Self::EncLog(_)
+            Self::FieldPtr(row) => row.resolve_placeholders(changes),
+            Self::MethodPtr(row) => row.resolve_placeholders(changes),
+            Self::ParamPtr(row) => row.resolve_placeholders(changes),
+            Self::EventPtr(row) => row.resolve_placeholders(changes),
+            Self::PropertyPtr(row) => row.resolve_placeholders(changes),
+            Self::AssemblyRefProcessor(row) => row.resolve_placeholders(changes),
+            Self::AssemblyRefOS(row) => row.resolve_placeholders(changes),
+            Self::Document(row) => row.resolve_placeholders(changes),
+            Self::MethodDebugInformation(row) => row.resolve_placeholders(changes),
+            Self::LocalScope(row) => row.resolve_placeholders(changes),
+            Self::LocalVariable(row) => row.resolve_placeholders(changes),
+            Self::LocalConstant(row) => row.resolve_placeholders(changes),
+            Self::ImportScope(row) => row.resolve_placeholders(changes),
+            Self::StateMachineMethod(row) => row.resolve_placeholders(changes),
+            Self::CustomDebugInformation(row) => row.resolve_placeholders(changes),
+            // Tables whose columns are constants and tokens, never placeholders
+            Self::EncLog(_)
             | Self::EncMap(_)
-            | Self::EventPtr(_)
-            | Self::PropertyPtr(_)
             | Self::AssemblyProcessor(_)
-            | Self::AssemblyOS(_)
-            | Self::AssemblyRefProcessor(_)
-            | Self::AssemblyRefOS(_) => {
-                // These tables don't have heap references that use placeholders
-            }
+            | Self::AssemblyOS(_) => {}
         }
     }
 }
@@ -522,6 +520,29 @@ impl RowWritable for TableDataOwned {
             Self::GenericParam(row) => row.row_write(data, offset, rid, sizes),
             Self::MethodSpec(row) => row.row_write(data, offset, rid, sizes),
             Self::GenericParamConstraint(row) => row.row_write(data, offset, rid, sizes),
+        }
+    }
+
+    fn sort_key(&self, sizes: &TableInfoRef) -> Result<Option<(u32, u32)>> {
+        match self {
+            Self::ClassLayout(row) => row.sort_key(sizes),
+            Self::Constant(row) => row.sort_key(sizes),
+            Self::CustomAttribute(row) => row.sort_key(sizes),
+            Self::DeclSecurity(row) => row.sort_key(sizes),
+            Self::FieldLayout(row) => row.sort_key(sizes),
+            Self::FieldMarshal(row) => row.sort_key(sizes),
+            Self::FieldRVA(row) => row.sort_key(sizes),
+            Self::GenericParam(row) => row.sort_key(sizes),
+            Self::GenericParamConstraint(row) => row.sort_key(sizes),
+            Self::ImplMap(row) => row.sort_key(sizes),
+            Self::InterfaceImpl(row) => row.sort_key(sizes),
+            Self::MethodImpl(row) => row.sort_key(sizes),
+            Self::MethodSemantics(row) => row.sort_key(sizes),
+            Self::NestedClass(row) => row.sort_key(sizes),
+            Self::LocalScope(row) => row.sort_key(sizes),
+            Self::StateMachineMethod(row) => row.sort_key(sizes),
+            Self::CustomDebugInformation(row) => row.sort_key(sizes),
+            _ => Ok(None),
         }
     }
 }

@@ -5,7 +5,7 @@
 //! and inlining decisions.
 
 use crate::{
-    analysis::{ConstValue, MethodPurity, ReturnInfo},
+    analysis::{ConstValue, InstrId, MethodPurity, ReturnInfo},
     metadata::{signatures::TypeSignature, token::Token},
 };
 
@@ -132,10 +132,14 @@ impl MethodSummary {
     ///
     /// # Returns
     ///
-    /// `true` if the method is pure or read-only.
+    /// `true` if the method is pure, read-only, or modifies nothing but may
+    /// raise an exception.
     #[must_use]
     pub fn is_read_only(&self) -> bool {
-        matches!(self.purity, MethodPurity::Pure | MethodPurity::ReadOnly)
+        matches!(
+            self.purity,
+            MethodPurity::Pure | MethodPurity::ReadOnly | MethodPurity::MayThrow
+        )
     }
 
     /// Returns the constant value for a parameter if all call sites pass the same value.
@@ -361,8 +365,13 @@ pub struct CallSiteInfo {
     /// The calling method.
     pub caller: Token,
 
-    /// Offset within the caller where the call occurs.
-    pub offset: usize,
+    /// The call instruction, by identity.
+    ///
+    /// `None` for a call whose instruction has not been stamped. An index
+    /// would not do: a position means nothing once a pass has moved the
+    /// instruction, and a block-local one means nothing even before that,
+    /// since every block has an instruction 3.
+    pub site: Option<InstrId>,
 
     /// Argument values at this call site (None if unknown).
     pub arguments: Vec<Option<ConstValue>>,
@@ -377,16 +386,16 @@ impl CallSiteInfo {
     /// # Arguments
     ///
     /// * `caller` - The metadata token of the calling method.
-    /// * `offset` - The instruction offset within the caller.
+    /// * `site` - The call instruction's identity, when it has one.
     ///
     /// # Returns
     ///
     /// A new `CallSiteInfo` marked as live with no argument information.
     #[must_use]
-    pub fn new(caller: Token, offset: usize) -> Self {
+    pub fn new(caller: Token, site: Option<InstrId>) -> Self {
         Self {
             caller,
-            offset,
+            site,
             arguments: Vec::new(),
             is_live: true,
         }
@@ -469,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_call_site_info() {
-        let mut call_site = CallSiteInfo::new(Token::new(0x06000001), 0x20);
+        let mut call_site = CallSiteInfo::new(Token::new(0x06000001), None);
         call_site.arguments = vec![Some(ConstValue::I32(1)), None, Some(ConstValue::I32(3))];
 
         assert_eq!(call_site.argument_constant(0), Some(&ConstValue::I32(1)));

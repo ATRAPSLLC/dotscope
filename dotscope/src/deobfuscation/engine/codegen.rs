@@ -16,6 +16,22 @@ use crate::{
     CilObject, Error, Result,
 };
 
+/// What code generation produced, and what cleanup needs to know about it.
+pub struct GeneratedCode {
+    /// The assembly with the regenerated bodies.
+    pub assembly: CilObject,
+    /// How many method bodies were regenerated.
+    pub regenerated: usize,
+    /// The StandAloneSig rows of replaced local signatures, now orphaned.
+    pub old_local_signatures: Vec<Token>,
+    /// The FieldDef and TypeDef rows created for array data, which cleanup
+    /// must not remove.
+    pub protected_tokens: BTreeSet<Token>,
+    /// The methods whose regenerated code failed, which ship their original
+    /// body.
+    pub kept_original: BTreeSet<Token>,
+}
+
 impl DeobfuscationEngine {
     /// Generates bytecode from optimized SSA and writes it back to the assembly.
     ///
@@ -29,22 +45,22 @@ impl DeobfuscationEngine {
     ///
     /// # Returns
     ///
-    /// A tuple of (updated assembly, methods regenerated count, old StandAloneSig tokens,
-    /// protected tokens). The old SAS tokens are from original method bodies whose
-    /// local variable signatures were replaced during regeneration. The protected
-    /// tokens are FieldDef + TypeDef entries created for array initializer data
-    /// that must not be removed by cleanup.
+    /// The [`GeneratedCode`]: the updated assembly and what cleanup needs to
+    /// know about it.
     ///
     /// # Errors
     ///
     /// Returns an error if code generation or assembly writing fails.
-    pub(crate) fn generate_code(
-        assembly: CilObject,
-        ctx: &AnalysisContext,
-    ) -> Result<(CilObject, usize, Vec<Token>, BTreeSet<Token>)> {
+    pub fn generate_code(assembly: CilObject, ctx: &AnalysisContext) -> Result<GeneratedCode> {
         // Skip if no methods were processed
         if ctx.processed_methods.is_empty() {
-            return Ok((assembly, 0, Vec::new(), BTreeSet::new()));
+            return Ok(GeneratedCode {
+                assembly,
+                regenerated: 0,
+                old_local_signatures: Vec::new(),
+                protected_tokens: BTreeSet::new(),
+                kept_original: BTreeSet::new(),
+            });
         }
 
         let mut cil_assembly = assembly.into_assembly();
@@ -53,9 +69,10 @@ impl DeobfuscationEngine {
         let mut codegen = SsaCodeGenerator::new();
         let mut methods_updated: usize = 0;
         let mut old_sas_tokens = Vec::new();
+        let mut kept_original = BTreeSet::new();
 
         for entry in ctx.processed_methods.iter() {
-            let method_token = *entry;
+            let method_token = *entry.value();
             // Note: Dead methods are not removed here during code generation.
             // Dead method removal is handled separately in postprocess cleanup
             // (see cleanup.rs), which uses table_row_remove() with proper RID
@@ -76,6 +93,11 @@ impl DeobfuscationEngine {
                         "Code generation failed for method {method_token}, \
                          keeping original IL: {e}"
                     );
+                    ctx.events
+                        .record(EventKind::CodegenRefused)
+                        .method(method_token)
+                        .message(e.to_string());
+                    kept_original.insert(method_token);
                     continue;
                 }
             };
@@ -92,7 +114,7 @@ impl DeobfuscationEngine {
 
             // Read existing MethodDef row to get the old RVA
             let rid = method_token.row();
-            // closure needed — method reference with turbofish breaks type inference
+            // closure needed - method reference with turbofish breaks type inference
             #[allow(clippy::redundant_closure_for_method_calls)]
             let existing_row = cil_assembly
                 .view()
@@ -162,12 +184,24 @@ impl DeobfuscationEngine {
         if methods_updated == 0 {
             let result = cil_assembly
                 .into_cilobject_with(ValidationConfig::analysis(), GeneratorConfig::default())?;
-            return Ok((result, 0, Vec::new(), protected_tokens));
+            return Ok(GeneratedCode {
+                assembly: result,
+                regenerated: 0,
+                old_local_signatures: Vec::new(),
+                protected_tokens,
+                kept_original,
+            });
         }
 
         // Use deobfuscation config to skip original method bodies since we regenerated them
         let result = cil_assembly
             .into_cilobject_with(ValidationConfig::analysis(), GeneratorConfig::default())?;
-        Ok((result, methods_updated, old_sas_tokens, protected_tokens))
+        Ok(GeneratedCode {
+            assembly: result,
+            regenerated: methods_updated,
+            old_local_signatures: old_sas_tokens,
+            protected_tokens,
+            kept_original,
+        })
     }
 }

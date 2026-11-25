@@ -16,22 +16,29 @@ use std::sync::Arc;
 
 use crate::{
     assembly::{FlowType, Immediate, Instruction, InstructionCategory, Operand, StackBehavior},
+    cilassembly::CilAssembly,
     emulation::{
         engine::{interpreter::Interpreter, result::StepResult},
         memory::AddressSpace,
-        process::EmulationLimits,
-        EmValue, EmulationThread, ThreadId,
+        ConversionType, EmValue, EmulationThread, ManagedPointer, ThreadId,
     },
     metadata::{
+        tables::{FieldAttributes, FieldBuilder, TableId, TypeAttributes, TypeDefBuilder},
         token::Token,
         typesystem::{CilFlavor, PointerSize},
     },
-    test::emulation::{create_test_context, create_test_thread},
+    testkit::{
+        emulation::{
+            create_test_context, create_test_context_with, create_test_thread, emulation_limits,
+        },
+        fixture,
+    },
+    CilObject,
 };
 
 fn create_test_interpreter() -> (Interpreter, Arc<AddressSpace>) {
     let ctx = create_test_context();
-    let limits = EmulationLimits::default();
+    let limits = emulation_limits();
     let address_space = Arc::clone(&ctx.address_space);
     (
         Interpreter::new(limits, Arc::clone(&address_space), PointerSize::Bit64),
@@ -354,7 +361,7 @@ fn test_conv_i8() {
 
 #[test]
 fn test_execution_stats() {
-    let limits = EmulationLimits::new().with_max_instructions(10);
+    let limits = emulation_limits().with_max_instructions(10);
     let ctx = create_test_context();
     let mut interpreter =
         Interpreter::new(limits, Arc::clone(&ctx.address_space), PointerSize::Bit64);
@@ -370,7 +377,7 @@ fn test_execution_stats() {
 
 #[test]
 fn test_instruction_limit() {
-    let limits = EmulationLimits::new().with_max_instructions(5);
+    let limits = emulation_limits().with_max_instructions(5);
     let ctx = create_test_context();
     let mut interpreter =
         Interpreter::new(limits, Arc::clone(&ctx.address_space), PointerSize::Bit64);
@@ -882,4 +889,185 @@ fn test_blt_s() {
 
     let result = interpreter.execute_standard(&mut thread, &instr).unwrap();
     assert!(matches!(result, StepResult::Branch { target: 0x100 }));
+}
+
+/// Every overflow-checked conversion, by its single-byte opcode, converts as ECMA-335
+/// Partition III names it: `0x82`-`0x8B` read their source as unsigned
+/// (`conv.ovf.<to>.un`), `0xB3`-`0xBA` and `0xD4`/`0xD5` as signed. The table below is the
+/// specification's opcode list; each opcode must produce exactly what that conversion does
+/// to the value, an overflow included.
+#[test]
+fn every_overflow_checked_conversion_converts_as_its_opcode_names() {
+    let opcodes: [(u8, &str, ConversionType); 20] = [
+        (0x82, "conv.ovf.i1.un", ConversionType::I1OvfUn),
+        (0x83, "conv.ovf.i2.un", ConversionType::I2OvfUn),
+        (0x84, "conv.ovf.i4.un", ConversionType::I4OvfUn),
+        (0x85, "conv.ovf.i8.un", ConversionType::I8OvfUn),
+        (0x86, "conv.ovf.u1.un", ConversionType::U1OvfUn),
+        (0x87, "conv.ovf.u2.un", ConversionType::U2OvfUn),
+        (0x88, "conv.ovf.u4.un", ConversionType::U4OvfUn),
+        (0x89, "conv.ovf.u8.un", ConversionType::U8OvfUn),
+        (0x8A, "conv.ovf.i.un", ConversionType::IOvfUn),
+        (0x8B, "conv.ovf.u.un", ConversionType::UOvfUn),
+        (0xB3, "conv.ovf.i1", ConversionType::I1Ovf),
+        (0xB4, "conv.ovf.u1", ConversionType::U1Ovf),
+        (0xB5, "conv.ovf.i2", ConversionType::I2Ovf),
+        (0xB6, "conv.ovf.u2", ConversionType::U2Ovf),
+        (0xB7, "conv.ovf.i4", ConversionType::I4Ovf),
+        (0xB8, "conv.ovf.u4", ConversionType::U4Ovf),
+        (0xB9, "conv.ovf.i8", ConversionType::I8Ovf),
+        (0xBA, "conv.ovf.u8", ConversionType::U8Ovf),
+        (0xD4, "conv.ovf.i", ConversionType::IOvf),
+        (0xD5, "conv.ovf.u", ConversionType::UOvf),
+    ];
+    let values = [
+        EmValue::I32(0),
+        EmValue::I32(100),
+        EmValue::I32(300),
+        EmValue::I32(-1),
+        EmValue::I32(i32::MIN),
+        EmValue::I64(i64::from(u32::MAX)),
+        EmValue::I64(-1),
+        EmValue::I64(i64::MAX),
+    ];
+    let (mut interpreter, _address_space) = create_test_interpreter();
+    for (opcode, mnemonic, conversion) in opcodes {
+        for value in &values {
+            let mut thread = create_test_thread();
+            thread.push(value.clone()).unwrap();
+            let stepped = interpreter
+                .execute_standard(&mut thread, &make_instruction(opcode, mnemonic))
+                .map(|_| thread.pop().unwrap());
+            let expected = value.convert(conversion, PointerSize::Bit64);
+            match (&stepped, &expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{mnemonic} of {value:?}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("{mnemonic} of {value:?}: {stepped:?}, expected {expected:?}"),
+            }
+        }
+    }
+}
+
+/// `no.` lets the next instruction skip the checks it names; the interpreter runs it as a
+/// prefix that keeps them, and the `0xFE` table holds no conversion opcodes.
+#[test]
+fn the_no_prefix_continues_and_fe_holds_no_conversions() {
+    let (mut interpreter, _address_space) = create_test_interpreter();
+    let mut thread = create_test_thread();
+    let mut no = make_instruction(0x19, "no.");
+    no.prefix = 0xFE;
+    no.operand = Operand::Immediate(Immediate::UInt8(0x01));
+    assert!(matches!(
+        interpreter.execute_fe_prefixed(&mut thread, &no).unwrap(),
+        StepResult::Continue
+    ));
+    assert!(no.is_prefix());
+
+    for opcode in (0x82..=0x8Bu8).chain(0xB3..=0xBC) {
+        let mut instruction = make_instruction(opcode, "?");
+        instruction.prefix = 0xFE;
+        let mut thread = create_test_thread();
+        thread.push(EmValue::I32(1)).unwrap();
+        assert!(
+            interpreter
+                .execute_fe_prefixed(&mut thread, &instruction)
+                .is_err(),
+            "0xFE 0x{opcode:02X} is no instruction"
+        );
+    }
+}
+
+/// An array index is an `int32` or a `native int`; an object is no index. The interpreter read
+/// one out of a boxed integer or the first integer among an object's fields, so it computed an
+/// element the program never asked for where the runtime rejects the program.
+#[test]
+fn an_object_is_no_array_index() {
+    let (mut interpreter, _address_space) = create_test_interpreter();
+    let mut thread = create_test_thread();
+    let array = thread
+        .heap()
+        .alloc_array_with_values(CilFlavor::I4, vec![EmValue::I32(10), EmValue::I32(20)])
+        .unwrap();
+    let boxed = thread
+        .heap()
+        .alloc_boxed(Token::new(0x0100_0001), EmValue::I32(1))
+        .unwrap();
+    let ldelem = make_instruction(0x94, "ldelem.i4");
+
+    thread.push(EmValue::ObjectRef(array)).unwrap();
+    thread.push(EmValue::ObjectRef(boxed)).unwrap();
+    assert!(interpreter.execute_standard(&mut thread, &ldelem).is_err());
+
+    // An integer index reads the element
+    thread.push(EmValue::ObjectRef(array)).unwrap();
+    thread.push(EmValue::I32(1)).unwrap();
+    interpreter.execute_standard(&mut thread, &ldelem).unwrap();
+    assert_eq!(thread.pop().unwrap(), EmValue::I32(20));
+}
+
+/// A pointer to an object's field (`ldflda`) points at the value the field holds: `ldfld` and
+/// `stfld` through it read and write a field of the struct stored there. Both went to the object
+/// holding the field instead, so a struct field of an object could not be read or set through
+/// its address.
+#[test]
+fn a_field_pointer_reaches_the_struct_in_the_field() {
+    // `Pair { int a; int b; }`
+    let mut builder = CilAssembly::from_path(fixture("crafted_2.exe")).unwrap();
+    let pair = TypeDefBuilder::new()
+        .name("Pair")
+        .namespace("Ptr")
+        .flags(TypeAttributes::PUBLIC | TypeAttributes::SEQUENTIAL_LAYOUT)
+        .build(&mut builder)
+        .unwrap();
+    let mut fields = Vec::new();
+    for name in ["a", "b"] {
+        let field = FieldBuilder::new()
+            .name(name)
+            .flags(FieldAttributes::PUBLIC)
+            .signature(&[0x06, 0x08])
+            .build(&mut builder)
+            .unwrap();
+        fields.push(Token::from_parts(
+            TableId::Field,
+            field.token().unwrap().row(),
+        ));
+    }
+    let pair = Token::from_parts(TableId::TypeDef, pair.token().unwrap().row());
+    let assembly = Arc::new(CilObject::from_mem(builder.to_memory().unwrap()).unwrap());
+
+    let (mut interpreter, _address_space) = create_test_interpreter();
+    let mut thread = EmulationThread::new(ThreadId::MAIN, create_test_context_with(Some(assembly)));
+    thread.start_method(Token::new(0x06000001), vec![], vec![], false);
+    // An object whose field `holder_field` holds a `Pair { a = 5, b = 7 }`
+    let holder_field = Token::new(0x0400_0001);
+    let holder = thread.heap().alloc_object(Token::new(0x0200_0002)).unwrap();
+    thread
+        .heap()
+        .set_field(
+            holder,
+            holder_field,
+            EmValue::ValueType {
+                type_token: pair,
+                fields: vec![EmValue::I32(5), EmValue::I32(7)],
+            },
+        )
+        .unwrap();
+    let pointer = EmValue::ManagedPtr(ManagedPointer::to_object_field(holder, holder_field));
+
+    thread.push(pointer.clone()).unwrap();
+    let ldfld = make_instruction_with_operand(0x7B, "ldfld", Operand::Token(fields[1]));
+    interpreter.execute_standard(&mut thread, &ldfld).unwrap();
+    assert_eq!(thread.pop().unwrap(), EmValue::I32(7));
+
+    thread.push(pointer).unwrap();
+    thread.push(EmValue::I32(9)).unwrap();
+    let stfld = make_instruction_with_operand(0x7D, "stfld", Operand::Token(fields[0]));
+    interpreter.execute_standard(&mut thread, &stfld).unwrap();
+    assert_eq!(
+        thread.heap().get_field(holder, holder_field).unwrap(),
+        EmValue::ValueType {
+            type_token: pair,
+            fields: vec![EmValue::I32(9), EmValue::I32(7)],
+        }
+    );
 }

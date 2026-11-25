@@ -9,13 +9,14 @@
 //!
 //! - **PE signature corruption** (BitDotNet): `0x00014550` → `0x00004550`
 //! - **CLR header zeroing** (BitDotNet/BitDecompiler): cb, runtime version, metadata size zeroed
-//! - **Data directory inflation** (BitMono packer): `NumberOfRvaAndSizes` set to `0x13` instead of `0x10`
+//! - **Data directory inflation** (BitMono packer and others): `NumberOfRvaAndSizes` above `0x10`
+//!   (BitMono writes `0x13`); the loader reads only the first 16 directories
 //! - **CLR directory size zeroing** (BitMono packer): .NET directory size set to 0
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use dotscope::file::repair::{repair_pe, RepairResult};
+//! ```no_run
+//! use dotscope::{repair_pe, RepairResult};
 //!
 //! let mut bytes = std::fs::read("corrupted.exe")?;
 //! let result = repair_pe(&mut bytes);
@@ -26,18 +27,22 @@
 //!         println!("  {:?}", repair);
 //!     }
 //! }
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 
 use cowfile::CowFile;
 use log::debug;
 
 use crate::{
-    file::pe::{
-        constants::{
-            CLR_DIRECTORY_INDEX, CLR_MAJOR_RUNTIME_VERSION, COR20_HEADER_SIZE, PE32PLUS_MAGIC,
-            PE32_MAGIC, PE_SIGNATURE, STANDARD_DATA_DIRECTORY_COUNT,
+    file::{
+        pe::{
+            constants::{
+                CLR_DIRECTORY_INDEX, CLR_MAJOR_RUNTIME_VERSION, COR20_HEADER_SIZE, PE32PLUS_MAGIC,
+                PE32_MAGIC, PE_SIGNATURE, STANDARD_DATA_DIRECTORY_COUNT,
+            },
+            SectionTable,
         },
-        SectionTable,
+        sectionmap::{RvaMapping, SectionMap},
     },
     metadata::root::CIL_HEADER_MAGIC,
     utils::{read_le_at, write_le_at},
@@ -81,7 +86,8 @@ pub enum RepairAction {
         /// Restored metadata size.
         restored_size: u32,
     },
-    /// `NumberOfRvaAndSizes` corrected (BitMono packer: `0x13` → `0x10`).
+    /// `NumberOfRvaAndSizes` above 16 corrected to 16, the directories the loader reads
+    /// (BitMono packer: `0x13` → `0x10`).
     DataDirectoryCount {
         /// Original (corrupted) data directory count.
         original: u32,
@@ -100,32 +106,115 @@ pub enum RepairAction {
 /// BitDotNet's corrupted PE signature (byte at offset +2 changed from 0x00 to 0x01).
 const BITDOTNET_PE_SIGNATURE: u32 = 0x0001_4550;
 
-/// BitMono packer's inflated data directory count.
-const BITMONO_INFLATED_DATA_DIRECTORY_COUNT: u32 = 0x13;
-
-/// Attempt all known PE repairs on raw bytes.
+/// Attempt all known PE repairs on raw bytes, in place.
 ///
 /// Returns a [`RepairResult`] recording what was repaired. If no repairs were
 /// needed or possible, returns an empty result.
 ///
 /// Repairs are applied in order:
-/// 1. PE signature (must run first — goblin needs a valid PE signature)
+/// 1. PE signature (must run first - goblin needs a valid PE signature)
 /// 2. Optional header / data directories (fix count before navigating to .NET dir)
 /// 3. CLR header (uses .NET data directory RVA which may have been fixed in step 2)
 pub fn repair_pe(bytes: &mut [u8]) -> RepairResult {
+    repair(&mut SliceBytes(bytes))
+}
+
+/// Attempt all known PE repairs using the CowFile overlay.
+///
+/// Writes are applied to the CowFile's overlay without modifying the base data.
+/// Reads through the CowFile see pending overlay writes, so repair step 2 can
+/// read step 1's writes correctly. The section table and the BSJB scan read
+/// the base data.
+///
+/// Returns a [`RepairResult`] recording what was repaired.
+pub fn repair_pe_cow(cowfile: &CowFile) -> RepairResult {
+    repair(&mut CowBytes(cowfile))
+}
+
+/// The byte access the repairs need: the integers they read and write, and the
+/// bytes the section table and the metadata scan are read from.
+trait PeBytes {
+    /// The bytes the section table and the metadata signature are found in.
+    fn data(&self) -> &[u8];
+    /// A little-endian `u16` at `offset`, as written so far.
+    fn read_u16(&self, offset: usize) -> Option<u16>;
+    /// A little-endian `u32` at `offset`, as written so far.
+    fn read_u32(&self, offset: usize) -> Option<u32>;
+    /// Writes a little-endian `u16` at `offset`.
+    fn write_u16(&mut self, offset: usize, value: u16);
+    /// Writes a little-endian `u32` at `offset`.
+    fn write_u32(&mut self, offset: usize, value: u32);
+}
+
+/// Repairs written straight into a byte slice.
+struct SliceBytes<'a>(&'a mut [u8]);
+
+impl PeBytes for SliceBytes<'_> {
+    fn data(&self) -> &[u8] {
+        self.0
+    }
+
+    fn read_u16(&self, offset: usize) -> Option<u16> {
+        read_u16(self.0, offset)
+    }
+
+    fn read_u32(&self, offset: usize) -> Option<u32> {
+        read_u32(self.0, offset)
+    }
+
+    fn write_u16(&mut self, offset: usize, value: u16) {
+        let mut off = offset;
+        let _ = write_le_at(self.0, &mut off, value);
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        let mut off = offset;
+        let _ = write_le_at(self.0, &mut off, value);
+    }
+}
+
+/// Repairs written to a CowFile's overlay; its base data stays as loaded.
+struct CowBytes<'a>(&'a CowFile);
+
+impl PeBytes for CowBytes<'_> {
+    fn data(&self) -> &[u8] {
+        self.0.data()
+    }
+
+    fn read_u16(&self, offset: usize) -> Option<u16> {
+        self.0.read_le::<u16>(offset).ok()
+    }
+
+    fn read_u32(&self, offset: usize) -> Option<u32> {
+        self.0.read_le::<u32>(offset).ok()
+    }
+
+    fn write_u16(&mut self, offset: usize, value: u16) {
+        let _ = self.0.write_le::<u16>(offset, value);
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        let _ = self.0.write_le::<u32>(offset, value);
+    }
+}
+
+/// Runs every repair over `bytes`, in the order [`repair_pe`] documents.
+fn repair(bytes: &mut impl PeBytes) -> RepairResult {
     let mut result = RepairResult::default();
 
     // Bail fast: not a PE file or too small for a DOS header
-    if bytes.len() < 64 || bytes.first() != Some(&b'M') || bytes.get(1) != Some(&b'Z') {
+    let data = bytes.data();
+    if data.len() < 64 || data.first() != Some(&b'M') || data.get(1) != Some(&b'Z') {
         return result;
     }
-    let Some(pe_off) = read_u32(bytes, 0x3C).map(|v| v as usize) else {
+    let len = data.len();
+    let Some(pe_off) = bytes.read_u32(0x3C).map(|v| v as usize) else {
         return result;
     };
     let Some(end) = pe_off.checked_add(4) else {
         return result;
     };
-    if end > bytes.len() {
+    if end > len {
         return result;
     }
 
@@ -136,43 +225,8 @@ pub fn repair_pe(bytes: &mut [u8]) -> RepairResult {
     result
 }
 
-/// Attempt all known PE repairs using the CowFile overlay.
-///
-/// Writes are applied to the CowFile's overlay without modifying the base data.
-/// Reads through the CowFile see pending overlay writes, so repair step 2 can
-/// read step 1's writes correctly.
-///
-/// Returns a [`RepairResult`] recording what was repaired.
-pub fn repair_pe_cow(cowfile: &CowFile) -> RepairResult {
-    let mut result = RepairResult::default();
-
-    // Bail fast: not a PE file or too small for a DOS header
-    if cowfile.len() < 64 {
-        return result;
-    }
-    let base = cowfile.data();
-    if base.first() != Some(&b'M') || base.get(1) != Some(&b'Z') {
-        return result;
-    }
-    let Some(pe_off) = cowfile.read_le::<u32>(0x3C).ok().map(|v| v as usize) else {
-        return result;
-    };
-    let Some(end) = pe_off.checked_add(4) else {
-        return result;
-    };
-    if end > base.len() {
-        return result;
-    }
-
-    repair_pe_signature_cow(cowfile, pe_off, &mut result);
-    repair_pe_optional_header_cow(cowfile, pe_off, &mut result);
-    repair_clr_header_cow(cowfile, pe_off, &mut result);
-
-    result
-}
-
-fn repair_pe_signature_cow(cowfile: &CowFile, pe_off: usize, result: &mut RepairResult) {
-    let Some(signature) = cowfile.read_le::<u32>(pe_off).ok() else {
+fn repair_pe_signature(bytes: &mut impl PeBytes, pe_off: usize, result: &mut RepairResult) {
+    let Some(signature) = bytes.read_u32(pe_off) else {
         return;
     };
     if signature != BITDOTNET_PE_SIGNATURE {
@@ -182,18 +236,18 @@ fn repair_pe_signature_cow(cowfile: &CowFile, pe_off: usize, result: &mut Repair
         "PE signature repair: 0x{:08X} → 0x{:08X} at offset 0x{:X}",
         signature, PE_SIGNATURE, pe_off
     );
-    let _ = cowfile.write_le::<u32>(pe_off, PE_SIGNATURE);
+    bytes.write_u32(pe_off, PE_SIGNATURE);
     result.repairs.push(RepairAction::PeSignature {
         original: signature,
         restored: PE_SIGNATURE,
     });
 }
 
-fn repair_pe_optional_header_cow(cowfile: &CowFile, pe_off: usize, result: &mut RepairResult) {
+fn repair_pe_optional_header(bytes: &mut impl PeBytes, pe_off: usize, result: &mut RepairResult) {
     let Some(optional_header_offset) = pe_off.checked_add(24) else {
         return;
     };
-    let Some(magic) = cowfile.read_le::<u16>(optional_header_offset).ok() else {
+    let Some(magic) = bytes.read_u16(optional_header_offset) else {
         return;
     };
     let num_rva_sizes_offset = match magic {
@@ -205,13 +259,14 @@ fn repair_pe_optional_header_cow(cowfile: &CowFile, pe_off: usize, result: &mut 
         return;
     };
 
-    if let Ok(num_rva_sizes) = cowfile.read_le::<u32>(num_rva_sizes_offset) {
-        if num_rva_sizes == BITMONO_INFLATED_DATA_DIRECTORY_COUNT {
+    if let Some(num_rva_sizes) = bytes.read_u32(num_rva_sizes_offset) {
+        // The loader reads the first 16 directories whatever the count says past them
+        if num_rva_sizes > STANDARD_DATA_DIRECTORY_COUNT {
             debug!(
                 "Data directory count repair: 0x{:X} → 0x{:X}",
                 num_rva_sizes, STANDARD_DATA_DIRECTORY_COUNT
             );
-            let _ = cowfile.write_le::<u32>(num_rva_sizes_offset, STANDARD_DATA_DIRECTORY_COUNT);
+            bytes.write_u32(num_rva_sizes_offset, STANDARD_DATA_DIRECTORY_COUNT);
             result.repairs.push(RepairAction::DataDirectoryCount {
                 original: num_rva_sizes,
                 restored: STANDARD_DATA_DIRECTORY_COUNT,
@@ -219,26 +274,20 @@ fn repair_pe_optional_header_cow(cowfile: &CowFile, pe_off: usize, result: &mut 
         }
     }
 
-    let Some(data_dir_start) = num_rva_sizes_offset.checked_add(4) else {
-        return;
-    };
-    let Some(clr_offset_in_table) = CLR_DIRECTORY_INDEX.checked_mul(8) else {
-        return;
-    };
-    let Some(clr_dir_offset) = data_dir_start.checked_add(clr_offset_in_table) else {
+    let Some(clr_dir_offset) = clr_directory_offset(bytes, pe_off, num_rva_sizes_offset) else {
         return;
     };
     let Some(clr_size_offset) = clr_dir_offset.checked_add(4) else {
         return;
     };
-    let clr_rva = cowfile.read_le::<u32>(clr_dir_offset).ok();
-    let clr_size = cowfile.read_le::<u32>(clr_size_offset).ok();
+    let clr_rva = bytes.read_u32(clr_dir_offset);
+    let clr_size = bytes.read_u32(clr_size_offset);
     if let (Some(rva), Some(0)) = (clr_rva.filter(|&r| r != 0), clr_size) {
         debug!(
             ".NET directory size repair: 0 → {} (RVA=0x{:X})",
             COR20_HEADER_SIZE, rva
         );
-        let _ = cowfile.write_le::<u32>(clr_size_offset, COR20_HEADER_SIZE);
+        bytes.write_u32(clr_size_offset, COR20_HEADER_SIZE);
         result.repairs.push(RepairAction::DotNetDirectorySize {
             original: 0,
             restored: COR20_HEADER_SIZE,
@@ -246,11 +295,32 @@ fn repair_pe_optional_header_cow(cowfile: &CowFile, pe_off: usize, result: &mut 
     }
 }
 
-fn repair_clr_header_cow(cowfile: &CowFile, pe_off: usize, result: &mut RepairResult) {
+/// The file offset of the CLR data directory entry, when the image has one: its directory
+/// count reaches it and the optional header holds it. A count of 14 or fewer declares no CLR
+/// directory, and the bytes where it would be belong to whatever follows the directories.
+fn clr_directory_offset(
+    bytes: &impl PeBytes,
+    pe_off: usize,
+    num_rva_sizes_offset: usize,
+) -> Option<usize> {
+    if usize::try_from(bytes.read_u32(num_rva_sizes_offset)?).ok()? <= CLR_DIRECTORY_INDEX {
+        return None;
+    }
+    let optional_header_size = bytes.read_u16(pe_off.checked_add(20)?)?;
+    let optional_header_end = pe_off
+        .checked_add(24)?
+        .checked_add(usize::from(optional_header_size))?;
+    let entry = num_rva_sizes_offset
+        .checked_add(4)?
+        .checked_add(CLR_DIRECTORY_INDEX.checked_mul(8)?)?;
+    (entry.checked_add(8)? <= optional_header_end).then_some(entry)
+}
+
+fn repair_clr_header(bytes: &mut impl PeBytes, pe_off: usize, result: &mut RepairResult) {
     let Some(optional_header_offset) = pe_off.checked_add(24) else {
         return;
     };
-    let Some(magic) = cowfile.read_le::<u16>(optional_header_offset).ok() else {
+    let Some(magic) = bytes.read_u16(optional_header_offset) else {
         return;
     };
     let num_rva_sizes_offset = match magic {
@@ -261,24 +331,17 @@ fn repair_clr_header_cow(cowfile: &CowFile, pe_off: usize, result: &mut RepairRe
     let Some(num_rva_sizes_offset) = num_rva_sizes_offset else {
         return;
     };
-    let Some(data_dir_start) = num_rva_sizes_offset.checked_add(4) else {
+    let Some(clr_dir_offset) = clr_directory_offset(bytes, pe_off, num_rva_sizes_offset) else {
         return;
     };
-    let Some(clr_offset_in_table) = CLR_DIRECTORY_INDEX.checked_mul(8) else {
-        return;
-    };
-    let Some(clr_dir_offset) = data_dir_start.checked_add(clr_offset_in_table) else {
-        return;
-    };
-    let Some(clr_rva) = cowfile.read_le::<u32>(clr_dir_offset).ok() else {
+    let Some(clr_rva) = bytes.read_u32(clr_dir_offset) else {
         return;
     };
     if clr_rva == 0 {
         return;
     }
 
-    let base = cowfile.data();
-    let Some(clr_file_offset) = rva_to_file_offset(base, pe_off, clr_rva) else {
+    let Some(clr_file_offset) = rva_to_file_offset(bytes.data(), pe_off, clr_rva) else {
         return;
     };
     let clr_offset = clr_file_offset as usize;
@@ -292,38 +355,38 @@ fn repair_clr_header_cow(cowfile: &CowFile, pe_off: usize, result: &mut RepairRe
         return;
     };
 
-    if let Ok(0) = cowfile.read_le::<u32>(clr_offset) {
+    if bytes.read_u32(clr_offset) == Some(0) {
         debug!("CLR header size repair: 0 → {}", COR20_HEADER_SIZE);
-        let _ = cowfile.write_le::<u32>(clr_offset, COR20_HEADER_SIZE);
+        bytes.write_u32(clr_offset, COR20_HEADER_SIZE);
         result.repairs.push(RepairAction::ClrHeaderSize {
             original: 0,
             restored: COR20_HEADER_SIZE,
         });
     }
 
-    if let Ok(0) = cowfile.read_le::<u16>(version_offset) {
+    if bytes.read_u16(version_offset) == Some(0) {
         debug!(
             "CLR runtime version repair: 0 → {}",
             CLR_MAJOR_RUNTIME_VERSION
         );
-        let _ = cowfile.write_le::<u16>(version_offset, CLR_MAJOR_RUNTIME_VERSION);
+        bytes.write_u16(version_offset, CLR_MAJOR_RUNTIME_VERSION);
         result.repairs.push(RepairAction::ClrHeaderVersion {
             original_major: 0,
             restored_major: CLR_MAJOR_RUNTIME_VERSION,
         });
     }
 
-    let metadata_rva = cowfile.read_le::<u32>(metadata_rva_offset).ok();
-    let metadata_size = cowfile.read_le::<u32>(metadata_size_offset).ok();
+    let metadata_rva = bytes.read_u32(metadata_rva_offset);
+    let metadata_size = bytes.read_u32(metadata_size_offset);
 
     if metadata_rva == Some(0) || metadata_size == Some(0) {
-        if let Some((found_rva, found_size)) = find_metadata_by_bsjb_scan(base, pe_off) {
+        if let Some((found_rva, found_size)) = find_metadata_by_bsjb_scan(bytes.data(), pe_off) {
             debug!(
                 "CLR metadata repair via BSJB scan: RVA=0x{:X}, size=0x{:X}",
                 found_rva, found_size
             );
-            let _ = cowfile.write_le::<u32>(metadata_rva_offset, found_rva);
-            let _ = cowfile.write_le::<u32>(metadata_size_offset, found_size);
+            bytes.write_u32(metadata_rva_offset, found_rva);
+            bytes.write_u32(metadata_size_offset, found_size);
             result.repairs.push(RepairAction::ClrMetadataRva {
                 restored_rva: found_rva,
                 restored_size: found_size,
@@ -344,205 +407,19 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     read_le_at::<u32>(bytes, &mut off).ok()
 }
 
-fn repair_pe_signature(bytes: &mut [u8], pe_off: usize, result: &mut RepairResult) {
-    let Some(signature) = read_u32(bytes, pe_off) else {
-        return;
-    };
-    if signature != BITDOTNET_PE_SIGNATURE {
-        return;
-    }
-    debug!(
-        "PE signature repair: 0x{:08X} → 0x{:08X} at offset 0x{:X}",
-        signature, PE_SIGNATURE, pe_off
-    );
-    let mut off = pe_off;
-    let _ = write_le_at(bytes, &mut off, PE_SIGNATURE);
-    result.repairs.push(RepairAction::PeSignature {
-        original: signature,
-        restored: PE_SIGNATURE,
-    });
-}
-
-fn repair_pe_optional_header(bytes: &mut [u8], pe_off: usize, result: &mut RepairResult) {
-    let Some(optional_header_offset) = pe_off.checked_add(24) else {
-        return;
-    };
-    let Some(magic) = read_u16(bytes, optional_header_offset) else {
-        return;
-    };
-    let num_rva_sizes_offset = match magic {
-        PE32_MAGIC => optional_header_offset.checked_add(0x5C),
-        PE32PLUS_MAGIC => optional_header_offset.checked_add(0x6C),
-        _ => return,
-    };
-    let Some(num_rva_sizes_offset) = num_rva_sizes_offset else {
-        return;
-    };
-
-    if let Some(num_rva_sizes) = read_u32(bytes, num_rva_sizes_offset) {
-        if num_rva_sizes == BITMONO_INFLATED_DATA_DIRECTORY_COUNT {
-            debug!(
-                "Data directory count repair: 0x{:X} → 0x{:X}",
-                num_rva_sizes, STANDARD_DATA_DIRECTORY_COUNT
-            );
-            let mut off = num_rva_sizes_offset;
-            let _ = write_le_at(bytes, &mut off, STANDARD_DATA_DIRECTORY_COUNT);
-            result.repairs.push(RepairAction::DataDirectoryCount {
-                original: num_rva_sizes,
-                restored: STANDARD_DATA_DIRECTORY_COUNT,
-            });
-        }
-    }
-
-    let Some(data_dir_start) = num_rva_sizes_offset.checked_add(4) else {
-        return;
-    };
-    let Some(clr_offset_in_table) = CLR_DIRECTORY_INDEX.checked_mul(8) else {
-        return;
-    };
-    let Some(clr_dir_offset) = data_dir_start.checked_add(clr_offset_in_table) else {
-        return;
-    };
-    let Some(clr_size_offset) = clr_dir_offset.checked_add(4) else {
-        return;
-    };
-    let clr_rva = read_u32(bytes, clr_dir_offset);
-    let clr_size = read_u32(bytes, clr_size_offset);
-    if let (Some(rva), Some(0)) = (clr_rva.filter(|&r| r != 0), clr_size) {
-        debug!(
-            ".NET directory size repair: 0 → {} (RVA=0x{:X})",
-            COR20_HEADER_SIZE, rva
-        );
-        let mut off = clr_size_offset;
-        let _ = write_le_at(bytes, &mut off, COR20_HEADER_SIZE);
-        result.repairs.push(RepairAction::DotNetDirectorySize {
-            original: 0,
-            restored: COR20_HEADER_SIZE,
-        });
-    }
-}
-
-fn repair_clr_header(bytes: &mut [u8], pe_off: usize, result: &mut RepairResult) {
-    let Some(optional_header_offset) = pe_off.checked_add(24) else {
-        return;
-    };
-    let Some(magic) = read_u16(bytes, optional_header_offset) else {
-        return;
-    };
-    let num_rva_sizes_offset = match magic {
-        PE32_MAGIC => optional_header_offset.checked_add(0x5C),
-        PE32PLUS_MAGIC => optional_header_offset.checked_add(0x6C),
-        _ => return,
-    };
-    let Some(num_rva_sizes_offset) = num_rva_sizes_offset else {
-        return;
-    };
-    let Some(data_dir_start) = num_rva_sizes_offset.checked_add(4) else {
-        return;
-    };
-    let Some(clr_offset_in_table) = CLR_DIRECTORY_INDEX.checked_mul(8) else {
-        return;
-    };
-    let Some(clr_dir_offset) = data_dir_start.checked_add(clr_offset_in_table) else {
-        return;
-    };
-    let Some(clr_rva) = read_u32(bytes, clr_dir_offset) else {
-        return;
-    };
-    if clr_rva == 0 {
-        return;
-    }
-
-    let Some(clr_file_offset) = rva_to_file_offset(bytes, pe_off, clr_rva) else {
-        return;
-    };
-    let clr_offset = clr_file_offset as usize;
-    let Some(version_offset) = clr_offset.checked_add(4) else {
-        return;
-    };
-    let Some(metadata_rva_offset) = clr_offset.checked_add(8) else {
-        return;
-    };
-    let Some(metadata_size_offset) = clr_offset.checked_add(12) else {
-        return;
-    };
-
-    if let Some(0) = read_u32(bytes, clr_offset) {
-        debug!("CLR header size repair: 0 → {}", COR20_HEADER_SIZE);
-        let mut off = clr_offset;
-        let _ = write_le_at(bytes, &mut off, COR20_HEADER_SIZE);
-        result.repairs.push(RepairAction::ClrHeaderSize {
-            original: 0,
-            restored: COR20_HEADER_SIZE,
-        });
-    }
-
-    if let Some(0) = read_u16(bytes, version_offset) {
-        debug!(
-            "CLR runtime version repair: 0 → {}",
-            CLR_MAJOR_RUNTIME_VERSION
-        );
-        let mut off = version_offset;
-        let _ = write_le_at(bytes, &mut off, CLR_MAJOR_RUNTIME_VERSION);
-        result.repairs.push(RepairAction::ClrHeaderVersion {
-            original_major: 0,
-            restored_major: CLR_MAJOR_RUNTIME_VERSION,
-        });
-    }
-
-    let metadata_rva = read_u32(bytes, metadata_rva_offset);
-    let metadata_size = read_u32(bytes, metadata_size_offset);
-
-    if metadata_rva == Some(0) || metadata_size == Some(0) {
-        if let Some((found_rva, found_size)) = find_metadata_by_bsjb_scan(bytes, pe_off) {
-            debug!(
-                "CLR metadata repair via BSJB scan: RVA=0x{:X}, size=0x{:X}",
-                found_rva, found_size
-            );
-            let mut off = metadata_rva_offset;
-            let _ = write_le_at(bytes, &mut off, found_rva);
-            let mut off = metadata_size_offset;
-            let _ = write_le_at(bytes, &mut off, found_size);
-            result.repairs.push(RepairAction::ClrMetadataRva {
-                restored_rva: found_rva,
-                restored_size: found_size,
-            });
-        }
-    }
-}
-
-/// Converts an RVA to a file offset using the section table.
+/// Where the runtime finds `rva` in the file, by the section table (see [`SectionMap`]).
 fn rva_to_file_offset(bytes: &[u8], pe_off: usize, rva: u32) -> Option<u32> {
     let sections = parse_section_table(bytes, pe_off)?;
-
-    for section in &sections {
-        let section_end = section.virtual_address.checked_add(section.virtual_size)?;
-        if rva >= section.virtual_address && rva < section_end {
-            let offset_within_section = rva.checked_sub(section.virtual_address)?;
-            return section
-                .pointer_to_raw_data
-                .checked_add(offset_within_section);
-        }
+    match SectionMap::new(&sections, bytes.len()).map(rva) {
+        RvaMapping::File(offset) => u32::try_from(offset).ok(),
+        RvaMapping::ZeroFill | RvaMapping::Unmapped => None,
     }
-
-    None
 }
 
-/// Converts a file offset to an RVA using the section table.
+/// The RVA the file byte at `offset` is loaded at, by the section table (see [`SectionMap`]).
 fn file_offset_to_rva(bytes: &[u8], pe_off: usize, offset: u32) -> Option<u32> {
     let sections = parse_section_table(bytes, pe_off)?;
-
-    for section in &sections {
-        let section_end = section
-            .pointer_to_raw_data
-            .checked_add(section.size_of_raw_data)?;
-        if offset >= section.pointer_to_raw_data && offset < section_end {
-            let offset_within_section = offset.checked_sub(section.pointer_to_raw_data)?;
-            return section.virtual_address.checked_add(offset_within_section);
-        }
-    }
-
-    None
+    SectionMap::new(&sections, bytes.len()).offset_to_rva(offset as usize)
 }
 
 /// Parses the section table from raw PE bytes into [`SectionTable`] entries.
@@ -731,16 +608,19 @@ fn estimate_metadata_size(bytes: &[u8], bsjb_offset: usize) -> u32 {
 mod tests {
     use cowfile::CowFile;
 
-    use crate::file::{
-        pe::constants::{
-            CLR_MAJOR_RUNTIME_VERSION, COR20_HEADER_SIZE, PE_SIGNATURE,
-            STANDARD_DATA_DIRECTORY_COUNT,
+    use crate::{
+        file::{
+            pe::constants::{
+                CLR_MAJOR_RUNTIME_VERSION, COR20_HEADER_SIZE, PE_SIGNATURE,
+                STANDARD_DATA_DIRECTORY_COUNT,
+            },
+            repair::{repair_pe, repair_pe_cow, RepairAction, BITDOTNET_PE_SIGNATURE},
         },
-        repair::{
-            repair_pe, repair_pe_cow, RepairAction, BITDOTNET_PE_SIGNATURE,
-            BITMONO_INFLATED_DATA_DIRECTORY_COUNT,
-        },
+        testkit::fixture,
     };
+
+    /// BitMono packer's inflated data directory count.
+    const BITMONO_INFLATED_DATA_DIRECTORY_COUNT: u32 = 0x13;
 
     /// Helper to build a minimal valid PE32 with known layout.
     ///
@@ -920,6 +800,72 @@ mod tests {
         }
     }
 
+    /// A count of 14 or fewer declares no CLR directory: the CLR-slot repairs leave the bytes
+    /// where it would be, which belong to what follows the directories, as they are.
+    #[test]
+    fn no_clr_directory_is_repaired_where_none_is_declared() {
+        for count in [0u32, 10, 14] {
+            let mut pe = build_minimal_pe();
+            pe[0xF4..0xF8].copy_from_slice(&count.to_le_bytes());
+            // The CLR slot (directory 14) with an RVA and a zero size
+            pe[0x168..0x16C].copy_from_slice(&0x2008u32.to_le_bytes());
+            pe[0x16C..0x170].copy_from_slice(&0u32.to_le_bytes());
+            let before = pe.clone();
+            let result = repair_pe(&mut pe);
+            assert_eq!(pe, before, "count {count}");
+            assert!(
+                result.repairs.is_empty(),
+                "count {count}: {:?}",
+                result.repairs
+            );
+        }
+    }
+
+    /// A CLR slot past the optional header's declared size is not the optional header's.
+    #[test]
+    fn no_clr_directory_is_repaired_past_the_optional_header() {
+        let mut pe = build_minimal_pe();
+        pe[0x16C..0x170].copy_from_slice(&0u32.to_le_bytes());
+        // SizeOfOptionalHeader ends before directory 14's entry
+        pe[0x94..0x96].copy_from_slice(&0x00D0u16.to_le_bytes());
+        let before = pe.clone();
+        repair_pe(&mut pe);
+        assert_eq!(pe[0x168..0x170], before[0x168..0x170]);
+    }
+
+    /// Any count past 16 is repaired, not only BitMono's 0x13; 16 and below are left as
+    /// they are.
+    #[test]
+    fn every_data_directory_count_past_16_is_repaired() {
+        for count in [0x11, 0x14, 0x20, 0xFFFF, u32::MAX] {
+            let mut pe = build_minimal_pe();
+            pe[0xF4..0xF8].copy_from_slice(&count.to_le_bytes());
+            let result = repair_pe(&mut pe);
+            assert_eq!(
+                u32::from_le_bytes(pe[0xF4..0xF8].try_into().unwrap()),
+                STANDARD_DATA_DIRECTORY_COUNT,
+                "count {count:#x}"
+            );
+            assert!(result.repairs.iter().any(|repair| matches!(
+                repair,
+                RepairAction::DataDirectoryCount { original, .. } if *original == count
+            )));
+        }
+        for count in [0x0F, STANDARD_DATA_DIRECTORY_COUNT] {
+            let mut pe = build_minimal_pe();
+            pe[0xF4..0xF8].copy_from_slice(&count.to_le_bytes());
+            let result = repair_pe(&mut pe);
+            assert_eq!(
+                u32::from_le_bytes(pe[0xF4..0xF8].try_into().unwrap()),
+                count
+            );
+            assert!(!result
+                .repairs
+                .iter()
+                .any(|repair| matches!(repair, RepairAction::DataDirectoryCount { .. })));
+        }
+    }
+
     #[test]
     fn test_dotnet_directory_size_repair() {
         let mut pe = build_minimal_pe();
@@ -1068,10 +1014,7 @@ mod tests {
 
     #[test]
     fn test_bitdotnet_sample() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_bitdotnet.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_bitdotnet.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read BitDotNet sample");
 
         // Verify the file is currently corrupted
@@ -1114,10 +1057,7 @@ mod tests {
 
     #[test]
     fn test_bitdecompiler_sample() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_bitdecompiler.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_bitdecompiler.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read BitDecompiler sample");
 
         let result = repair_pe(&mut bytes);
@@ -1136,10 +1076,7 @@ mod tests {
 
     #[test]
     fn test_packer_sample() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_packer.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_packer.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read Packer sample");
 
         let result = repair_pe(&mut bytes);
@@ -1170,10 +1107,7 @@ mod tests {
 
     #[test]
     fn test_pe_combined_sample() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_pe_combined.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_pe_combined.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read pe_combined sample");
 
         let result = repair_pe(&mut bytes);
@@ -1193,10 +1127,7 @@ mod tests {
 
     #[test]
     fn test_maximum_sample() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_maximum.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_maximum.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read maximum sample");
 
         let result = repair_pe(&mut bytes);
@@ -1225,10 +1156,7 @@ mod tests {
 
     #[test]
     fn test_original_sample_no_repairs() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/original.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/original.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read original sample");
 
         let result = repair_pe(&mut bytes);
@@ -1241,10 +1169,7 @@ mod tests {
 
     #[test]
     fn test_repaired_bitdotnet_loads_as_pe() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_bitdotnet.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_bitdotnet.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read BitDotNet sample");
 
         repair_pe(&mut bytes);
@@ -1260,10 +1185,7 @@ mod tests {
 
     #[test]
     fn test_repaired_bitdecompiler_loads_as_pe() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_bitdecompiler.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_bitdecompiler.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read BitDecompiler sample");
 
         repair_pe(&mut bytes);
@@ -1278,10 +1200,7 @@ mod tests {
 
     #[test]
     fn test_repaired_packer_loads_as_pe() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_packer.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_packer.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read Packer sample");
 
         repair_pe(&mut bytes);
@@ -1296,10 +1215,7 @@ mod tests {
 
     #[test]
     fn test_repaired_maximum_loads_as_pe() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_maximum.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_maximum.exe");
         let mut bytes = std::fs::read(path).expect("Failed to read Maximum sample");
 
         repair_pe(&mut bytes);
@@ -1312,7 +1228,7 @@ mod tests {
         );
     }
 
-    // --- CowFile-based repair tests ---
+    // CowFile-based repair tests
 
     #[test]
     fn test_cow_clean_pe_no_repairs() {
@@ -1383,10 +1299,7 @@ mod tests {
 
     #[test]
     fn test_cow_bitdotnet_sample() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_bitdotnet.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_bitdotnet.exe");
         let bytes = std::fs::read(path).expect("Failed to read BitDotNet sample");
         let mut cowfile = CowFile::from_vec(bytes);
         let result = repair_pe_cow(&cowfile);
@@ -1407,10 +1320,7 @@ mod tests {
 
     #[test]
     fn test_cow_maximum_sample() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/samples/packers/bitmono/0.39.0/bitmono_maximum.exe"
-        );
+        let path = fixture("packers/bitmono/0.39.0/bitmono_maximum.exe");
         let bytes = std::fs::read(path).expect("Failed to read maximum sample");
         let mut cowfile = CowFile::from_vec(bytes);
         let result = repair_pe_cow(&cowfile);

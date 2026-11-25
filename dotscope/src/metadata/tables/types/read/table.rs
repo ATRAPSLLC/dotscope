@@ -52,16 +52,22 @@ use crate::{
 /// ## Examples
 ///
 /// ### Basic Usage
-/// ```rust,ignore
-/// # use dotscope::metadata::tables::types::{MetadataTable, RowReadable};
+/// ```no_run
+/// # use dotscope::metadata::tables::MetadataTable;
+/// # use dotscope::metadata::tables::RowReadable;
 /// # use dotscope::metadata::tables::TableInfoRef;
+/// # use dotscope::metadata::tables::{TableId, TableRow};
 /// # struct MyRow { id: u32 }
-/// # impl RowReadable for MyRow {
+/// # impl TableRow for MyRow {
 /// #     fn row_size(_: &TableInfoRef) -> u32 { 4 }
+/// # }
+/// # impl RowReadable for MyRow {
+/// #     const TABLE_ID: TableId = TableId::Module;
 /// #     fn row_read(_: &[u8], offset: &mut usize, rid: u32, _: &TableInfoRef) -> dotscope::Result<Self> {
 /// #         *offset += 4; Ok(MyRow { id: rid })
 /// #     }
 /// # }
+/// # use dotscope::metadata::tables::skip_unreadable;
 /// # fn example(data: &[u8], table_info: TableInfoRef) -> dotscope::Result<()> {
 /// let table: MetadataTable<MyRow> = MetadataTable::new(data, 100, table_info)?;
 ///
@@ -76,22 +82,26 @@ use crate::{
 /// }
 /// # Ok(())
 /// # }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// ### Parallel Processing
-/// ```rust,ignore
-/// # use dotscope::metadata::tables::types::{MetadataTable, RowReadable};
+/// ```no_run
+/// # use dotscope::metadata::tables::MetadataTable;
+/// # use dotscope::metadata::tables::RowReadable;
 /// # use dotscope::metadata::tables::TableInfoRef;
 /// # use rayon::prelude::*;
+/// # use dotscope::metadata::tables::{TableId, TableRow};
 /// # struct MyRow { id: u32 }
-/// # impl RowReadable for MyRow {
+/// # impl TableRow for MyRow {
 /// #     fn row_size(_: &TableInfoRef) -> u32 { 4 }
+/// # }
+/// # impl RowReadable for MyRow {
+/// #     const TABLE_ID: TableId = TableId::Module;
 /// #     fn row_read(_: &[u8], offset: &mut usize, rid: u32, _: &TableInfoRef) -> dotscope::Result<Self> {
 /// #         *offset += 4; Ok(MyRow { id: rid })
 /// #     }
 /// # }
-/// # impl Send for MyRow {}
-/// # impl Sync for MyRow {}
 /// # fn example(data: &[u8], table_info: TableInfoRef) -> dotscope::Result<()> {
 /// let table: MetadataTable<MyRow> = MetadataTable::new(data, 100, table_info)?;
 ///
@@ -100,10 +110,11 @@ use crate::{
 ///     // A row that failed to parse is reported, not skipped.
 ///     let row = row?;
 ///     println!("Processing row: {}", row.id);
-///     Ok(())
+///     Ok::<(), dotscope::Error>(())
 /// })?;
 /// # Ok(())
 /// # }
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub struct MetadataTable<'a, T> {
     /// Reference to the raw table data bytes
@@ -206,7 +217,7 @@ impl<'a, T: RowReadable> MetadataTable<'a, T> {
     ///
     /// `Ok(Some(row))` when the row exists and parses, `Ok(None)` when the index is outside
     /// the table, and `Err` when the row exists but does not parse. Those are three different
-    /// facts and callers act on them differently — a row that will not parse is a defect in
+    /// facts and callers act on them differently - a row that will not parse is a defect in
     /// the input, not an absent row.
     ///
     /// # Errors

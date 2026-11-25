@@ -450,11 +450,16 @@ impl Cor20Header {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use dotscope::metadata::cor20header::Cor20Header;
+    /// ```
+    /// use dotscope::CilObject;
     ///
-    /// let header = Cor20Header { /* ... */ };
+    /// // The header of a loaded assembly, written back out: 72 bytes
+    /// let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+    /// let header = assembly.cor20header();
+    /// let mut writer = Vec::new();
     /// header.write_to(&mut writer)?;
+    /// assert_eq!(writer.len(), 72);
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         // cb (size) - always 72

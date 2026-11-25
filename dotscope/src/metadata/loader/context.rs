@@ -31,24 +31,8 @@
 //!
 //! # Examples
 //!
-//! ```rust,ignore
-//! # use dotscope::metadata::loader::context::LoaderContext;
-//! # use dotscope::metadata::tables::CodedIndex;
-//! # fn example_usage(context: &LoaderContext) {
-//! // Resolve a coded index to a type reference
-//! let coded_index = CodedIndex { /* ... */ };
-//! let type_ref = context.get_ref(&coded_index);
-//!
-//! // Access metadata streams
-//! if let Some(strings) = context.strings {
-//!     // Use string heap for name resolution
-//! }
-//!
-//! // Access specific table maps
-//! let method_count = context.method_def.len();
-//! println!("Assembly contains {} methods", method_count);
-//! # }
-//! ```
+//! The loaders show it in use: `CustomAttributeLoader` resolves each attribute's parent
+//! and constructor with [`LoaderContext::get_ref`] (`metadata/tables/customattribute/loader.rs`).
 //!
 //! # Memory Management
 //!
@@ -87,21 +71,21 @@ use crate::{
         exports::Exports,
         imports::Imports,
         method::MethodMap,
+        pdb::PortablePdb,
         resources::Resources,
         root::Root,
         streams::{Blob, Guid, Strings, TablesHeader, UserStrings},
         tables::{
             AssemblyOsRc, AssemblyProcessorRc, AssemblyRc, AssemblyRefMap, AssemblyRefOsMap,
             AssemblyRefProcessorMap, ClassLayoutMap, CodedIndex, ConstantMap, CustomAttributeMap,
-            CustomDebugInformationMap, DeclSecurityMap, DocumentMap, EncLogMap, EncMapMap,
-            EventMap, EventMapEntryMap, EventPtrMap, FieldLayoutMap, FieldMap, FieldMarshalMap,
-            FieldPtrMap, FieldRVAMap, FileMap, GenericParamConstraintMap, GenericParamMap,
-            ImportScopeMap, InterfaceImplMap, LocalConstantMap, LocalScopeMap, LocalVariableMap,
-            MemberRefMap, MethodDebugInformationMap, MethodImplMap, MethodPtrMap,
-            MethodSemanticsMap, MethodSpecMap, ModuleRc, ModuleRefMap, NestedClassMap, ParamMap,
-            ParamPtrMap, PropertyMap, PropertyMapEntryMap, PropertyPtrMap, RowReadable,
-            StandAloneSigMap, StateMachineMethodMap, TableId, TypeSpecMap,
+            DeclSecurityMap, EncLogMap, EncMapMap, EventMap, EventMapEntryMap, EventPtrMap,
+            FieldLayoutMap, FieldMap, FieldMarshalMap, FieldPtrMap, FieldRVAMap, FileMap,
+            GenericParamConstraintMap, GenericParamMap, InterfaceImplMap, MemberList, MemberRanges,
+            MemberRefMap, MethodImplMap, MethodPtrMap, MethodSemanticsMap, MethodSpecMap, ModuleRc,
+            ModuleRefMap, NestedClassMap, ParamMap, ParamPtrMap, PropertyMap, PropertyMapEntryMap,
+            PropertyPtrMap, RowReadable, StandAloneSigMap, TableId, TypeSpecMap,
         },
+        token::Token,
         typesystem::{CilTypeReference, TypeRegistry},
     },
     Result,
@@ -141,31 +125,11 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// # use dotscope::metadata::loader::context::LoaderContext;
-/// # use dotscope::metadata::tables::{CodedIndex, TableId};
-/// # use dotscope::metadata::token::Token;
-/// # fn loader_example(context: &LoaderContext) -> dotscope::Result<()> {
-/// // Resolve a coded index during loading
-/// let coded_index = CodedIndex {
-///     tag: TableId::TypeDef,
-///     token: Token::new(0x02000001),
-/// };
-/// let type_reference = context.get_ref(&coded_index);
-///
-/// // Access metadata streams for name resolution
-/// if let Some(strings) = context.strings {
-///     let name = strings.get(123)?; // Get string at index 123
-/// }
-///
-/// // Query loaded metadata
-/// println!("Methods loaded: {}", context.method_def.len());
-/// println!("Types registered: {}", context.types.len());
-/// # Ok(())
-/// # }
-/// ```
-pub(crate) struct LoaderContext<'a> {
-    // === Core Assembly Data ===
+/// Every table loader receives one; `CustomAttributeLoader`
+/// (`metadata/tables/customattribute/loader.rs`) reads its maps and resolves coded indices
+/// through it.
+pub struct LoaderContext<'a> {
+    // Core Assembly Data
     /// Input file reference for the assembly being loaded.
     pub input: Arc<File>,
     /// Raw binary data of the assembly file.
@@ -181,7 +145,7 @@ pub(crate) struct LoaderContext<'a> {
     /// When true, errors are logged to diagnostics and loading continues.
     pub lenient: bool,
 
-    // === Metadata Streams ===
+    // Metadata Streams
     /// Tables stream containing all metadata table definitions.
     pub meta: Option<&'a TablesHeader<'a>>,
     /// String heap containing UTF-8 encoded names and identifiers.
@@ -193,7 +157,7 @@ pub(crate) struct LoaderContext<'a> {
     /// Blob heap containing binary data (signatures, custom attributes, etc.).
     pub blobs: Option<&'a Blob<'a>>,
 
-    // === Assembly and Module Tables ===
+    // Assembly and Module Tables
     /// Assembly definition (single entry per assembly).
     pub assembly: &'a OnceLock<AssemblyRc>,
     /// Assembly operating system information.
@@ -211,11 +175,11 @@ pub(crate) struct LoaderContext<'a> {
     /// Module references to external modules.
     pub module_ref: &'a ModuleRefMap,
 
-    // === Type System Tables ===
+    // Type System Tables
     /// Type specifications for instantiated generic types.
     pub type_spec: TypeSpecMap,
 
-    // === Method and Field Tables ===
+    // Method and Field Tables
     /// Method definitions in the assembly.
     pub method_def: &'a MethodMap,
     /// Method implementations for interface/virtual methods.
@@ -225,7 +189,7 @@ pub(crate) struct LoaderContext<'a> {
     /// Method specifications for generic method instantiations.
     pub method_spec: &'a MethodSpecMap,
     /// Field definitions in types.
-    pub field: FieldMap,
+    pub field: &'a FieldMap,
     /// Field pointer indirection table.
     pub field_ptr: FieldPtrMap,
     /// Method pointer indirection table.
@@ -237,31 +201,17 @@ pub(crate) struct LoaderContext<'a> {
     /// Field relative virtual addresses for initialized data.
     pub field_rva: FieldRVAMap,
 
-    // === Edit-and-Continue Tables ===
+    // Edit-and-Continue Tables
     /// Edit-and-Continue log entries tracking debugging modifications.
     pub enc_log: EncLogMap,
     /// Edit-and-Continue token mapping for debugging scenarios.
     pub enc_map: EncMapMap,
 
-    // === Portable PDB Debug Tables ===
-    /// Document information for source file mapping in Portable PDB format.
-    pub document: DocumentMap,
-    /// Method debugging information including sequence points.
-    pub method_debug_information: MethodDebugInformationMap,
-    /// Local variable scope information for debugging.
-    pub local_scope: LocalScopeMap,
-    /// Local variable information for debugging.
-    pub local_variable: LocalVariableMap,
-    /// Local constant information for debugging.
-    pub local_constant: LocalConstantMap,
-    /// Import scope information for debugging.
-    pub import_scope: ImportScopeMap,
-    /// State machine method mapping for async/iterator debugging.
-    pub state_machine_method: StateMachineMethodMap,
-    /// Custom debug information for extensible debugging metadata.
-    pub custom_debug_information: CustomDebugInformationMap,
+    // Portable PDB
+    /// The Portable PDB the debug-table loaders read and fill, when the assembly has one.
+    pub pdb: Option<PdbSource<'a>>,
 
-    // === Parameter and Generic Tables ===
+    // Parameter and Generic Tables
     /// Parameter definitions for methods.
     pub param: ParamMap,
     /// Parameter pointer indirection table.
@@ -271,7 +221,7 @@ pub(crate) struct LoaderContext<'a> {
     /// Constraints on generic parameters.
     pub generic_param_constraint: GenericParamConstraintMap,
 
-    // === Property and Event Tables ===
+    // Property and Event Tables
     /// Property definitions in types.
     pub property: PropertyMap,
     /// Property pointer indirection table.
@@ -285,7 +235,7 @@ pub(crate) struct LoaderContext<'a> {
     /// Event map linking types to their events.
     pub event_map: EventMapEntryMap,
 
-    // === Reference and Relationship Tables ===
+    // Reference and Relationship Tables
     /// Member references to external methods and fields.
     pub member_ref: &'a MemberRefMap,
     /// Class layout information for explicit layout types.
@@ -295,11 +245,11 @@ pub(crate) struct LoaderContext<'a> {
     /// Interface implementation relationships.
     pub interface_impl: InterfaceImplMap,
 
-    // === Metadata and Security Tables ===
+    // Metadata and Security Tables
     /// Constant values for fields, parameters, and properties.
     pub constant: ConstantMap,
     /// Custom attribute definitions.
-    pub custom_attribute: CustomAttributeMap,
+    pub custom_attribute: &'a CustomAttributeMap,
     /// Declarative security attributes.
     pub decl_security: &'a DeclSecurityMap,
     /// File definitions for multi-file assemblies.
@@ -309,13 +259,35 @@ pub(crate) struct LoaderContext<'a> {
     /// Standalone signature definitions.
     pub standalone_sig: StandAloneSigMap,
 
-    // === High-Level Registries ===
+    // High-Level Registries
     /// Import tracking for external dependencies.
     pub imports: &'a Imports,
     /// Resource management for embedded resources.
     pub resources: &'a Resources,
     /// Central type registry for all loaded types.
     pub types: &'a Arc<TypeRegistry>,
+}
+
+/// The metadata the Portable PDB's tables are read from, and the PDB they fill.
+///
+/// For debug tables in the image's own metadata these are the image's tables and heaps; for
+/// an embedded or standalone PDB, the PDB's own. Either way their columns index the image's
+/// tables, which the loaders resolve through the [`LoaderContext`].
+pub struct PdbSource<'a> {
+    /// The tables stream holding the debug tables
+    pub meta: Option<&'a TablesHeader<'a>>,
+    /// The `#Strings` heap
+    pub strings: Option<&'a Strings<'a>>,
+    /// The `#Blob` heap
+    pub blobs: Option<&'a Blob<'a>>,
+    /// The `#GUID` heap
+    pub guids: Option<&'a Guid<'a>>,
+    /// Whether a malformed row is a diagnostic rather than an error. The runtime never reads
+    /// debug information to load an assembly, so the PDB found in the image is always read
+    /// leniently; a standalone PDB follows the load's mode.
+    pub lenient: bool,
+    /// The PDB the loaders fill
+    pub target: &'a PortablePdb,
 }
 
 impl LoaderContext<'_> {
@@ -352,39 +324,8 @@ impl LoaderContext<'_> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use dotscope::metadata::loader::context::LoaderContext;
-    /// use dotscope::metadata::tables::{CodedIndex, TableId};
-    /// use dotscope::metadata::token::Token;
-    /// use dotscope::metadata::typesystem::CilTypeReference;
-    ///
-    /// # fn resolve_example(context: &LoaderContext) {
-    /// // Resolve a TypeDef coded index
-    /// let coded_index = CodedIndex {
-    ///     tag: TableId::TypeDef,
-    ///     token: Token::new(0x02000001),
-    /// };
-    ///
-    /// match context.get_ref(&coded_index) {
-    ///     CilTypeReference::TypeDef(type_def) => {
-    ///         println!("Resolved TypeDef: {}", type_def.name);
-    ///     }
-    ///     CilTypeReference::None => {
-    ///         println!("Could not resolve coded index");
-    ///     }
-    ///     _ => {
-    ///         println!("Unexpected reference type");
-    ///     }
-    /// }
-    ///
-    /// // The method automatically handles different table types
-    /// let method_index = CodedIndex {
-    ///     tag: TableId::MethodDef,
-    ///     token: Token::new(0x06000001),
-    /// };
-    /// let method_ref = context.get_ref(&method_index);
-    /// # }
-    /// ```
+    /// `CustomAttributeLoader` (`metadata/tables/customattribute/loader.rs`) resolves each
+    /// attribute's parent and constructor through it.
     ///
     /// # Thread Safety
     ///
@@ -562,7 +503,7 @@ impl LoaderContext<'_> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// use dotscope::metadata::diagnostics::DiagnosticCategory;
     ///
     /// let result = row.to_owned(strings, blob);
@@ -580,11 +521,23 @@ impl LoaderContext<'_> {
         category: DiagnosticCategory,
         context_msg: F,
     ) -> Result<Option<T>> {
+        self.handle_result_in(self.lenient, result, category, context_msg)
+    }
+
+    /// [`handle_result`](Self::handle_result) in the mode `lenient` rather than the load's,
+    /// for metadata read in a mode of its own (a [`PdbSource`]).
+    pub fn handle_result_in<T, E: Display, F: FnOnce() -> String>(
+        &self,
+        lenient: bool,
+        result: StdResult<T, E>,
+        category: DiagnosticCategory,
+        context_msg: F,
+    ) -> Result<Option<T>> {
         match result {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
                 let msg = context_msg();
-                if self.lenient {
+                if lenient {
                     self.diagnostics
                         .warning(category, format!("Failed to load {msg}: {e}"));
                     Ok(None)
@@ -599,7 +552,7 @@ impl LoaderContext<'_> {
     ///
     /// The counterpart to [`handle_result`](Self::handle_result) for the one failure that
     /// happens before there is anything to build a message from. Every loader routes the
-    /// failures it can describe — `to_owned`, reference resolution — through `handle_result`
+    /// failures it can describe - `to_owned`, reference resolution - through `handle_result`
     /// with a message keyed on `row.token`. A row that failed to *parse* has no token, so it
     /// cannot use that path, and the natural `let row = row?;` propagates straight out of
     /// `load()` and aborts the whole [`CilObject`](crate::CilObject) load. That defeats
@@ -615,7 +568,7 @@ impl LoaderContext<'_> {
     /// * `row` - The row-parse result, as yielded by the table iterators
     /// * `index` - The row's 0-based position in the iteration. The table iterators are
     ///   range-based and read each row at an offset derived from its own RID, so nothing is
-    ///   dropped on a parse failure and `index + 1` is the true RID — unlike a filtered
+    ///   dropped on a parse failure and `index + 1` is the true RID - unlike a filtered
     ///   sequence, where position stops tracking RID.
     ///
     /// The table is taken from [`RowReadable::TABLE_ID`], so it cannot drift from the row
@@ -629,14 +582,25 @@ impl LoaderContext<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Malformed`] when a row fails to parse in strict mode.
+    /// Returns [`crate::Error::Parse`] when a row fails to parse in strict mode.
     pub fn handle_row<T: RowReadable>(&self, row: Result<T>, index: usize) -> Result<Option<T>> {
+        self.handle_row_in(self.lenient, row, index)
+    }
+
+    /// [`handle_row`](Self::handle_row) in the mode `lenient` rather than the load's, for
+    /// metadata read in a mode of its own (a [`PdbSource`]).
+    pub fn handle_row_in<T: RowReadable>(
+        &self,
+        lenient: bool,
+        row: Result<T>,
+        index: usize,
+    ) -> Result<Option<T>> {
         match row {
             Ok(row) => Ok(Some(row)),
             Err(e) => {
                 let table = T::TABLE_ID;
                 let rid = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
-                if self.lenient {
+                if lenient {
                     self.diagnostics.push(
                         Diagnostic::new(
                             DiagnosticSeverity::Warning,
@@ -692,5 +656,45 @@ impl LoaderContext<'_> {
                 }
             }
         }
+    }
+
+    /// The normalized runs of `list` in `header`, with a warning for every fix-up.
+    ///
+    /// Builds [`TablesHeader::member_ranges`] (one pass over the owner table) and reports the
+    /// owners whose column was moved into the member table or above its predecessor, and the
+    /// owners whose column was 0 or whose row could not be read, as one warning each naming
+    /// the count and the first owner token. Neither fails a strict load: the runs are still
+    /// well defined, and the owners' members load as the normalized runs give them (a row
+    /// that cannot be read fails the strict load on its own when its loader reaches it).
+    ///
+    /// `header` is the image's tables for the type-system lists and the PDB's for the
+    /// `LocalScope` lists.
+    pub fn member_ranges(&self, header: &TablesHeader, list: MemberList) -> MemberRanges {
+        let ranges = header.member_ranges(list);
+        let owner = list.owner_table();
+        let report = |rids: &[u32], what: &str| {
+            if let Some(&first) = rids.first() {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticSeverity::Warning,
+                        DiagnosticCategory::Table,
+                        format!(
+                            "{list:?}: {} {owner:?} row(s) {what} (first: row {first})",
+                            rids.len()
+                        ),
+                    )
+                    .with_token(Token::from_parts(owner, first).value()),
+                );
+            }
+        };
+        report(
+            ranges.adjusted(),
+            "start their run outside the member table or before the previous row's run; clamped",
+        );
+        report(
+            ranges.absent(),
+            "have no run (list column 0 or unreadable row); they own no members",
+        );
+        ranges
     }
 }

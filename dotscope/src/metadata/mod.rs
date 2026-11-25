@@ -109,7 +109,7 @@
 //!
 //! ## Type System Exploration
 //!
-//! ```ignore
+//! ```
 //! use dotscope::CilObject;
 //! use std::path::Path;
 //!
@@ -123,20 +123,20 @@
 //!              type_def.name, type_def.namespace);
 //!     
 //!     // Show type characteristics using flags
-//!     if type_def.flags_visibility.contains(TypeVisibility::PUBLIC) {
+//!     if type_def.is_public() {
 //!         println!("  - Public visibility");
 //!     }
 //!     
-//!     if type_def.flags_layout.contains(TypeLayout::ABSTRACT) {
+//!     if type_def.is_abstract() {
 //!         println!("  - Abstract type");
 //!     }
 //!     
-//!     if type_def.flags_layout.contains(TypeLayout::SEALED) {
+//!     if type_def.is_sealed() {
 //!         println!("  - Sealed type");
 //!     }
 //!     
 //!     println!("  - {} methods, {} fields",
-//!              type_def.methods.len(), type_def.fields.len());
+//!              type_def.methods.len(), type_def.fields.count());
 //! }
 //! # Ok::<(), dotscope::Error>(())
 //! ```
@@ -185,13 +185,20 @@ pub mod imports;
 /// Implementation of import scope parsing for Portable PDB format
 pub mod importscope;
 /// Implementation of our `MetaDataTable` loader
-pub(crate) mod loader;
+mod loader;
 /// Implementation of the type marshalling for native code invokations
 pub mod marshalling;
 /// Implementation of the MethodHeader of CIL
 pub mod method;
+/// Extending text hashes, the identity of the type names joined from shared parts.
+mod texthash;
+
+/// Portable PDB metadata: standalone `.pdb` files and PDBs embedded in images.
+pub mod pdb;
 /// Composable query system for types and methods
 pub mod query;
+/// ReadyToRun images: the header, the methods compiled ahead of time, and the import cells
+pub mod readytorun;
 /// Cross-table token resolver for metadata normalization
 pub mod resolver;
 /// Implementation of the .NET resources
@@ -218,3 +225,6 @@ pub mod typesystem;
 pub mod validation;
 /// VTable fixup directory parsing for mixed-mode and COM interop assemblies
 pub mod vtfixup;
+pub use texthash::TextHash;
+
+pub use crate::utils::{LazyList, LazyListIter, RowList, RowListIter};

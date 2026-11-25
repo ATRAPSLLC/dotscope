@@ -223,14 +223,11 @@ impl WorkingAssembly {
 mod tests {
     use crate::{
         deobfuscation::techniques::WorkingAssembly, metadata::validation::ValidationConfig,
-        CilObject,
+        testkit::fixture, CilObject,
     };
 
     fn load_sample() -> CilObject {
-        let p = format!(
-            "{}/tests/samples/packers/confuserex/1.6.0/original.exe",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let p = fixture("packers/confuserex/1.6.0/original.exe");
         CilObject::from_path_with_validation(&p, ValidationConfig::analysis())
             .unwrap_or_else(|e| panic!("Failed to load test sample: {e}"))
     }

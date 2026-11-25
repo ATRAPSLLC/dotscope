@@ -35,16 +35,19 @@
 //! The [`SyncState`] struct is the central coordinator for all synchronization
 //! primitives. It should be shared across all threads in an emulation session.
 //!
-//! ```ignore
-//! use dotscope::emulation::thread::SyncState;
+//! ```
+//! use dotscope::emulation::{HeapRef, SyncState, ThreadId};
 //!
 //! let mut sync = SyncState::new();
+//! let obj_ref = HeapRef::new(1);
+//! let thread_id = ThreadId::new(1);
 //!
 //! // Enter a monitor
 //! if sync.monitor_try_enter(obj_ref, thread_id) {
 //!     // Critical section
 //!     sync.monitor_exit(obj_ref, thread_id)?;
 //! }
+//! # Ok::<(), dotscope::emulation::SyncError>(())
 //! ```
 
 use std::collections::{HashMap, VecDeque};
@@ -63,7 +66,9 @@ use crate::emulation::{HeapRef, ThreadId};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use dotscope::emulation::EventState;
+///
 /// // Create a manual reset event, initially not signaled
 /// let event = EventState::manual_reset(false);
 ///
@@ -130,7 +135,9 @@ impl EventState {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use dotscope::emulation::{MonitorState, ThreadId};
+///
 /// let mut monitor = MonitorState::default();
 /// let thread_id = ThreadId::new(1);
 ///
@@ -145,6 +152,7 @@ impl EventState {
 /// // Must exit twice to fully release
 /// monitor.exit(thread_id)?; // recursion_count = 1
 /// monitor.exit(thread_id)?; // recursion_count = 0, released
+/// # Ok::<(), dotscope::emulation::SyncError>(())
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct MonitorState {
@@ -356,7 +364,9 @@ impl MutexState {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use dotscope::emulation::SemaphoreState;
+///
 /// // Create a semaphore allowing 3 concurrent accesses
 /// let mut sem = SemaphoreState::new(3, 3);
 ///
@@ -369,6 +379,7 @@ impl MutexState {
 /// // Release one slot
 /// sem.release(1)?; // count = 1
 /// assert!(sem.try_acquire()); // count = 0
+/// # Ok::<(), dotscope::emulation::SyncError>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct SemaphoreState {
@@ -388,7 +399,9 @@ impl SemaphoreState {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use dotscope::emulation::SemaphoreState;
+    ///
     /// // Pool of 5 resources, all initially available
     /// let sem = SemaphoreState::new(5, 5);
     ///
@@ -525,8 +538,12 @@ impl std::error::Error for SyncError {}
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use dotscope::emulation::{HeapRef, SyncState, ThreadId};
+///
 /// let mut sync = SyncState::new();
+/// let (obj, event_obj) = (HeapRef::new(1), HeapRef::new(2));
+/// let thread_id = ThreadId::new(1);
 ///
 /// // Monitor operations
 /// if sync.monitor_try_enter(obj, thread_id) {
@@ -537,6 +554,7 @@ impl std::error::Error for SyncError {}
 /// // Event operations
 /// sync.event_create(event_obj, true, false); // ManualResetEvent
 /// let threads_to_wake = sync.event_set(event_obj);
+/// # Ok::<(), dotscope::emulation::SyncError>(())
 /// ```
 #[derive(Debug, Default)]
 pub struct SyncState {

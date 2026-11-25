@@ -31,13 +31,16 @@
 use crate::{
     cilassembly::{changes::ChangeRef, AssemblyChanges},
     metadata::tables::{
-        AssemblyRaw, AssemblyRefRaw, ClassLayoutRaw, CodedIndex, ConstantRaw, CustomAttributeRaw,
-        DeclSecurityRaw, EventMapRaw, EventRaw, ExportedTypeRaw, FieldLayoutRaw, FieldMarshalRaw,
-        FieldRaw, FieldRvaRaw, FileRaw, GenericParamConstraintRaw, GenericParamRaw, ImplMapRaw,
-        InterfaceImplRaw, ManifestResourceRaw, MemberRefRaw, MethodDefRaw, MethodImplRaw,
-        MethodSemanticsRaw, MethodSpecRaw, ModuleRaw, ModuleRefRaw, NestedClassRaw, ParamRaw,
-        PropertyMapRaw, PropertyRaw, StandAloneSigRaw, TableId, TypeDefRaw, TypeRefRaw,
-        TypeSpecRaw,
+        AssemblyRaw, AssemblyRefOsRaw, AssemblyRefProcessorRaw, AssemblyRefRaw, ClassLayoutRaw,
+        CodedIndex, ConstantRaw, CustomAttributeRaw, CustomDebugInformationRaw, DeclSecurityRaw,
+        DocumentRaw, EventMapRaw, EventPtrRaw, EventRaw, ExportedTypeRaw, FieldLayoutRaw,
+        FieldMarshalRaw, FieldPtrRaw, FieldRaw, FieldRvaRaw, FileRaw, GenericParamConstraintRaw,
+        GenericParamRaw, ImplMapRaw, ImportScopeRaw, InterfaceImplRaw, LocalConstantRaw,
+        LocalScopeRaw, LocalVariableRaw, ManifestResourceRaw, MemberRefRaw,
+        MethodDebugInformationRaw, MethodDefRaw, MethodImplRaw, MethodPtrRaw, MethodSemanticsRaw,
+        MethodSpecRaw, ModuleRaw, ModuleRefRaw, NestedClassRaw, ParamPtrRaw, ParamRaw,
+        PropertyMapRaw, PropertyPtrRaw, PropertyRaw, StandAloneSigRaw, StateMachineMethodRaw,
+        TableId, TypeDefRaw, TypeRefRaw, TypeSpecRaw,
     },
 };
 
@@ -57,7 +60,7 @@ use crate::{
 /// The resolved value (actual heap offset) or original value if not a placeholder.
 #[inline]
 pub fn resolve_placeholder(value: u32, changes: &AssemblyChanges) -> u32 {
-    if ChangeRef::is_placeholder(value) {
+    if ChangeRef::is_heap_placeholder(value) {
         if let Some(change_ref) = changes.lookup_by_placeholder(value) {
             if let Some(resolved) = change_ref.offset() {
                 return resolved;
@@ -452,6 +455,129 @@ impl ResolvePlaceholders for GenericParamConstraintRaw {
     }
 }
 
+impl ResolvePlaceholders for FieldPtrRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.field = resolve_rid_placeholder(self.field, changes);
+    }
+}
+
+impl ResolvePlaceholders for MethodPtrRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.method = resolve_rid_placeholder(self.method, changes);
+    }
+}
+
+impl ResolvePlaceholders for ParamPtrRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.param = resolve_rid_placeholder(self.param, changes);
+    }
+}
+
+impl ResolvePlaceholders for EventPtrRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.event = resolve_rid_placeholder(self.event, changes);
+    }
+}
+
+impl ResolvePlaceholders for PropertyPtrRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.property = resolve_rid_placeholder(self.property, changes);
+    }
+}
+
+impl ResolvePlaceholders for AssemblyRefProcessorRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.assembly_ref = resolve_rid_placeholder(self.assembly_ref, changes);
+    }
+}
+
+impl ResolvePlaceholders for AssemblyRefOsRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.assembly_ref = resolve_rid_placeholder(self.assembly_ref, changes);
+    }
+}
+
+impl ResolvePlaceholders for DocumentRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Blob heap refs
+        self.name = resolve_placeholder(self.name, changes);
+        self.hash = resolve_placeholder(self.hash, changes);
+        // GUID heap refs
+        self.hash_algorithm = resolve_placeholder(self.hash_algorithm, changes);
+        self.language = resolve_placeholder(self.language, changes);
+    }
+}
+
+impl ResolvePlaceholders for MethodDebugInformationRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.document = resolve_rid_placeholder(self.document, changes);
+        // Blob heap ref
+        self.sequence_points = resolve_placeholder(self.sequence_points, changes);
+    }
+}
+
+impl ResolvePlaceholders for LocalScopeRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index refs
+        self.method = resolve_rid_placeholder(self.method, changes);
+        self.import_scope = resolve_rid_placeholder(self.import_scope, changes);
+        self.variable_list = resolve_rid_placeholder(self.variable_list, changes);
+        self.constant_list = resolve_rid_placeholder(self.constant_list, changes);
+    }
+}
+
+impl ResolvePlaceholders for LocalVariableRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // String heap ref
+        self.name = resolve_placeholder(self.name, changes);
+    }
+}
+
+impl ResolvePlaceholders for LocalConstantRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // String heap ref
+        self.name = resolve_placeholder(self.name, changes);
+        // Blob heap ref
+        self.signature = resolve_placeholder(self.signature, changes);
+    }
+}
+
+impl ResolvePlaceholders for ImportScopeRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index ref
+        self.parent = resolve_rid_placeholder(self.parent, changes);
+        // Blob heap ref
+        self.imports = resolve_placeholder(self.imports, changes);
+    }
+}
+
+impl ResolvePlaceholders for StateMachineMethodRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // Table index refs
+        self.move_next_method = resolve_rid_placeholder(self.move_next_method, changes);
+        self.kickoff_method = resolve_rid_placeholder(self.kickoff_method, changes);
+    }
+}
+
+impl ResolvePlaceholders for CustomDebugInformationRaw {
+    fn resolve_placeholders(&mut self, changes: &AssemblyChanges) {
+        // CodedIndex ref
+        resolve_coded_index_placeholder(&mut self.parent, changes);
+        // GUID heap ref
+        self.kind = resolve_placeholder(self.kind, changes);
+        // Blob heap ref
+        self.value = resolve_placeholder(self.value, changes);
+    }
+}
+
 /// Resolves placeholders in a boxed table row based on its table ID.
 ///
 /// This is a dispatch function that casts the row to the appropriate type
@@ -643,6 +769,46 @@ pub fn resolve_row_placeholders_by_table(
                 r.resolve_placeholders(changes);
             }
         }
+        TableId::Document => {
+            if let Some(r) = row.downcast_mut::<DocumentRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
+        TableId::MethodDebugInformation => {
+            if let Some(r) = row.downcast_mut::<MethodDebugInformationRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
+        TableId::LocalScope => {
+            if let Some(r) = row.downcast_mut::<LocalScopeRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
+        TableId::LocalVariable => {
+            if let Some(r) = row.downcast_mut::<LocalVariableRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
+        TableId::LocalConstant => {
+            if let Some(r) = row.downcast_mut::<LocalConstantRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
+        TableId::ImportScope => {
+            if let Some(r) = row.downcast_mut::<ImportScopeRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
+        TableId::StateMachineMethod => {
+            if let Some(r) = row.downcast_mut::<StateMachineMethodRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
+        TableId::CustomDebugInformation => {
+            if let Some(r) = row.downcast_mut::<CustomDebugInformationRaw>() {
+                r.resolve_placeholders(changes);
+            }
+        }
         // Tables without heap refs or less common tables
         _ => {
             // No resolution needed for pointer tables, ENC tables, etc.
@@ -654,7 +820,7 @@ pub fn resolve_row_placeholders_by_table(
 mod tests {
     use super::*;
     use crate::{
-        cilassembly::changes::{AssemblyChanges, HeapChanges},
+        cilassembly::changes::{AssemblyChanges, ChangeIds, HeapChanges},
         metadata::{
             tables::{CodedIndex, CodedIndexType},
             token::Token,
@@ -664,7 +830,7 @@ mod tests {
     #[test]
     fn test_resolve_placeholder_with_match() {
         let mut changes = AssemblyChanges::empty();
-        let mut string_changes = HeapChanges::<String>::new_strings();
+        let mut string_changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let change_ref = string_changes.append("TestString".to_string());
         changes.string_heap_changes = string_changes;
 
@@ -692,7 +858,7 @@ mod tests {
     #[test]
     fn test_resolve_typedef_placeholders() {
         let mut changes = AssemblyChanges::empty();
-        let mut string_changes = HeapChanges::<String>::new_strings();
+        let mut string_changes = HeapChanges::<String>::new_strings(ChangeIds::new());
         let name_ref = string_changes.append("MyClass".to_string());
         let ns_ref = string_changes.append("MyNamespace".to_string());
         changes.string_heap_changes = string_changes;
@@ -760,12 +926,13 @@ mod tests {
         // Test that MemberRef heap placeholders (name, signature) are resolved
         let mut changes = AssemblyChanges::empty();
 
-        // Create change refs for heap values
-        let mut string_changes = HeapChanges::<String>::new_strings();
+        // Create change refs for heap values: an assembly's heaps share its change ids
+        let ids = ChangeIds::new();
+        let mut string_changes = HeapChanges::<String>::new_strings(ids.clone());
         let name_ref = string_changes.append("TestMethod".to_string());
         changes.string_heap_changes = string_changes;
 
-        let mut blob_changes = HeapChanges::<Vec<u8>>::new_blobs();
+        let mut blob_changes = HeapChanges::<Vec<u8>>::new_blobs(ids);
         let sig_ref = blob_changes.append(vec![0x00, 0x01, 0x02]);
         changes.blob_heap_changes = blob_changes;
 

@@ -51,7 +51,6 @@
 //! - Delete operations creating referential integrity violations or targeting critical metadata
 //! - Operation sequence conflicts or invalid temporal ordering
 //! - Multiple operations targeting the same RID without proper sequencing
-//! - Excessive update operations indicating potential loops
 //!
 //! # Thread Safety
 //!
@@ -246,7 +245,6 @@ impl RawOperationValidator {
     /// - Update operations target non-existent rows (beyond original count and not inserted)
     /// - Update RIDs are invalid (zero/reserved) or target deleted rows
     /// - Table data types are incompatible with target tables
-    /// - Excessive updates target the same RID (potential update loop detection)
     fn validate_update_operations(
         table_changes: &HashMap<TableId, TableModifications>,
     ) -> Result<()> {
@@ -258,8 +256,6 @@ impl RawOperationValidator {
                 ..
             } = modifications
             {
-                let mut update_rids = FxHashMap::default();
-
                 for operation in operations {
                     if let Operation::Update(rid, table_data) = &operation.operation {
                         // Validate RID is not zero (reserved)
@@ -288,19 +284,6 @@ impl RawOperationValidator {
                         if deleted_rows.contains(rid) {
                             return Err(malformed_error!(
                                 "Update operation for table {:?} targets deleted RID {}",
-                                table_id,
-                                rid
-                            ));
-                        }
-
-                        // Track multiple updates to the same RID (allowed with timestamp ordering)
-                        let update_count: &mut u32 = update_rids.entry(*rid).or_insert(0);
-                        *update_count = update_count.saturating_add(1);
-
-                        if *update_count > 10 {
-                            return Err(malformed_error!(
-                                "Excessive update operations ({}) for table {:?} RID {} - potential update loop",
-                                update_count,
                                 table_id,
                                 rid
                             ));
@@ -523,7 +506,7 @@ impl RawOperationValidator {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// use dotscope::metadata::tables::{TableDataOwned, TableId};
     ///
     /// // Compatible: TypeDef data for TypeDef table
@@ -607,7 +590,6 @@ impl Default for RawOperationValidator {
 
 #[cfg(test)]
 mod tests {
-    use rayon::ThreadPoolBuilder;
 
     use super::*;
     use crate::{
@@ -618,10 +600,9 @@ mod tests {
                 context::RawValidationContext, scanner::ReferenceScanner, ValidationConfig,
             },
         },
-        test::{
+        testkit::{
             factories::validation::raw_modification_operation::*, get_testfile_wb, validator_test,
         },
-        Error,
     };
 
     #[test]
@@ -635,7 +616,6 @@ mod tests {
         validator_test(
             raw_operation_validator_file_factory,
             "RawOperationValidator",
-            "Parse",
             config,
             |context| validator.validate_raw(context),
         )
@@ -696,17 +676,6 @@ mod tests {
         }
 
         {
-            let corrupted_changes = create_corrupted_changes_with_excessive_updates();
-            let result = test_validator_with_corrupted_changes(&validator, corrupted_changes);
-            assert!(result.is_err(), "Validator should reject excessive updates");
-            let error_msg = format!("{:?}", result.unwrap_err());
-            assert!(
-                error_msg.contains("Excessive update operations"),
-                "Error should mention excessive updates. Got: {error_msg}"
-            );
-        }
-
-        {
             let corrupted_changes = create_corrupted_changes_with_unordered_operations();
             let result = test_validator_with_corrupted_changes(&validator, corrupted_changes);
             assert!(
@@ -741,9 +710,7 @@ mod tests {
         validator: &RawOperationValidator,
         corrupted_changes: AssemblyChanges,
     ) -> Result<()> {
-        let Some(clean_testfile) = get_testfile_wb() else {
-            return Err(Error::Other("WindowsBase.dll not available".to_string()));
-        };
+        let clean_testfile = get_testfile_wb();
 
         let view = CilAssemblyView::from_path(&clean_testfile)?;
         let config = ValidationConfig {
@@ -752,14 +719,12 @@ mod tests {
         };
 
         let scanner = ReferenceScanner::from_view(&view)?;
-        let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
 
         let context = RawValidationContext::new_for_modification(
             &view,
             &corrupted_changes,
             &scanner,
             &config,
-            &thread_pool,
         );
 
         validator.validate_raw(&context)

@@ -13,7 +13,6 @@ use crate::{
         tables::{StateMachineMethod, StateMachineMethodRc, TableId, TableInfoRef, TableRow},
         token::Token,
     },
-    Error::TypeNotFound,
     Result,
 };
 
@@ -87,13 +86,14 @@ impl StateMachineMethodRaw {
     /// or an error if either method reference cannot be resolved.
     ///
     /// # Errors
-    /// Returns [`TypeNotFound`] if either the `move_next_method` or `kickoff_method` cannot be resolved from the map.
+    /// Returns [`crate::Error::TypeNotFound`] if either the `move_next_method` or `kickoff_method` cannot be resolved from the map.
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// # use dotscope::metadata::tables::statemachinemethod::StateMachineMethodRaw;
+    /// ```no_run
+    /// # use dotscope::metadata::tables::StateMachineMethodRaw;
     /// # use dotscope::metadata::token::Token;
+    /// # use dotscope::metadata::method::MethodMap;
     /// # fn example(method_map: &MethodMap) -> dotscope::Result<()> {
     /// let mapping_raw = StateMachineMethodRaw {
     ///     rid: 1,
@@ -106,6 +106,7 @@ impl StateMachineMethodRaw {
     /// let mapping = mapping_raw.to_owned(method_map)?;
     /// # Ok(())
     /// # }
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn to_owned(&self, method_map: &MethodMap) -> Result<StateMachineMethodRc> {
         let move_next_token = Token::new(0x0600_0000 | self.move_next_method);
@@ -113,13 +114,13 @@ impl StateMachineMethodRaw {
 
         let move_next_method = method_map
             .get(&move_next_token)
-            .ok_or(TypeNotFound(move_next_token))?
+            .ok_or_else(|| malformed_error!("Failed to resolve method token - {move_next_token}"))?
             .value()
             .clone();
 
         let kickoff_method = method_map
             .get(&kickoff_token)
-            .ok_or(TypeNotFound(kickoff_token))?
+            .ok_or_else(|| malformed_error!("Failed to resolve method token - {kickoff_token}"))?
             .value()
             .clone();
 

@@ -67,23 +67,40 @@
 //!
 //! // Generate public key token
 //! let token = identity.to_token(AssemblyHashAlgorithm::SHA1)?;
-//! println!("Public key token: 0x{:016X}", token);
+//! println!("Public key token: {:02x?}", token);
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! ## Integration with Metadata
 //!
-//! ```rust,ignore
+//! ```
+//! use dotscope::metadata::dependencies::{
+//!     AssemblyDependency, AssemblyDependencyGraph, DependencyResolutionState, DependencySource,
+//!     DependencyType, VersionRequirement,
+//! };
 //! use dotscope::metadata::identity::AssemblyIdentity;
-//! use dotscope::metadata::tables::AssemblyRef;
+//! use dotscope::CilObject;
 //!
-//! // Extract identity from metadata
-//! let assembly_ref: AssemblyRef = // ... loaded from metadata
-//! let identity = AssemblyIdentity::from_assembly_ref(&assembly_ref);
+//! // Extract identities from metadata: the assembly's own, and each it references
+//! let assembly = CilObject::from_path("tests/samples/crafted_2.exe")?;
+//! let source_identity =
+//!     AssemblyIdentity::from_assembly(assembly.assembly().expect("an assembly manifest"));
 //!
 //! // Use in dependency tracking
 //! let dependency_graph = AssemblyDependencyGraph::new();
-//! dependency_graph.add_dependency(source_identity, target_identity);
+//! for entry in assembly.refs_assembly() {
+//!     let assembly_ref = entry.value().clone();
+//!     let dependency = AssemblyDependency {
+//!         target_identity: AssemblyIdentity::from_assembly_ref(&assembly_ref),
+//!         source: DependencySource::AssemblyRef(assembly_ref),
+//!         dependency_type: DependencyType::Reference,
+//!         version_requirement: VersionRequirement::Compatible,
+//!         is_optional: false,
+//!         resolution_state: DependencyResolutionState::Unresolved,
+//!     };
+//!     dependency_graph.add_dependency_with_source(&source_identity, dependency)?;
+//! }
+//! assert_eq!(dependency_graph.dependency_count(), assembly.refs_assembly().len());
 //! # Ok::<(), dotscope::Error>(())
 //! ```
 //!

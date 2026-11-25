@@ -10,7 +10,7 @@ use crate::{
         customattributes::CustomAttributeValueList,
         signatures::{
             parse_field_signature, parse_local_var_signature, parse_method_signature,
-            CALLING_CONVENTION, SIGNATURE_HEADER,
+            SIGNATURE_HEADER,
         },
         streams::Blob,
         tables::{StandAloneSig, StandAloneSigRc, StandAloneSignature, TableInfoRef, TableRow},
@@ -46,7 +46,7 @@ use crate::{
 /// - **Generic Signatures**: Generic type and method instantiation signatures
 ///
 /// ## See Also
-/// - [`StandAloneSig`](crate::metadata::tables::StandAloneSig) - Resolved owned variant
+/// - [`StandAloneSig`] - Resolved owned variant
 /// - [ECMA-335 §II.22.39](https://www.ecma-international.org/publications-and-standards/standards/ecma-335/) - `StandAloneSig` table specification
 #[derive(Clone, Debug)]
 pub struct StandAloneSigRaw {
@@ -93,7 +93,7 @@ impl StandAloneSigRaw {
     /// Returns an error if:
     /// - The signature blob index is invalid
     /// - The signature data is malformed or truncated
-    /// - An unknown signature type is encountered
+    /// - The first byte names no local, field or method signature
     pub fn to_owned(&self, blob: &Blob) -> Result<StandAloneSigRc> {
         let sig_data = blob.get(self.signature as usize)?;
 
@@ -116,21 +116,9 @@ impl StandAloneSigRaw {
                 let field = parse_field_signature(sig_data)?;
                 StandAloneSignature::Field(field)
             }
-            _ => {
-                // Check if this is a method signature by examining calling convention
-                // Method signatures have calling convention in low 4 bits (0x00-0x05)
-                // with optional HASTHIS (0x20), EXPLICITTHIS (0x40), or GENERIC (0x10) flags
-                let calling_conv = first_byte & CALLING_CONVENTION::KIND_MASK;
-                if calling_conv <= CALLING_CONVENTION::VARARG {
-                    let method = parse_method_signature(sig_data)?;
-                    StandAloneSignature::Method(method)
-                } else {
-                    return Err(malformed_error!(
-                        "Unknown StandAloneSig signature type: 0x{:02X}",
-                        first_byte
-                    ));
-                }
-            }
+            // Anything else is a method signature (a `calli` site's), whose parser refuses a
+            // calling convention no method signature has
+            _ => StandAloneSignature::Method(parse_method_signature(sig_data)?),
         };
 
         Ok(Arc::new(StandAloneSig {

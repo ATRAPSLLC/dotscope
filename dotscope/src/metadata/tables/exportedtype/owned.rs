@@ -28,8 +28,8 @@ use std::sync::OnceLock;
 
 use crate::{
     metadata::{
-        customattributes::CustomAttributeValueList, tables::TypeAttributes, token::Token,
-        typesystem::CilTypeReference,
+        customattributes::CustomAttributeValueList, streams::SharedStr, tables::TypeAttributes,
+        token::Token, typesystem::CilTypeReference,
     },
     Result,
 };
@@ -81,13 +81,13 @@ pub struct ExportedType {
     ///
     /// The simple name of the exported type without namespace qualification.
     /// Combined with the namespace to form the full type identity.
-    pub name: String,
+    pub name: SharedStr,
 
     /// Optional resolved namespace from the String heap
     ///
     /// The namespace containing the exported type, or `None` for types in the
     /// global namespace. Combined with the name to form the full type identity.
-    pub namespace: Option<String>,
+    pub namespace: Option<SharedStr>,
 
     /// Resolved reference to the type implementation location
     ///

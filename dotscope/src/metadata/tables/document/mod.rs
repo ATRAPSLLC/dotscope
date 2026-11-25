@@ -21,7 +21,7 @@
 //!
 //! - [`crate::metadata::tables::document::DocumentRaw`] - Raw table structure with unresolved heap indices
 //! - [`crate::metadata::tables::document::Document`] - Owned variant with resolved references and parsed document data
-//! - [`crate::metadata::tables::document::DocumentLoader`] - Internal loader for processing Document table data
+//! - [`crate::metadata::loader::tables::DocumentLoader`] - Internal loader for processing Document table data
 //! - [`crate::metadata::tables::document::DocumentMap`] - Thread-safe concurrent map for caching document entries
 //! - [`crate::metadata::tables::document::DocumentList`] - Thread-safe append-only vector for document collections
 //! - [`crate::metadata::tables::document::DocumentRc`] - Reference-counted pointer for shared ownership
@@ -85,14 +85,12 @@ use crossbeam_skiplist::SkipMap;
 use crate::metadata::token::Token;
 
 mod builder;
-mod loader;
 mod owned;
 mod raw;
 mod reader;
 mod writer;
 
 pub use builder::*;
-pub(crate) use loader::*;
 pub use owned::*;
 pub use raw::*;
 

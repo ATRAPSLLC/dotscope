@@ -9,7 +9,7 @@
 //!
 //! A proxy method is one that:
 //! 1. Has a single basic block
-//! 2. Contains exactly one `Call`/`CallVirt` instruction
+//! 2. Contains exactly one direct or virtual call
 //! 3. Forwards parameters directly as arguments (possibly reordered)
 //! 4. Returns the call result (if non-void)
 //! 5. Has no other side effects besides the forwarded call
@@ -44,11 +44,15 @@
 
 use crate::{
     analysis::{
-        CilTarget, ConstValue, ConstValueCilExt, DefSite, MethodRef, ReturnInfo, SsaFunction,
-        SsaInstruction, SsaOp, SsaVarId, VariableOrigin,
+        Callee, CilTarget, ConstValue, ConstValueCilExt, DefSite, MethodRef, ReturnInfo,
+        SsaFunction, SsaInstruction, SsaOp, SsaVarId, VariableOrigin,
     },
     compiler::{CompilerContext, EventKind, EventLog, ModificationScope, PassCapability, SsaPass},
-    metadata::{tables::MemberRefSignature, token::Token, typesystem::CilTypeReference},
+    metadata::{
+        resolver::select_method_overload,
+        tables::{MemberRefSignature, TableId},
+        token::Token,
+    },
     CilObject,
 };
 
@@ -120,7 +124,7 @@ impl ProxyDevirtualizationPass {
     ///
     /// A proxy method:
     /// 1. Has a single basic block
-    /// 2. Contains exactly one `Call`/`CallVirt`/`NewObj` instruction
+    /// 2. Contains exactly one direct or virtual call, or one `NewObj`
     /// 3. All call arguments come directly from method parameters
     /// 4. If non-void, returns the call result directly
     /// 5. Has no other instructions besides parameter loads, the call, and return
@@ -130,7 +134,7 @@ impl ProxyDevirtualizationPass {
     /// If this is a proxy, returns `Some((target_method, arg_mapping, kind))` where:
     /// - `target_method` is the forwarding target
     /// - `arg_mapping` maps caller argument index to callee parameter index
-    /// - `kind` indicates Call, CallVirt, or NewObj forwarding
+    /// - `kind` indicates direct call, virtual call, or NewObj forwarding
     pub fn detect_proxy_pattern(
         ssa: &SsaFunction,
     ) -> Option<(MethodRef, Vec<ProxyArgSource>, ForwardKind)> {
@@ -164,19 +168,23 @@ impl ProxyDevirtualizationPass {
 
         let instructions = block.instructions();
 
-        // Find the call instruction (Call, CallVirt, or NewObj)
+        // Find the call instruction (a call or a NewObj)
         let mut call_info: Option<(&MethodRef, &[SsaVarId], Option<SsaVarId>, ForwardKind)> = None;
         let mut call_count: usize = 0;
 
         for instr in instructions {
             match instr.op() {
-                SsaOp::Call { method, args, dest } => {
+                // A proxy forwards by naming its target: a constrained call
+                // takes the address of its receiver, and an indirect one names
+                // no method.
+                SsaOp::Call(call) => {
+                    let (method, kind) = match &call.callee {
+                        Callee::Direct(method) => (method, ForwardKind::Call),
+                        Callee::Virtual(method) => (method, ForwardKind::CallVirt),
+                        Callee::Constrained { .. } | Callee::Indirect { .. } => return None,
+                    };
                     call_count = call_count.saturating_add(1);
-                    call_info = Some((method, args, *dest, ForwardKind::Call));
-                }
-                SsaOp::CallVirt { method, args, dest } => {
-                    call_count = call_count.saturating_add(1);
-                    call_info = Some((method, args, *dest, ForwardKind::CallVirt));
+                    call_info = Some((method, &call.args, call.dest, kind));
                 }
                 SsaOp::NewObj { ctor, args, dest } => {
                     call_count = call_count.saturating_add(1);
@@ -231,6 +239,7 @@ impl ProxyDevirtualizationPass {
         for instr in instructions {
             if let SsaOp::Return {
                 value: Some(ret_var),
+                ..
             } = instr.op()
             {
                 if Some(*ret_var) != call_dest {
@@ -318,58 +327,43 @@ impl ProxyDevirtualizationPass {
     /// SSA forms are stored under MethodDef tokens, but call instructions may
     /// use MemberRef tokens for internal methods. This resolves
     /// MemberRef -> MethodDef so we can look up the callee's SSA.
+    ///
+    /// The declaring type is tried first. ConfuserEx's proxy protection points
+    /// internal MemberRefs at fake assembly references whose TypeRef resolves
+    /// to nothing, so the fallback is the module's own type of that full name -
+    /// by the same overload selection, so a name shared by several methods
+    /// resolves to none of them rather than to whichever comes first. A name
+    /// alone is no identity: `[mscorlib]System.IO.Stream::Read` is not an
+    /// internal stream's `Read` override, and binding it there lets that
+    /// method's body stand in for the runtime's.
     fn resolve_to_method_def(token: Token, assembly: &CilObject) -> Token {
-        let table_id = token.table();
-
-        // Already a MethodDef - return as-is
-        if table_id == 0x06 {
+        if !token.is_table(TableId::MemberRef) {
             return token;
         }
-
-        // MemberRef - try to resolve to MethodDef
-        if table_id == 0x0A {
-            let refs = assembly.refs_members();
-            if let Some(member_ref_entry) = refs.get(&token) {
-                let member_ref = member_ref_entry.value();
-
-                // Only handle method signatures, not fields
-                let MemberRefSignature::Method(ref _method_sig) = member_ref.signature else {
-                    return token;
-                };
-
-                // Check if declared by an internal type. Try TypeDef first,
-                // then TypeRef (ConfuserEx creates fake assembly references so
-                // internal MemberRefs appear external — the TypeRef may still
-                // resolve to an internal TypeDef via the weak reference).
-                let resolved_type = match &member_ref.declaredby {
-                    CilTypeReference::TypeDef(r) | CilTypeReference::TypeRef(r) => r.upgrade(),
-                    _ => None,
-                };
-                if let Some(type_info) = resolved_type {
-                    if let Some(method) = type_info
-                        .query_methods()
-                        .name(&member_ref.name)
-                        .find_first()
-                    {
-                        return method.token;
-                    }
-                }
-
-                // Fallback: scan all methods by name. Handles cases where the
-                // MemberRef's TypeRef points to a fake assembly that can't be
-                // resolved to a TypeDef (e.g., ConfuserEx proxy protection).
-                for entry in assembly.methods().iter() {
-                    let method_token = *entry.key();
-                    if let Some(name) = assembly.resolve_method_name(method_token) {
-                        if name == member_ref.name {
-                            return method_token;
-                        }
-                    }
-                }
-            }
+        if let Some(method_def) = assembly.resolver().resolve_memberref_method(token) {
+            return method_def;
         }
-
-        token
+        let Some(member_ref) = assembly.member_ref(&token) else {
+            return token;
+        };
+        let MemberRefSignature::Method(signature) = &member_ref.signature else {
+            return token;
+        };
+        let Some(declaring_type) = member_ref.declaredby.fullname() else {
+            return token;
+        };
+        select_method_overload(
+            assembly
+                .methods()
+                .iter()
+                .map(|entry| entry.value().clone())
+                .filter(|method| {
+                    method.declaring_type_fullname().as_deref() == Some(declaring_type.as_str())
+                }),
+            &member_ref.name,
+            signature,
+        )
+        .unwrap_or(token)
     }
 
     /// Checks if a method should be devirtualized as a proxy.
@@ -430,7 +424,7 @@ impl ProxyDevirtualizationPass {
 
         ctx.with_ssa(callee_token, |callee_ssa| {
             // Must have no side effects to safely eliminate
-            if !callee_ssa.purity().can_eliminate_if_unused() {
+            if !callee_ssa.purity(|_| None).can_eliminate_if_unused() {
                 return None;
             }
 
@@ -454,21 +448,27 @@ impl ProxyDevirtualizationPass {
         let mut candidates = Vec::new();
 
         for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
-            let raw_callee_token = match instr.op() {
-                SsaOp::Call { method, .. } => method.token(),
-                SsaOp::CallVirt { method, .. } => {
-                    let token = method.token();
-                    // Check if this is actually polymorphic
-                    if ctx.call_graph.resolver().is_polymorphic(token) {
-                        continue;
-                    }
-                    token
-                }
-                _ => continue,
+            // A constrained call passes the address of its receiver, which
+            // the forwarded call does not take.
+            let (raw_callee_token, is_virtual) = match instr.op().as_call().map(|call| &call.callee)
+            {
+                Some(Callee::Direct(method)) => (method.token(), false),
+                Some(Callee::Virtual(method)) => (method.token(), true),
+                Some(Callee::Constrained { .. } | Callee::Indirect { .. }) | None => continue,
             };
 
             // Resolve MemberRef tokens to MethodDef tokens for SSA lookup
             let callee_token = Self::resolve_to_method_def(raw_callee_token, assembly);
+
+            // A virtual call dispatches by the method it resolves to: overrides
+            // are indexed under the MethodDef, not the MemberRef naming it.
+            let resolver = ctx.call_graph.resolver();
+            if is_virtual
+                && (resolver.is_polymorphic(raw_callee_token)
+                    || resolver.is_polymorphic(callee_token))
+            {
+                continue;
+            }
 
             // Try no-op elimination first (cheaper check)
             if let Some(noop_result) = Self::detect_noop_method(callee_token, method_token, ctx) {
@@ -579,12 +579,10 @@ impl ProxyDevirtualizationPass {
         caller_token: Token,
         changes: &mut EventLog,
     ) -> bool {
-        let (dest, original_args) = match call_op {
-            SsaOp::Call { dest, args, .. } | SsaOp::CallVirt { dest, args, .. } => {
-                (*dest, args.clone())
-            }
-            _ => return false,
+        let Some(call) = call_op.as_named_call() else {
+            return false;
         };
+        let (dest, original_args) = (call.dest, &call.args);
 
         // Build arguments for the target call from the proxy's arg sources
         let mut remapped_args = Vec::with_capacity(arg_sources.len());
@@ -630,16 +628,12 @@ impl ProxyDevirtualizationPass {
                     args: remapped_args,
                 }
             }
-            ForwardKind::CallVirt => SsaOp::CallVirt {
-                dest,
-                method: target_method,
-                args: remapped_args,
-            },
-            ForwardKind::Call => SsaOp::Call {
-                dest,
-                method: target_method,
-                args: remapped_args,
-            },
+            ForwardKind::CallVirt => call
+                .redirected(Callee::Virtual(target_method), remapped_args)
+                .into(),
+            ForwardKind::Call => call
+                .redirected(Callee::Direct(target_method), remapped_args)
+                .into(),
         };
 
         // Replace the instruction, inserting any constant definitions before the call
@@ -690,7 +684,13 @@ impl ProxyDevirtualizationPass {
         caller_token: Token,
         changes: &mut EventLog,
     ) -> bool {
-        if !matches!(call_op, SsaOp::Call { .. } | SsaOp::CallVirt { .. }) {
+        // A void callee defines nothing, so a call whose result is read has
+        // not bound the method it names; dropping it would leave that read
+        // without a definition.
+        if !call_op
+            .as_named_call()
+            .is_some_and(|call| call.dest.is_none())
+        {
             return false;
         }
 
@@ -722,9 +722,8 @@ impl ProxyDevirtualizationPass {
         caller_token: Token,
         changes: &mut EventLog,
     ) -> bool {
-        let dest = match call_op {
-            SsaOp::Call { dest, .. } | SsaOp::CallVirt { dest, .. } => *dest,
-            _ => return false,
+        let Some(dest) = call_op.as_named_call().map(|call| call.dest) else {
+            return false;
         };
 
         if let Some(dest_var) = dest {
@@ -821,13 +820,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        analysis::{CallGraph, ConstValue, MethodRef, SsaFunctionBuilder, SsaOp, SsaType},
+        analysis::{CallGraph, Callee, ConstValue, MethodRef, SsaFunctionBuilder, SsaOp, SsaType},
         compiler::{
             passes::proxy::{ForwardKind, ProxyArgSource, ProxyDevirtualizationPass},
             CompilerContext, SsaPass,
         },
-        metadata::token::Token,
-        test::helpers::test_assembly_arc,
+        metadata::{tables::TableId, token::Token},
+        testkit::{fixture, helpers::test_assembly_arc, passes::run_verified},
+        CilObject,
     };
 
     fn test_context() -> CompilerContext {
@@ -851,7 +851,7 @@ mod tests {
             .build_with(|f| {
                 let param0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(target_token), &[param0]);
+                    b.call_void(Callee::Direct(MethodRef::new(target_token)), &[param0]);
                     b.ret();
                 });
             })
@@ -876,7 +876,7 @@ mod tests {
                 let param1 = f.arg(1, SsaType::I32);
                 f.block(0, |b| {
                     let result = b.call(
-                        MethodRef::new(target_token),
+                        Callee::Direct(MethodRef::new(target_token)),
                         &[param0, param1],
                         SsaType::I32,
                     );
@@ -907,7 +907,7 @@ mod tests {
                 let param1 = f.arg(1, SsaType::I32);
                 f.block(0, |b| {
                     let result = b.call(
-                        MethodRef::new(target_token),
+                        Callee::Direct(MethodRef::new(target_token)),
                         &[param1, param0],
                         SsaType::I32,
                     );
@@ -938,7 +938,11 @@ mod tests {
                 f.block(0, |b| {
                     let one = b.const_i32(1);
                     let sum = b.add(param0, one);
-                    let result = b.call(MethodRef::new(target_token), &[sum], SsaType::I32);
+                    let result = b.call(
+                        Callee::Direct(MethodRef::new(target_token)),
+                        &[sum],
+                        SsaType::I32,
+                    );
                     b.ret_val(result);
                 });
             })
@@ -963,7 +967,7 @@ mod tests {
             .build_with(|f| {
                 let param0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(target_token), &[param0]);
+                    b.call_void(Callee::Direct(MethodRef::new(target_token)), &[param0]);
                     b.ret();
                 });
             })
@@ -975,7 +979,7 @@ mod tests {
             .build_with(|f| {
                 let arg0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(proxy_token), &[arg0]);
+                    b.call_void(Callee::Direct(MethodRef::new(proxy_token)), &[arg0]);
                     b.ret();
                 });
             })
@@ -985,17 +989,16 @@ mod tests {
         ctx.set_ssa(proxy_token, proxy_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(caller_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(caller_token), &ctx).unwrap();
 
         assert!(changed, "Should have made changes");
 
         // Verify the call target was changed
         let block = caller_ssa.block(0).unwrap();
         let first_instr = &block.instructions()[0];
-        match first_instr.op() {
-            SsaOp::Call { method, .. } => {
+        match first_instr.op().as_call().map(|call| &call.callee) {
+            Some(Callee::Direct(method)) => {
                 assert_eq!(
                     method.token(),
                     target_token,
@@ -1023,7 +1026,7 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(noop_token), &[]);
+                    b.call_void(Callee::Direct(MethodRef::new(noop_token)), &[]);
                     b.ret();
                 });
             })
@@ -1033,19 +1036,105 @@ mod tests {
         ctx.set_ssa(noop_token, noop_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(caller_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(caller_token), &ctx).unwrap();
 
         assert!(changed, "Should have made changes");
 
-        // Verify the call was replaced with Nop
+        // The call is gone: the block is its return
         let block = caller_ssa.block(0).unwrap();
-        let first_instr = &block.instructions()[0];
         assert!(
-            matches!(first_instr.op(), SsaOp::Nop),
-            "Expected Nop, got {:?}",
-            first_instr.op()
+            matches!(block.instructions(), [only] if matches!(only.op(), SsaOp::Return { value: None, .. })),
+            "Expected only the return, got {:?}",
+            block.instructions()
+        );
+    }
+
+    /// A void callee defines nothing, so a call naming it whose result is read
+    /// has bound the wrong method. Dropping the call would leave the read with
+    /// no definition, so it stays.
+    #[test]
+    fn a_call_whose_result_is_read_is_not_a_void_noop() {
+        let noop_token = Token::new(0x06000002);
+        let noop_ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| b.ret());
+            })
+            .unwrap();
+
+        let caller_token = Token::new(0x06000001);
+        let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
+            .build_with(|f| {
+                f.block(0, |b| {
+                    let read = b.call(
+                        Callee::Direct(MethodRef::new(noop_token)),
+                        &[],
+                        SsaType::I32,
+                    );
+                    b.ret_val(read);
+                });
+            })
+            .unwrap();
+
+        let ctx = test_context();
+        ctx.set_ssa(noop_token, noop_ssa);
+
+        run_verified(
+            &ProxyDevirtualizationPass::new(),
+            &mut caller_ssa,
+            &MethodRef::from(caller_token),
+            &ctx,
+        )
+        .unwrap();
+
+        let call = &caller_ssa.block(0).unwrap().instructions()[0];
+        assert!(
+            call.op().as_call().is_some_and(|call| call.dest.is_some()),
+            "the call defining a read result must stay, got {:?}",
+            call.op()
+        );
+    }
+
+    /// JIEJIE.NET's resource helper derives a stream, so its `Read`,
+    /// `set_Position` and `get_Length` share names and signatures with the
+    /// runtime's. A reference to `[mscorlib]System.IO.Stream::Read` must not
+    /// resolve to that override: the helper is deleted and its body gutted, and
+    /// the user's own `Stream.Read` call was dropped as a no-op in its name.
+    #[test]
+    fn a_runtime_method_is_not_bound_to_a_namesake_in_the_module() {
+        let assembly =
+            CilObject::from_path(fixture("packers/jiejie/source/jiejie_resources_only.exe"))
+                .unwrap();
+        for entry in assembly.refs_members().iter() {
+            let member_ref = entry.value();
+            let resolved =
+                ProxyDevirtualizationPass::resolve_to_method_def(member_ref.token, &assembly);
+            if !resolved.is_table(TableId::MethodDef) {
+                continue;
+            }
+            let method = assembly.method(&resolved).unwrap();
+            assert_eq!(
+                method.declaring_type_fullname(),
+                member_ref.declaredby.fullname(),
+                "{} {}::{} bound to {}",
+                member_ref.token,
+                member_ref.declaredby.fullname().unwrap_or_default(),
+                member_ref.name,
+                resolved
+            );
+        }
+        let read = assembly
+            .refs_members()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .find(|member_ref| {
+                member_ref.name == "Read"
+                    && member_ref.declaredby.fullname().as_deref() == Some("System.IO.Stream")
+            })
+            .expect("the sample reads a runtime stream");
+        assert_eq!(
+            ProxyDevirtualizationPass::resolve_to_method_def(read.token, &assembly),
+            read.token
         );
     }
 
@@ -1068,7 +1157,11 @@ mod tests {
         let mut caller_ssa = SsaFunctionBuilder::new(0, 0)
             .build_with(|f| {
                 f.block(0, |b| {
-                    let result = b.call(MethodRef::new(const_token), &[], SsaType::I32);
+                    let result = b.call(
+                        Callee::Direct(MethodRef::new(const_token)),
+                        &[],
+                        SsaType::I32,
+                    );
                     b.ret_val(result);
                 });
             })
@@ -1078,9 +1171,8 @@ mod tests {
         ctx.set_ssa(const_token, const_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(caller_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(caller_token), &ctx).unwrap();
 
         assert!(changed, "Should have made changes");
 
@@ -1104,7 +1196,7 @@ mod tests {
             .build_with(|f| {
                 let param0 = f.arg(0, SsaType::I32);
                 f.block(0, |b| {
-                    b.call_void(MethodRef::new(self_token), &[param0]);
+                    b.call_void(Callee::Direct(MethodRef::new(self_token)), &[param0]);
                     b.ret();
                 });
             })
@@ -1116,9 +1208,8 @@ mod tests {
         ctx.set_ssa(self_token, self_ssa);
 
         let pass = ProxyDevirtualizationPass::new();
-        let changed = pass
-            .run_on_method(&mut caller_ssa, &MethodRef::from(self_token), &ctx)
-            .unwrap();
+        let changed =
+            run_verified(&pass, &mut caller_ssa, &MethodRef::from(self_token), &ctx).unwrap();
 
         assert!(!changed, "Should not devirtualize self-recursive calls");
     }

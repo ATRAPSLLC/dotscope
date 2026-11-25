@@ -26,16 +26,18 @@
 //!
 //! # Usage Examples
 //!
-//! ```rust,ignore
-//! use crate::cilassembly::resolver::{LastWriteWinsResolver, ConflictResolver, Conflict};
+//! ```
+//! use dotscope::{Conflict, ConflictResolver, LastWriteWinsResolver};
 //!
 //! // Create a resolver
 //! let resolver = LastWriteWinsResolver;
 //!
 //! // Resolve conflicts (typically used by validation pipeline)
-//! // let conflicts = vec![/* conflicts */];
-//! // let resolution = resolver.resolve_conflict(&conflicts)?;
-//! # Ok::<(), crate::Error>(())
+//! // The conflicts the validation pipeline detected: none here
+//! let conflicts: Vec<Conflict> = Vec::new();
+//! let resolution = resolver.resolve_conflict(&conflicts)?;
+//! assert!(resolution.operations.is_empty());
+//! # Ok::<(), dotscope::Error>(())
 //! ```
 //!
 //! # Thread Safety
@@ -70,21 +72,31 @@ use crate::{cilassembly::TableOperation, Error, Result};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use crate::cilassembly::resolver::{ConflictResolver, Conflict, Resolution};
+/// ```
+/// use dotscope::{Conflict, ConflictResolver, OperationResolution, Resolution};
 ///
-/// struct LastWriteWinsResolver;
+/// /// Keeps the first operation on each row and drops the rest.
+/// struct FirstWriteWinsResolver;
 ///
-/// impl ConflictResolver for LastWriteWinsResolver {
-///     fn resolve_conflict(&self, conflicts: &[Conflict]) -> Result<Resolution> {
+/// impl ConflictResolver for FirstWriteWinsResolver {
+///     fn resolve_conflict(&self, conflicts: &[Conflict]) -> dotscope::Result<Resolution> {
 ///         let mut resolution = Resolution::default();
 ///         for conflict in conflicts {
-///             // Resolve by choosing the latest operation
-///             // Implementation details...
+///             if let Conflict::MultipleOperationsOnRid { rid, operations } = conflict {
+///                 if let Some(first) = operations.first() {
+///                     resolution
+///                         .operations
+///                         .insert(*rid, OperationResolution::UseOperation(first.clone()));
+///                 }
+///             }
 ///         }
 ///         Ok(resolution)
 ///     }
 /// }
+///
+/// let resolution = FirstWriteWinsResolver.resolve_conflict(&[])?;
+/// assert!(resolution.operations.is_empty());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 pub trait ConflictResolver {
     /// Resolves conflicts between operations.
@@ -109,16 +121,17 @@ pub trait ConflictResolver {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use crate::cilassembly::resolver::{ConflictResolver, Conflict};
+    /// ```
+    /// use dotscope::{Conflict, ConflictResolver, LastWriteWinsResolver};
     ///
-    /// # let resolver = LastWriteWinsResolver;
-    /// # let conflicts = vec![]; // conflicts would be populated
+    /// let resolver = LastWriteWinsResolver;
+    /// // The conflicts the validation pipeline detected: none here
+    /// let conflicts: Vec<Conflict> = Vec::new();
     /// let resolution = resolver.resolve_conflict(&conflicts)?;
     /// for (rid, operation_resolution) in resolution.operations {
     ///     println!("RID {} resolved to: {:?}", rid, operation_resolution);
     /// }
-    /// # Ok::<(), crate::Error>(())
+    /// # Ok::<(), dotscope::Error>(())
     /// ```
     fn resolve_conflict(&self, conflicts: &[Conflict]) -> Result<Resolution>;
 }
@@ -191,15 +204,17 @@ pub enum OperationResolution {
 ///
 /// # Usage Examples
 ///
-/// ```rust,ignore
-/// use crate::cilassembly::resolver::{LastWriteWinsResolver, ConflictResolver, Conflict};
+/// ```
+/// use dotscope::{Conflict, ConflictResolver, LastWriteWinsResolver};
 ///
 /// let resolver = LastWriteWinsResolver;
 ///
 /// // Typically used by validation pipeline
-/// // let conflicts = vec![/* detected conflicts */];
-/// // let resolution = resolver.resolve_conflict(&conflicts)?;
-/// # Ok::<(), crate::Error>(())
+/// // The conflicts the validation pipeline detected: none here
+/// let conflicts: Vec<Conflict> = Vec::new();
+/// let resolution = resolver.resolve_conflict(&conflicts)?;
+/// assert!(resolution.operations.is_empty());
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 ///
 /// # Thread Safety
@@ -283,14 +298,14 @@ impl ConflictResolver for LastWriteWinsResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cilassembly::Operation, test::factories::table::cilassembly::create_test_row};
+    use crate::{cilassembly::Operation, testkit::factories::table::cilassembly::create_test_row};
 
     #[test]
     fn test_last_write_wins_resolver_multiple_operations() {
         let operations = vec![
             {
                 let mut op = TableOperation::new(Operation::Insert(100, create_test_row()));
-                op.timestamp = 1000; // Microseconds since epoch
+                op.timestamp = 1000;
                 op
             },
             {
@@ -381,11 +396,36 @@ mod tests {
         assert!(resolution.operations.contains_key(&100));
     }
 
+    /// A delete made right after an insert of the same row wins, however close together
+    /// they were made.
+    #[test]
+    fn a_delete_made_right_after_an_insert_wins() {
+        for rid in 1..1_000 {
+            let insert_op = TableOperation::new(Operation::Insert(rid, create_test_row()));
+            let delete_op = TableOperation::new(Operation::Delete(rid));
+            let conflict = Conflict::InsertDeleteConflict {
+                rid,
+                insert_op,
+                delete_op,
+            };
+            let resolution = LastWriteWinsResolver
+                .resolve_conflict(&[conflict])
+                .expect("resolves");
+            assert!(
+                matches!(
+                    resolution.operations.get(&rid),
+                    Some(OperationResolution::UseOperation(op)) if op.is_delete()
+                ),
+                "RID {rid}: the later delete must win"
+            );
+        }
+    }
+
     #[test]
     fn test_last_write_wins_resolver_insert_delete_conflict() {
         let insert_op = {
             let mut op = TableOperation::new(Operation::Insert(100, create_test_row()));
-            op.timestamp = 1000; // Microseconds since epoch
+            op.timestamp = 1000;
             op
         };
 

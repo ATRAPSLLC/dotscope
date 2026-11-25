@@ -452,12 +452,12 @@ impl MethodImplBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
     use crate::{
         cilassembly::{ChangeRefKind, CilAssembly},
         metadata::cilassemblyview::CilAssemblyView,
+        testkit::fixture,
     };
 
     #[test]
@@ -478,203 +478,194 @@ mod tests {
 
     #[test]
     fn test_interface_implementation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Get the expected next RID for MethodImpl
-            let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
+        // Get the expected next RID for MethodImpl
+        let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
 
-            let implementing_class = 1; // MyClass
-            let implementation_method = 1; // MyClass.DoWork()
-            let interface_method = 1; // IWorker.DoWork()
+        let implementing_class = 1; // MyClass
+        let implementation_method = 1; // MyClass.DoWork()
+        let interface_method = 1; // IWorker.DoWork()
 
-            let ref_ = MethodImplBuilder::new()
-                .class(implementing_class)
-                .method_body_from_method_def(implementation_method)
-                .method_declaration_from_member_ref(interface_method)
-                .build(&mut assembly)
-                .expect("Should build MethodImpl");
+        let ref_ = MethodImplBuilder::new()
+            .class(implementing_class)
+            .method_body_from_method_def(implementation_method)
+            .method_declaration_from_member_ref(interface_method)
+            .build(&mut assembly)
+            .expect("Should build MethodImpl");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
     }
 
     #[test]
     fn test_virtual_method_override() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Get the expected next RID for MethodImpl
-            let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
+        // Get the expected next RID for MethodImpl
+        let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
 
-            let derived_class = 2; // DerivedClass
-            let override_method = 2; // DerivedClass.VirtualMethod()
-            let base_method = 3; // BaseClass.VirtualMethod()
+        let derived_class = 2; // DerivedClass
+        let override_method = 2; // DerivedClass.VirtualMethod()
+        let base_method = 3; // BaseClass.VirtualMethod()
 
-            let ref_ = MethodImplBuilder::new()
-                .class(derived_class)
-                .method_body_from_method_def(override_method)
-                .method_declaration_from_method_def(base_method)
-                .build(&mut assembly)
-                .expect("Should build virtual override MethodImpl");
+        let ref_ = MethodImplBuilder::new()
+            .class(derived_class)
+            .method_body_from_method_def(override_method)
+            .method_declaration_from_method_def(base_method)
+            .build(&mut assembly)
+            .expect("Should build virtual override MethodImpl");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
     }
 
     #[test]
     fn test_explicit_interface_implementation() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Get the expected next RID for MethodImpl
-            let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
+        // Get the expected next RID for MethodImpl
+        let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
 
-            let explicit_class = 3; // ExplicitImpl
-            let explicit_method = 4; // ExplicitImpl.IInterface.Method()
-            let interface_decl = 2; // IInterface.Method()
+        let explicit_class = 3; // ExplicitImpl
+        let explicit_method = 4; // ExplicitImpl.IInterface.Method()
+        let interface_decl = 2; // IInterface.Method()
 
-            let ref_ = MethodImplBuilder::new()
-                .class(explicit_class)
-                .method_body_from_method_def(explicit_method)
-                .method_declaration_from_member_ref(interface_decl)
-                .build(&mut assembly)
-                .expect("Should build explicit interface MethodImpl");
+        let ref_ = MethodImplBuilder::new()
+            .class(explicit_class)
+            .method_body_from_method_def(explicit_method)
+            .method_declaration_from_member_ref(interface_decl)
+            .build(&mut assembly)
+            .expect("Should build explicit interface MethodImpl");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
     }
 
     #[test]
     fn test_external_method_body() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Get the expected next RID for MethodImpl
-            let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
+        // Get the expected next RID for MethodImpl
+        let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
 
-            let implementing_class = 1;
-            let external_method = 3; // External method implementation
-            let interface_method = 4;
+        let implementing_class = 1;
+        let external_method = 3; // External method implementation
+        let interface_method = 4;
 
-            let ref_ = MethodImplBuilder::new()
-                .class(implementing_class)
-                .method_body_from_member_ref(external_method)
-                .method_declaration_from_member_ref(interface_method)
-                .build(&mut assembly)
-                .expect("Should build external method MethodImpl");
+        let ref_ = MethodImplBuilder::new()
+            .class(implementing_class)
+            .method_body_from_member_ref(external_method)
+            .method_declaration_from_member_ref(interface_method)
+            .build(&mut assembly)
+            .expect("Should build external method MethodImpl");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
     }
 
     #[test]
     fn test_mixed_method_refs() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            // Get the expected next RID for MethodImpl
-            let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
+        // Get the expected next RID for MethodImpl
+        let _expected_rid = assembly.next_rid(TableId::MethodImpl).unwrap();
 
-            // Test using direct row indices with both MethodDef and MemberRef tables
-            let implementing_class = 1;
+        // Test using direct row indices with both MethodDef and MemberRef tables
+        let implementing_class = 1;
 
-            let ref_ = MethodImplBuilder::new()
-                .class(implementing_class)
-                .method_body_from_method_def(1)
-                .method_declaration_from_member_ref(1)
-                .build(&mut assembly)
-                .expect("Should build mixed method ref MethodImpl");
+        let ref_ = MethodImplBuilder::new()
+            .class(implementing_class)
+            .method_body_from_method_def(1)
+            .method_declaration_from_member_ref(1)
+            .build(&mut assembly)
+            .expect("Should build mixed method ref MethodImpl");
 
-            assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
-        }
+        assert_eq!(ref_.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
     }
 
     #[test]
     fn test_build_without_class_fails() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = MethodImplBuilder::new()
-                .method_body_from_method_def(1)
-                .method_declaration_from_member_ref(1)
-                .build(&mut assembly);
+        let result = MethodImplBuilder::new()
+            .method_body_from_method_def(1)
+            .method_declaration_from_member_ref(1)
+            .build(&mut assembly);
 
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("requires a class row index"));
-        }
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires a class row index"));
     }
 
     #[test]
     fn test_build_without_method_body_fails() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = MethodImplBuilder::new()
-                .class(1)
-                .method_declaration_from_member_ref(1)
-                .build(&mut assembly);
+        let result = MethodImplBuilder::new()
+            .class(1)
+            .method_declaration_from_member_ref(1)
+            .build(&mut assembly);
 
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("requires a method body"));
-        }
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires a method body"));
     }
 
     #[test]
     fn test_build_without_method_declaration_fails() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let result = MethodImplBuilder::new()
-                .class(1)
-                .method_body_from_method_def(1)
-                .build(&mut assembly);
+        let result = MethodImplBuilder::new()
+            .class(1)
+            .method_body_from_method_def(1)
+            .build(&mut assembly);
 
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("requires a method declaration"));
-        }
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires a method declaration"));
     }
 
     #[test]
     fn test_multiple_method_impls() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/WindowsBase.dll");
-        if let Ok(view) = CilAssemblyView::from_path(&path) {
-            let mut assembly = CilAssembly::new(view);
+        let path = fixture("WindowsBase.dll");
+        let view = CilAssemblyView::from_path(&path).expect("the fixture loads");
+        let mut assembly = CilAssembly::new(view);
 
-            let ref1 = MethodImplBuilder::new()
-                .class(1)
-                .method_body_from_method_def(1)
-                .method_declaration_from_member_ref(1)
-                .build(&mut assembly)
-                .expect("Should build first MethodImpl");
+        let ref1 = MethodImplBuilder::new()
+            .class(1)
+            .method_body_from_method_def(1)
+            .method_declaration_from_member_ref(1)
+            .build(&mut assembly)
+            .expect("Should build first MethodImpl");
 
-            let ref2 = MethodImplBuilder::new()
-                .class(1)
-                .method_body_from_method_def(2)
-                .method_declaration_from_member_ref(2)
-                .build(&mut assembly)
-                .expect("Should build second MethodImpl");
+        let ref2 = MethodImplBuilder::new()
+            .class(1)
+            .method_body_from_method_def(2)
+            .method_declaration_from_member_ref(2)
+            .build(&mut assembly)
+            .expect("Should build second MethodImpl");
 
-            assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
-            assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
-            assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
-        }
+        assert_eq!(ref1.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
+        assert_eq!(ref2.kind(), ChangeRefKind::TableRow(TableId::MethodImpl));
+        assert!(!std::sync::Arc::ptr_eq(&ref1, &ref2));
     }
 }

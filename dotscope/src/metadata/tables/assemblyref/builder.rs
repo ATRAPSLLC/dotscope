@@ -349,7 +349,7 @@ impl AssemblyRefBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// # use dotscope::prelude::*;
     /// # use std::path::Path;
     /// # let view = CilAssemblyView::from_path(Path::new("test.dll"))?;
@@ -360,7 +360,7 @@ impl AssemblyRefBuilder {
     ///     .version(4, 0, 0, 0)
     ///     .build(&mut assembly)?;
     ///
-    /// println!("Created AssemblyRef with token: {}", assembly_ref_token);
+    /// println!("Created AssemblyRef with token: {:?}", assembly_ref_token.placeholder_token());
     /// # Ok::<(), dotscope::Error>(())
     /// ```
     pub fn build(self, assembly: &mut CilAssembly) -> Result<ChangeRefRc> {
@@ -459,7 +459,7 @@ mod tests {
     use super::*;
     use crate::{
         cilassembly::ChangeRefKind, metadata::tables::AssemblyFlags,
-        test::factories::table::assemblyref::get_test_assembly,
+        testkit::factories::table::assemblyref::get_test_assembly,
     };
 
     #[test]

@@ -23,7 +23,6 @@ use crate::{
         token::Token,
         typesystem::{CilTypeRef, TypeRegistry},
     },
-    utils::LazyList,
     Result,
 };
 
@@ -110,10 +109,13 @@ impl InterfaceImplRaw {
 
         match types.get(&Token::new(self.class | 0x0200_0000)) {
             Some(class) => {
-                class.interfaces.push(InterfaceEntry {
-                    interface: CilTypeRef::new(&interface),
-                    custom_attributes: LazyList::new(),
-                });
+                class.interfaces.push_row(
+                    self.token,
+                    InterfaceEntry {
+                        interface: CilTypeRef::new(&interface),
+                        custom_attributes: Default::default(),
+                    },
+                );
                 Ok(())
             }
             None => Err(malformed_error!(
@@ -164,7 +166,7 @@ impl InterfaceImplRaw {
                     ))
                 }
             },
-            custom_attributes: LazyList::new(),
+            custom_attributes: Default::default(),
         }))
     }
 }

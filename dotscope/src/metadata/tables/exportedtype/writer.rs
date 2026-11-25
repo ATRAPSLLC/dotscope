@@ -35,7 +35,7 @@
 //! This writer integrates with the metadata table infrastructure:
 //! - [`crate::metadata::tables::types::RowWritable`]: Writing trait for table rows
 //! - [`crate::metadata::tables::exportedtype::ExportedTypeRaw`]: Raw exported type data structure
-//! - [`crate::file::io`]: Low-level binary I/O operations
+//! - [`crate::io`]: Low-level binary I/O operations
 //!
 //! # Reference
 //! - [ECMA-335 II.22.14](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf) - `ExportedType` table specification
@@ -89,11 +89,7 @@ impl RowWritable for ExportedTypeRaw {
         write_le_at_dyn(data, offset, self.namespace, sizes.is_large_str())?;
 
         // Write coded index
-        let encoded_index = sizes.encode_coded_index(
-            self.implementation.tag,
-            self.implementation.row,
-            CodedIndexType::Implementation,
-        )?;
+        let encoded_index = self.implementation.encode(sizes)?;
         write_le_at_dyn(
             data,
             offset,

@@ -108,20 +108,19 @@ use crate::{
 ///
 /// # Usage Patterns
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::tables::methodsemantics::raw::MethodSemanticsRaw;
+/// ```no_run
+/// use dotscope::metadata::tables::MethodSemanticsRaw;
 /// use dotscope::metadata::tables::MethodSemanticsAttributes;
 ///
 /// # fn process_semantic_entry(raw_entry: &MethodSemanticsRaw) {
 /// // Check semantic type
-/// match raw_entry.semantics {
-///     MethodSemanticsAttributes::GETTER => {
-///         println!("Property getter method: {}", raw_entry.method);
-///     }
-///     MethodSemanticsAttributes::ADD_ON => {
-///         println!("Event add method: {}", raw_entry.method);
-///     }
-///     _ => println!("Other semantic type"),
+/// let semantics = MethodSemanticsAttributes::new(raw_entry.semantics);
+/// if semantics.contains(MethodSemanticsAttributes::GETTER) {
+///     println!("Property getter method: {}", raw_entry.method);
+/// } else if semantics.contains(MethodSemanticsAttributes::ADD_ON) {
+///     println!("Event add method: {}", raw_entry.method);
+/// } else {
+///     println!("Other semantic type");
 /// }
 ///
 /// // Access coded index for association
@@ -251,8 +250,7 @@ impl MethodSemanticsRaw {
                     MethodSemanticsAttributes::OTHER => {
                         property
                             .fn_other
-                            .set(method.value().clone().into())
-                            .map_err(|_| malformed_error!("Property `other` method already set"))?;
+                            .push_row(self.token, method.value().clone().into());
                         Ok(())
                     }
                     _ => Err(malformed_error!("Invalid property semantics")),
@@ -284,8 +282,7 @@ impl MethodSemanticsRaw {
                     MethodSemanticsAttributes::OTHER => {
                         event
                             .fn_on_other
-                            .set(method.value().clone().into())
-                            .map_err(|_| malformed_error!("Event `other` method already set"))?;
+                            .push_row(self.token, method.value().clone().into());
                         Ok(())
                     }
                     _ => Err(malformed_error!("Invalid event semantics")),

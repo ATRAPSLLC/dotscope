@@ -12,7 +12,7 @@ use crate::{
         tables::{Property, PropertyAttributes, PropertyRc, TableInfoRef, TableRow},
         token::Token,
     },
-    utils::LazyList,
+    utils::RowList,
     Result,
 };
 
@@ -119,13 +119,13 @@ impl PropertyRaw {
         Ok(Arc::new(Property {
             token: self.token,
             flags: PropertyAttributes::new(self.flags),
-            name: strings.get(self.name as usize)?.to_string(),
+            name: strings.get_shared(self.name as usize)?,
             signature: parse_property_signature(blob.get(self.signature as usize)?)?,
             default: OnceLock::new(),
             fn_setter: OnceLock::new(),
             fn_getter: OnceLock::new(),
-            fn_other: OnceLock::new(),
-            custom_attributes: LazyList::new(),
+            fn_other: RowList::new(),
+            custom_attributes: Default::default(),
         }))
     }
 

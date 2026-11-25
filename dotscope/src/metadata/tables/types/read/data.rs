@@ -13,8 +13,9 @@
 //!
 //! ## Usage Example
 //!
-//! ```rust,ignore
-//! use dotscope::metadata::tables::types::TableData;
+//! ```no_run
+//! use dotscope::metadata::tables::TableData;
+//! use rayon::prelude::*;
 //!
 //! fn process_table(table: &TableData) {
 //!     match table {
@@ -71,8 +72,8 @@ use crate::metadata::tables::{
 ///
 /// This enum is designed for pattern matching to handle different table types:
 ///
-/// ```rust,ignore
-/// use dotscope::metadata::tables::types::TableData;
+/// ```no_run
+/// use dotscope::metadata::tables::TableData;
 ///
 /// fn analyze_table(table: &TableData) -> String {
 ///     match table {

@@ -48,6 +48,11 @@ impl CleanupStats {
         }
     }
 
+    /// Sets the removal count of each table to `removals`, replacing what the passes added.
+    pub fn set_removals(&mut self, removals: HashMap<TableId, usize>) {
+        self.removals = removals;
+    }
+
     /// Returns the total number of metadata entries removed.
     ///
     /// This includes all table entries: types, methods, fields, attributes,

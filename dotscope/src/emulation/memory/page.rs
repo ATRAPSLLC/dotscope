@@ -40,7 +40,7 @@ pub const PAGE_SIZE: usize = 4096;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use dotscope::emulation::Page;
 ///
 /// // Create a page with some data
@@ -60,6 +60,7 @@ pub const PAGE_SIZE: usize = 4096;
 /// forked.write_byte(0, 200)?;
 /// assert_eq!(page.read_byte(0)?, 100); // Original unchanged
 /// assert_eq!(forked.read_byte(0)?, 200);
+/// # Ok::<(), dotscope::Error>(())
 /// ```
 #[derive(Debug)]
 pub struct Page {

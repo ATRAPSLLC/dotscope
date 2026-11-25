@@ -9,13 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use analyssa::analysis::{Machine, WorkBudget};
+use crossbeam_skiplist::SkipSet;
 use dashmap::{DashMap, DashSet};
 use rayon::prelude::*;
 
 use crate::{
-    analysis::{
-        CallGraph, ConstValue, SsaFunction, SsaFunctionCilExt, SsaOp, SsaVarId, ValueRange,
-    },
+    analysis::{CallGraph, CilTarget, ConstValue, SsaFunction, SsaFunctionCilExt, SsaOp, SsaVarId},
     compiler::{
         summary::{CallSiteInfo, MethodSummary},
         EventLog, ProcessingState,
@@ -53,7 +53,12 @@ pub struct CompilerContext {
     pub dead_methods: DashSet<Token>,
 
     /// Methods that have been fully processed by the pass pipeline.
-    pub processed_methods: DashSet<Token>,
+    ///
+    /// Ordered, because code generation walks it: the order methods are
+    /// emitted in decides where each body lands and the order new user
+    /// strings and signatures enter their heaps and tables, so an unordered
+    /// set wrote the same program out differently on every run.
+    pub processed_methods: SkipSet<Token>,
 
     /// Entry point methods (Main, event handlers, etc.).
     pub entry_points: DashSet<Token>,
@@ -74,19 +79,10 @@ pub struct CompilerContext {
     /// delegate's Invoke dispatch, never called directly.
     pub devirtualized_methods: DashSet<Token>,
 
-    /// Metadata tokens neutralized by SSA passes (Call/CallVirt targets that were
+    /// Metadata tokens neutralized by SSA passes (methods of calls that were
     /// NOP'd or replaced). Used by cleanup to cascade-remove orphaned MemberRef,
     /// TypeRef, and AssemblyRef entries that are no longer referenced.
     pub neutralized_tokens: DashSet<Token>,
-
-    /// Known constant values for SSA variables, per method.
-    known_values: DashMap<Token, DashMap<SsaVarId, ConstValue>>,
-
-    /// Known value ranges for SSA variables, per method.
-    known_ranges: DashMap<Token, DashMap<SsaVarId, ValueRange>>,
-
-    /// Local variable remappings after optimization, per method.
-    local_remappings: DashMap<Token, Vec<Option<u16>>>,
 
     /// Assembly under analysis. Set by the pipeline before running passes
     /// via [`set_assembly`](Self::set_assembly). Test contexts may leave
@@ -104,6 +100,9 @@ pub struct CompilerContext {
 
     /// When analysis started.
     start_time: Instant,
+
+    /// The work budget the passes' analyses run within.
+    budget: WorkBudget,
 }
 
 impl CompilerContext {
@@ -117,19 +116,31 @@ impl CompilerContext {
             call_sites: DashMap::new(),
             events: EventLog::new(),
             dead_methods: DashSet::new(),
-            processed_methods: DashSet::new(),
+            processed_methods: SkipSet::new(),
             entry_points: DashSet::new(),
             no_inline: DashSet::new(),
             inlined_methods: DashSet::new(),
             devirtualized_methods: DashSet::new(),
             neutralized_tokens: DashSet::new(),
-            known_values: DashMap::new(),
-            known_ranges: DashMap::new(),
-            local_remappings: DashMap::new(),
             assembly_slot: RwLock::new(None),
             processing_state: ProcessingState::new(),
             start_time: Instant::now(),
+            budget: WorkBudget::DEFAULT,
         }
+    }
+
+    /// Returns this context with `budget` as the work budget its passes'
+    /// analyses run within.
+    #[must_use]
+    pub fn with_budget(mut self, budget: WorkBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Returns the work budget the passes' analyses run within.
+    #[must_use]
+    pub const fn budget(&self) -> WorkBudget {
+        self.budget
     }
 
     /// Sets the assembly under analysis. Idempotent; the pipeline calls
@@ -147,6 +158,18 @@ impl CompilerContext {
     #[must_use]
     pub fn assembly(&self) -> Option<Arc<CilObject>> {
         self.assembly_slot.read().ok().and_then(|s| s.clone())
+    }
+
+    /// Returns the machine the assembly runs on.
+    ///
+    /// If the assembly is set, its PE header states the pointer width. Test
+    /// contexts without an assembly take the 64-bit target, dotscope's
+    /// default (`CilTarget::x64`).
+    #[must_use]
+    pub fn machine(&self) -> Machine {
+        self.assembly()
+            .map_or_else(CilTarget::x64, |assembly| CilTarget::of(&assembly))
+            .machine()
     }
 
     /// Releases the assembly handle held in this context. Required
@@ -343,15 +366,15 @@ impl CompilerContext {
     /// Returns methods in reverse topological order (callees before callers).
     #[must_use]
     pub fn methods_reverse_topological(&self) -> Vec<Token> {
-        let mut order = self.call_graph.topological_order().to_vec();
-        order.reverse();
-        order
+        self.call_graph.topological_order().to_vec()
     }
 
     /// Returns methods in topological order (callers before callees).
     #[must_use]
     pub fn methods_topological(&self) -> Vec<Token> {
-        self.call_graph.topological_order().to_vec()
+        let mut order = self.call_graph.topological_order().to_vec();
+        order.reverse();
+        order
     }
 
     /// Returns an iterator over all method tokens that have SSA functions.
@@ -366,21 +389,25 @@ impl CompilerContext {
     }
 
     /// Executes a closure with a reference to a known constant value.
+    ///
+    /// The value's own record answers this. Nothing is kept beside the
+    /// function: see [`CilVariableFacts`](crate::analysis::CilVariableFacts)
+    /// for why a table keyed by [`SsaVarId`] cannot.
     pub fn with_known_value<R, F>(&self, method: Token, var: SsaVarId, f: F) -> Option<R>
     where
         F: FnOnce(&ConstValue) -> R,
     {
-        self.known_values
-            .get(&method)
-            .and_then(|method_values| method_values.get(&var).map(|r| f(&r)))
+        self.with_ssa(method, |ssa| {
+            ssa.variable(var)
+                .and_then(|variable| variable.facts().known_value().map(f))
+        })
+        .flatten()
     }
 
     /// Checks if a known value exists for an SSA variable.
     #[must_use]
     pub fn has_known_value(&self, method: Token, var: SsaVarId) -> bool {
-        self.known_values
-            .get(&method)
-            .is_some_and(|m| m.contains_key(&var))
+        self.with_known_value(method, var, |_| ()).is_some()
     }
 
     /// Checks if a known value satisfies a predicate.
@@ -389,9 +416,7 @@ impl CompilerContext {
     where
         F: FnOnce(&ConstValue) -> bool,
     {
-        self.known_values
-            .get(&method)
-            .and_then(|m| m.get(&var).map(|r| predicate(&r)))
+        self.with_known_value(method, var, predicate)
             .unwrap_or(false)
     }
 
@@ -400,75 +425,55 @@ impl CompilerContext {
     where
         F: FnMut(SsaVarId, &ConstValue),
     {
-        if let Some(inner) = self.known_values.get(&method) {
-            for entry in inner.iter() {
-                f(*entry.key(), entry.value());
+        self.with_ssa(method, |ssa| {
+            for variable in ssa.variables().iter() {
+                if let Some(value) = variable.facts().known_value() {
+                    f(variable.id(), value);
+                }
             }
-        }
+        });
     }
 
     /// Records a known constant value for an SSA variable.
+    ///
+    /// Stored on the variable, so it travels with the value through every
+    /// renumbering and is restored with the function when a pass group rolls
+    /// back. A method with no SSA loaded records nothing: there is no value to
+    /// record it against.
     pub fn add_known_value(&self, method: Token, var: SsaVarId, value: ConstValue) {
-        self.known_values
-            .entry(method)
-            .or_default()
-            .insert(var, value);
+        self.with_ssa_mut(method, |ssa| {
+            if let Some(variable) = ssa.variable_mut(var) {
+                variable.facts_mut().set_known_value(value);
+            }
+        });
     }
 
     /// Clears known values for a method when its SSA is modified.
     pub fn clear_known_values(&self, method: Token) {
-        self.known_values.remove(&method);
+        self.with_ssa_mut(method, |ssa| {
+            let ids: Vec<SsaVarId> = ssa
+                .variables()
+                .iter()
+                .map(|variable| variable.id())
+                .collect();
+            for var in ids {
+                if let Some(variable) = ssa.variable_mut(var) {
+                    variable.facts_mut().clear_known_value();
+                }
+            }
+        });
     }
 
     /// Returns the number of known values for a method.
     #[must_use]
     pub fn known_value_count(&self, method: Token) -> usize {
-        self.known_values
-            .get(&method)
-            .map_or(0, |inner| inner.len())
-    }
-
-    /// Records a known value range for an SSA variable.
-    pub fn add_known_range(&self, method: Token, var: SsaVarId, range: ValueRange) {
-        self.known_ranges
-            .entry(method)
-            .or_default()
-            .insert(var, range);
-    }
-
-    /// Executes a closure with a reference to a known value range.
-    pub fn with_known_range<R, F>(&self, method: Token, var: SsaVarId, f: F) -> Option<R>
-    where
-        F: FnOnce(&ValueRange) -> R,
-    {
-        self.known_ranges
-            .get(&method)
-            .and_then(|method_ranges| method_ranges.get(&var).map(|r| f(&r)))
-    }
-
-    /// Checks if a known range exists for an SSA variable.
-    #[must_use]
-    pub fn has_known_range(&self, method: Token, var: SsaVarId) -> bool {
-        self.known_ranges
-            .get(&method)
-            .is_some_and(|m| m.contains_key(&var))
-    }
-
-    /// Iterates over all known ranges for a method.
-    pub fn for_each_known_range<F>(&self, method: Token, mut f: F)
-    where
-        F: FnMut(SsaVarId, &ValueRange),
-    {
-        if let Some(inner) = self.known_ranges.get(&method) {
-            for entry in inner.iter() {
-                f(*entry.key(), entry.value());
-            }
-        }
-    }
-
-    /// Clears known ranges for a method when its SSA is modified.
-    pub fn clear_known_ranges(&self, method: Token) {
-        self.known_ranges.remove(&method);
+        self.with_ssa(method, |ssa| {
+            ssa.variables()
+                .iter()
+                .filter(|variable| variable.facts().known_value().is_some())
+                .count()
+        })
+        .unwrap_or(0)
     }
 
     /// Canonicalizes all SSA functions in preparation for code generation.
@@ -481,41 +486,39 @@ impl CompilerContext {
             };
 
             ssa.canonicalize();
-            let remapping = ssa.optimize_locals();
+            // The remapping says where each original local moved. Nothing reads
+            // it: code generation reads the optimized function, and a consumer
+            // that wants to relate a value back to its original slot reads the
+            // variable's own origin. Keeping it meant a per-method table that
+            // no edit ever updated.
+            let _ = ssa.optimize_locals();
 
             self.ssa_functions.insert(token, ssa);
-            self.local_remappings.insert(token, remapping);
         });
-    }
-
-    /// Executes a closure with a reference to the local variable remapping.
-    pub fn with_local_remapping<R, F>(&self, token: Token, f: F) -> Option<R>
-    where
-        F: FnOnce(&[Option<u16>]) -> R,
-    {
-        self.local_remappings.get(&token).map(|r| f(&r))
-    }
-
-    /// Checks if a local variable remapping exists for a method.
-    #[must_use]
-    pub fn has_local_remapping(&self, token: Token) -> bool {
-        self.local_remappings.contains_key(&token)
     }
 
     /// Builds a live call graph from actual SSA instructions.
     ///
-    /// Scans all SSA functions for `Call`, `CallVirt`, `NewObj`,
+    /// Scans all SSA functions for the calls that name a method, `NewObj`,
     /// `LoadFunctionPtr`, and `LoadVirtFunctionPtr` instructions and records
     /// the caller → callee edges. This accounts for inlining and other
     /// transformations that may have removed or added calls since the
     /// initial static call graph was built.
+    ///
+    /// A call through a MemberRef or MethodSpec naming a method of this assembly records that
+    /// method as well as the token: a generic method's instantiation, or a method of a generic
+    /// type, is called through one, and is called all the same. Without `assembly` such a call
+    /// records the token alone.
     ///
     /// Note this graph only has entries for methods that *have* an SSA function. A method whose
     /// body never converted contributes no edges at all, which reads as "calls nothing" rather
     /// than "unknown". Reachability consumers must use [`Self::build_effective_call_graph`];
     /// this one is for consumers that specifically want the post-transformation view.
     #[must_use]
-    pub fn build_ssa_call_graph(&self) -> BTreeMap<Token, BTreeSet<Token>> {
+    pub fn build_ssa_call_graph(
+        &self,
+        assembly: Option<&CilObject>,
+    ) -> BTreeMap<Token, BTreeSet<Token>> {
         let mut call_graph = BTreeMap::new();
         for entry in &self.ssa_functions {
             let caller_token = *entry.key();
@@ -524,9 +527,12 @@ impl CompilerContext {
             for block in ssa.blocks() {
                 for instr in block.instructions() {
                     match instr.op() {
-                        SsaOp::Call { method, .. }
-                        | SsaOp::CallVirt { method, .. }
-                        | SsaOp::LoadFunctionPtr { method, .. }
+                        SsaOp::Call(call) => {
+                            if let Some(method) = call.callee.method() {
+                                callees.insert(method.token());
+                            }
+                        }
+                        SsaOp::LoadFunctionPtr { method, .. }
                         | SsaOp::LoadVirtFunctionPtr { method, .. } => {
                             callees.insert(method.token());
                         }
@@ -536,6 +542,14 @@ impl CompilerContext {
                         _ => {}
                     }
                 }
+            }
+            if let Some(assembly) = assembly {
+                let resolver = assembly.resolver();
+                let local: Vec<Token> = callees
+                    .iter()
+                    .filter_map(|&callee| resolver.resolve_method(callee))
+                    .collect();
+                callees.extend(local);
             }
             call_graph.insert(caller_token, callees);
         }
@@ -555,13 +569,41 @@ impl CompilerContext {
     /// So SSA edges win where they exist, and the static call graph fills in for every method
     /// that has none. This mirrors what `CtxWorld::callees` does for dead-method elimination.
     #[must_use]
-    pub fn build_effective_call_graph(&self) -> BTreeMap<Token, BTreeSet<Token>> {
-        let mut call_graph = self.build_ssa_call_graph();
+    pub fn build_effective_call_graph(
+        &self,
+        assembly: &CilObject,
+    ) -> BTreeMap<Token, BTreeSet<Token>> {
+        let mut call_graph = self.build_ssa_call_graph(Some(assembly));
         for node in self.call_graph.nodes() {
             call_graph
                 .entry(node.token)
                 .or_insert_with(|| self.call_graph.callees(node.token).into_iter().collect());
         }
         call_graph
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::helpers::load_sample;
+
+    #[test]
+    fn a_call_through_a_method_spec_is_a_call_of_its_method() {
+        // ConfuserEx's type scrambler: SayHello calls `BuildMessage<string>` through MethodSpec
+        // 0x2B000013.
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_typescramble.exe");
+        let say_hello = Token::new(0x0600_0007);
+        let ctx = CompilerContext::new(Arc::new(CallGraph::new()));
+        let ssa = assembly
+            .method(&say_hello)
+            .and_then(|method| method.ssa(&assembly))
+            .expect("SayHello converts");
+        ctx.ssa_functions.insert(say_hello, ssa);
+
+        let callees = ctx.build_ssa_call_graph(Some(&assembly));
+        let callees = callees.get(&say_hello).expect("SayHello's calls");
+        assert!(callees.contains(&Token::new(0x2B00_0013)), "{callees:x?}");
+        assert!(callees.contains(&Token::new(0x0600_0009)), "{callees:x?}");
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! This module builds a CFG from decoded x86 instructions, identifying basic blocks
 //! and their successor relationships. It leverages the existing graph infrastructure
-//! from [`crate::utils::graph`] for efficient analysis.
+//! from [`analyssa::graph`] for efficient analysis.
 
 use std::{collections::BTreeSet, sync::OnceLock};
 
@@ -85,7 +85,7 @@ pub struct X86Function {
 }
 
 impl X86Function {
-    /// Build a CFG from decoded instructions.
+    /// Build a CFG from decoded instructions, entered at the first of them.
     ///
     /// This identifies basic block boundaries based on:
     /// - Jump targets (start of block)
@@ -93,9 +93,32 @@ impl X86Function {
     /// - Jump/ret instructions (end of block)
     ///
     /// The resulting CFG uses a directed graph internally and provides
-    /// lazy-computed analysis (dominators, etc.).
+    /// lazy-computed analysis (dominators, etc.). A linear decode
+    /// ([`x86_decode_all`](crate::analysis::x86_decode_all)) starts at the entry,
+    /// so its first instruction is it; a traversal decode returns its instructions
+    /// by address, and is built with [`Self::with_entry`].
     #[must_use]
     pub fn new(instructions: &[X86DecodedInstruction], bitness: u32, base_address: u64) -> Self {
+        let entry = instructions.first().map_or(0, |instr| instr.offset);
+        Self::with_entry(instructions, bitness, base_address, entry)
+    }
+
+    /// Build a CFG from decoded instructions, entered at `entry_offset`.
+    ///
+    /// The block starting at the entry is block 0, whatever its address: code
+    /// before the entry that a jump reaches comes after it. The other blocks
+    /// follow in address order.
+    ///
+    /// A jump target that starts no decoded instruction (the middle of one, or an
+    /// offset outside the decoded range) starts no block, and the jump has no edge
+    /// there. The instructions after it stay in the block they were decoded in.
+    #[must_use]
+    pub fn with_entry(
+        instructions: &[X86DecodedInstruction],
+        bitness: u32,
+        base_address: u64,
+        entry_offset: u64,
+    ) -> Self {
         if instructions.is_empty() {
             let graph: DirectedGraph<'static, X86BasicBlock, X86EdgeKind> = DirectedGraph::new();
             return Self {
@@ -111,10 +134,11 @@ impl X86Function {
         // Step 1: Identify block leaders (offsets that start a basic block)
         let mut leaders = BTreeSet::new();
 
-        // First instruction is always a leader
+        // The first instruction and the entry are always leaders
         if let Some(first) = instructions.first() {
             leaders.insert(first.offset);
         }
+        leaders.insert(entry_offset);
 
         // Find jump targets and fallthrough points
         for (i, instr) in instructions.iter().enumerate() {
@@ -158,8 +182,14 @@ impl X86Function {
             .map(|(i, instr)| (instr.offset, i))
             .collect();
 
-        // Step 3: Create blocks
-        let leader_list: Vec<u64> = leaders.iter().copied().collect();
+        // Step 3: Create blocks, from the leaders that start a decoded instruction: a
+        // block ending at one that does not would leave the instructions after it in no
+        // block at all
+        let leader_list: Vec<u64> = leaders
+            .iter()
+            .copied()
+            .filter(|leader| offset_to_index.contains_key(leader))
+            .collect();
         let mut blocks: Vec<X86BasicBlock> = Vec::new();
         let mut offset_to_block: FxHashMap<u64, usize> = FxHashMap::default();
 
@@ -193,7 +223,6 @@ impl X86Function {
             }
 
             if !block_instrs.is_empty() {
-                offset_to_block.insert(leader_offset, blocks.len());
                 blocks.push(X86BasicBlock {
                     index: blocks.len(),
                     start_offset: leader_offset,
@@ -201,6 +230,19 @@ impl X86Function {
                     instructions: block_instrs,
                 });
             }
+        }
+
+        // The entry block first, the others in address order
+        if let Some(position) = blocks
+            .iter()
+            .position(|block| block.start_offset == entry_offset)
+        {
+            let entry_block = blocks.remove(position);
+            blocks.insert(0, entry_block);
+        }
+        for (index, block) in blocks.iter_mut().enumerate() {
+            block.index = index;
+            offset_to_block.insert(block.start_offset, index);
         }
 
         // Step 4: Compute edges before building graph (to avoid borrow issues)
@@ -504,6 +546,27 @@ mod tests {
         decoder::x86_decode_all,
         types::{X86Condition, X86EdgeKind},
     };
+
+    /// A jump into the middle of an instruction starts no block: the block it would have
+    /// ended keeps the instructions after it. `jne 4` jumps inside the `mov` at 2; ending
+    /// the block at 2 there dropped the `add` and `ret` after the `mov` from every block.
+    #[test]
+    fn a_jump_into_an_instruction_drops_no_code() {
+        // 0: jne 4; 2: mov eax, 0x11223344; 7: add eax, 1; 10: ret
+        let bytes = [
+            0x75, 0x02, 0xB8, 0x44, 0x33, 0x22, 0x11, 0x83, 0xC0, 0x01, 0xC3,
+        ];
+        let instructions = x86_decode_all(&bytes, 32, 0).unwrap();
+        let cfg = X86Function::new(&instructions, 32, 0);
+        let decoded: usize = (0..cfg.block_count())
+            .filter_map(|index| cfg.block(index))
+            .map(|block| block.instructions.len())
+            .sum();
+        assert_eq!(decoded, instructions.len());
+        assert!((0..cfg.block_count())
+            .filter_map(|index| cfg.block(index))
+            .all(|block| block.start_offset != 4));
+    }
 
     #[test]
     fn test_build_cfg_linear() {

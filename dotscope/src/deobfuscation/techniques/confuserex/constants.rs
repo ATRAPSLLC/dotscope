@@ -323,12 +323,12 @@ impl Technique for ConfuserExConstants {
                     if row.rva == 0 {
                         continue;
                     }
-                    if let Ok(offset) = file.rva_to_offset(row.rva as usize) {
-                        let data = file.data();
-                        if data.get(offset).is_some_and(|b| *b == LZMA_MAGIC) {
-                            has_lzma_fieldrva = true;
-                            data_field_tokens.push(Token::from_parts(TableId::Field, row.field));
-                        }
+                    if file
+                        .rva_slice(row.rva as usize, 1)
+                        .is_ok_and(|data| data.first() == Some(&LZMA_MAGIC))
+                    {
+                        has_lzma_fieldrva = true;
+                        data_field_tokens.push(Token::from_parts(TableId::Field, row.field));
                     }
                 }
             }
@@ -626,7 +626,8 @@ impl Technique for ConfuserExConstants {
             let semantics = detect_cfgctx_semantics(assembly);
             if let Some(semantics) = semantics {
                 // Find which methods use the state machine.
-                let call_sites = find_call_sites(assembly, &findings.decryptor_tokens);
+                let call_sites =
+                    find_call_sites(assembly, &findings.decryptor_tokens, &ctx.config.budget);
                 let cfg_mode_methods: HashSet<Token> = call_sites
                     .iter()
                     .filter(|site| site.uses_statemachine)
@@ -801,12 +802,12 @@ mod tests {
             confuserex::constants::{ConfuserExConstants, ConstantsFindings},
             Technique,
         },
-        test::helpers::load_sample,
+        testkit::helpers::load_sample,
     };
 
     #[test]
     fn test_detect_positive() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/mkaring_constants.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/mkaring_constants.exe");
 
         let technique = ConfuserExConstants;
         let detection = technique.detect(&assembly);
@@ -832,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_detect_negative() {
-        let assembly = load_sample("tests/samples/packers/confuserex/1.6.0/original.exe");
+        let assembly = load_sample("packers/confuserex/1.6.0/original.exe");
 
         let technique = ConfuserExConstants;
         let detection = technique.detect(&assembly);
